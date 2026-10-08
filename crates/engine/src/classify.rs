@@ -152,6 +152,7 @@ fn label_only(label: &str) -> Classification {
         confidence: 0.0,
         features: Default::default(),
         sync: None,
+        fields: None,
         analysed_s: 0.0,
     }
 }

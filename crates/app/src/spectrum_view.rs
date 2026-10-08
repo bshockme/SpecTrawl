@@ -379,7 +379,10 @@ impl SpectrumView {
             let named = class.is_some_and(|c| c.protocol.is_some());
             if sel || (!self.subtle_boxes && (b.width() >= 46.0 || named) && b.height() >= 10.0) {
                 let text = match class {
-                    Some(c) if c.label != "too short" => c.label.clone(),
+                    Some(c) if c.label != "too short" => match c.fields.as_ref().and_then(|f| f.id.as_deref()) {
+                        Some(id) => format!("{} · {id}", c.label),
+                        None => c.label.clone(),
+                    },
                     _ => format!("#{}", r.id),
                 };
                 let g = painter.layout_no_wrap(text, mono(10.0), theme::BG);
@@ -412,6 +415,16 @@ impl SpectrumView {
                     text += &format!("\n\n{}  ({:.0}%)", c.label, c.confidence * 100.0);
                     if let Some(s) = &c.sync {
                         text += &format!("\nsync ×{}{}", s.count, if s.inverted { " (inverted)" } else { "" });
+                    }
+                    if let Some(f) = &c.fields {
+                        let kinds: Vec<String> = f.kinds.iter().take(3).map(|(k, n)| format!("{k}×{n}")).collect();
+                        text += &format!(
+                            "\n{} · {} · {}/{} frames decoded",
+                            f.id.as_deref().unwrap_or("-"),
+                            kinds.join(", "),
+                            f.decoded,
+                            f.tried
+                        );
                     }
                     text += &format!(
                         "\nlevels {} · {} · ±{:.1} kHz\nenvelope CV {:.2} · {:.2} s analysed",

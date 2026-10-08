@@ -1,3 +1,4 @@
 /target
 *.sigmf-data
 /testdata/large/
+/testdata/captures/

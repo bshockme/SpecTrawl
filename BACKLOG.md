@@ -18,6 +18,8 @@ Ideas and known rough edges that aren't scheduled yet. Newest at the top of each
 
 ## Detection
 
+- **Decoding next steps.** P25 NID (NAC/DUID, BCH-corrected), DMR slot type (colour code/data type, Golay-corrected) and NXDN LICH are decoded and checked against real captures (`detect/tests/real_captures.rs`). Next: P25 TSBK (control channel messages: system/site IDs, grants → follow voice), DMR CSBK, DMR EMB (colour code on voice bursts), NXDN SACCH/RAN, P25 Phase 2. Also confirm the NXDN direction bit against a known transmitter.
+- **Per-protocol re-slicing.** The prefilter cutoff is chosen before the protocol is known (4–6.5 kHz). Weak DMR improved further at 4 kHz (22 → ~50 slot types), so re-slice with a protocol-specific cutoff once identified.
 - **Features are weak on real signals.** On hardware, FSK level counts and symbol rates often come out blank even where the sync bank confirms a protocol (NXDN48 at 460 MHz with ×8–18 syncs, DMR at 855.59 with ×15–33). Deviation also reads high (noise, discriminator clicks). Once a sync is found, use its timing to slice symbols properly (levels set per sync) and measure levels/deviation from that, instead of a raw histogram.
 - **TDMA single-slot traffic fragments into many short records** (e.g. 47 records in 45 s at 856.3375), each too short to hold two syncs, so they stay unidentified. Group records by channel/emitter and classify the group, or lengthen the hangover for slotted signals.
 - **Unverified labels:** ProVoice (binary sync, 2-bit tolerance) seen ×3 at 854.71 MHz, and the X2-TDMA patterns. Treat as provisional until checked against a known transmitter.

@@ -39,6 +39,8 @@ pub struct Emitter {
     pub tally: BTreeMap<String, u32>,
     /// Labels in `tally` that named a protocol.
     pub protocols: BTreeMap<String, u32>,
+    /// Decoded system identities ("NAC 0x2A5", "CC 9"), weighted by frames.
+    pub ids: BTreeMap<String, usize>,
     /// Protocol labels seen at least once with `STRONG_SYNCS` or more syncs.
     pub strong: std::collections::BTreeSet<String>,
     /// Latest group-level classification.
@@ -59,6 +61,11 @@ impl Emitter {
     /// seen at least twice, else the most frequent feature label.
     pub fn label(&self) -> Option<String> {
         self.protocol_label().or_else(|| self.majority_feature_label())
+    }
+
+    /// Most-seen decoded identity (NAC, colour code), if any.
+    pub fn id(&self) -> Option<&str> {
+        self.ids.iter().max_by_key(|(_, n)| **n).map(|(k, _)| k.as_str())
     }
 
     fn majority_feature_label(&self) -> Option<String> {
@@ -141,6 +148,7 @@ impl EmitterBook {
                         peak_snr_db: r.max_snr_db,
                         tally: BTreeMap::new(),
                         protocols: BTreeMap::new(),
+                        ids: BTreeMap::new(),
                         strong: Default::default(),
                         class: None,
                         best: None,
@@ -222,6 +230,9 @@ impl EmitterBook {
             return;
         }
         *e.tally.entry(c.label.clone()).or_default() += 1;
+        if let Some(id) = c.fields.as_ref().and_then(|f| f.id.clone().map(|id| (id, f.decoded))) {
+            *e.ids.entry(id.0).or_default() += id.1;
+        }
         if c.protocol.is_some() {
             *e.protocols.entry(c.label.clone()).or_default() += 1;
             if c.sync.as_ref().is_some_and(|s| s.count >= STRONG_SYNCS) {

@@ -724,12 +724,13 @@ impl App {
             .column(egui_extras::Column::exact(28.0))
             .column(egui_extras::Column::exact(80.0))
             .column(egui_extras::Column::exact(150.0))
-            .column(egui_extras::Column::exact(240.0))
+            .column(egui_extras::Column::exact(90.0))
+            .column(egui_extras::Column::exact(220.0))
             .columns(egui_extras::Column::exact(64.0), 3)
             .columns(egui_extras::Column::exact(72.0), 2)
             .column(egui_extras::Column::remainder())
             .header(row_h, |mut h| {
-                for t in ["", "Src", "MHz", "Class", "Also seen", "BW kHz", "Bursts", "Duty %", "First", "Last", "SNR dB"] {
+                for t in ["", "Src", "MHz", "Class", "ID", "Also seen", "BW kHz", "Bursts", "Duty %", "First", "Last", "SNR dB"] {
                     h.col(|ui| {
                         ui.label(egui::RichText::new(t).small().color(theme::MUTED));
                     });
@@ -753,6 +754,7 @@ impl App {
                     row.col(|ui| text(ui, if *role == Role::Survey { "S".into() } else { "A".into() }, c));
                     row.col(|ui| text(ui, format!("{:.4}", e.center_hz / 1e6), c));
                     row.col(|ui| text(ui, label, class_col));
+                    row.col(|ui| text(ui, e.id().unwrap_or("").to_string(), c));
                     row.col(|ui| text(ui, also.join(", "), theme::MUTED));
                     row.col(|ui| text(ui, format!("{:.1}", e.bandwidth_hz / 1e3), c));
                     row.col(|ui| text(ui, e.records.to_string(), c));
