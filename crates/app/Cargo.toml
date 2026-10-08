@@ -1,0 +1,15 @@
+[package]
+name = "spectrawl"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+backend-airspy = { version = "0.1.0", path = "../backend-airspy" }
+backend-sim = { version = "0.1.0", path = "../backend-sim" }
+dsp = { version = "0.1.0", path = "../dsp" }
+eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
+egui = "0.36.2"
+engine = { version = "0.1.0", path = "../engine" }
+env_logger = "0.11.11"
+log = "0.4.34"
+sdr-core = { version = "0.1.0", path = "../sdr-core" }

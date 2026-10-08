@@ -1,0 +1,8 @@
+[package]
+name = "backend-sim"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+num-complex = "0.4.6"
+sdr-core = { version = "0.1.0", path = "../sdr-core" }

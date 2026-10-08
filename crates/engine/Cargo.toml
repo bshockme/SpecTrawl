@@ -1,0 +1,11 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dsp = { version = "0.1.0", path = "../dsp" }
+log = "0.4.34"
+num-complex = "0.4.6"
+parking_lot = "0.12.5"
+sdr-core = { version = "0.1.0", path = "../sdr-core" }
