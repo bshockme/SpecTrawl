@@ -3,6 +3,7 @@
 //! steady rate) or `Sweep` (retune-and-dwell across a span, one stitched row
 //! per pass). See DESIGN.md §5.
 
+mod bursts;
 mod ring;
 mod sweep;
 
@@ -16,6 +17,7 @@ use dsp::SpectrumAnalyzer;
 use parking_lot::Mutex;
 use sdr_core::{Capabilities, Complex32, Device, DeviceInfo, Samples, StreamEvent, StreamSink};
 
+pub use bursts::{BurstDetector, DetectorConfig, SignalRecord};
 pub use ring::IqRing;
 pub use sweep::{SweepPlan, SweepStatus};
 
@@ -69,8 +71,18 @@ struct StreamState {
     lost_device: bool,
 }
 
+/// Finished records (bounded) plus the snapshot of still-open ones.
+#[derive(Default)]
+struct RecordStore {
+    closed: VecDeque<SignalRecord>,
+    open: Vec<SignalRecord>,
+}
+
+const MAX_CLOSED_RECORDS: usize = 20_000;
+
 struct Shared {
     ring: Mutex<IqRing>,
+    records: Mutex<RecordStore>,
     state: Mutex<StreamState>,
     rows: Mutex<VecDeque<Arc<SpectrumRow>>>,
     sweep: Mutex<Option<SweepStatus>>,
@@ -78,6 +90,19 @@ struct Shared {
 }
 
 impl Shared {
+    /// Runs the detector on a row and files what it reports.
+    fn detect(&self, det: &mut BurstDetector, row: &SpectrumRow) {
+        let closed = det.process(row);
+        let mut st = self.records.lock();
+        for r in closed {
+            if st.closed.len() >= MAX_CLOSED_RECORDS {
+                st.closed.pop_front();
+            }
+            st.closed.push_back(r);
+        }
+        st.open = det.open_records();
+    }
+
     fn push_row(&self, row: SpectrumRow, cap: usize) {
         let mut rows = self.rows.lock();
         while rows.len() >= cap {
@@ -153,6 +178,7 @@ impl Source {
         let cap = (rate * cfg.ring_seconds).ceil() as usize;
         let shared = Arc::new(Shared {
             ring: Mutex::new(IqRing::new(cap)),
+            records: Mutex::new(RecordStore::default()),
             state: Mutex::new(StreamState { center_hz: device.center_hz(), sample_rate: rate, ..Default::default() }),
             rows: Mutex::new(VecDeque::with_capacity(cfg.row_history)),
             sweep: Mutex::new(None),
@@ -170,14 +196,21 @@ impl Source {
     pub fn set_mode(&mut self, mode: Mode) {
         self.stop_worker();
         self.shared.rows.lock().clear();
+        *self.shared.records.lock() = RecordStore::default();
         *self.shared.sweep.lock() = None;
         let stop = Arc::new(AtomicBool::new(false));
         let (shared, cfg, st) = (self.shared.clone(), self.cfg.clone(), stop.clone());
+        let serial = self.info.serial.clone();
         let handle = match &mode {
-            Mode::Live => std::thread::Builder::new().name("spectrum".into()).spawn(move || live_worker(shared, cfg, st)),
+            Mode::Live => {
+                let usable = self.device.lock().capabilities().usable_bandwidth_fraction as f32;
+                let det = BurstDetector::new(DetectorConfig { usable_fraction: usable, ..DetectorConfig::live(cfg.rows_per_sec) }, serial);
+                std::thread::Builder::new().name("spectrum".into()).spawn(move || live_worker(shared, cfg, st, det))
+            }
             Mode::Sweep(plan) => {
                 let (dev, plan) = (self.device.clone(), plan.clone());
-                std::thread::Builder::new().name("sweep".into()).spawn(move || sweep::run(shared, dev, plan, cfg, st))
+                let det = BurstDetector::new(DetectorConfig::sweep(), serial);
+                std::thread::Builder::new().name("sweep".into()).spawn(move || sweep::run(shared, dev, plan, cfg, st, det))
             }
         }
         .expect("spawn worker");
@@ -217,6 +250,10 @@ impl Source {
         self.device.lock().set_center(hz)
     }
 
+    pub fn set_gain(&self, gain: sdr_core::GainSetting) -> sdr_core::Result<()> {
+        self.device.lock().set_gain(gain)
+    }
+
     /// Rows with `seq > after`, oldest first.
     pub fn rows_after(&self, after: Option<u64>) -> Vec<Arc<SpectrumRow>> {
         let rows = self.shared.rows.lock();
@@ -224,6 +261,19 @@ impl Source {
             None => rows.iter().cloned().collect(),
             Some(a) => rows.iter().filter(|r| r.seq > a).cloned().collect(),
         }
+    }
+
+    /// Records that were still active at or after row `min_seq` (open ones
+    /// always included), oldest first.
+    pub fn records_since(&self, min_seq: u64) -> Vec<SignalRecord> {
+        let st = self.shared.records.lock();
+        st.closed.iter().filter(|r| r.last_seq >= min_seq).chain(st.open.iter()).cloned().collect()
+    }
+
+    /// The newest `n` records (open first, then most recently closed).
+    pub fn recent_records(&self, n: usize) -> Vec<SignalRecord> {
+        let st = self.shared.records.lock();
+        st.open.iter().cloned().chain(st.closed.iter().rev().cloned()).take(n).collect()
     }
 
     pub fn sweep_status(&self) -> Option<SweepStatus> {
@@ -262,7 +312,7 @@ impl Drop for Source {
     }
 }
 
-fn live_worker(shared: Arc<Shared>, cfg: SourceConfig, stop: Arc<AtomicBool>) {
+fn live_worker(shared: Arc<Shared>, cfg: SourceConfig, stop: Arc<AtomicBool>, mut det: BurstDetector) {
     let n = cfg.fft_size;
     let mut sa = SpectrumAnalyzer::new(n);
     let mut block = vec![Complex32::default(); n];
@@ -320,6 +370,7 @@ fn live_worker(shared: Arc<Shared>, cfg: SourceConfig, stop: Arc<AtomicBool>) {
                     time: SystemTime::now(),
                     db: std::mem::replace(&mut db, Vec::with_capacity(n)),
                 };
+                shared.detect(&mut det, &row);
                 shared.push_row(row, cfg.row_history);
             }
         }

@@ -8,7 +8,7 @@
 use std::collections::VecDeque;
 
 use egui::{Color32, Mesh, Pos2, Rect, Shape, Stroke, TextureHandle, TextureOptions, pos2, vec2};
-use engine::{Source, SweepStatus, Tuning};
+use engine::{SignalRecord, Source, SweepStatus, Tuning};
 
 use crate::theme;
 
@@ -23,6 +23,8 @@ pub struct SpectrumView {
     pub smoothing: f32,
     /// Waterfall row height in points; `None` fits the whole history.
     pub row_px: Option<f32>,
+    /// Draw unselected record boxes faintly and without labels (dense views).
+    pub subtle_boxes: bool,
     trace: Vec<f32>,
     hold: Vec<f32>,
     tuning: Option<Tuning>,
@@ -43,6 +45,7 @@ impl SpectrumView {
             db_max: -45.0,
             smoothing: 0.6,
             row_px: None,
+            subtle_boxes: false,
             trace: Vec::new(),
             hold: Vec::new(),
             tuning: None,
@@ -169,9 +172,21 @@ impl SpectrumView {
         p.galley(at, g, theme::BG);
     }
 
-    /// Draws header, spectrum and waterfall into `rect`. Returns the frequency
-    /// clicked, if any.
-    pub fn show(&mut self, ui: &mut egui::Ui, rect: Rect, title: &str, sweep: Option<&SweepStatus>) -> Option<f64> {
+    /// Oldest row sequence number that can be on screen.
+    pub fn oldest_seq(&self) -> u64 {
+        self.last_seq.unwrap_or(0).saturating_sub(ROWS as u64)
+    }
+
+    /// Draws header, spectrum, waterfall and record boxes into `rect`.
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: Rect,
+        title: &str,
+        sweep: Option<&SweepStatus>,
+        records: &[SignalRecord],
+        selected: Option<u64>,
+    ) -> ShowResult {
         let header = Rect::from_min_size(rect.min, vec2(rect.width(), HEADER_H));
         {
             let p = ui.painter_at(rect);
@@ -207,7 +222,11 @@ impl SpectrumView {
             painter.rect_filled(full, 0.0, theme::PLOT_BG);
             let msg = if sweep.is_some() { "first sweep pass in progress…" } else { "waiting for samples…" };
             painter.text(full.center(), egui::Align2::CENTER_CENTER, msg, egui::FontId::proportional(14.0), theme::MUTED);
-            return None;
+            return ShowResult::default();
+        };
+        let visible = match self.row_px {
+            Some(px) => ((wf.height() / px).floor() as usize).clamp(1, ROWS),
+            None => ROWS,
         };
 
         // --- waterfall ---
@@ -219,10 +238,6 @@ impl SpectrumView {
         if let Some(tex) = &self.tex {
             // Newest row at the top. Show `visible` rows starting at the ring's
             // write position, wrapping once past the end of the texture.
-            let visible = match self.row_px {
-                Some(px) => ((wf.height() / px).floor() as usize).clamp(1, ROWS),
-                None => ROWS,
-            };
             let start = self.write_row;
             let first = visible.min(ROWS - start);
             let v = |r: usize| r as f32 / ROWS as f32;
@@ -288,8 +303,68 @@ impl SpectrumView {
         painter.add(Shape::line(pts, Stroke::new(1.3, theme::ACCENT)));
         painter.hline(full.x_range(), spec.bottom() + 0.5, Stroke::new(1.0, theme::BORDER));
 
+        // --- record boxes ---
+        let newest = self.last_seq.unwrap_or(0);
+        let row_h = wf.height() / visible as f32;
+        let x_hz = |f: f64| full.left() + ((f - f0) / span) as f32 * full.width();
+        let mut boxes: Vec<(Rect, &SignalRecord)> = Vec::new();
+        for r in records {
+            if r.f_hi_hz < f0 || r.f_lo_hz > f1 || r.first_seq > newest {
+                continue;
+            }
+            let back_end = newest.saturating_sub(r.last_seq) as f32;
+            let back_start = newest.saturating_sub(r.first_seq) as f32 + 1.0;
+            if back_end >= visible as f32 {
+                continue;
+            }
+            let (mut x0, mut x1) = (x_hz(r.f_lo_hz), x_hz(r.f_hi_hz));
+            if x1 - x0 < 6.0 {
+                let c = (x0 + x1) / 2.0;
+                (x0, x1) = (c - 3.0, c + 3.0);
+            }
+            let y0 = wf.top() + back_end * row_h;
+            let y1 = (wf.top() + back_start * row_h).min(wf.bottom());
+            boxes.push((Rect::from_min_max(pos2(x0 - 1.0, y0), pos2(x1 + 1.0, y1.max(y0 + 2.0))), r));
+        }
+        let hover = resp.hover_pos();
+        let hovered = hover.and_then(|p| boxes.iter().filter(|(b, _)| b.expand(2.0).contains(p)).min_by(|a, b| a.0.area().total_cmp(&b.0.area())).map(|(_, r)| r.id));
+        for (b, r) in &boxes {
+            let sel = selected == Some(r.id) || hovered == Some(r.id);
+            let mut c = if sel { theme::SELECT } else if r.active { theme::ACCENT } else { theme::RECORD };
+            if self.subtle_boxes && !sel {
+                c = c.gamma_multiply(0.35);
+            }
+            painter.rect_stroke(*b, 2.0, Stroke::new(if sel { 2.0 } else { 1.0 }, c), egui::StrokeKind::Outside);
+            if sel || (b.width() >= 46.0 && !self.subtle_boxes) {
+                let g = painter.layout_no_wrap(format!("#{}", r.id), mono(10.0), theme::BG);
+                let at = pos2(b.left(), (b.top() - g.size().y - 1.0).max(wf.top()));
+                painter.rect_filled(Rect::from_min_size(at, g.size() + vec2(6.0, 0.0)), 2.0, c);
+                painter.galley(at + vec2(3.0, 0.0), g, theme::BG);
+            }
+        }
+
         // --- hover readout ---
-        if let Some(p) = resp.hover_pos() {
+        if let Some(r) = hovered.and_then(|id| records.iter().find(|r| r.id == id)) {
+            let p = hover.unwrap_or_default();
+            let text = format!(
+                "#{}{}
+{:.4} MHz · {:.1} kHz
+{:.2} s · SNR {:.0}/{:.0} dB
+peak {:.1} dBFS",
+                r.id,
+                if r.active { "  ACTIVE" } else { "" },
+                r.center_hz() / 1e6,
+                r.bandwidth_hz() / 1e3,
+                r.duration_s(),
+                r.mean_snr_db,
+                r.max_snr_db,
+                r.peak_dbfs
+            );
+            let g = painter.layout_no_wrap(text, mono(11.0), theme::TEXT);
+            let at = pos2((p.x + 14.0).min(full.right() - g.size().x - 10.0), (p.y + 14.0).min(full.bottom() - g.size().y - 8.0));
+            painter.rect(Rect::from_min_size(at - vec2(6.0, 4.0), g.size() + vec2(12.0, 8.0)), 4.0, theme::BG, Stroke::new(1.0, theme::BORDER2), egui::StrokeKind::Inside);
+            painter.galley(at, g, theme::TEXT);
+        } else if let Some(p) = resp.hover_pos() {
             let fx = f0 + ((p.x - full.left()) / full.width()) as f64 * span;
             painter.vline(p.x, full.y_range(), Stroke::new(1.0, Color32::from_rgba_unmultiplied(230, 237, 243, 90)));
             let i = (((p.x - spec.left()) / spec.width()) * self.trace.len() as f32) as usize;
@@ -301,8 +376,18 @@ impl SpectrumView {
             painter.galley(at, galley, theme::TEXT);
         }
         let click = resp.interact_pointer_pos().filter(|_| resp.clicked());
-        click.map(|p| f0 + ((p.x - full.left()) / full.width()) as f64 * span)
+        ShowResult {
+            freq_hz: click.map(|p| f0 + ((p.x - full.left()) / full.width()) as f64 * span),
+            record: click.and(hovered),
+        }
     }
+}
+
+/// What a click on the view hit.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ShowResult {
+    pub freq_hz: Option<f64>,
+    pub record: Option<u64>,
 }
 
 const HEADER_H: f32 = 26.0;

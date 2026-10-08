@@ -11,11 +11,17 @@ Ideas and known rough edges that aren't scheduled yet. Newest at the top of each
 
 ## Sweep / survey
 
-- **Per-device flatness correction.** Faint vertical striping at hop boundaries: the R2's response isn't flat across each 9 MHz slice. Measure the passband shape per serial and divide it out.
+- **Survey detection is dense.** Every persistent emitter (TV, LTE, paging) becomes a long record, so the survey shows many boxes (now drawn faintly). Needs grouping by emitter and a "new since baseline" view rather than boxes for everything.
+- **Hop profile is estimated live** (median across hops, smoothed across passes). It removes passband ripple and fixed-offset spurs. Consider saving it per serial and gain so a fresh sweep starts clean.
 - **Tighter retune guard.** The 9.5 ms guard is conservative (the USB transfer size is the main uncertainty). Finding the actual retune edge in the data could roughly double the hop rate.
 - **Survey waterfall fills slowly** (one row per pass). Consider updating the newest row hop by hop as the pass progresses.
 
+## Detection
+
+- **Bandwidth of FM broadcast/voice varies with modulation**, so a record's extent is the union over its lifetime. Fine for now; a per-row occupied-bandwidth average would be steadier.
+- **Wideband signals that fill a floor block** (e.g. an LTE carrier filling most of a 10 MHz focus span) raise the floor estimate and can go undetected. Needs a floor that also looks at neighbouring blocks or history.
+
 ## Hardware
 
-- **Airspy gain control in the UI.** Currently fixed at linearity 13/21.
+- **Manual Airspy gain stages** (LNA/Mixer/VGA individually). The UI has the linearity/sensitivity presets and AGC.
 - **Recover when a device is unplugged** (the `DeviceLost` event is defined but nothing reacts to it).

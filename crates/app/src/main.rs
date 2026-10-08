@@ -4,7 +4,7 @@ mod theme;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use engine::{Mode, Source, SourceConfig, SweepPlan};
-use sdr_core::{Backend, DeviceInfo};
+use sdr_core::{Backend, DeviceInfo, GainSetting};
 use spectrum_view::SpectrumView;
 
 fn main() -> eframe::Result {
@@ -32,10 +32,51 @@ impl Role {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GainMode {
+    Linearity,
+    Sensitivity,
+    Agc,
+}
+
 struct Pane {
     role: Role,
     source: Source,
     view: SpectrumView,
+    gain_mode: GainMode,
+    /// Preset step 0..=21 (Airspy's linearity/sensitivity tables).
+    gain_step: u8,
+}
+
+impl Pane {
+    fn gain_setting(&self) -> GainSetting {
+        let v = self.gain_step as f32 / 21.0;
+        match self.gain_mode {
+            GainMode::Linearity => GainSetting::Linearity(v),
+            GainMode::Sensitivity => GainSetting::Sensitivity(v),
+            GainMode::Agc => GainSetting::Auto,
+        }
+    }
+}
+
+/// Gain controls for one pane; applies changes to the device.
+fn gain_ui(ui: &mut egui::Ui, p: &mut Pane) -> Option<String> {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label("Gain");
+        for (m, name) in [(GainMode::Linearity, "Linearity"), (GainMode::Sensitivity, "Sensitivity"), (GainMode::Agc, "AGC")] {
+            changed |= ui.selectable_value(&mut p.gain_mode, m, name).changed();
+        }
+    });
+    if p.gain_mode != GainMode::Agc {
+        changed |= ui.add(egui::Slider::new(&mut p.gain_step, 0..=21).text("step")).changed();
+    } else if p.role == Role::Survey {
+        ui.label(egui::RichText::new("AGC makes hops inconsistent; fixed gain is better for surveys").small().color(theme::MUTED));
+    }
+    if changed {
+        return p.source.set_gain(p.gain_setting()).err().map(|e| e.to_string());
+    }
+    None
 }
 
 struct App {
@@ -47,6 +88,7 @@ struct App {
     sweep_lo_mhz: f64,
     sweep_hi_mhz: f64,
     error: Option<String>,
+    selected: Option<u64>,
 }
 
 /// Command line: `--sim` (simulator only), `--freq <MHz>` (focus centre),
@@ -99,6 +141,7 @@ impl App {
             sweep_lo_mhz: lo,
             sweep_hi_mhz: hi,
             error: None,
+            selected: None,
         };
         app.rescan();
 
@@ -180,7 +223,8 @@ impl App {
                     self.tune_mhz = source.snapshot().center_hz / 1e6;
                 }
                 let view = if role == Role::Survey { survey_view() } else { SpectrumView::new() };
-                self.panes.push(Pane { role, source, view });
+                // Matches the backend's opening default (Airspy linearity 13/21).
+                self.panes.push(Pane { role, source, view, gain_mode: GainMode::Linearity, gain_step: 13 });
                 self.error = None;
             }
             Err(e) => self.error = Some(format!("{}: {e}", info.label)),
@@ -280,10 +324,12 @@ impl App {
             None => {}
         }
 
-        if let Some(p) = self.pane(Role::Survey) {
+        // Borrow the pane field-wise so the closures can also touch other fields.
+        if let Some(p) = self.panes.iter_mut().find(|p| p.role == Role::Survey) {
             let st = p.source.sweep_status();
             let stats = p.source.stats();
             let mut apply = false;
+            let mut err = None;
             ui.add_space(8.0);
             ui.label(egui::RichText::new("SURVEY").small().strong().color(theme::MUTED));
             theme::card(ui, |ui| {
@@ -293,6 +339,9 @@ impl App {
                     ui.add(egui::DragValue::new(&mut self.sweep_hi_mhz).speed(1.0).range(34.0..=1800.0).suffix(" MHz"));
                 });
                 apply = ui.button("Apply range").clicked();
+                if let Some(e) = gain_ui(ui, p) {
+                    err = Some(e);
+                }
                 if let Some(s) = &st {
                     kv(ui, "Hops", &format!("{} × {:.1} MHz", s.hops, s.hop_hz / 1e6));
                     kv(ui, "Rate", &format!("{:.0} hops/s · {:.0} MHz/s", s.hops_per_sec, s.mhz_per_sec()));
@@ -300,6 +349,9 @@ impl App {
                     kv(ui, "Re-done hops", &format!("{} · gaps {}", s.redone_hops, stats.gaps));
                 }
             });
+            if err.is_some() {
+                self.error = err;
+            }
             if apply {
                 if self.sweep_hi_mhz <= self.sweep_lo_mhz + 1.0 {
                     self.sweep_hi_mhz = self.sweep_lo_mhz + 10.0;
@@ -312,11 +364,12 @@ impl App {
             }
         }
 
-        if let Some(p) = self.pane(Role::Focus) {
+        if let Some(p) = self.panes.iter_mut().find(|p| p.role == Role::Focus) {
             let snap = p.source.snapshot();
             let st = p.source.stats();
             let cfg = p.source.config().clone();
             let mut tune = None;
+            let mut err = None;
             ui.add_space(8.0);
             ui.label(egui::RichText::new("FOCUS A").small().strong().color(theme::MUTED));
             theme::card(ui, |ui| {
@@ -333,8 +386,14 @@ impl App {
                 kv(ui, "FFT", &format!("{} pt · {:.0}/s · {:.0} Hz", cfg.fft_size, st.ffts_per_sec, rate / cfg.fft_size as f64));
                 kv(ui, "Look-back", &format!("{:.1} / {:.0} s", st.ring_samples as f64 / rate, cfg.ring_seconds));
                 kv(ui, "Gaps", &format!("{} ({} samples)", st.gaps, st.lost_samples));
+                if let Some(e) = gain_ui(ui, p) {
+                    err = Some(e);
+                }
                 ui.label(egui::RichText::new("Tip: click the survey to tune here").small().color(theme::MUTED));
             });
+            if err.is_some() {
+                self.error = err;
+            }
             if let Some(m) = tune {
                 self.retune_focus(m);
             }
@@ -383,7 +442,9 @@ impl App {
         };
 
         let focus_span = self.pane(Role::Focus).and_then(|p| p.view.span());
-        let mut clicked = None;
+        let selected = self.selected;
+        let mut tune_to = None;
+        let mut select = None;
         if let (Some(r), Some(p)) = (survey_rect, self.pane_mut(Role::Survey)) {
             let st = p.source.sweep_status();
             let title = match &st {
@@ -398,9 +459,18 @@ impl App {
                 ),
                 None => format!("SURVEY · {}", p.source.info().label),
             };
-            clicked = p.view.show(ui, r, &title, st.as_ref());
+            let records = p.source.records_since(p.view.oldest_seq());
+            let res = p.view.show(ui, r, &title, st.as_ref(), &records, selected);
             if let Some((lo, hi)) = focus_span {
                 p.view.bracket(ui, r, lo, hi, "A");
+            }
+            // Survey click: tune the focus there; on a record, also select it
+            // and centre on the record rather than the click point.
+            if let Some(id) = res.record {
+                select = Some(id);
+                tune_to = records.iter().find(|r| r.id == id).map(|r| r.center_hz());
+            } else {
+                tune_to = res.freq_hz;
             }
         }
         if let (Some(r), Some(p)) = (focus_rect, self.pane_mut(Role::Focus)) {
@@ -411,12 +481,70 @@ impl App {
                 snap.center_hz / 1e6,
                 snap.sample_rate / 1e6
             );
-            if let Some(f) = p.view.show(ui, r, &title, None) {
-                // Click within the focus pane: recentre there.
-                clicked = Some(f);
+            let records = p.source.records_since(p.view.oldest_seq());
+            let res = p.view.show(ui, r, &title, None, &records, selected);
+            // Focus click: select a record if one was hit, otherwise recentre.
+            match (res.record, res.freq_hz) {
+                (Some(id), _) => select = Some(id),
+                (None, Some(f)) => tune_to = Some(f),
+                _ => {}
             }
         }
-        if let Some(f) = clicked {
+        if let Some(id) = select {
+            self.selected = Some(id);
+        }
+        if let Some(f) = tune_to {
+            self.retune_focus((f / 1e3).round() / 1e3);
+        }
+    }
+
+    /// Newest records from all panes, most recent first.
+    fn signal_list(&mut self, ui: &mut egui::Ui) {
+        let mut rows: Vec<(Role, engine::SignalRecord)> = Vec::new();
+        for p in &self.panes {
+            rows.extend(p.source.recent_records(300).into_iter().map(|r| (p.role, r)));
+        }
+        rows.sort_by(|a, b| b.1.active.cmp(&a.1.active).then(b.1.t_end.cmp(&a.1.t_end)));
+        rows.truncate(300);
+        let active = rows.iter().filter(|r| r.1.active).count();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("SIGNALS").small().strong().color(theme::MUTED));
+            ui.label(egui::RichText::new(format!("{} shown · {active} active", rows.len())).small().monospace().color(theme::MUTED));
+            ui.label(egui::RichText::new("click a row to select · double-click to tune Focus A").small().color(theme::MUTED));
+        });
+        let mut tune = None;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            egui::Grid::new("signals").striped(true).num_columns(9).spacing([14.0, 3.0]).show(ui, |ui| {
+                for h in ["#", "Src", "Last seen", "MHz", "BW kHz", "Dur s", "SNR dB", "Peak dBFS", "State"] {
+                    ui.label(egui::RichText::new(h).small().color(theme::MUTED));
+                }
+                ui.end_row();
+                for (role, r) in &rows {
+                    let sel = self.selected == Some(r.id);
+                    let c = if sel { theme::SELECT } else { theme::TEXT2 };
+                    let cell = |ui: &mut egui::Ui, s: String| ui.add(egui::Label::new(egui::RichText::new(s).monospace().color(c)).sense(egui::Sense::click()));
+                    let resps = [
+                        cell(ui, format!("{}", r.id)),
+                        cell(ui, match role { Role::Survey => "S".into(), Role::Focus => "A".into() }),
+                        cell(ui, hms(r.t_end)),
+                        cell(ui, format!("{:.4}", r.center_hz() / 1e6)),
+                        cell(ui, format!("{:.1}", r.bandwidth_hz() / 1e3)),
+                        cell(ui, format!("{:.2}", r.duration_s())),
+                        cell(ui, format!("{:.0} / {:.0}", r.mean_snr_db, r.max_snr_db)),
+                        cell(ui, format!("{:.1}", r.peak_dbfs)),
+                        cell(ui, if r.active { "active".into() } else { "done".into() }),
+                    ];
+                    if resps.iter().any(|x| x.clicked()) {
+                        self.selected = Some(r.id);
+                    }
+                    if resps.iter().any(|x| x.double_clicked()) {
+                        tune = Some(r.center_hz());
+                    }
+                    ui.end_row();
+                }
+            });
+        });
+        if let Some(f) = tune {
             self.retune_focus((f / 1e3).round() / 1e3);
         }
     }
@@ -450,6 +578,11 @@ impl eframe::App for App {
                 });
             });
         });
+        egui::Panel::bottom("signals")
+            .resizable(true)
+            .default_size(210.0)
+            .frame(theme::side_frame())
+            .show(ui, |ui| self.signal_list(ui));
         egui::Panel::left("side").exact_size(270.0).frame(theme::side_frame()).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| self.side_panel(ui));
         });
@@ -463,6 +596,7 @@ fn survey_view() -> SpectrumView {
     // One row per pass (seconds apart): already averaged, and drawn thick.
     v.smoothing = 0.0;
     v.row_px = Some(3.0);
+    v.subtle_boxes = true;
     v
 }
 
@@ -473,6 +607,11 @@ fn kv(ui: &mut egui::Ui, k: &str, v: &str) {
             ui.label(egui::RichText::new(v).monospace().color(theme::TEXT2));
         });
     });
+}
+
+fn hms(t: SystemTime) -> String {
+    let s = t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() % 86_400;
+    format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
 }
 
 fn utc_now() -> String {

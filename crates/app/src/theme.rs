@@ -14,6 +14,10 @@ pub const TEXT: Color32 = Color32::from_rgb(0xdf, 0xe6, 0xee);
 pub const TEXT2: Color32 = Color32::from_rgb(0xb9, 0xc4, 0xcf);
 pub const MUTED: Color32 = Color32::from_rgb(0x8b, 0x97, 0xa5);
 pub const ACCENT: Color32 = Color32::from_rgb(0x38, 0xd3, 0xcf);
+/// Closed (finished) signal record boxes.
+pub const RECORD: Color32 = Color32::from_rgb(0xc8, 0xd2, 0xdc);
+/// Selected / hovered record.
+pub const SELECT: Color32 = Color32::from_rgb(0xf2, 0xa3, 0x3a);
 pub const CHIP_FOCUS_BG: Color32 = Color32::from_rgb(0xe6, 0xed, 0xf3);
 pub const CHIP_FOCUS_FG: Color32 = BG;
 
