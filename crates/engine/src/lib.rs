@@ -4,10 +4,11 @@
 //! per pass). See DESIGN.md §5.
 
 mod bursts;
+mod classify;
 mod ring;
 mod sweep;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -71,11 +72,22 @@ struct StreamState {
     lost_device: bool,
 }
 
-/// Finished records (bounded) plus the snapshot of still-open ones.
+/// Finished records (bounded) plus the snapshot of still-open ones, and the
+/// classifier's results keyed by record id.
 #[derive(Default)]
 struct RecordStore {
     closed: VecDeque<SignalRecord>,
     open: Vec<SignalRecord>,
+    /// Result, when it was made, and whether the record was still open then.
+    classes: HashMap<u64, (Arc<detect::Classification>, Instant, bool)>,
+}
+
+impl RecordStore {
+    fn with_class(&self, r: &SignalRecord) -> SignalRecord {
+        let mut r = r.clone();
+        r.class = self.classes.get(&r.id).map(|c| c.0.clone());
+        r
+    }
 }
 
 const MAX_CLOSED_RECORDS: usize = 20_000;
@@ -101,7 +113,9 @@ impl Shared {
         let mut st = self.records.lock();
         for r in closed {
             if st.closed.len() >= MAX_CLOSED_RECORDS {
-                st.closed.pop_front();
+                if let Some(old) = st.closed.pop_front() {
+                    st.classes.remove(&old.id);
+                }
             }
             st.closed.push_back(r);
         }
@@ -167,14 +181,14 @@ pub struct DeviceSnapshot {
 
 type SharedDevice = Arc<Mutex<Box<dyn Device>>>;
 
-/// A running source: owns the device, its IQ ring and one worker thread.
+/// A running source: owns the device, its IQ ring and its worker threads.
 pub struct Source {
     device: SharedDevice,
     info: DeviceInfo,
     shared: Arc<Shared>,
     cfg: SourceConfig,
     mode: Mode,
-    worker: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
+    worker: Option<(Arc<AtomicBool>, Vec<JoinHandle<()>>)>,
 }
 
 impl Source {
@@ -206,27 +220,33 @@ impl Source {
         let stop = Arc::new(AtomicBool::new(false));
         let (shared, cfg, st) = (self.shared.clone(), self.cfg.clone(), stop.clone());
         let serial = self.info.serial.clone();
-        let handle = match &mode {
+        let mut handles = Vec::new();
+        match &mode {
             Mode::Live => {
                 let usable = self.device.lock().capabilities().usable_bandwidth_fraction as f32;
                 let det = BurstDetector::new(DetectorConfig { usable_fraction: usable, ..DetectorConfig::live(cfg.rows_per_sec) }, serial);
-                std::thread::Builder::new().name("spectrum".into()).spawn(move || live_worker(shared, cfg, st, det))
+                let (sh, c, s) = (shared.clone(), cfg.clone(), st.clone());
+                handles.push(std::thread::Builder::new().name("spectrum".into()).spawn(move || live_worker(sh, c, s, det)));
+                let rate = self.device.lock().sample_rate();
+                handles.push(std::thread::Builder::new().name("classify".into()).spawn(move || classify::run(shared, cfg, st, rate)));
             }
             Mode::Sweep(plan) => {
                 let (dev, plan) = (self.device.clone(), plan.clone());
                 let det = BurstDetector::new(DetectorConfig::sweep(), serial);
-                std::thread::Builder::new().name("sweep".into()).spawn(move || sweep::run(shared, dev, plan, cfg, st, det))
+                handles.push(std::thread::Builder::new().name("sweep".into()).spawn(move || sweep::run(shared, dev, plan, cfg, st, det)));
             }
         }
-        .expect("spawn worker");
-        self.worker = Some((stop, handle));
+        let handles = handles.into_iter().map(|h| h.expect("spawn worker")).collect();
+        self.worker = Some((stop, handles));
         self.mode = mode;
     }
 
     fn stop_worker(&mut self) {
-        if let Some((stop, h)) = self.worker.take() {
+        if let Some((stop, hs)) = self.worker.take() {
             stop.store(true, Ordering::Relaxed);
-            let _ = h.join();
+            for h in hs {
+                let _ = h.join();
+            }
         }
     }
 
@@ -272,13 +292,13 @@ impl Source {
     /// always included), oldest first.
     pub fn records_since(&self, min_seq: u64) -> Vec<SignalRecord> {
         let st = self.shared.records.lock();
-        st.closed.iter().filter(|r| r.last_seq >= min_seq).chain(st.open.iter()).cloned().collect()
+        st.closed.iter().filter(|r| r.last_seq >= min_seq).chain(st.open.iter()).map(|r| st.with_class(r)).collect()
     }
 
     /// The newest `n` records (open first, then most recently closed).
     pub fn recent_records(&self, n: usize) -> Vec<SignalRecord> {
         let st = self.shared.records.lock();
-        st.open.iter().cloned().chain(st.closed.iter().rev().cloned()).take(n).collect()
+        st.open.iter().chain(st.closed.iter().rev()).take(n).map(|r| st.with_class(r)).collect()
     }
 
     pub fn sweep_status(&self) -> Option<SweepStatus> {

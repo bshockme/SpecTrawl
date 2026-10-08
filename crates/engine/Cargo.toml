@@ -4,8 +4,12 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+detect = { version = "0.1.0", path = "../detect" }
 dsp = { version = "0.1.0", path = "../dsp" }
 log = "0.4.34"
 num-complex = "0.4.6"
 parking_lot = "0.12.5"
 sdr-core = { version = "0.1.0", path = "../sdr-core" }
+
+[dev-dependencies]
+backend-sim = { path = "../backend-sim" }

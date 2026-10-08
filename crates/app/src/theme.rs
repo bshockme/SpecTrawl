@@ -113,3 +113,26 @@ pub fn waterfall_lut() -> [Color32; 256] {
     }
     lut
 }
+
+/// Colour for a classified record: by protocol when one was identified, else
+/// by broad type. `None` when unclassified.
+pub fn class_color(c: Option<&detect::Classification>) -> Option<Color32> {
+    let c = c?;
+    let rgb = match c.protocol.as_deref() {
+        Some("P25") => (0xf2, 0xa3, 0x3a),
+        Some("DMR") => (0x5a, 0xa9, 0xff),
+        Some("NXDN") => (0xc3, 0x9b, 0xff),
+        Some("POCSAG") => (0x6f, 0xd6, 0x8a),
+        Some("YSF") => (0x4f, 0xd1, 0xc5),
+        Some("dPMR") => (0xe8, 0xd2, 0x5a),
+        Some("ProVoice") => (0xff, 0x9e, 0x64),
+        Some(_) => (0x9f, 0xb4, 0xc7),
+        None => match c.label.as_str() {
+            l if l.starts_with("Analog FM") => (0xb8, 0xc2, 0xcc),
+            l if l.contains("FSK") => (0xff, 0x70, 0x96),
+            "Carrier" => (0x8b, 0x97, 0xa5),
+            _ => return None,
+        },
+    };
+    Some(Color32::from_rgb(rgb.0, rgb.1, rgb.2))
+}

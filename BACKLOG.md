@@ -24,4 +24,9 @@ Ideas and known rough edges that aren't scheduled yet. Newest at the top of each
 ## Hardware
 
 - **Manual Airspy gain stages** (LNA/Mixer/VGA individually). The UI has the linearity/sensitivity presets and AGC.
+- **tinySA Ultra support** (on hand). A swept spectrum analyzer, not an SDR: no IQ, so no look-back or decoding. Three uses:
+  - **Calibration reference:** reads in dBm, so measuring the same signal on both gives per-device dBFS→dBm offsets for the Airspys.
+  - **Test source:** its signal-generator output gives known tones to measure Airspy gain tables and passband shape, and to test detection repeatably.
+  - **Survey outside the R2's range:** about 100 kHz–6 GHz (HF below 24 MHz; 1.8–6 GHz for cellular, Wi-Fi, drone links).
+  - Needs a second kind of source, a *power-sweep device* producing spectrum rows directly (USB serial text protocol). The Survey role and burst detector already work on rows. Check its COM port and firmware commands before writing it.
 - **Recover when a device is unplugged** (the `DeviceLost` event is defined but nothing reacts to it).

@@ -138,7 +138,7 @@ impl App {
             devices: Vec::new(),
             panes: Vec::new(),
             paused: false,
-            tune_mhz: args.freq_mhz.unwrap_or(if args.sim { 856.0 } else { 100.0 }),
+            tune_mhz: args.freq_mhz.unwrap_or(if args.sim { 855.25 } else { 100.0 }),
             sweep_lo_mhz: lo,
             sweep_hi_mhz: hi,
             error: None,
@@ -515,8 +515,8 @@ impl App {
         });
         let mut tune = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            egui::Grid::new("signals").striped(true).num_columns(9).spacing([14.0, 3.0]).show(ui, |ui| {
-                for h in ["#", "Src", "Last seen", "MHz", "BW kHz", "Dur s", "SNR dB", "Peak dBFS", "State"] {
+            egui::Grid::new("signals").striped(true).num_columns(10).spacing([14.0, 3.0]).show(ui, |ui| {
+                for h in ["#", "Src", "Last seen", "MHz", "Class", "BW kHz", "Dur s", "SNR dB", "Peak dBFS", "State"] {
                     ui.label(egui::RichText::new(h).small().color(theme::MUTED));
                 }
                 ui.end_row();
@@ -529,6 +529,13 @@ impl App {
                         cell(ui, match role { Role::Survey => "S".into(), Role::Focus => "A".into() }),
                         cell(ui, hms(r.t_end)),
                         cell(ui, format!("{:.4}", r.center_hz() / 1e6)),
+                        {
+                            let (txt, col) = match r.class.as_deref() {
+                                Some(k) => (k.label.clone(), theme::class_color(Some(k)).unwrap_or(c)),
+                                None => (if *role == Role::Survey { "-".into() } else { "…".into() }, theme::MUTED),
+                            };
+                            ui.add(egui::Label::new(egui::RichText::new(txt).monospace().color(if sel { theme::SELECT } else { col })).sense(egui::Sense::click()))
+                        },
                         cell(ui, format!("{:.1}", r.bandwidth_hz() / 1e3)),
                         cell(ui, format!("{:.2}", r.duration_s())),
                         cell(ui, format!("{:.0} / {:.0}", r.mean_snr_db, r.max_snr_db)),

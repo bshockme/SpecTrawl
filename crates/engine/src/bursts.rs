@@ -99,6 +99,14 @@ pub struct SignalRecord {
     pub max_snr_db: f32,
     pub rows: u32,
     pub active: bool,
+    /// Ring sample index at the end of the first and last rows that saw the
+    /// signal (the IQ for this record lies just before/within these).
+    pub first_row_end_sample: u64,
+    pub last_row_end_sample: u64,
+    /// Tuner centre when the record was made (live rows).
+    pub tuner_center_hz: f64,
+    /// Filled in by the classifier when available.
+    pub class: Option<std::sync::Arc<detect::Classification>>,
 }
 
 impl SignalRecord {
@@ -128,6 +136,8 @@ struct Track {
     snr_sum: f32,
     snr_max: f32,
     rows: u32,
+    first_end: u64,
+    last_end: u64,
 }
 
 pub struct BurstDetector {
@@ -217,6 +227,10 @@ impl BurstDetector {
             max_snr_db: t.snr_max,
             rows: t.rows,
             active,
+            first_row_end_sample: t.first_end,
+            last_row_end_sample: t.last_end,
+            tuner_center_hz: self.tuning.map(|t| t.center_hz).unwrap_or(0.0),
+            class: None,
         }
     }
 
@@ -321,6 +335,8 @@ impl BurstDetector {
                     snr_sum: s.snr,
                     snr_max: s.snr,
                     rows: 1,
+                    first_end: row.end_sample,
+                    last_end: row.end_sample,
                 }),
                 Some(_) => {
                     // Pull out every overlapping track (descending indices keep
@@ -337,6 +353,8 @@ impl BurstDetector {
                         // Rows overlap in time; keep the larger count rather than double-count.
                         t.rows = t.rows.max(o.rows);
                         t.last_seq = t.last_seq.max(o.last_seq);
+                        t.first_end = t.first_end.min(o.first_end);
+                        t.last_end = t.last_end.max(o.last_end);
                     }
                     t.lo = t.lo.min(s.lo);
                     t.hi = t.hi.max(s.hi);
@@ -345,6 +363,7 @@ impl BurstDetector {
                         t.snr_sum += s.snr;
                     }
                     t.last_seq = row.seq;
+                    t.last_end = row.end_sample;
                     t.t_end = row.time;
                     t.peak_db = t.peak_db.max(s.peak_db);
                     t.snr_max = t.snr_max.max(s.snr);

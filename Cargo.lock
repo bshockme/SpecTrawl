@@ -543,6 +543,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "detect"
+version = "0.1.0"
+dependencies = [
+ "num-complex",
+ "rustfft",
+]
+
+[[package]]
 name = "dispatch"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -734,6 +742,8 @@ dependencies = [
 name = "engine"
 version = "0.1.0"
 dependencies = [
+ "backend-sim",
+ "detect",
  "dsp",
  "log",
  "num-complex",
@@ -2547,6 +2557,7 @@ version = "0.1.0"
 dependencies = [
  "backend-airspy",
  "backend-sim",
+ "detect",
  "dsp",
  "eframe",
  "egui",

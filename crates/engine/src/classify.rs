@@ -1,0 +1,110 @@
+//! Classifier thread for a live source: pulls each record's channel out of
+//! the look-back ring, down-converts it, and runs `detect::classify`.
+//!
+//! Priorities: newly closed records first (their IQ will age out of the
+//! ring), then open records that have no class yet or one older than
+//! `REFRESH`. Records whose IQ has already left the ring are marked so they
+//! aren't retried.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use detect::{Classification, Ddc};
+use sdr_core::Complex32;
+
+use crate::{Shared, SignalRecord, SourceConfig};
+
+/// Re-classify an open record this often.
+const REFRESH: Duration = Duration::from_secs(8);
+/// At most this much signal is analysed per record.
+const MAX_WINDOW_S: f64 = 1.5;
+/// Records wider than this get a label from bandwidth alone.
+const MAX_DDC_BW_HZ: f64 = 1.0e6;
+
+pub(crate) fn run(shared: Arc<Shared>, cfg: SourceConfig, stop: Arc<AtomicBool>, rate: f64) {
+    let mut chunk = vec![Complex32::default(); 1 << 18];
+    while !stop.load(Ordering::Relaxed) {
+        let Some(rec) = pick(&shared) else {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        };
+        let class = classify_record(&shared, &cfg, rate, &rec, &mut chunk, &stop);
+        let mut st = shared.records.lock();
+        st.classes.insert(rec.id, (Arc::new(class), Instant::now(), rec.active));
+    }
+}
+
+fn pick(shared: &Shared) -> Option<SignalRecord> {
+    let st = shared.records.lock();
+    // A closed record needs a (final) look if it was never classified, or
+    // only while open, when it may have held too little signal.
+    let fresh = |r: &SignalRecord| st.classes.get(&r.id).is_none_or(|c| c.2);
+    if let Some(r) = st.closed.iter().rev().take(200).find(|r| fresh(r)) {
+        return Some(r.clone());
+    }
+    st.open
+        .iter()
+        // Let an open record build up ~0.25 s of signal before a first look.
+        .filter(|r| r.rows >= 12)
+        .filter(|r| st.classes.get(&r.id).is_none_or(|c| c.1.elapsed() > REFRESH))
+        // Unclassified first, then the stalest.
+        .min_by_key(|r| st.classes.get(&r.id).map(|c| c.1))
+        .cloned()
+}
+
+fn label_only(label: &str) -> Classification {
+    Classification {
+        label: label.into(),
+        protocol: None,
+        confidence: 0.0,
+        features: Default::default(),
+        sync: None,
+        analysed_s: 0.0,
+    }
+}
+
+fn classify_record(
+    shared: &Shared,
+    cfg: &SourceConfig,
+    rate: f64,
+    r: &SignalRecord,
+    chunk: &mut [Complex32],
+    stop: &AtomicBool,
+) -> Classification {
+    let bw = r.bandwidth_hz().max(5e3);
+    if bw > MAX_DDC_BW_HZ {
+        return label_only("Wideband");
+    }
+    // The first row's FFTs started roughly one row before its end sample.
+    let per_row = (rate / cfg.rows_per_sec) as u64;
+    let end = r.last_row_end_sample;
+    let start = r.first_row_end_sample.saturating_sub(per_row).max(end.saturating_sub((MAX_WINDOW_S * rate) as u64));
+    let oldest = shared.ring.lock().oldest();
+    let start = start.max(oldest);
+    if end <= start + (0.02 * rate) as u64 {
+        return label_only(if end <= oldest { "IQ expired" } else { "too short" });
+    }
+
+    let offset = r.center_hz() - r.tuner_center_hz;
+    let mut ddc = Ddc::new(rate, offset, bw * 0.65 + 1e3, (bw * 2.5).max(48e3));
+    let mut chan = Vec::with_capacity(((end - start) as f64 / rate * ddc.fs_out) as usize + 16);
+    let mut pos = start;
+    while pos < end {
+        if stop.load(Ordering::Relaxed) {
+            return label_only("interrupted");
+        }
+        let n = ((end - pos) as usize).min(chunk.len());
+        // One lock at a time; copy out and release before processing.
+        let ok = shared.ring.lock().read(pos, &mut chunk[..n]);
+        if !ok {
+            break;
+        }
+        ddc.process(&chunk[..n], &mut chan);
+        pos += n as u64;
+    }
+    if chan.is_empty() {
+        return label_only("IQ expired");
+    }
+    detect::classify(&chan, ddc.fs_out, r.bandwidth_hz())
+}

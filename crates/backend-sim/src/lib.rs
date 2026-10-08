@@ -16,10 +16,68 @@ use sdr_core::{
 pub enum Modulation {
     /// Unmodulated carrier.
     Cw,
-    /// M-level FSK with random symbols; `levels` = 2 or 4.
-    Fsk { levels: u8, sym_rate: f64, dev_hz: f64 },
+    /// M-level FSK with random symbols; `levels` = 2 or 4. `sync` inserts a
+    /// fixed symbol pattern periodically so protocol detection can be tested.
+    Fsk { levels: u8, sym_rate: f64, dev_hz: f64, sync: Option<SyncInsert> },
     /// FM with a single audio tone.
     FmTone { tone_hz: f64, dev_hz: f64 },
+}
+
+/// A sync word sent every `period` symbols. 4-level patterns are dibits
+/// (2 bits per symbol, oldest first: 01=+3, 00=+1, 10=−1, 11=−3); 2-level
+/// patterns are bits (1 = negative deviation).
+#[derive(Debug, Clone, Copy)]
+pub struct SyncInsert {
+    pub bits: u64,
+    pub symbols: u8,
+    pub period: u64,
+    /// Symbol offset of the sync within each period.
+    pub offset: u64,
+}
+
+impl SyncInsert {
+    /// Symbol `i` (0 = oldest) as a fraction of full deviation.
+    fn level(&self, i: u64, levels: u8) -> f64 {
+        if levels == 2 {
+            let b = self.bits >> (self.symbols as u64 - 1 - i) & 1;
+            if b == 1 { -1.0 } else { 1.0 }
+        } else {
+            match self.bits >> (2 * (self.symbols as u64 - 1 - i)) & 3 {
+                0b01 => 1.0,
+                0b00 => 1.0 / 3.0,
+                0b10 => -1.0 / 3.0,
+                _ => -1.0,
+            }
+        }
+    }
+}
+
+/// P25 Phase 1 frame sync (48 bits = 24 dibits), every 864 symbols.
+pub const P25_SYNC: SyncInsert = SyncInsert { bits: 0x5575_F5FF_77FF, symbols: 24, period: 864, offset: 0 };
+/// DMR BS-sourced voice sync, once per 30 ms burst (144 symbols at 4800),
+/// in the middle of the burst after 54 payload symbols as in real DMR.
+pub const DMR_BS_VOICE: SyncInsert = SyncInsert { bits: 0x755F_D7DF_75F7, symbols: 24, period: 144, offset: 54 };
+/// POCSAG batch sync codeword, every 544 bits.
+pub const POCSAG_SYNC: SyncInsert = SyncInsert { bits: 0x7CD2_15D8, symbols: 32, period: 544, offset: 0 };
+
+/// NXDN frame sync + LICH with the sign pattern 0x2B0C8:
+/// outer symbols except the two ±1 positions the table masks (bits 9, 16).
+pub fn nxdn_sync() -> SyncInsert {
+    let sign = 0x2B0C8u64;
+    let mut bits = 0u64;
+    for b in (0..18).rev() {
+        let neg = sign >> b & 1 == 1;
+        let inner = b == 9 || b == 16;
+        let dibit = match (neg, inner) {
+            (false, false) => 0b01,
+            (false, true) => 0b00,
+            (true, true) => 0b10,
+            (true, false) => 0b11,
+        };
+        bits = bits << 2 | dibit;
+    }
+    // 192 symbols = one 80 ms NXDN48 frame.
+    SyncInsert { bits, symbols: 18, period: 192, offset: 0 }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -43,17 +101,19 @@ pub struct Emitter {
 pub fn default_scenario() -> Vec<Emitter> {
     use Keying::*;
     use Modulation::*;
-    let c4fm = Fsk { levels: 4, sym_rate: 4800.0, dev_hz: 1800.0 };
+    let c4fm = Fsk { levels: 4, sym_rate: 4800.0, dev_hz: 1800.0, sync: None };
+    let p25 = Fsk { levels: 4, sym_rate: 4800.0, dev_hz: 1800.0, sync: Some(P25_SYNC) };
+    let dmr = Fsk { levels: 4, sym_rate: 4800.0, dev_hz: 1944.0, sync: Some(DMR_BS_VOICE) };
     let mut v = vec![
-        Emitter { freq_hz: 851.0125e6, level_dbfs: -38.0, modulation: c4fm, keying: Continuous },
-        Emitter { freq_hz: 851.2625e6, level_dbfs: -44.0, modulation: c4fm, keying: Bursts { period_s: 9.0, duty: 0.45, phase: 0.0 } },
+        Emitter { freq_hz: 851.0125e6, level_dbfs: -38.0, modulation: p25, keying: Continuous },
+        Emitter { freq_hz: 851.2625e6, level_dbfs: -44.0, modulation: p25, keying: Bursts { period_s: 9.0, duty: 0.45, phase: 0.0 } },
         Emitter { freq_hz: 851.5375e6, level_dbfs: -50.0, modulation: c4fm, keying: Bursts { period_s: 13.0, duty: 0.3, phase: 0.5 } },
-        Emitter { freq_hz: 853.6500e6, level_dbfs: -46.0, modulation: Fsk { levels: 2, sym_rate: 1200.0, dev_hz: 4500.0 }, keying: Bursts { period_s: 11.0, duty: 0.2, phase: 0.3 } },
+        Emitter { freq_hz: 853.6500e6, level_dbfs: -46.0, modulation: Fsk { levels: 2, sym_rate: 1200.0, dev_hz: 4500.0, sync: Some(POCSAG_SYNC) }, keying: Bursts { period_s: 11.0, duty: 0.2, phase: 0.3 } },
         Emitter { freq_hz: 855.0000e6, level_dbfs: -62.0, modulation: Cw, keying: Continuous },
         Emitter { freq_hz: 856.2125e6, level_dbfs: -42.0, modulation: FmTone { tone_hz: 1000.0, dev_hz: 3000.0 }, keying: Bursts { period_s: 7.0, duty: 0.35, phase: 0.6 } },
-        Emitter { freq_hz: 857.2375e6, level_dbfs: -45.0, modulation: c4fm, keying: Slotted { period_s: 8.0, duty: 0.55, phase: 0.1, slot_s: 0.030 } },
-        Emitter { freq_hz: 858.8125e6, level_dbfs: -48.0, modulation: Fsk { levels: 4, sym_rate: 2400.0, dev_hz: 800.0 }, keying: Bursts { period_s: 6.0, duty: 0.3, phase: 0.2 } },
-        Emitter { freq_hz: 859.4625e6, level_dbfs: -47.0, modulation: Fsk { levels: 4, sym_rate: 9600.0, dev_hz: 2900.0 }, keying: Bursts { period_s: 2.0, duty: 0.1, phase: 0.0 } },
+        Emitter { freq_hz: 857.2375e6, level_dbfs: -45.0, modulation: dmr, keying: Slotted { period_s: 8.0, duty: 0.55, phase: 0.1, slot_s: 0.030 } },
+        Emitter { freq_hz: 858.8125e6, level_dbfs: -48.0, modulation: Fsk { levels: 4, sym_rate: 2400.0, dev_hz: 800.0, sync: Some(nxdn_sync()) }, keying: Bursts { period_s: 6.0, duty: 0.3, phase: 0.2 } },
+        Emitter { freq_hz: 859.4625e6, level_dbfs: -47.0, modulation: Fsk { levels: 4, sym_rate: 9600.0, dev_hz: 2900.0, sync: None }, keying: Bursts { period_s: 2.0, duty: 0.1, phase: 0.0 } },
     ];
     // Background traffic.
     let mut rng = XorShift(0x5eed_1234_abcd_0001);
@@ -125,7 +185,8 @@ impl SimDevice {
                 hw_timestamps: false,
             },
             emitters: Arc::new(emitters),
-            center: Arc::new(AtomicU64::new(856e6f64.to_bits())),
+            // Keeps every scripted emitter inside the 90% usable band.
+            center: Arc::new(AtomicU64::new(855.25e6f64.to_bits())),
             rate: 10e6,
             noise_dbfs: -62.0,
             running: Arc::new(AtomicBool::new(false)),
@@ -220,6 +281,7 @@ struct EmState {
     amp: f32,
     sym_left: f64,
     tone_phase: f64,
+    sym_index: u64,
 }
 
 impl Generator {
@@ -238,6 +300,7 @@ impl Generator {
                 amp: 10f64.powf(e.level_dbfs / 20.0) as f32,
                 sym_left: 0.0,
                 tone_phase: 0.0,
+                sym_index: 0,
             })
             .collect();
         let mut rng = XorShift(0x1234_5678_9abc_def1);
@@ -274,11 +337,20 @@ impl Generator {
                     if s.sym_left <= 0.0 {
                         let dev = match e.modulation {
                             Modulation::Cw => 0.0,
-                            Modulation::Fsk { levels, sym_rate, dev_hz } => {
+                            Modulation::Fsk { levels, sym_rate, dev_hz, sync } => {
                                 s.sym_left += fs / sym_rate;
-                                let k = (rng.next() % levels as u64) as f64;
-                                // Map 0..levels-1 onto ±1 (2FSK) or ±1/3, ±1 (4FSK).
-                                (2.0 * k / (levels as f64 - 1.0) - 1.0) * dev_hz
+                                let i = s.sym_index;
+                                s.sym_index += 1;
+                                match sync {
+                                    Some(sy) if (i % sy.period).wrapping_sub(sy.offset) < sy.symbols as u64 => {
+                                        sy.level((i % sy.period) - sy.offset, levels) * dev_hz
+                                    }
+                                    _ => {
+                                        let k = (rng.next() % levels as u64) as f64;
+                                        // Map 0..levels-1 onto ±1 (2FSK) or ±1/3, ±1 (4FSK).
+                                        (2.0 * k / (levels as f64 - 1.0) - 1.0) * dev_hz
+                                    }
+                                }
                             }
                             Modulation::FmTone { tone_hz, dev_hz } => {
                                 // Update the tone ~32 times per cycle.

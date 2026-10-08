@@ -330,13 +330,21 @@ impl SpectrumView {
         let hovered = hover.and_then(|p| boxes.iter().filter(|(b, _)| b.expand(2.0).contains(p)).min_by(|a, b| a.0.area().total_cmp(&b.0.area())).map(|(_, r)| r.id));
         for (b, r) in &boxes {
             let sel = selected == Some(r.id) || hovered == Some(r.id);
-            let mut c = if sel { theme::SELECT } else if r.active { theme::ACCENT } else { theme::RECORD };
+            let class = r.class.as_deref();
+            let base = theme::class_color(class).unwrap_or(if r.active { theme::ACCENT } else { theme::RECORD });
+            let mut c = if sel { theme::SELECT } else if r.active { base } else { base.gamma_multiply(0.8) };
             if self.subtle_boxes && !sel {
                 c = c.gamma_multiply(0.35);
             }
             painter.rect_stroke(*b, 2.0, Stroke::new(if sel { 2.0 } else { 1.0 }, c), egui::StrokeKind::Outside);
-            if sel || (b.width() >= 46.0 && !self.subtle_boxes) {
-                let g = painter.layout_no_wrap(format!("#{}", r.id), mono(10.0), theme::BG);
+            // Identified protocols are labelled even on narrow boxes.
+            let named = class.is_some_and(|c| c.protocol.is_some());
+            if sel || (!self.subtle_boxes && (b.width() >= 46.0 || named) && b.height() >= 10.0) {
+                let text = match class {
+                    Some(c) if c.label != "too short" => c.label.clone(),
+                    _ => format!("#{}", r.id),
+                };
+                let g = painter.layout_no_wrap(text, mono(10.0), theme::BG);
                 let at = pos2(b.left(), (b.top() - g.size().y - 1.0).max(wf.top()));
                 painter.rect_filled(Rect::from_min_size(at, g.size() + vec2(6.0, 0.0)), 2.0, c);
                 painter.galley(at + vec2(3.0, 0.0), g, theme::BG);
@@ -346,7 +354,7 @@ impl SpectrumView {
         // --- hover readout ---
         if let Some(r) = hovered.and_then(|id| records.iter().find(|r| r.id == id)) {
             let p = hover.unwrap_or_default();
-            let text = format!(
+            let mut text = format!(
                 "#{}{}\n{:.4} MHz · {:.1} kHz\n{:.2} s · SNR {:.0}/{:.0} dB\npeak {:.1} dBFS",
                 r.id,
                 if r.active { "  ACTIVE" } else { "" },
@@ -357,6 +365,24 @@ impl SpectrumView {
                 r.max_snr_db,
                 r.peak_dbfs
             );
+            match r.class.as_deref() {
+                Some(c) => {
+                    let f = &c.features;
+                    text += &format!("\n\n{}  ({:.0}%)", c.label, c.confidence * 100.0);
+                    if let Some(s) = &c.sync {
+                        text += &format!("\nsync ×{}{}", s.count, if s.inverted { " (inverted)" } else { "" });
+                    }
+                    text += &format!(
+                        "\nlevels {} · {} · ±{:.1} kHz\nenvelope CV {:.2} · {:.2} s analysed",
+                        if f.fsk_levels == 0 { "-".to_string() } else { f.fsk_levels.to_string() },
+                        f.symbol_rate_raw.map(|v| format!("{v:.0} Bd")).unwrap_or("no symbol rate".into()),
+                        f.deviation_hz / 1e3,
+                        f.envelope_cv,
+                        c.analysed_s
+                    );
+                }
+                None => text += "\n\nnot classified yet",
+            }
             let g = painter.layout_no_wrap(text, mono(11.0), theme::TEXT);
             let at = pos2((p.x + 14.0).min(full.right() - g.size().x - 10.0), (p.y + 14.0).min(full.bottom() - g.size().y - 8.0));
             painter.rect(Rect::from_min_size(at - vec2(6.0, 4.0), g.size() + vec2(12.0, 8.0)), 4.0, theme::BG, Stroke::new(1.0, theme::BORDER2), egui::StrokeKind::Inside);
