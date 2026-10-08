@@ -186,6 +186,7 @@ impl SpectrumView {
         sweep: Option<&SweepStatus>,
         records: &[SignalRecord],
         selected: Option<u64>,
+        selected_emitter: Option<u64>,
     ) -> ShowResult {
         let header = Rect::from_min_size(rect.min, vec2(rect.width(), HEADER_H));
         {
@@ -329,8 +330,8 @@ impl SpectrumView {
         let hover = resp.hover_pos();
         let hovered = hover.and_then(|p| boxes.iter().filter(|(b, _)| b.expand(2.0).contains(p)).min_by(|a, b| a.0.area().total_cmp(&b.0.area())).map(|(_, r)| r.id));
         for (b, r) in &boxes {
-            let sel = selected == Some(r.id) || hovered == Some(r.id);
-            let class = r.class.as_deref();
+            let sel = selected == Some(r.id) || hovered == Some(r.id) || (selected_emitter.is_some() && r.emitter == selected_emitter);
+            let class = r.display_class();
             let base = theme::class_color(class).unwrap_or(if r.active { theme::ACCENT } else { theme::RECORD });
             let mut c = if sel { theme::SELECT } else if r.active { base } else { base.gamma_multiply(0.8) };
             if self.subtle_boxes && !sel {
@@ -365,7 +366,10 @@ impl SpectrumView {
                 r.max_snr_db,
                 r.peak_dbfs
             );
-            match r.class.as_deref() {
+            if let Some(e) = r.emitter {
+                text += &format!("\nemitter E{e}");
+            }
+            match r.display_class() {
                 Some(c) => {
                     let f = &c.features;
                     text += &format!("\n\n{}  ({:.0}%)", c.label, c.confidence * 100.0);
@@ -399,9 +403,11 @@ impl SpectrumView {
             painter.galley(at, galley, theme::TEXT);
         }
         let click = resp.interact_pointer_pos().filter(|_| resp.clicked());
+        let record = click.and(hovered);
         ShowResult {
             freq_hz: click.map(|p| f0 + ((p.x - full.left()) / full.width()) as f64 * span),
-            record: click.and(hovered),
+            record,
+            emitter: record.and_then(|id| records.iter().find(|r| r.id == id)).and_then(|r| r.emitter),
         }
     }
 }
@@ -411,6 +417,7 @@ impl SpectrumView {
 pub struct ShowResult {
     pub freq_hz: Option<f64>,
     pub record: Option<u64>,
+    pub emitter: Option<u64>,
 }
 
 const HEADER_H: f32 = 26.0;

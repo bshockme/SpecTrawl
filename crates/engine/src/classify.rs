@@ -25,13 +25,17 @@ const MAX_DDC_BW_HZ: f64 = 1.0e6;
 pub(crate) fn run(shared: Arc<Shared>, cfg: SourceConfig, stop: Arc<AtomicBool>, rate: f64) {
     let mut chunk = vec![Complex32::default(); 1 << 18];
     while !stop.load(Ordering::Relaxed) {
-        let Some(rec) = pick(&shared) else {
+        if let Some(rec) = pick(&shared) {
+            let class = Arc::new(classify_record(&shared, &cfg, rate, &rec, &mut chunk, &stop));
+            let mut st = shared.records.lock();
+            st.emitters.tally(rec.id, &class);
+            st.classes.insert(rec.id, (class, Instant::now(), rec.active));
+        } else if let Some(job) = pick_emitter(&shared, rate) {
+            let class = Arc::new(classify_window(&shared, rate, &job, &mut chunk, &stop));
+            shared.records.lock().emitters.set_group_class(job.emitter, class);
+        } else {
             std::thread::sleep(Duration::from_millis(100));
-            continue;
-        };
-        let class = classify_record(&shared, &cfg, rate, &rec, &mut chunk, &stop);
-        let mut st = shared.records.lock();
-        st.classes.insert(rec.id, (Arc::new(class), Instant::now(), rec.active));
+        }
     }
 }
 
@@ -53,6 +57,42 @@ fn pick(shared: &Shared) -> Option<SignalRecord> {
         .cloned()
 }
 
+/// A window of IQ to classify, independent of record boundaries.
+struct Window {
+    emitter: u64,
+    start: u64,
+    end: u64,
+    center_hz: f64,
+    bandwidth_hz: f64,
+    tuner_center_hz: f64,
+}
+
+/// Re-try an unidentified emitter's group window this often.
+const GROUP_REFRESH: Duration = Duration::from_secs(10);
+
+/// Emitters still unidentified despite recent activity: their records were
+/// individually too short (TDMA slots, short bursts), so classify a window
+/// spanning several of them.
+fn pick_emitter(shared: &Shared, rate: f64) -> Option<Window> {
+    let st = shared.records.lock();
+    let now = std::time::SystemTime::now();
+    st.emitters
+        .map
+        .values()
+        .filter(|e| !e.has_protocol() && e.records >= 3)
+        .filter(|e| now.duration_since(e.last_seen).map(|d| d.as_secs_f64() < 3.0).unwrap_or(true))
+        .filter(|e| e.class_at.is_none_or(|t| t.elapsed() > GROUP_REFRESH))
+        .min_by_key(|e| e.class_at)
+        .map(|e| Window {
+            emitter: e.id,
+            start: e.last_end_sample.saturating_sub((MAX_WINDOW_S * rate) as u64),
+            end: e.last_end_sample,
+            center_hz: e.center_hz,
+            bandwidth_hz: e.bandwidth_hz,
+            tuner_center_hz: e.tuner_center_hz,
+        })
+}
+
 fn label_only(label: &str) -> Classification {
     Classification {
         label: label.into(),
@@ -72,21 +112,33 @@ fn classify_record(
     chunk: &mut [Complex32],
     stop: &AtomicBool,
 ) -> Classification {
-    let bw = r.bandwidth_hz().max(5e3);
-    if bw > MAX_DDC_BW_HZ {
-        return label_only("Wideband");
-    }
     // The first row's FFTs started roughly one row before its end sample.
     let per_row = (rate / cfg.rows_per_sec) as u64;
     let end = r.last_row_end_sample;
-    let start = r.first_row_end_sample.saturating_sub(per_row).max(end.saturating_sub((MAX_WINDOW_S * rate) as u64));
+    let w = Window {
+        emitter: 0,
+        start: r.first_row_end_sample.saturating_sub(per_row).max(end.saturating_sub((MAX_WINDOW_S * rate) as u64)),
+        end,
+        center_hz: r.center_hz(),
+        bandwidth_hz: r.bandwidth_hz(),
+        tuner_center_hz: r.tuner_center_hz,
+    };
+    classify_window(shared, rate, &w, chunk, stop)
+}
+
+fn classify_window(shared: &Shared, rate: f64, w: &Window, chunk: &mut [Complex32], stop: &AtomicBool) -> Classification {
+    let bw = w.bandwidth_hz.max(5e3);
+    if bw > MAX_DDC_BW_HZ {
+        return label_only("Wideband");
+    }
+    let (start, end) = (w.start, w.end);
     let oldest = shared.ring.lock().oldest();
     let start = start.max(oldest);
     if end <= start + (0.02 * rate) as u64 {
         return label_only(if end <= oldest { "IQ expired" } else { "too short" });
     }
 
-    let offset = r.center_hz() - r.tuner_center_hz;
+    let offset = w.center_hz - w.tuner_center_hz;
     let mut ddc = Ddc::new(rate, offset, bw * 0.65 + 1e3, (bw * 2.5).max(48e3));
     let mut chan = Vec::with_capacity(((end - start) as f64 / rate * ddc.fs_out) as usize + 16);
     let mut pos = start;
@@ -106,5 +158,5 @@ fn classify_record(
     if chan.is_empty() {
         return label_only("IQ expired");
     }
-    detect::classify(&chan, ddc.fs_out, r.bandwidth_hz())
+    detect::classify(&chan, ddc.fs_out, w.bandwidth_hz)
 }

@@ -5,6 +5,7 @@
 
 mod bursts;
 mod classify;
+mod emitters;
 mod ring;
 mod sweep;
 
@@ -19,6 +20,7 @@ use parking_lot::Mutex;
 use sdr_core::{Capabilities, Complex32, Device, DeviceInfo, Samples, StreamEvent, StreamSink};
 
 pub use bursts::{BurstDetector, DetectorConfig, SignalRecord};
+pub use emitters::Emitter;
 pub use ring::IqRing;
 pub use sweep::{SweepPlan, SweepStatus};
 
@@ -80,12 +82,15 @@ struct RecordStore {
     open: Vec<SignalRecord>,
     /// Result, when it was made, and whether the record was still open then.
     classes: HashMap<u64, (Arc<detect::Classification>, Instant, bool)>,
+    emitters: emitters::EmitterBook,
 }
 
 impl RecordStore {
     fn with_class(&self, r: &SignalRecord) -> SignalRecord {
         let mut r = r.clone();
         r.class = self.classes.get(&r.id).map(|c| c.0.clone());
+        r.emitter = self.emitters.by_record.get(&r.id).copied();
+        r.emitter_class = r.emitter.and_then(|id| self.emitters.get(id)).and_then(|e| e.best.clone());
         r
     }
 }
@@ -115,11 +120,18 @@ impl Shared {
             if st.closed.len() >= MAX_CLOSED_RECORDS {
                 if let Some(old) = st.closed.pop_front() {
                     st.classes.remove(&old.id);
+                    st.emitters.by_record.remove(&old.id);
                 }
             }
+            st.emitters.observe(&r, true);
             st.closed.push_back(r);
         }
-        st.open = det.open_records();
+        let open = det.open_records();
+        for r in &open {
+            st.emitters.observe(r, false);
+        }
+        st.emitters.mark_active(&open);
+        st.open = open;
     }
 
     fn push_row(&self, row: SpectrumRow, cap: usize) {
@@ -299,6 +311,13 @@ impl Source {
     pub fn recent_records(&self, n: usize) -> Vec<SignalRecord> {
         let st = self.shared.records.lock();
         st.open.iter().chain(st.closed.iter().rev()).take(n).map(|r| st.with_class(r)).collect()
+    }
+
+    /// All emitters, active first, then most recently seen.
+    pub fn emitters(&self) -> Vec<Emitter> {
+        let mut v: Vec<Emitter> = self.shared.records.lock().emitters.map.values().cloned().collect();
+        v.sort_by(|a, b| b.active.cmp(&a.active).then(b.last_seen.cmp(&a.last_seen)));
+        v
     }
 
     pub fn sweep_status(&self) -> Option<SweepStatus> {

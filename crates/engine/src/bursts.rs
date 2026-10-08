@@ -86,7 +86,7 @@ impl DetectorConfig {
 #[derive(Debug, Clone)]
 pub struct SignalRecord {
     pub id: u64,
-    pub source_serial: String,
+    pub source_serial: std::sync::Arc<str>,
     pub first_seq: u64,
     pub last_seq: u64,
     pub t_start: SystemTime,
@@ -107,6 +107,25 @@ pub struct SignalRecord {
     pub tuner_center_hz: f64,
     /// Filled in by the classifier when available.
     pub class: Option<std::sync::Arc<detect::Classification>>,
+    /// The emitter this record belongs to, and that emitter's best class.
+    pub emitter: Option<u64>,
+    pub emitter_class: Option<std::sync::Arc<detect::Classification>>,
+}
+
+impl SignalRecord {
+    /// What to show for this record: its own class if it names a protocol,
+    /// else its emitter's if that does, else whichever exists. (An emitter's
+    /// best class only names a protocol once that was seen twice.)
+    pub fn display_class(&self) -> Option<&detect::Classification> {
+        let own = self.class.as_deref().filter(|c| !matches!(c.label.as_str(), "too short" | "IQ expired" | "interrupted"));
+        let em = self.emitter_class.as_deref();
+        match (own, em) {
+            (Some(o), _) if o.protocol.is_some() => Some(o),
+            (_, Some(e)) if e.protocol.is_some() => Some(e),
+            (Some(o), _) => Some(o),
+            (None, e) => e,
+        }
+    }
 }
 
 impl SignalRecord {
@@ -142,7 +161,7 @@ struct Track {
 
 pub struct BurstDetector {
     cfg: DetectorConfig,
-    serial: String,
+    serial: std::sync::Arc<str>,
     tuning: Option<Tuning>,
     bins: usize,
     block_floor: Vec<f32>,
@@ -160,7 +179,7 @@ struct Segment {
 
 impl BurstDetector {
     pub fn new(cfg: DetectorConfig, serial: String) -> Self {
-        Self { cfg, serial, tuning: None, bins: 0, block_floor: Vec::new(), floor: Vec::new(), tracks: Vec::new(), scratch: Vec::new() }
+        Self { cfg, serial: serial.into(), tuning: None, bins: 0, block_floor: Vec::new(), floor: Vec::new(), tracks: Vec::new(), scratch: Vec::new() }
     }
 
     /// Feeds one row. Returns records that closed on this row.
@@ -231,6 +250,8 @@ impl BurstDetector {
             last_row_end_sample: t.last_end,
             tuner_center_hz: self.tuning.map(|t| t.center_hz).unwrap_or(0.0),
             class: None,
+            emitter: None,
+            emitter_class: None,
         }
     }
 
