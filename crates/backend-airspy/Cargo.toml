@@ -7,3 +7,6 @@ edition.workspace = true
 libloading = "0.9.0"
 log = "0.4.34"
 sdr-core = { version = "0.1.0", path = "../sdr-core" }
+
+[dev-dependencies]
+parking_lot = "0.12.5"

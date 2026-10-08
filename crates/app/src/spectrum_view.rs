@@ -8,7 +8,7 @@
 use std::collections::VecDeque;
 
 use egui::{Color32, Mesh, Pos2, Rect, Shape, Stroke, TextureHandle, TextureOptions, pos2, vec2};
-use engine::{Source, Tuning};
+use engine::{Source, SweepStatus, Tuning};
 
 use crate::theme;
 
@@ -21,6 +21,8 @@ pub struct SpectrumView {
     pub db_min: f32,
     pub db_max: f32,
     pub smoothing: f32,
+    /// Waterfall row height in points; `None` fits the whole history.
+    pub row_px: Option<f32>,
     trace: Vec<f32>,
     hold: Vec<f32>,
     tuning: Option<Tuning>,
@@ -40,6 +42,7 @@ impl SpectrumView {
             db_min: -110.0,
             db_max: -45.0,
             smoothing: 0.6,
+            row_px: None,
             trace: Vec::new(),
             hold: Vec::new(),
             tuning: None,
@@ -140,21 +143,72 @@ impl SpectrumView {
         }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, _src: &Source) {
-        let full = ui.available_rect_before_wrap();
-        let resp = ui.allocate_rect(full, egui::Sense::hover());
+    /// Frequency extent currently displayed, in Hz.
+    pub fn span(&self) -> Option<(f64, f64)> {
+        self.tuning.map(|t| (t.center_hz - t.span_hz / 2.0, t.center_hz + t.span_hz / 2.0))
+    }
+
+    /// Draws a labelled bracket over `[lo, hi]` Hz (e.g. a focus pane's coverage).
+    pub fn bracket(&self, ui: &egui::Ui, rect: Rect, lo: f64, hi: f64, label: &str) {
+        let Some((f0, f1)) = self.span() else { return };
+        let body = Rect::from_min_max(pos2(rect.left(), rect.top() + HEADER_H), rect.max);
+        let x = |f: f64| body.left() + ((f - f0) / (f1 - f0)) as f32 * body.width();
+        let (x0, x1) = (x(lo) - 2.0, x(hi) + 2.0);
+        if x1 < body.left() || x0 > body.right() {
+            return;
+        }
+        let r = Rect::from_x_y_ranges(x0.max(body.left())..=x1.min(body.right()), body.y_range());
+        let p = ui.painter_at(rect);
+        p.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(230, 237, 243, 14));
+        let edge = Stroke::new(1.0, Color32::from_rgba_unmultiplied(230, 237, 243, 170));
+        p.vline(r.left(), r.y_range(), edge);
+        p.vline(r.right(), r.y_range(), edge);
+        let g = p.layout_no_wrap(label.to_string(), mono(11.0), theme::BG);
+        let at = pos2(r.left() + 4.0, r.top() + 4.0);
+        p.rect_filled(Rect::from_min_size(at - vec2(4.0, 1.0), g.size() + vec2(8.0, 2.0)), 3.0, theme::CHIP_FOCUS_BG);
+        p.galley(at, g, theme::BG);
+    }
+
+    /// Draws header, spectrum and waterfall into `rect`. Returns the frequency
+    /// clicked, if any.
+    pub fn show(&mut self, ui: &mut egui::Ui, rect: Rect, title: &str, sweep: Option<&SweepStatus>) -> Option<f64> {
+        let header = Rect::from_min_size(rect.min, vec2(rect.width(), HEADER_H));
+        {
+            let p = ui.painter_at(rect);
+            p.rect_filled(header, 0.0, theme::PANEL);
+            p.text(header.left_center() + vec2(10.0, 0.0), egui::Align2::LEFT_CENTER, title, egui::FontId::proportional(12.5), theme::TEXT);
+            p.hline(rect.x_range(), header.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
+        }
+        let mut full = Rect::from_min_max(pos2(rect.left(), header.bottom()), rect.max);
+        if let Some(s) = sweep {
+            // Hop freshness strip: bright = just measured, fading with age.
+            let strip = Rect::from_min_size(full.min, vec2(full.width(), 5.0));
+            let p = ui.painter_at(strip);
+            p.rect_filled(strip, 0.0, theme::PLOT_BG);
+            let now = std::time::Instant::now();
+            let pass = s.last_pass_s.max(0.5);
+            for (h, t) in s.hop_times.iter().enumerate() {
+                let Some(t) = t else { continue };
+                let age = now.duration_since(*t).as_secs_f64() / pass;
+                let a = if h == s.current_hop { 255 } else { (200.0 * (1.0 - age.min(1.0) * 0.8)) as u8 };
+                let x0 = strip.left() + strip.width() * h as f32 / s.hops as f32;
+                let x1 = strip.left() + strip.width() * (h + 1) as f32 / s.hops as f32;
+                p.rect_filled(Rect::from_x_y_ranges(x0..=(x1 - 1.0).max(x0 + 0.5), strip.y_range()), 0.0, Color32::from_rgba_unmultiplied(0x38, 0xd3, 0xcf, a));
+            }
+            full.min.y += 6.0;
+        }
+        let resp = ui.allocate_rect(full, egui::Sense::click());
         let painter = ui.painter_at(full);
         let spec_h = (full.height() * 0.32).round();
         let spec = Rect::from_min_size(full.min, vec2(full.width(), spec_h));
         let wf = Rect::from_min_max(pos2(full.left(), spec.bottom() + 1.0), full.max);
 
-        let Some(tuning) = self.tuning else {
-            painter.rect_filled(full, 6.0, theme::PANEL);
-            painter.text(full.center(), egui::Align2::CENTER_CENTER, "waiting for samples…", egui::FontId::proportional(14.0), theme::MUTED);
-            return;
+        let Some((f0, f1)) = self.span() else {
+            painter.rect_filled(full, 0.0, theme::PLOT_BG);
+            let msg = if sweep.is_some() { "first sweep pass in progress…" } else { "waiting for samples…" };
+            painter.text(full.center(), egui::Align2::CENTER_CENTER, msg, egui::FontId::proportional(14.0), theme::MUTED);
+            return None;
         };
-        let f0 = tuning.center_hz - tuning.sample_rate / 2.0;
-        let f1 = tuning.center_hz + tuning.sample_rate / 2.0;
 
         // --- waterfall ---
         let ppp = ui.ctx().pixels_per_point();
@@ -163,14 +217,21 @@ impl SpectrumView {
             self.rebuild_tex(ui.ctx(), want_w);
         }
         if let Some(tex) = &self.tex {
-            let split = self.write_row as f32 / ROWS as f32;
-            let h1 = wf.height() * (1.0 - split);
+            // Newest row at the top. Show `visible` rows starting at the ring's
+            // write position, wrapping once past the end of the texture.
+            let visible = match self.row_px {
+                Some(px) => ((wf.height() / px).floor() as usize).clamp(1, ROWS),
+                None => ROWS,
+            };
+            let start = self.write_row;
+            let first = visible.min(ROWS - start);
+            let v = |r: usize| r as f32 / ROWS as f32;
             let mut mesh = Mesh::with_texture(tex.id());
-            let r1 = Rect::from_min_size(wf.min, vec2(wf.width(), h1));
-            mesh.add_rect_with_uv(r1, Rect::from_min_max(pos2(0.0, split), pos2(1.0, 1.0)), Color32::WHITE);
-            if self.write_row > 0 {
+            let r1 = Rect::from_min_size(wf.min, vec2(wf.width(), wf.height() * first as f32 / visible as f32));
+            mesh.add_rect_with_uv(r1, Rect::from_min_max(pos2(0.0, v(start)), pos2(1.0, v(start + first))), Color32::WHITE);
+            if first < visible {
                 let r2 = Rect::from_min_max(pos2(wf.left(), r1.bottom()), wf.max);
-                mesh.add_rect_with_uv(r2, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, split)), Color32::WHITE);
+                mesh.add_rect_with_uv(r2, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, v(visible - first))), Color32::WHITE);
             }
             painter.add(Shape::mesh(mesh));
         }
@@ -239,8 +300,12 @@ impl SpectrumView {
             painter.rect_filled(Rect::from_min_size(at - vec2(5.0, 2.0), galley.size() + vec2(10.0, 4.0)), 3.0, theme::BG);
             painter.galley(at, galley, theme::TEXT);
         }
+        let click = resp.interact_pointer_pos().filter(|_| resp.clicked());
+        click.map(|p| f0 + ((p.x - full.left()) / full.width()) as f64 * span)
     }
 }
+
+const HEADER_H: f32 = 26.0;
 
 fn mono(size: f32) -> egui::FontId {
     egui::FontId::monospace(size)

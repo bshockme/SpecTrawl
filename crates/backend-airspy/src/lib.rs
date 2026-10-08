@@ -224,7 +224,9 @@ impl Backend for AirspyBackend {
             caps: Capabilities {
                 freq_ranges_hz: vec![(24e6, 1.8e9)],
                 tuning_step_hz: 1.0,
-                retune_latency_s: 0.005,
+                // Measured on an R2 (examples/retune_probe): new frequency visible
+                // 1.6-8.2 ms after set_freq returns; the spread is the USB transfer size.
+                retune_latency_s: 0.0095,
                 sample_rates: rates,
                 usable_bandwidth_fraction: 0.9,
                 native_format: SampleFormat::Cf32,

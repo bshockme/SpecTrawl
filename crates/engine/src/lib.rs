@@ -1,7 +1,10 @@
-//! Per-source pipeline: driver → IQ ring (look-back) → spectrum frames.
-//! See DESIGN.md §5.
+//! Per-source pipeline: driver → IQ ring (look-back) → spectrum rows.
+//! A source runs in one of two modes: `Live` (fixed tuning, FFT rows at a
+//! steady rate) or `Sweep` (retune-and-dwell across a span, one stitched row
+//! per pass). See DESIGN.md §5.
 
 mod ring;
+mod sweep;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -11,9 +14,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use dsp::SpectrumAnalyzer;
 use parking_lot::Mutex;
-use sdr_core::{Complex32, Device, DeviceInfo, Samples, StreamEvent, StreamSink};
+use sdr_core::{Capabilities, Complex32, Device, DeviceInfo, Samples, StreamEvent, StreamSink};
 
 pub use ring::IqRing;
+pub use sweep::{SweepPlan, SweepStatus};
 
 #[derive(Debug, Clone)]
 pub struct SourceConfig {
@@ -30,14 +34,21 @@ impl Default for SourceConfig {
     }
 }
 
-/// Tuning in effect for a stretch of the stream.
+#[derive(Debug, Clone)]
+pub enum Mode {
+    Live,
+    Sweep(SweepPlan),
+}
+
+/// Frequency extent of a row: `center_hz ± span_hz/2`. For a live row the
+/// span is the sample rate; for a sweep row it is the swept span.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tuning {
     pub center_hz: f64,
-    pub sample_rate: f64,
+    pub span_hz: f64,
 }
 
-/// One waterfall row: averaged power spectrum in dBFS, DC-centred.
+/// One waterfall row: power spectrum in dBFS, lowest frequency first.
 #[derive(Debug)]
 pub struct SpectrumRow {
     pub seq: u64,
@@ -50,7 +61,8 @@ pub struct SpectrumRow {
 
 #[derive(Default)]
 struct StreamState {
-    tuning: Option<Tuning>,
+    center_hz: f64,
+    sample_rate: f64,
     gaps: u64,
     lost_samples: u64,
     overloads: u64,
@@ -61,7 +73,18 @@ struct Shared {
     ring: Mutex<IqRing>,
     state: Mutex<StreamState>,
     rows: Mutex<VecDeque<Arc<SpectrumRow>>>,
-    stop: AtomicBool,
+    sweep: Mutex<Option<SweepStatus>>,
+    ffts_per_sec: Mutex<f64>,
+}
+
+impl Shared {
+    fn push_row(&self, row: SpectrumRow, cap: usize) {
+        let mut rows = self.rows.lock();
+        while rows.len() >= cap {
+            rows.pop_front();
+        }
+        rows.push_back(Arc::new(row));
+    }
 }
 
 struct RingSink {
@@ -76,7 +99,10 @@ impl StreamSink for RingSink {
     fn on_event(&mut self, event: StreamEvent) {
         let mut st = self.shared.state.lock();
         match event {
-            StreamEvent::Retune { center_hz, sample_rate, .. } => st.tuning = Some(Tuning { center_hz, sample_rate }),
+            StreamEvent::Retune { center_hz, sample_rate, .. } => {
+                st.center_hz = center_hz;
+                st.sample_rate = sample_rate;
+            }
             StreamEvent::Gap { lost_samples, .. } => {
                 st.gaps += 1;
                 st.lost_samples += lost_samples;
@@ -100,56 +126,95 @@ pub struct SourceStats {
     pub ffts_per_sec: f64,
 }
 
-/// A running source: owns the device, its IQ ring and the spectrum thread.
+/// Copy of the device's identity and settings, safe to hold in the UI.
+#[derive(Debug, Clone)]
+pub struct DeviceSnapshot {
+    pub info: DeviceInfo,
+    pub caps: Capabilities,
+    pub center_hz: f64,
+    pub sample_rate: f64,
+}
+
+type SharedDevice = Arc<Mutex<Box<dyn Device>>>;
+
+/// A running source: owns the device, its IQ ring and one worker thread.
 pub struct Source {
-    device: Box<dyn Device>,
+    device: SharedDevice,
+    info: DeviceInfo,
     shared: Arc<Shared>,
-    worker: Option<JoinHandle<()>>,
     cfg: SourceConfig,
-    ffts_per_sec: Arc<Mutex<f64>>,
+    mode: Mode,
+    worker: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
 }
 
 impl Source {
-    pub fn start(mut device: Box<dyn Device>, cfg: SourceConfig) -> sdr_core::Result<Self> {
+    pub fn start(mut device: Box<dyn Device>, cfg: SourceConfig, mode: Mode) -> sdr_core::Result<Self> {
         let rate = device.sample_rate();
         let cap = (rate * cfg.ring_seconds).ceil() as usize;
         let shared = Arc::new(Shared {
             ring: Mutex::new(IqRing::new(cap)),
-            state: Mutex::new(StreamState {
-                tuning: Some(Tuning { center_hz: device.center_hz(), sample_rate: rate }),
-                ..Default::default()
-            }),
+            state: Mutex::new(StreamState { center_hz: device.center_hz(), sample_rate: rate, ..Default::default() }),
             rows: Mutex::new(VecDeque::with_capacity(cfg.row_history)),
-            stop: AtomicBool::new(false),
+            sweep: Mutex::new(None),
+            ffts_per_sec: Mutex::new(0.0),
         });
         device.start(Box::new(RingSink { shared: shared.clone() }))?;
-        let ffts_per_sec = Arc::new(Mutex::new(0.0));
-        let worker = {
-            let shared = shared.clone();
-            let cfg = cfg.clone();
-            let fps = ffts_per_sec.clone();
-            std::thread::Builder::new()
-                .name("spectrum".into())
-                .spawn(move || spectrum_worker(shared, cfg, fps))
-                .expect("spawn spectrum thread")
-        };
-        Ok(Self { device, shared, worker: Some(worker), cfg, ffts_per_sec })
+        let info = device.info().clone();
+        let mut s = Self { device: Arc::new(Mutex::new(device)), info, shared, cfg, mode: Mode::Live, worker: None };
+        s.set_mode(mode);
+        Ok(s)
+    }
+
+    /// Stops the current worker and starts one for `mode`. Row history is
+    /// cleared because rows from different modes don't share a frequency axis.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.stop_worker();
+        self.shared.rows.lock().clear();
+        *self.shared.sweep.lock() = None;
+        let stop = Arc::new(AtomicBool::new(false));
+        let (shared, cfg, st) = (self.shared.clone(), self.cfg.clone(), stop.clone());
+        let handle = match &mode {
+            Mode::Live => std::thread::Builder::new().name("spectrum".into()).spawn(move || live_worker(shared, cfg, st)),
+            Mode::Sweep(plan) => {
+                let (dev, plan) = (self.device.clone(), plan.clone());
+                std::thread::Builder::new().name("sweep".into()).spawn(move || sweep::run(shared, dev, plan, cfg, st))
+            }
+        }
+        .expect("spawn worker");
+        self.worker = Some((stop, handle));
+        self.mode = mode;
+    }
+
+    fn stop_worker(&mut self) {
+        if let Some((stop, h)) = self.worker.take() {
+            stop.store(true, Ordering::Relaxed);
+            let _ = h.join();
+        }
+    }
+
+    pub fn mode(&self) -> &Mode {
+        &self.mode
     }
 
     pub fn info(&self) -> &DeviceInfo {
-        self.device.info()
+        &self.info
     }
 
-    pub fn device(&self) -> &dyn Device {
-        self.device.as_ref()
+    pub fn snapshot(&self) -> DeviceSnapshot {
+        let d = self.device.lock();
+        DeviceSnapshot { info: d.info().clone(), caps: d.capabilities().clone(), center_hz: d.center_hz(), sample_rate: d.sample_rate() }
     }
 
     pub fn config(&self) -> &SourceConfig {
         &self.cfg
     }
 
+    /// Retunes a live source. Ignored while sweeping (the sweep owns tuning).
     pub fn set_center(&mut self, hz: f64) -> sdr_core::Result<()> {
-        self.device.set_center(hz)
+        if matches!(self.mode, Mode::Sweep(_)) {
+            return Ok(());
+        }
+        self.device.lock().set_center(hz)
     }
 
     /// Rows with `seq > after`, oldest first.
@@ -161,8 +226,8 @@ impl Source {
         }
     }
 
-    pub fn latest_row(&self) -> Option<Arc<SpectrumRow>> {
-        self.shared.rows.lock().back().cloned()
+    pub fn sweep_status(&self) -> Option<SweepStatus> {
+        self.shared.sweep.lock().clone()
     }
 
     pub fn stats(&self) -> SourceStats {
@@ -176,7 +241,7 @@ impl Source {
             ring_samples: ring.available(),
             ring_capacity: ring.capacity(),
             total_samples: ring.head(),
-            ffts_per_sec: *self.ffts_per_sec.lock(),
+            ffts_per_sec: *self.shared.ffts_per_sec.lock(),
         }
     }
 
@@ -192,15 +257,12 @@ impl Source {
 
 impl Drop for Source {
     fn drop(&mut self) {
-        let _ = self.device.stop();
-        self.shared.stop.store(true, Ordering::Relaxed);
-        if let Some(w) = self.worker.take() {
-            let _ = w.join();
-        }
+        self.stop_worker();
+        let _ = self.device.lock().stop();
     }
 }
 
-fn spectrum_worker(shared: Arc<Shared>, cfg: SourceConfig, fps_out: Arc<Mutex<f64>>) {
+fn live_worker(shared: Arc<Shared>, cfg: SourceConfig, stop: Arc<AtomicBool>) {
     let n = cfg.fft_size;
     let mut sa = SpectrumAnalyzer::new(n);
     let mut block = vec![Complex32::default(); n];
@@ -212,7 +274,7 @@ fn spectrum_worker(shared: Arc<Shared>, cfg: SourceConfig, fps_out: Arc<Mutex<f6
     let mut fft_window = Instant::now();
     let mut db = Vec::with_capacity(n);
 
-    while !shared.stop.load(Ordering::Relaxed) {
+    while !stop.load(Ordering::Relaxed) {
         let (head, oldest) = {
             let r = shared.ring.lock();
             (r.head(), r.oldest())
@@ -246,25 +308,24 @@ fn spectrum_worker(shared: Arc<Shared>, cfg: SourceConfig, fps_out: Arc<Mutex<f6
                 next_row = now + row_interval;
             }
             if sa.take_db(&mut db) {
-                let tuning = shared.state.lock().tuning.unwrap_or(Tuning { center_hz: 0.0, sample_rate: 1.0 });
+                let tuning = {
+                    let st = shared.state.lock();
+                    Tuning { center_hz: st.center_hz, span_hz: st.sample_rate }
+                };
                 seq += 1;
-                let row = Arc::new(SpectrumRow {
+                let row = SpectrumRow {
                     seq,
                     tuning,
                     end_sample: *cur,
                     time: SystemTime::now(),
                     db: std::mem::replace(&mut db, Vec::with_capacity(n)),
-                });
-                let mut rows = shared.rows.lock();
-                if rows.len() >= cfg.row_history {
-                    rows.pop_front();
-                }
-                rows.push_back(row);
+                };
+                shared.push_row(row, cfg.row_history);
             }
         }
         let el = fft_window.elapsed();
         if el >= Duration::from_secs(1) {
-            *fps_out.lock() = fft_count as f64 / el.as_secs_f64();
+            *shared.ffts_per_sec.lock() = fft_count as f64 / el.as_secs_f64();
             fft_count = 0;
             fft_window = Instant::now();
         }
