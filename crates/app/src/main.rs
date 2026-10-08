@@ -95,6 +95,9 @@ struct App {
     selected_emitter: Option<(Role, u64)>,
     list_tab: ListTab,
     last_frame: std::time::Instant,
+    /// Running SigMF export (description, handle) and the last result.
+    export: Option<(String, std::thread::JoinHandle<Result<engine::sigmf::ExportResult, String>>)>,
+    export_msg: Option<String>,
     /// Emitter table, refreshed a few times a second rather than every frame.
     emitter_cache: (std::time::Instant, Vec<(Role, engine::Emitter)>),
 }
@@ -163,6 +166,8 @@ impl App {
             list_tab: ListTab::Emitters,
             emitter_cache: (std::time::Instant::now() - std::time::Duration::from_secs(1), Vec::new()),
             last_frame: std::time::Instant::now(),
+            export: None,
+            export_msg: None,
         };
         app.rescan();
 
@@ -433,6 +438,7 @@ impl App {
             }
         }
 
+        self.selection_card(ui);
         ui.add_space(8.0);
         ui.label(egui::RichText::new("DISPLAY").small().strong().color(theme::MUTED));
         theme::card(ui, |ui| {
@@ -452,6 +458,9 @@ impl App {
     }
 
     fn central(&mut self, ui: &mut egui::Ui) {
+        for p in self.panes.iter_mut() {
+            p.view.paused = self.paused;
+        }
         if !self.paused {
             for p in self.panes.iter_mut() {
                 p.view.ingest(&p.source);
@@ -532,6 +541,141 @@ impl App {
         }
         if let Some(f) = tune_to {
             self.retune_focus((f / 1e3).round() / 1e3);
+        }
+    }
+
+    /// What's selected, and SigMF export for it.
+    fn selection_card(&mut self, ui: &mut egui::Ui) {
+        // Poll a running export.
+        if self.export.as_ref().is_some_and(|(_, h)| h.is_finished()) {
+            let (what, h) = self.export.take().unwrap();
+            self.export_msg = Some(match h.join() {
+                Ok(Ok(r)) => format!(
+                    "Saved {what}: {:.1} s, {:.1} MB\n{}",
+                    r.seconds,
+                    r.bytes as f64 / 1e6,
+                    r.data_path.with_extension("").display()
+                ),
+                Ok(Err(e)) => format!("Export failed: {e}"),
+                Err(_) => "Export crashed".into(),
+            });
+        }
+        let Some(focus) = self.panes.iter().find(|p| p.role == Role::Focus) else { return };
+        let records: Vec<engine::SignalRecord> = focus.records.2.iter().cloned().collect();
+        let record = self.selected.and_then(|id| records.iter().find(|r| r.id == id).cloned().or_else(|| {
+            focus.source.recent_records(3000).into_iter().find(|r| r.id == id)
+        }));
+        let emitter = self
+            .selected_emitter
+            .filter(|(role, _)| *role == Role::Focus)
+            .and_then(|(_, id)| focus.source.emitters().into_iter().find(|e| e.id == id));
+        let busy = self.export.is_some();
+        let mut req: Option<(String, engine::sigmf::ExportRequest)> = None;
+        let annotate = |rs: &[engine::SignalRecord]| -> Vec<engine::sigmf::ExportAnnotation> {
+            rs.iter()
+                .map(|r| {
+                    let (s, e) = focus.source.record_sample_range(r);
+                    let label = r.display_class().map(|c| c.label.clone()).unwrap_or_else(|| format!("#{}", r.id));
+                    engine::sigmf::ExportAnnotation {
+                        start_sample: s,
+                        end_sample: e,
+                        f_lo_hz: r.f_lo_hz,
+                        f_hi_hz: r.f_hi_hz,
+                        label,
+                        comment: format!("SpecTrawl record #{} · SNR {:.0} dB · peak {:.1} dBFS", r.id, r.max_snr_db, r.peak_dbfs),
+                    }
+                })
+                .collect()
+        };
+        let dir = engine::sigmf::default_dir();
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("SELECTION").small().strong().color(theme::MUTED));
+        theme::card(ui, |ui| {
+            if let Some(r) = &record {
+                let label = r.display_class().map(|c| c.label.clone()).unwrap_or_else(|| "unclassified".into());
+                ui.label(egui::RichText::new(format!("Record #{} · {}", r.id, label)).strong());
+                ui.label(
+                    egui::RichText::new(format!("{:.4} MHz · {:.1} kHz · {:.2} s", r.center_hz() / 1e6, r.bandwidth_hz() / 1e3, r.duration_s()))
+                        .monospace()
+                        .color(theme::TEXT2),
+                );
+                let stem = |kind: &str| {
+                    engine::sigmf::sanitize(&format!("{}_{:.4}MHz_{}_{kind}", engine::sigmf::stamp(r.t_start), r.center_hz() / 1e6, label))
+                };
+                let (s, e) = focus.source.record_sample_range(r);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!busy, egui::Button::new("Export channel")).on_hover_text("Down-converted to this signal only (cf32, ~50 kS/s)").clicked() {
+                        req = Some((format!("record #{} channel", r.id), engine::sigmf::ExportRequest {
+                            start_sample: s,
+                            end_sample: e,
+                            kind: engine::sigmf::ExportKind::Channel { center_hz: r.center_hz(), bandwidth_hz: r.bandwidth_hz() },
+                            dir: dir.clone(),
+                            stem: stem("ch"),
+                            description: format!("SpecTrawl record #{} ({label}), channel", r.id),
+                            annotations: annotate(std::slice::from_ref(r)),
+                        }));
+                    }
+                    if ui.add_enabled(!busy, egui::Button::new("Full band")).on_hover_text("Raw 10 MHz capture for the record's time span (ci16)").clicked() {
+                        let overlapping: Vec<engine::SignalRecord> = records.iter().filter(|o| o.last_row_end_sample >= s && o.first_row_end_sample <= e).cloned().collect();
+                        req = Some((format!("record #{} full band", r.id), engine::sigmf::ExportRequest {
+                            start_sample: s,
+                            end_sample: e,
+                            kind: engine::sigmf::ExportKind::Wideband,
+                            dir: dir.clone(),
+                            stem: stem("wide"),
+                            description: format!("SpecTrawl record #{} ({label}), full band", r.id),
+                            annotations: annotate(&overlapping),
+                        }));
+                    }
+                });
+            } else if let Some(em) = &emitter {
+                let label = em.label().unwrap_or_else(|| "unclassified".into());
+                ui.label(egui::RichText::new(format!("Emitter E{} · {}", em.id, label)).strong());
+                ui.label(egui::RichText::new(format!("{:.4} MHz · {} bursts", em.center_hz / 1e6, em.records)).monospace().color(theme::TEXT2));
+                if ui.add_enabled(!busy, egui::Button::new("Export channel (look-back)")).on_hover_text("This emitter's channel over the whole look-back buffer").clicked() {
+                    let (s, e) = focus.source.ring_range();
+                    let mine: Vec<engine::SignalRecord> = records.iter().filter(|r| r.emitter == Some(em.id)).cloned().collect();
+                    req = Some((format!("emitter E{} channel", em.id), engine::sigmf::ExportRequest {
+                        start_sample: s,
+                        end_sample: e,
+                        kind: engine::sigmf::ExportKind::Channel { center_hz: em.center_hz, bandwidth_hz: em.bandwidth_hz },
+                        dir: dir.clone(),
+                        stem: engine::sigmf::sanitize(&format!("{}_{:.4}MHz_{}_E{}_ch", engine::sigmf::stamp(std::time::SystemTime::now()), em.center_hz / 1e6, label, em.id)),
+                        description: format!("SpecTrawl emitter E{} ({label}), channel", em.id),
+                        annotations: annotate(&mine),
+                    }));
+                }
+            } else {
+                ui.label(egui::RichText::new("Click a box or a list row (Focus A) to select it.").small().color(theme::MUTED));
+            }
+            ui.separator();
+            if ui.add_enabled(!busy, egui::Button::new("Export look-back (full band)")).on_hover_text("Everything in the Focus A look-back buffer (~10 s, ~400 MB)").clicked() {
+                let (s, e) = focus.source.ring_range();
+                let snap = focus.source.snapshot();
+                req = Some(("look-back".into(), engine::sigmf::ExportRequest {
+                    start_sample: s,
+                    end_sample: e,
+                    kind: engine::sigmf::ExportKind::Wideband,
+                    dir: dir.clone(),
+                    stem: engine::sigmf::sanitize(&format!("{}_{:.3}MHz_lookback_wide", engine::sigmf::stamp(std::time::SystemTime::now()), snap.center_hz / 1e6)),
+                    description: "SpecTrawl look-back buffer, full band".into(),
+                    annotations: annotate(&records),
+                }));
+            }
+            if busy {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(egui::RichText::new("exporting…").small().color(theme::MUTED));
+                });
+            } else if let Some(m) = &self.export_msg {
+                ui.label(egui::RichText::new(m).small().color(theme::TEXT2));
+            }
+            ui.label(egui::RichText::new(format!("Saves to {}", dir.display())).small().color(theme::MUTED));
+        });
+        if let Some((what, r)) = req {
+            let h = focus.source.export(r);
+            self.export = Some((what, h));
+            self.export_msg = None;
         }
     }
 

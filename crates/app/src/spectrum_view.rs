@@ -25,6 +25,12 @@ pub struct SpectrumView {
     pub row_px: Option<f32>,
     /// Draw unselected record boxes faintly and without labels (dense views).
     pub subtle_boxes: bool,
+    /// While paused, the mouse wheel scrolls back through history.
+    pub paused: bool,
+    /// Rows scrolled back from the newest (0 = live edge).
+    scroll: usize,
+    /// Wall time of each history row, newest first (parallel to `history`).
+    row_times: VecDeque<std::time::SystemTime>,
     trace: Vec<f32>,
     hold: Vec<f32>,
     tuning: Option<Tuning>,
@@ -46,6 +52,9 @@ impl SpectrumView {
             smoothing: 0.6,
             row_px: None,
             subtle_boxes: false,
+            paused: false,
+            scroll: 0,
+            row_times: VecDeque::with_capacity(ROWS),
             trace: Vec::new(),
             hold: Vec::new(),
             tuning: None,
@@ -97,8 +106,10 @@ impl SpectrumView {
             dsp::decimate_max(&row.db, &mut dec);
             if self.history.len() == ROWS {
                 self.history.pop_back();
+                self.row_times.pop_back();
             }
             self.history.push_front(dec);
+            self.row_times.push_front(row.time);
             self.push_tex_row();
         }
     }
@@ -219,6 +230,17 @@ impl SpectrumView {
             full.min.y += 6.0;
         }
         let resp = ui.allocate_rect(full, egui::Sense::click());
+        if !self.paused {
+            self.scroll = 0;
+        } else if resp.hovered() {
+            // Wheel up = further back in time, ~10 rows per notch.
+            let dy = ui.input(|i| i.smooth_scroll_delta.y);
+            if dy != 0.0 {
+                let step = (dy.abs() / 5.0).ceil() as usize;
+                let max = self.history.len().saturating_sub(1);
+                self.scroll = if dy > 0.0 { (self.scroll + step).min(max) } else { self.scroll.saturating_sub(step) };
+            }
+        }
         let painter = ui.painter_at(full);
         let spec_h = (full.height() * 0.32).round();
         let spec = Rect::from_min_size(full.min, vec2(full.width(), spec_h));
@@ -244,7 +266,7 @@ impl SpectrumView {
         if let Some(tex) = &self.tex {
             // Newest row at the top. Show `visible` rows starting at the ring's
             // write position, wrapping once past the end of the texture.
-            let start = self.write_row;
+            let start = (self.write_row + self.scroll) % ROWS;
             let first = visible.min(ROWS - start);
             let v = |r: usize| r as f32 / ROWS as f32;
             let mut mesh = Mesh::with_texture(tex.id());
@@ -310,7 +332,17 @@ impl SpectrumView {
         painter.hline(full.x_range(), spec.bottom() + 0.5, Stroke::new(1.0, theme::BORDER));
 
         // --- record boxes ---
-        let newest = self.last_seq.unwrap_or(0);
+        let newest = self.last_seq.unwrap_or(0).saturating_sub(self.scroll as u64);
+        if self.scroll > 0 {
+            // Show how far back the top row is.
+            if let Some(t) = self.row_times.get(self.scroll) {
+                let ago = std::time::SystemTime::now().duration_since(*t).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+                let g = painter.layout_no_wrap(format!("◀ {ago:.1} s ago · wheel to scroll"), mono(11.0), theme::BG);
+                let at = pos2(wf.right() - g.size().x - 14.0, wf.top() + 6.0);
+                painter.rect_filled(Rect::from_min_size(at - vec2(6.0, 2.0), g.size() + vec2(12.0, 4.0)), 3.0, theme::SELECT);
+                painter.galley(at, g, theme::BG);
+            }
+        }
         let row_h = wf.height() / visible as f32;
         let x_hz = |f: f64| full.left() + ((f - f0) / span) as f32 * full.width();
         let mut boxes: Vec<(Rect, &SignalRecord)> = Vec::new();

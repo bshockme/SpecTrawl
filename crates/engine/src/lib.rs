@@ -7,6 +7,7 @@ mod bursts;
 mod classify;
 mod emitters;
 mod ring;
+pub mod sigmf;
 mod sweep;
 
 use std::collections::{HashMap, VecDeque};
@@ -73,6 +74,19 @@ struct StreamState {
     lost_samples: u64,
     overloads: u64,
     lost_device: bool,
+    /// Latest (sample index, wall time) pair from a TimeAnchor event.
+    anchor: Option<(u64, SystemTime)>,
+}
+
+impl StreamState {
+    /// Wall-clock time of a sample, from the latest time anchor.
+    fn time_of(&self, sample: u64, rate: f64) -> SystemTime {
+        match self.anchor {
+            Some((at, t)) if sample >= at => t + Duration::from_secs_f64((sample - at) as f64 / rate),
+            Some((at, t)) => t - Duration::from_secs_f64((at - sample) as f64 / rate),
+            None => SystemTime::now(),
+        }
+    }
 }
 
 /// Finished records (bounded) plus the snapshot of still-open ones, and the
@@ -167,7 +181,8 @@ impl StreamSink for RingSink {
             }
             StreamEvent::Overload { .. } => st.overloads += 1,
             StreamEvent::DeviceLost => st.lost_device = true,
-            StreamEvent::TimeAnchor { .. } | StreamEvent::GainChange { .. } => {}
+            StreamEvent::TimeAnchor { at_sample, host_time } => st.anchor = Some((at_sample, host_time)),
+            StreamEvent::GainChange { .. } => {}
         }
     }
 }
@@ -321,6 +336,34 @@ impl Source {
         let mut v: Vec<Emitter> = self.shared.records.lock().emitters.map.values().cloned().collect();
         v.sort_by(|a, b| b.active.cmp(&a.active).then(b.last_seen.cmp(&a.last_seen)));
         v
+    }
+
+    /// Writes part of the look-back ring to SigMF on a background thread.
+    /// Returns a handle to join for the result.
+    pub fn export(&self, req: sigmf::ExportRequest) -> JoinHandle<Result<sigmf::ExportResult, String>> {
+        let snap = self.snapshot();
+        let ctx = sigmf::ExportContext {
+            shared: self.shared.clone(),
+            sample_rate: snap.sample_rate,
+            tuner_center_hz: snap.center_hz,
+            hw: format!("{} {}", snap.info.label, snap.info.serial),
+        };
+        std::thread::Builder::new().name("export".into()).spawn(move || sigmf::run(ctx, req)).expect("spawn export")
+    }
+
+    /// Ring sample range a record's IQ occupies (with a little margin),
+    /// for exports.
+    pub fn record_sample_range(&self, r: &SignalRecord) -> (u64, u64) {
+        let rate = self.snapshot().sample_rate;
+        let per_row = (rate / self.cfg.rows_per_sec) as u64;
+        let margin = (0.05 * rate) as u64;
+        (r.first_row_end_sample.saturating_sub(per_row + margin), r.last_row_end_sample + margin)
+    }
+
+    /// The ring's held range (oldest, head) in samples.
+    pub fn ring_range(&self) -> (u64, u64) {
+        let r = self.shared.ring.lock();
+        (r.oldest(), r.head())
     }
 
     pub fn classifier_load(&self) -> ClassifierLoad {

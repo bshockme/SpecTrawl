@@ -77,6 +77,25 @@ impl IqRing {
         self.head = first_sample + n as u64;
     }
 
+    /// Copies raw stored samples (native i16) starting at absolute index
+    /// `start`. Returns false if any are not held.
+    pub fn read_raw(&self, start: u64, out: &mut [[i16; 2]]) -> bool {
+        let end = start + out.len() as u64;
+        if start < self.oldest() || end > self.head {
+            return false;
+        }
+        let cap = self.buf.len();
+        let mut pos = (start % cap as u64) as usize;
+        let mut i = 0;
+        while i < out.len() {
+            let run = (out.len() - i).min(cap - pos);
+            out[i..i + run].copy_from_slice(&self.buf[pos..pos + run]);
+            i += run;
+            pos = 0;
+        }
+        true
+    }
+
     /// Copies `out.len()` samples starting at absolute index `start`, scaled
     /// to ±1.0. Returns false (leaving `out` untouched) if any are not held.
     pub fn read(&self, start: u64, out: &mut [Complex32]) -> bool {
