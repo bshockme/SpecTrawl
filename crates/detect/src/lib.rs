@@ -5,6 +5,7 @@ pub mod ddc;
 pub mod decode;
 pub mod features;
 pub mod frames;
+pub mod p25;
 pub mod sync;
 
 use num_complex::Complex32;
