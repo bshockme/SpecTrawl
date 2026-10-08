@@ -81,7 +81,7 @@ A backend knows how to enumerate and open one family of devices.
 
 | Backend | Library | Notes |
 |---|---|---|
-| `airspy` | libairspy | Owned: Airspy R1. Packed 12-bit samples. Real-IF, so no DC spike. |
+| `airspy` | libairspy | Owned: Airspy R2. Packed 12-bit samples. Real-IF, so no DC spike. |
 | `hydrasdr` | libhydrasdr | HydraSDR RFOne: Airspy R2-derived, R828D tuner, 12-bit, 10 MHz. Not owned yet. If its API is close to libairspy's, it may share a module with `airspy`. Check against the real headers. |
 | `hackrf` | libhackrf | Native **sweep mode** for fast surveys. 8-bit, zero-IF. |
 | `rtlsdr` | librtlsdr | Includes direct sampling. 8-bit, zero-IF. |

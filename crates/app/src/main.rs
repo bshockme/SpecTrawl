@@ -4,7 +4,7 @@ mod theme;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use engine::{Source, SourceConfig};
-use sdr_core::Backend;
+use sdr_core::{Backend, DeviceInfo};
 use spectrum_view::SpectrumView;
 
 fn main() -> eframe::Result {
@@ -18,24 +18,100 @@ fn main() -> eframe::Result {
 }
 
 struct App {
+    backends: Vec<Box<dyn Backend>>,
+    devices: Vec<DeviceInfo>,
     source: Option<Source>,
     view: SpectrumView,
     paused: bool,
+    tune_mhz: f64,
     error: Option<String>,
+}
+
+/// Command line: `--sim` to force the simulator, `--freq <MHz>` to set the
+/// initial centre, `--serial <hex>` to pick a device.
+struct Args {
+    sim: bool,
+    freq_mhz: Option<f64>,
+    serial: Option<String>,
+}
+
+fn parse_args() -> Args {
+    let mut a = Args { sim: false, freq_mhz: None, serial: None };
+    let mut it = std::env::args().skip(1);
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--sim" => a.sim = true,
+            "--freq" => a.freq_mhz = it.next().and_then(|v| v.parse().ok()),
+            "--serial" => a.serial = it.next(),
+            _ => log::warn!("ignoring argument {arg}"),
+        }
+    }
+    a
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply(&cc.egui_ctx);
-        let mut error = None;
-        let backend = backend_sim::SimBackend;
-        let source = backend
-            .enumerate()
-            .and_then(|devs| backend.open(&devs[0].serial))
-            .and_then(|dev| Source::start(dev, SourceConfig::default()))
-            .map_err(|e| error = Some(e.to_string()))
-            .ok();
-        Self { source, view: SpectrumView::new(), paused: false, error }
+        let args = parse_args();
+        let backends: Vec<Box<dyn Backend>> = vec![Box::new(backend_airspy::AirspyBackend::new()), Box::new(backend_sim::SimBackend)];
+        let mut app = Self {
+            backends,
+            devices: Vec::new(),
+            source: None,
+            view: SpectrumView::new(),
+            paused: false,
+            tune_mhz: args.freq_mhz.unwrap_or(if args.sim { 856.0 } else { 100.0 }),
+            error: None,
+        };
+        app.rescan();
+        // Until role assignment exists: an explicit serial, else the widest
+        // hardware (R2 before Mini/others), else the simulator.
+        let rank = |d: &DeviceInfo| match (d.backend.as_str(), d.label.as_str()) {
+            ("sim", _) => 9,
+            (_, "Airspy R2") => 0,
+            _ => 1,
+        };
+        let pick = match (&args.serial, args.sim) {
+            (Some(s), _) => app.devices.iter().find(|d| d.serial.eq_ignore_ascii_case(s)),
+            (None, true) => app.devices.iter().find(|d| d.backend == "sim"),
+            (None, false) => app.devices.iter().min_by_key(|d| rank(d)),
+        }
+        .cloned();
+        if let Some(d) = pick {
+            app.open_device(&d);
+        }
+        app
+    }
+
+    fn rescan(&mut self) {
+        self.devices.clear();
+        for b in &self.backends {
+            match b.enumerate() {
+                Ok(mut v) => self.devices.append(&mut v),
+                Err(e) => log::info!("backend {}: {e}", b.name()),
+            }
+        }
+    }
+
+    fn open_device(&mut self, info: &DeviceInfo) {
+        // Release the current device before opening another.
+        self.source = None;
+        self.view = SpectrumView::new();
+        let Some(backend) = self.backends.iter().find(|b| b.name() == info.backend) else { return };
+        let result = backend.open(&info.serial).and_then(|mut dev| {
+            if let Err(e) = dev.set_center(self.tune_mhz * 1e6) {
+                log::warn!("initial tune: {e}");
+            }
+            Source::start(dev, SourceConfig::default())
+        });
+        match result {
+            Ok(s) => {
+                self.tune_mhz = s.device().center_hz() / 1e6;
+                self.source = Some(s);
+                self.error = None;
+            }
+            Err(e) => self.error = Some(format!("{}: {e}", info.label)),
+        }
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
@@ -61,37 +137,65 @@ impl App {
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
-        ui.label(egui::RichText::new("SOURCES").small().strong().color(theme::MUTED));
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("SOURCES").small().strong().color(theme::MUTED));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Rescan").clicked() {
+                    // Release the open device so it can be probed too.
+                    let reopen = self.source.as_ref().map(|s| s.info().clone());
+                    self.source = None;
+                    self.rescan();
+                    if let Some(d) = reopen {
+                        self.open_device(&d);
+                    }
+                }
+            });
+        });
+        let mut to_open = None;
+        for d in &self.devices {
+            let open = self.source.as_ref().is_some_and(|s| s.info().serial == d.serial && s.info().backend == d.backend);
+            theme::card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(&d.label).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if open {
+                            theme::chip(ui, "FOCUS A", theme::CHIP_FOCUS_BG, theme::CHIP_FOCUS_FG);
+                        } else if ui.small_button("Open").clicked() {
+                            to_open = Some(d.clone());
+                        }
+                    });
+                });
+                ui.label(egui::RichText::new(format!("{} · {}", d.backend, d.serial)).small().color(theme::MUTED));
+                if let (true, Some(src)) = (open, self.source.as_mut()) {
+                    let dev = src.device();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{:.1} MS/s · {}-bit · {:?}",
+                            dev.sample_rate() / 1e6,
+                            dev.capabilities().adc_bits,
+                            dev.capabilities().if_arch
+                        ))
+                        .small()
+                        .color(theme::TEXT2),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("Centre");
+                        let r = ui.add(egui::DragValue::new(&mut self.tune_mhz).speed(0.1).range(24.0..=1800.0).max_decimals(6).suffix(" MHz"));
+                        if r.changed() {
+                            if let Err(e) = src.set_center(self.tune_mhz * 1e6) {
+                                self.error = Some(e.to_string());
+                            }
+                        }
+                    });
+                }
+            });
+        }
+        if let Some(d) = to_open {
+            self.open_device(&d);
+        }
         if let Some(src) = &self.source {
             let dev = src.device();
             let st = src.stats();
-            theme::card(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(&dev.info().label).strong());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        theme::chip(ui, "FOCUS A", theme::CHIP_FOCUS_BG, theme::CHIP_FOCUS_FG);
-                    });
-                });
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{:.3} MHz · {:.1} MS/s",
-                        dev.center_hz() / 1e6,
-                        dev.sample_rate() / 1e6
-                    ))
-                    .monospace()
-                    .color(theme::TEXT2),
-                );
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{}-bit · {:?} · serial {}",
-                        dev.capabilities().adc_bits,
-                        dev.capabilities().if_arch,
-                        dev.info().serial
-                    ))
-                    .small()
-                    .color(theme::MUTED),
-                );
-            });
             ui.add_space(8.0);
             ui.label(egui::RichText::new("ENGINE").small().strong().color(theme::MUTED));
             theme::card(ui, |ui| {
