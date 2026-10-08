@@ -9,6 +9,7 @@ use spectrum_view::SpectrumView;
 
 fn main() -> eframe::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    spawn_deadlock_watchdog();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1600.0, 960.0]).with_title("SpecTrawl"),
         renderer: eframe::Renderer::Wgpu,
@@ -607,6 +608,32 @@ fn kv(ui: &mut egui::Ui, k: &str, v: &str) {
             ui.label(egui::RichText::new(v).monospace().color(theme::TEXT2));
         });
     });
+}
+
+/// Checks every few seconds for threads deadlocked on parking_lot locks and
+/// logs their stacks (and writes them to spectrawl-deadlock.txt beside the
+/// executable), so a frozen UI leaves evidence.
+fn spawn_deadlock_watchdog() {
+    std::thread::Builder::new()
+        .name("deadlock-watchdog".into())
+        .spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let deadlocks = parking_lot::deadlock::check_deadlock();
+            if deadlocks.is_empty() {
+                continue;
+            }
+            let mut report = format!("{} deadlock(s) detected\n", deadlocks.len());
+            for (i, threads) in deadlocks.iter().enumerate() {
+                for t in threads {
+                    report += &format!("--- deadlock {i}, thread {:?}\n{:?}\n", t.thread_id(), t.backtrace());
+                }
+            }
+            log::error!("{report}");
+            if let Ok(exe) = std::env::current_exe() {
+                let _ = std::fs::write(exe.with_file_name("spectrawl-deadlock.txt"), &report);
+            }
+        })
+        .expect("spawn watchdog");
 }
 
 fn hms(t: SystemTime) -> String {

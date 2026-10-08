@@ -347,10 +347,7 @@ impl SpectrumView {
         if let Some(r) = hovered.and_then(|id| records.iter().find(|r| r.id == id)) {
             let p = hover.unwrap_or_default();
             let text = format!(
-                "#{}{}
-{:.4} MHz · {:.1} kHz
-{:.2} s · SNR {:.0}/{:.0} dB
-peak {:.1} dBFS",
+                "#{}{}\n{:.4} MHz · {:.1} kHz\n{:.2} s · SNR {:.0}/{:.0} dB\npeak {:.1} dBFS",
                 r.id,
                 if r.active { "  ACTIVE" } else { "" },
                 r.center_hz() / 1e6,

@@ -12,4 +12,5 @@ egui = "0.36.2"
 engine = { version = "0.1.0", path = "../engine" }
 env_logger = "0.11.11"
 log = "0.4.34"
+parking_lot = { version = "0.12.5", features = ["deadlock_detection"] }
 sdr-core = { version = "0.1.0", path = "../sdr-core" }

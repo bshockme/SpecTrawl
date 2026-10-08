@@ -80,6 +80,11 @@ struct RecordStore {
 
 const MAX_CLOSED_RECORDS: usize = 20_000;
 
+/// State shared between the driver callback, the worker and the UI.
+///
+/// Locking rule: hold at most one of these mutexes at a time. Copy what you
+/// need out and drop the guard before taking another. (A UI read of
+/// state→ring against a sweep read of ring→state deadlocked the app.)
 struct Shared {
     ring: Mutex<IqRing>,
     records: Mutex<RecordStore>,
@@ -281,17 +286,22 @@ impl Source {
     }
 
     pub fn stats(&self) -> SourceStats {
+        // One lock at a time (see the lock-order note on `Shared`).
+        let (ring_samples, ring_capacity, total_samples) = {
+            let ring = self.shared.ring.lock();
+            (ring.available(), ring.capacity(), ring.head())
+        };
+        let ffts_per_sec = *self.shared.ffts_per_sec.lock();
         let st = self.shared.state.lock();
-        let ring = self.shared.ring.lock();
         SourceStats {
             gaps: st.gaps,
             lost_samples: st.lost_samples,
             overloads: st.overloads,
             device_lost: st.lost_device,
-            ring_samples: ring.available(),
-            ring_capacity: ring.capacity(),
-            total_samples: ring.head(),
-            ffts_per_sec: *self.shared.ffts_per_sec.lock(),
+            ring_samples,
+            ring_capacity,
+            total_samples,
+            ffts_per_sec,
         }
     }
 

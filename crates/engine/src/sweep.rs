@@ -113,7 +113,10 @@ pub(crate) fn run(
                 break 'passes;
             }
             let center = plan.start_hz + hop_hz * (h as f64 + 0.5);
-            let (n0, gaps0) = (shared.ring.lock().head(), shared.state.lock().gaps);
+            // Separate statements: never hold two engine locks at once (a guard
+            // in a tuple lives until the end of the statement).
+            let n0 = shared.ring.lock().head();
+            let gaps0 = shared.state.lock().gaps;
             if let Err(e) = dev.lock().set_center(center) {
                 log::warn!("sweep retune to {:.3} MHz: {e}", center / 1e6);
                 h += 1;
