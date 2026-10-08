@@ -418,7 +418,7 @@ impl App {
                 kv(
                     ui,
                     "Classifier",
-                    &format!("{:.1} jobs/s · {:.0} ms · {:.0}% busy", load.jobs_per_sec, load.avg_job_ms, load.busy * 100.0),
+                    &format!("{:.1}/s · {:.0} ms · {:.0}%", load.jobs_per_sec, load.avg_job_ms, load.busy * 100.0),
                 );
                 if let Some(e) = gain_ui(ui, p) {
                     err = Some(e);

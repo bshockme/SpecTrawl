@@ -33,4 +33,6 @@ Ideas and known rough edges that aren't scheduled yet. Newest at the top of each
   - **Test source:** its signal-generator output gives known tones to measure Airspy gain tables and passband shape, and to test detection repeatably.
   - **Survey outside the R2's range:** about 100 kHz–6 GHz (HF below 24 MHz; 1.8–6 GHz for cellular, Wi-Fi, drone links).
   - Needs a second kind of source, a *power-sweep device* producing spectrum rows directly (USB serial text protocol). The Survey role and burst detector already work on rows. Check its COM port and firmware commands before writing it.
+- **Two R2s on one USB bus interfere.** With both R2s sharing a hub, the sweeping one put a dense comb of narrow carriers into the other (856.6–859.5 MHz). On separate buses it's gone. Worth a note in docs and maybe a warning when two Airspys share a hub.
+- **A second Airspy sometimes can't be opened while the first streams** (`AIRSPY_ERROR_NOT_FOUND`), seen in the `classify_sim` example but not in the app. libairspy opens each device in turn to read serials; the exact trigger isn't known yet.
 - **Recover when a device is unplugged** (the `DeviceLost` event is defined but nothing reacts to it).
