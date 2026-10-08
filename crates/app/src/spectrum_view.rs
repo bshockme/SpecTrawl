@@ -366,30 +366,58 @@ impl SpectrumView {
         }
         let hover = resp.hover_pos();
         let hovered = hover.and_then(|p| boxes.iter().filter(|(b, _)| b.expand(2.0).contains(p)).min_by(|a, b| a.0.area().total_cmp(&b.0.area())).map(|(_, r)| r.id));
+        // Detections are soft tints over the signal rather than outlines: the
+        // waterfall stays readable and the protocol colour still reads. Only
+        // the hovered/selected ones get an outline.
+        let focused = |r: &SignalRecord| selected == Some(r.id) || hovered == Some(r.id) || (selected_emitter.is_some() && r.emitter == selected_emitter);
         for (b, r) in &boxes {
-            let sel = selected == Some(r.id) || hovered == Some(r.id) || (selected_emitter.is_some() && r.emitter == selected_emitter);
             let class = r.display_class();
-            let base = theme::class_color(class).unwrap_or(if r.active { theme::ACCENT } else { theme::RECORD });
-            let mut c = if sel { theme::SELECT } else if r.active { base } else { base.gamma_multiply(0.8) };
-            if self.subtle_boxes && !sel {
-                c = c.gamma_multiply(0.35);
+            let identified = class.is_some_and(|c| c.protocol.is_some());
+            let base = theme::class_color(class).unwrap_or(theme::RECORD);
+            let alpha = match (focused(r), self.subtle_boxes, identified) {
+                (true, _, _) => 0.40,
+                (false, true, _) => 0.10,
+                (false, false, true) => 0.28,
+                (false, false, false) => 0.13,
+            };
+            painter.rect_filled(*b, 1.5, base.gamma_multiply(alpha));
+            if focused(r) {
+                painter.rect_stroke(*b, 1.5, Stroke::new(1.0, theme::SELECT), egui::StrokeKind::Outside);
             }
-            painter.rect_stroke(*b, 2.0, Stroke::new(if sel { 2.0 } else { 1.0 }, c), egui::StrokeKind::Outside);
-            // Identified protocols are labelled even on narrow boxes.
-            let named = class.is_some_and(|c| c.protocol.is_some());
-            if sel || (!self.subtle_boxes && (b.width() >= 46.0 || named) && b.height() >= 10.0) {
-                let text = match class {
-                    Some(c) if c.label != "too short" => match c.fields.as_ref().and_then(|f| f.id.as_deref()) {
-                        Some(id) => format!("{} · {id}", c.label),
-                        None => c.label.clone(),
-                    },
-                    _ => format!("#{}", r.id),
-                };
-                let g = painter.layout_no_wrap(text, mono(10.0), theme::BG);
-                let at = pos2(b.left(), (b.top() - g.size().y - 1.0).max(wf.top()));
-                painter.rect_filled(Rect::from_min_size(at, g.size() + vec2(6.0, 0.0)), 2.0, c);
-                painter.galley(at + vec2(3.0, 0.0), g, theme::BG);
+        }
+        // Labels on top: one per emitter (its newest visible burst), only for
+        // identified protocols, plus whatever is hovered/selected. Labels that
+        // would overlap an earlier one are skipped.
+        let mut order: Vec<&(Rect, &SignalRecord)> = boxes.iter().collect();
+        order.sort_by(|a, b| focused(b.1).cmp(&focused(a.1)).then(a.0.top().total_cmp(&b.0.top())));
+        let mut labelled = std::collections::HashSet::new();
+        let mut placed: Vec<Rect> = Vec::new();
+        for (b, r) in order {
+            let class = r.display_class();
+            let identified = class.is_some_and(|c| c.protocol.is_some());
+            let focus = focused(r);
+            let key = r.emitter.unwrap_or(r.id);
+            if !focus && (self.subtle_boxes || !identified || b.height() < 8.0 || labelled.contains(&key)) {
+                continue;
             }
+            let text = match class {
+                Some(c) => match c.fields.as_ref().and_then(|f| f.id.as_deref()) {
+                    Some(id) => format!("{} · {id}", c.label),
+                    None => c.label.clone(),
+                },
+                None => format!("#{}", r.id),
+            };
+            let g = painter.layout_no_wrap(text, mono(10.0), theme::BG);
+            let at = pos2(b.left(), (b.top() - g.size().y - 1.0).max(wf.top()));
+            let chip = Rect::from_min_size(at, g.size() + vec2(6.0, 0.0));
+            if !focus && placed.iter().any(|p| p.intersects(chip)) {
+                continue;
+            }
+            let bg = if focus { theme::SELECT } else { theme::class_color(class).unwrap_or(theme::RECORD) };
+            painter.rect_filled(chip, 2.0, bg);
+            painter.galley(at + vec2(3.0, 0.0), g, theme::BG);
+            labelled.insert(key);
+            placed.push(chip);
         }
 
         // --- hover readout ---
