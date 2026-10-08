@@ -20,6 +20,7 @@ use parking_lot::Mutex;
 use sdr_core::{Capabilities, Complex32, Device, DeviceInfo, Samples, StreamEvent, StreamSink};
 
 pub use bursts::{BurstDetector, DetectorConfig, SignalRecord};
+pub use classify::ClassifierLoad;
 pub use emitters::Emitter;
 pub use ring::IqRing;
 pub use sweep::{SweepPlan, SweepStatus};
@@ -109,6 +110,7 @@ struct Shared {
     rows: Mutex<VecDeque<Arc<SpectrumRow>>>,
     sweep: Mutex<Option<SweepStatus>>,
     ffts_per_sec: Mutex<f64>,
+    classifier_load: Mutex<classify::ClassifierLoad>,
 }
 
 impl Shared {
@@ -214,6 +216,7 @@ impl Source {
             rows: Mutex::new(VecDeque::with_capacity(cfg.row_history)),
             sweep: Mutex::new(None),
             ffts_per_sec: Mutex::new(0.0),
+            classifier_load: Mutex::new(Default::default()),
         });
         device.start(Box::new(RingSink { shared: shared.clone() }))?;
         let info = device.info().clone();
@@ -318,6 +321,10 @@ impl Source {
         let mut v: Vec<Emitter> = self.shared.records.lock().emitters.map.values().cloned().collect();
         v.sort_by(|a, b| b.active.cmp(&a.active).then(b.last_seen.cmp(&a.last_seen)));
         v
+    }
+
+    pub fn classifier_load(&self) -> ClassifierLoad {
+        *self.shared.classifier_load.lock()
     }
 
     pub fn sweep_status(&self) -> Option<SweepStatus> {

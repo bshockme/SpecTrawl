@@ -44,6 +44,8 @@ struct Pane {
     role: Role,
     source: Source,
     view: SpectrumView,
+    /// Records for the boxes, refetched only when new rows arrive.
+    records: (Option<u64>, std::time::Instant, std::sync::Arc<[engine::SignalRecord]>),
     gain_mode: GainMode,
     /// Preset step 0..=21 (Airspy's linearity/sensitivity tables).
     gain_step: u8,
@@ -92,9 +94,13 @@ struct App {
     selected: Option<u64>,
     selected_emitter: Option<(Role, u64)>,
     list_tab: ListTab,
+    last_frame: std::time::Instant,
     /// Emitter table, refreshed a few times a second rather than every frame.
     emitter_cache: (std::time::Instant, Vec<(Role, engine::Emitter)>),
 }
+
+/// Target frame interval (~60 fps).
+const FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(16_667);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ListTab {
@@ -156,6 +162,7 @@ impl App {
             selected_emitter: None,
             list_tab: ListTab::Emitters,
             emitter_cache: (std::time::Instant::now() - std::time::Duration::from_secs(1), Vec::new()),
+            last_frame: std::time::Instant::now(),
         };
         app.rescan();
 
@@ -238,7 +245,14 @@ impl App {
                 }
                 let view = if role == Role::Survey { survey_view() } else { SpectrumView::new() };
                 // Matches the backend's opening default (Airspy linearity 13/21).
-                self.panes.push(Pane { role, source, view, gain_mode: GainMode::Linearity, gain_step: 13 });
+                self.panes.push(Pane {
+                    role,
+                    source,
+                    view,
+                    records: (None, std::time::Instant::now(), Vec::new().into()),
+                    gain_mode: GainMode::Linearity,
+                    gain_step: 13,
+                });
                 self.error = None;
             }
             Err(e) => self.error = Some(format!("{}: {e}", info.label)),
@@ -382,6 +396,7 @@ impl App {
             let snap = p.source.snapshot();
             let st = p.source.stats();
             let cfg = p.source.config().clone();
+            let load = p.source.classifier_load();
             let mut tune = None;
             let mut err = None;
             ui.add_space(8.0);
@@ -400,6 +415,11 @@ impl App {
                 kv(ui, "FFT", &format!("{} pt · {:.0}/s · {:.0} Hz", cfg.fft_size, st.ffts_per_sec, rate / cfg.fft_size as f64));
                 kv(ui, "Look-back", &format!("{:.1} / {:.0} s", st.ring_samples as f64 / rate, cfg.ring_seconds));
                 kv(ui, "Gaps", &format!("{} ({} samples)", st.gaps, st.lost_samples));
+                kv(
+                    ui,
+                    "Classifier",
+                    &format!("{:.1} jobs/s · {:.0} ms · {:.0}% busy", load.jobs_per_sec, load.avg_job_ms, load.busy * 100.0),
+                );
                 if let Some(e) = gain_ui(ui, p) {
                     err = Some(e);
                 }
@@ -475,7 +495,7 @@ impl App {
                 ),
                 None => format!("SURVEY · {}", p.source.info().label),
             };
-            let records = p.source.records_since(p.view.oldest_seq());
+            let records = pane_records(p);
             let res = p.view.show(ui, r, &title, st.as_ref(), &records, selected, sel_survey);
             if let Some((lo, hi)) = focus_span {
                 p.view.bracket(ui, r, lo, hi, "A");
@@ -497,7 +517,7 @@ impl App {
                 snap.center_hz / 1e6,
                 snap.sample_rate / 1e6
             );
-            let records = p.source.records_since(p.view.oldest_seq());
+            let records = pane_records(p);
             let res = p.view.show(ui, r, &title, None, &records, selected, sel_focus);
             // Focus click: select a record if one was hit, otherwise recentre.
             match (res.record, res.freq_hz) {
@@ -528,6 +548,7 @@ impl App {
     }
 
     /// Emitters from all panes: active first, then most recently seen.
+    /// Virtualised: only rows on screen are laid out.
     fn emitter_list(&mut self, ui: &mut egui::Ui) {
         if self.emitter_cache.0.elapsed() > std::time::Duration::from_millis(300) {
             let mut rows: Vec<(Role, engine::Emitter)> = Vec::new();
@@ -535,10 +556,9 @@ impl App {
                 rows.extend(p.source.emitters().into_iter().map(|e| (p.role, e)));
             }
             rows.sort_by(|a, b| b.1.active.cmp(&a.1.active).then(b.1.last_seen.cmp(&a.1.last_seen)));
-            rows.truncate(400);
             self.emitter_cache = (std::time::Instant::now(), rows);
         }
-        let rows = self.emitter_cache.1.clone();
+        let rows = std::mem::take(&mut self.emitter_cache.1);
         let active = rows.iter().filter(|r| r.1.active).count();
         let identified = rows.iter().filter(|r| r.1.has_protocol()).count();
         ui.label(
@@ -547,104 +567,144 @@ impl App {
                 .monospace()
                 .color(theme::MUTED),
         );
+        let mut clicked = None;
         let mut tune = None;
-        egui::ScrollArea::vertical().id_salt("emitters").auto_shrink([false, false]).show(ui, |ui| {
-            egui::Grid::new("emitters").striped(true).num_columns(11).spacing([14.0, 3.0]).show(ui, |ui| {
-                for h in ["", "Src", "MHz", "Class", "Also seen", "BW kHz", "Bursts", "Duty %", "First", "Last", "SNR dB"] {
-                    ui.label(egui::RichText::new(h).small().color(theme::MUTED));
+        let row_h = 18.0;
+        egui_extras::TableBuilder::new(ui)
+            .id_salt("emitters")
+            .striped(true)
+            .sense(egui::Sense::click())
+            .auto_shrink([false, false])
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(egui_extras::Column::exact(14.0))
+            .column(egui_extras::Column::exact(28.0))
+            .column(egui_extras::Column::exact(80.0))
+            .column(egui_extras::Column::exact(150.0))
+            .column(egui_extras::Column::exact(240.0))
+            .columns(egui_extras::Column::exact(64.0), 3)
+            .columns(egui_extras::Column::exact(72.0), 2)
+            .column(egui_extras::Column::remainder())
+            .header(row_h, |mut h| {
+                for t in ["", "Src", "MHz", "Class", "Also seen", "BW kHz", "Bursts", "Duty %", "First", "Last", "SNR dB"] {
+                    h.col(|ui| {
+                        ui.label(egui::RichText::new(t).small().color(theme::MUTED));
+                    });
                 }
-                ui.end_row();
-                for (role, e) in &rows {
+            })
+            .body(|body| {
+                body.rows(row_h, rows.len(), |mut row| {
+                    let (role, e) = &rows[row.index()];
                     let sel = self.selected_emitter == Some((*role, e.id));
+                    row.set_selected(sel);
                     let c = if sel { theme::SELECT } else { theme::TEXT2 };
-                    let cell = |ui: &mut egui::Ui, s: String, col: egui::Color32| {
-                        ui.add(egui::Label::new(egui::RichText::new(s).monospace().color(col)).sense(egui::Sense::click()))
+                    let text = |ui: &mut egui::Ui, s: String, col: egui::Color32| {
+                        ui.add(egui::Label::new(egui::RichText::new(s).monospace().color(col)).selectable(false).truncate());
                     };
-                    let class_col = if sel { theme::SELECT } else { theme::class_color(e.best.as_deref()).unwrap_or(theme::MUTED) };
                     let label = e.label().unwrap_or_else(|| if *role == Role::Survey { "-".into() } else { "…".into() });
-                    // Other labels seen on this emitter, most frequent first.
+                    let class_col = if sel { theme::SELECT } else { theme::class_color(e.best.as_deref()).unwrap_or(theme::MUTED) };
                     let mut others: Vec<(&String, &u32)> = e.tally.iter().filter(|(l, _)| **l != label).collect();
                     others.sort_by(|a, b| b.1.cmp(a.1));
                     let also: Vec<String> = others.iter().take(2).map(|(l, n)| format!("{l}×{n}")).collect();
-                    let resps = [
-                        cell(ui, if e.active { "●".into() } else { String::new() }, theme::ACCENT),
-                        cell(ui, match role { Role::Survey => "S".into(), Role::Focus => "A".into() }, c),
-                        cell(ui, format!("{:.4}", e.center_hz / 1e6), c),
-                        cell(ui, label, class_col),
-                        cell(ui, also.join(", "), theme::MUTED),
-                        cell(ui, format!("{:.1}", e.bandwidth_hz / 1e3), c),
-                        cell(ui, format!("{}", e.records), c),
-                        cell(ui, format!("{:.0}", e.duty() * 100.0), c),
-                        cell(ui, hms(e.first_seen), c),
-                        cell(ui, hms(e.last_seen), c),
-                        cell(ui, format!("{:.0}", e.peak_snr_db), c),
-                    ];
-                    if resps.iter().any(|x| x.clicked()) {
-                        self.selected_emitter = Some((*role, e.id));
-                        self.selected = None;
+                    row.col(|ui| text(ui, if e.active { "●".into() } else { String::new() }, theme::ACCENT));
+                    row.col(|ui| text(ui, if *role == Role::Survey { "S".into() } else { "A".into() }, c));
+                    row.col(|ui| text(ui, format!("{:.4}", e.center_hz / 1e6), c));
+                    row.col(|ui| text(ui, label, class_col));
+                    row.col(|ui| text(ui, also.join(", "), theme::MUTED));
+                    row.col(|ui| text(ui, format!("{:.1}", e.bandwidth_hz / 1e3), c));
+                    row.col(|ui| text(ui, e.records.to_string(), c));
+                    row.col(|ui| text(ui, format!("{:.0}", e.duty() * 100.0), c));
+                    row.col(|ui| text(ui, hms(e.first_seen), c));
+                    row.col(|ui| text(ui, hms(e.last_seen), c));
+                    row.col(|ui| text(ui, format!("{:.0}", e.peak_snr_db), c));
+                    let resp = row.response();
+                    if resp.clicked() {
+                        clicked = Some((*role, e.id));
                     }
-                    if resps.iter().any(|x| x.double_clicked()) {
+                    if resp.double_clicked() {
                         tune = Some(e.center_hz);
                     }
-                    ui.end_row();
-                }
+                });
             });
-        });
+        self.emitter_cache.1 = rows;
+        if let Some(sel) = clicked {
+            self.selected_emitter = Some(sel);
+            self.selected = None;
+        }
         if let Some(f) = tune {
             self.retune_focus((f / 1e3).round() / 1e3);
         }
     }
 
-    /// Newest records from all panes, most recent first.
+    /// Newest records from all panes, most recent first. Virtualised.
     fn signal_list(&mut self, ui: &mut egui::Ui) {
         let mut rows: Vec<(Role, engine::SignalRecord)> = Vec::new();
         for p in &self.panes {
-            rows.extend(p.source.recent_records(300).into_iter().map(|r| (p.role, r)));
+            rows.extend(p.source.recent_records(500).into_iter().map(|r| (p.role, r)));
         }
         rows.sort_by(|a, b| b.1.active.cmp(&a.1.active).then(b.1.t_end.cmp(&a.1.t_end)));
-        rows.truncate(300);
         let active = rows.iter().filter(|r| r.1.active).count();
         ui.label(egui::RichText::new(format!("{} records shown · {active} active", rows.len())).small().monospace().color(theme::MUTED));
+        let mut clicked = None;
         let mut tune = None;
-        egui::ScrollArea::vertical().id_salt("records").auto_shrink([false, false]).show(ui, |ui| {
-            egui::Grid::new("signals").striped(true).num_columns(10).spacing([14.0, 3.0]).show(ui, |ui| {
-                for h in ["#", "Src", "Last seen", "MHz", "Class", "BW kHz", "Dur s", "SNR dB", "Peak dBFS", "State"] {
-                    ui.label(egui::RichText::new(h).small().color(theme::MUTED));
+        let row_h = 18.0;
+        egui_extras::TableBuilder::new(ui)
+            .id_salt("records")
+            .striped(true)
+            .sense(egui::Sense::click())
+            .auto_shrink([false, false])
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(egui_extras::Column::exact(56.0))
+            .column(egui_extras::Column::exact(28.0))
+            .column(egui_extras::Column::exact(72.0))
+            .column(egui_extras::Column::exact(80.0))
+            .column(egui_extras::Column::exact(150.0))
+            .columns(egui_extras::Column::exact(64.0), 2)
+            .column(egui_extras::Column::exact(72.0))
+            .column(egui_extras::Column::exact(80.0))
+            .column(egui_extras::Column::remainder())
+            .header(row_h, |mut h| {
+                for t in ["#", "Src", "Last seen", "MHz", "Class", "BW kHz", "Dur s", "SNR dB", "Peak dBFS", "State"] {
+                    h.col(|ui| {
+                        ui.label(egui::RichText::new(t).small().color(theme::MUTED));
+                    });
                 }
-                ui.end_row();
-                for (role, r) in &rows {
+            })
+            .body(|body| {
+                body.rows(row_h, rows.len(), |mut row| {
+                    let (role, r) = &rows[row.index()];
                     let sel = self.selected == Some(r.id);
+                    row.set_selected(sel);
                     let c = if sel { theme::SELECT } else { theme::TEXT2 };
-                    let cell = |ui: &mut egui::Ui, s: String| ui.add(egui::Label::new(egui::RichText::new(s).monospace().color(c)).sense(egui::Sense::click()));
-                    let resps = [
-                        cell(ui, format!("{}", r.id)),
-                        cell(ui, match role { Role::Survey => "S".into(), Role::Focus => "A".into() }),
-                        cell(ui, hms(r.t_end)),
-                        cell(ui, format!("{:.4}", r.center_hz() / 1e6)),
-                        {
-                            let (txt, col) = match r.display_class() {
-                                Some(k) => (k.label.clone(), theme::class_color(Some(k)).unwrap_or(c)),
-                                None => (if *role == Role::Survey { "-".into() } else { "…".into() }, theme::MUTED),
-                            };
-                            ui.add(egui::Label::new(egui::RichText::new(txt).monospace().color(if sel { theme::SELECT } else { col })).sense(egui::Sense::click()))
-                        },
-                        cell(ui, format!("{:.1}", r.bandwidth_hz() / 1e3)),
-                        cell(ui, format!("{:.2}", r.duration_s())),
-                        cell(ui, format!("{:.0} / {:.0}", r.mean_snr_db, r.max_snr_db)),
-                        cell(ui, format!("{:.1}", r.peak_dbfs)),
-                        cell(ui, if r.active { "active".into() } else { "done".into() }),
-                    ];
-                    if resps.iter().any(|x| x.clicked()) {
-                        self.selected = Some(r.id);
-                        self.selected_emitter = r.emitter.map(|e| (*role, e));
+                    let text = |ui: &mut egui::Ui, s: String, col: egui::Color32| {
+                        ui.add(egui::Label::new(egui::RichText::new(s).monospace().color(col)).selectable(false).truncate());
+                    };
+                    let (class, class_col) = match r.display_class() {
+                        Some(k) => (k.label.clone(), if sel { theme::SELECT } else { theme::class_color(Some(k)).unwrap_or(c) }),
+                        None => (if *role == Role::Survey { "-".into() } else { "…".into() }, theme::MUTED),
+                    };
+                    row.col(|ui| text(ui, r.id.to_string(), c));
+                    row.col(|ui| text(ui, if *role == Role::Survey { "S".into() } else { "A".into() }, c));
+                    row.col(|ui| text(ui, hms(r.t_end), c));
+                    row.col(|ui| text(ui, format!("{:.4}", r.center_hz() / 1e6), c));
+                    row.col(|ui| text(ui, class, class_col));
+                    row.col(|ui| text(ui, format!("{:.1}", r.bandwidth_hz() / 1e3), c));
+                    row.col(|ui| text(ui, format!("{:.2}", r.duration_s()), c));
+                    row.col(|ui| text(ui, format!("{:.0} / {:.0}", r.mean_snr_db, r.max_snr_db), c));
+                    row.col(|ui| text(ui, format!("{:.1}", r.peak_dbfs), c));
+                    row.col(|ui| text(ui, if r.active { "active".into() } else { "done".into() }, c));
+                    let resp = row.response();
+                    if resp.clicked() {
+                        clicked = Some((r.id, r.emitter.map(|e| (*role, e))));
                     }
-                    if resps.iter().any(|x| x.double_clicked()) {
+                    if resp.double_clicked() {
                         tune = Some(r.center_hz());
                     }
-                    ui.end_row();
-                }
+                });
             });
-        });
+        if let Some((id, em)) = clicked {
+            self.selected = Some(id);
+            self.selected_emitter = em;
+        }
         if let Some(f) = tune {
             self.retune_focus((f / 1e3).round() / 1e3);
         }
@@ -688,8 +748,26 @@ impl eframe::App for App {
             egui::ScrollArea::vertical().show(ui, |ui| self.side_panel(ui));
         });
         egui::CentralPanel::default().frame(theme::central_frame()).show(ui, |ui| self.central(ui));
+        // ~60 fps is plenty for a waterfall; uncapped it ran at the monitor's
+        // rate (165 Hz here) and cost a full core. egui repaints at once when
+        // the requested delay is under its frame time, so pace frames here.
+        let since = self.last_frame.elapsed();
+        if since < FRAME_TIME {
+            std::thread::sleep(FRAME_TIME - since);
+        }
+        self.last_frame = std::time::Instant::now();
         ctx.request_repaint();
     }
+}
+
+/// The pane's records for drawing, refetched when the view has new rows (or
+/// every half second, so classifications show up) instead of every frame.
+fn pane_records(p: &mut Pane) -> std::sync::Arc<[engine::SignalRecord]> {
+    let newest = p.view.newest_seq();
+    if p.records.0 != newest || p.records.1.elapsed() > std::time::Duration::from_millis(500) {
+        p.records = (newest, std::time::Instant::now(), p.source.records_since(p.view.oldest_seq()).into());
+    }
+    p.records.2.clone()
 }
 
 fn survey_view() -> SpectrumView {

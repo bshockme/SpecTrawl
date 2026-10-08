@@ -17,8 +17,10 @@ use crate::SignalRecord;
 /// Most emitters kept per source; the least recently seen inactive ones go first.
 const MAX_EMITTERS: usize = 5000;
 
-/// Times a protocol must be identified on an emitter before it's believed.
+/// Times a protocol must be identified on an emitter before it's believed...
 const MIN_PROTOCOL_HITS: u32 = 2;
+/// ...unless one identification alone contained this many syncs.
+const STRONG_SYNCS: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct Emitter {
@@ -37,32 +39,32 @@ pub struct Emitter {
     pub tally: BTreeMap<String, u32>,
     /// Labels in `tally` that named a protocol.
     pub protocols: BTreeMap<String, u32>,
+    /// Protocol labels seen at least once with `STRONG_SYNCS` or more syncs.
+    pub strong: std::collections::BTreeSet<String>,
     /// Latest group-level classification.
     pub class: Option<Arc<Classification>>,
     /// What the emitter is best described as: the most frequent
     /// protocol-naming result if any, else the latest feature result.
     pub best: Option<Arc<Classification>>,
     pub(crate) class_at: Option<Instant>,
+    /// Group classifications in a row that identified nothing.
+    pub(crate) group_misses: u32,
     /// Newest record's ring position and tuner centre (for group windows).
     pub(crate) last_end_sample: u64,
     pub(crate) tuner_center_hz: f64,
 }
 
 impl Emitter {
-    /// Best single label: the most frequent protocol label if any was seen,
-    /// else the group classification, else the most frequent feature label.
+    /// Best single label: the most frequent protocol label once it has been
+    /// seen at least twice, else the most frequent feature label.
     pub fn label(&self) -> Option<String> {
-        if let Some(l) = self.protocol_label() {
-            return Some(l);
-        }
-        if let Some(c) = &self.class {
-            if c.protocol.is_some() || !matches!(c.label.as_str(), "too short" | "IQ expired" | "interrupted") {
-                return Some(c.label.clone());
-            }
-        }
+        self.protocol_label().or_else(|| self.majority_feature_label())
+    }
+
+    fn majority_feature_label(&self) -> Option<String> {
         self.tally
             .iter()
-            .filter(|(l, _)| !matches!(l.as_str(), "too short" | "IQ expired" | "interrupted"))
+            .filter(|(l, _)| !self.protocols.contains_key(*l))
             .max_by_key(|(_, n)| **n)
             .map(|(l, _)| l.clone())
     }
@@ -70,11 +72,20 @@ impl Emitter {
     /// The protocol label seen most, if it was seen at least
     /// `MIN_PROTOCOL_HITS` times (one stray result isn't an identification).
     pub fn protocol_label(&self) -> Option<String> {
-        self.protocols.iter().filter(|(_, n)| **n >= MIN_PROTOCOL_HITS).max_by_key(|(_, n)| **n).map(|(l, _)| l.clone())
+        self.protocols
+            .iter()
+            .filter(|(l, n)| **n >= MIN_PROTOCOL_HITS || self.strong.contains(*l))
+            .max_by_key(|(_, n)| **n)
+            .map(|(l, _)| l.clone())
     }
 
     pub fn has_protocol(&self) -> bool {
         self.protocol_label().is_some()
+    }
+
+    /// Wait before the next group attempt: `base` doubled per miss, capped.
+    pub(crate) fn group_backoff(&self, base: std::time::Duration, max: std::time::Duration) -> std::time::Duration {
+        base.saturating_mul(1u32 << self.group_misses.min(8)).min(max)
     }
 
     /// Fraction of the time between first and last seen that it was on.
@@ -130,9 +141,11 @@ impl EmitterBook {
                         peak_snr_db: r.max_snr_db,
                         tally: BTreeMap::new(),
                         protocols: BTreeMap::new(),
+                        strong: Default::default(),
                         class: None,
                         best: None,
                         class_at: None,
+                        group_misses: 0,
                         last_end_sample: r.last_row_end_sample,
                         tuner_center_hz: r.tuner_center_hz,
                     });
@@ -198,6 +211,7 @@ impl EmitterBook {
         if let Some(e) = self.map.get_mut(&id) {
             e.class = Some(c.clone());
             e.class_at = Some(Instant::now());
+            e.group_misses = if c.protocol.is_some() { 0 } else { e.group_misses + 1 };
         }
         self.note(id, &c);
     }
@@ -210,16 +224,22 @@ impl EmitterBook {
         *e.tally.entry(c.label.clone()).or_default() += 1;
         if c.protocol.is_some() {
             *e.protocols.entry(c.label.clone()).or_default() += 1;
+            if c.sync.as_ref().is_some_and(|s| s.count >= STRONG_SYNCS) {
+                e.strong.insert(c.label.clone());
+            }
         }
-        let count = |l: &str| e.protocols.get(l).copied().unwrap_or(0);
-        let trusted = |cl: &Classification| cl.protocol.is_some() && count(&cl.label) >= MIN_PROTOCOL_HITS;
+        let pcount = |l: &str| e.protocols.get(l).copied().unwrap_or(0);
+        let tcount = |l: &str| e.tally.get(l).copied().unwrap_or(0);
+        let trusted =
+            |cl: &Classification| cl.protocol.is_some() && (pcount(&cl.label) >= MIN_PROTOCOL_HITS || e.strong.contains(&cl.label));
+        // `best` follows `label()`: a trusted protocol if any, else the most
+        // frequent feature result. Untrusted protocol claims never become best.
         let replace = match &e.best {
-            None => c.protocol.is_none() || trusted(c),
-            // A trusted protocol result is only displaced by a better-supported one.
-            Some(b) if trusted(b) => trusted(c) && count(&c.label) >= count(&b.label),
-            // Otherwise the newest result describes the emitter, unless it's an
-            // untrusted protocol claim.
-            Some(_) => c.protocol.is_none() || trusted(c),
+            _ if c.protocol.is_some() && !trusted(c) => false,
+            None => true,
+            Some(b) if trusted(b) => trusted(c) && pcount(&c.label) >= pcount(&b.label),
+            Some(_) if trusted(c) => true,
+            Some(b) => tcount(&c.label) >= tcount(&b.label),
         };
         if replace {
             e.best = Some(c.clone());

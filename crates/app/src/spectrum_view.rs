@@ -172,6 +172,11 @@ impl SpectrumView {
         p.galley(at, g, theme::BG);
     }
 
+    /// Newest row ingested so far.
+    pub fn newest_seq(&self) -> Option<u64> {
+        self.last_seq
+    }
+
     /// Oldest row sequence number that can be on screen.
     pub fn oldest_seq(&self) -> u64 {
         self.last_seq.unwrap_or(0).saturating_sub(ROWS as u64)
