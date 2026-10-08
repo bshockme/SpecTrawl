@@ -12,4 +12,5 @@ parking_lot = "0.12.5"
 sdr-core = { version = "0.1.0", path = "../sdr-core" }
 
 [dev-dependencies]
+backend-airspy = { path = "../backend-airspy" }
 backend-sim = { path = "../backend-sim" }

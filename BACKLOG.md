@@ -18,6 +18,10 @@ Ideas and known rough edges that aren't scheduled yet. Newest at the top of each
 
 ## Detection
 
+- **Features are weak on real signals.** On hardware, FSK level counts and symbol rates often come out blank even where the sync bank confirms a protocol (NXDN48 at 460 MHz with ×8–18 syncs, DMR at 855.59 with ×15–33). Deviation also reads high (noise, discriminator clicks). Once a sync is found, use its timing to slice symbols properly (levels set per sync) and measure levels/deviation from that, instead of a raw histogram.
+- **TDMA single-slot traffic fragments into many short records** (e.g. 47 records in 45 s at 856.3375), each too short to hold two syncs, so they stay unidentified. Group records by channel/emitter and classify the group, or lengthen the hangover for slotted signals.
+- **Unverified labels:** ProVoice (binary sync, 2-bit tolerance) seen ×3 at 854.71 MHz, and the X2-TDMA patterns. Treat as provisional until checked against a known transmitter.
+
 - **Bandwidth of FM broadcast/voice varies with modulation**, so a record's extent is the union over its lifetime. Fine for now; a per-row occupied-bandwidth average would be steadier.
 - **Wideband signals that fill a floor block** (e.g. an LTE carrier filling most of a 10 MHz focus span) raise the floor estimate and can go undetected. Needs a floor that also looks at neighbouring blocks or history.
 

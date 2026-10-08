@@ -189,17 +189,14 @@ pub fn best(hits: &[SyncHit]) -> Option<SyncResult> {
             g.4.push(h.symbol);
         }
     }
-    // A single occurrence is only trusted for amplitude-checked 4-level syncs;
-    // binary syncs (tolerating bit errors, no level check) need two.
-    let g = groups
-        .into_iter()
-        .filter(|g| g.4.len() >= 2 || table().iter().any(|e| e.protocol == g.0 && e.detail == g.1 && e.four_level))
-        .max_by_key(|g| (g.4.len(), g.5))?;
+    // A protocol needs a second sync to be believed. On real
+    // signals single hits do occur on analog voice (smooth discriminator
+    // output can pass the level check); genuine digital channels show many.
+    let g = groups.into_iter().filter(|g| g.4.len() >= 2).max_by_key(|g| (g.4.len(), g.5))?;
     let count = g.4.len();
-    let confidence = match (count, g.5) {
-        (1, l) if l >= 24 => 0.6,
-        (1, _) => 0.4,
-        (2, _) => 0.85,
+    let confidence = match count {
+        2 => 0.8,
+        3..=4 => 0.9,
         _ => 0.97,
     };
     Some(SyncResult { protocol: g.0, detail: g.1, baud: g.2, inverted: g.3, count, confidence })
@@ -267,7 +264,7 @@ mod tests {
         let disc = disc_from_symbols(&syms, 10);
         let r = best(&search(&disc, fs, &table())).expect("hit");
         assert_eq!((r.protocol, r.detail, r.count), ("DMR", "BS voice", 2));
-        assert!(r.confidence > 0.8);
+        assert!(r.confidence >= 0.8);
     }
 
     #[test]
