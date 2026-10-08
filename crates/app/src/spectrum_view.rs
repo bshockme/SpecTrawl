@@ -27,6 +27,8 @@ pub struct SpectrumView {
     pub subtle_boxes: bool,
     /// While paused, the mouse wheel scrolls back through history.
     pub paused: bool,
+    /// Channels being continuously decoded: (centre Hz, short label).
+    pub markers: Vec<(f64, String)>,
     /// Rows scrolled back from the newest (0 = live edge).
     scroll: usize,
     /// Wall time of each history row, newest first (parallel to `history`).
@@ -53,6 +55,7 @@ impl SpectrumView {
             row_px: None,
             subtle_boxes: false,
             paused: false,
+            markers: Vec::new(),
             scroll: 0,
             row_times: VecDeque::with_capacity(ROWS),
             trace: Vec::new(),
@@ -418,6 +421,29 @@ impl SpectrumView {
             painter.galley(at + vec2(3.0, 0.0), g, theme::BG);
             labelled.insert(key);
             placed.push(chip);
+        }
+
+        // --- monitor markers: a slim line through the pane and a tag on the spectrum ---
+        let mut tags: Vec<Rect> = Vec::new();
+        let mut markers = self.markers.clone();
+        markers.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (f, label) in &markers {
+            if *f < f0 || *f > f1 {
+                continue;
+            }
+            let x = x_hz(*f);
+            painter.vline(x, full.y_range(), Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.55)));
+            let g = painter.layout_no_wrap(label.clone(), mono(10.0), theme::BG);
+            // Stack tags downwards when neighbours would overlap.
+            let mut at = pos2((x + 4.0).min(full.right() - g.size().x - 6.0), spec.top() + 4.0);
+            let mut tag = Rect::from_min_size(at - vec2(3.0, 1.0), g.size() + vec2(6.0, 2.0));
+            while tags.iter().any(|t| t.intersects(tag)) {
+                at.y += g.size().y + 4.0;
+                tag = tag.translate(vec2(0.0, g.size().y + 4.0));
+            }
+            painter.rect_filled(tag, 2.0, theme::ACCENT);
+            painter.galley(at, g, theme::BG);
+            tags.push(tag);
         }
 
         // --- hover readout ---

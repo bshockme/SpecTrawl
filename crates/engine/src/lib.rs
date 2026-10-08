@@ -6,6 +6,7 @@
 mod bursts;
 mod classify;
 mod emitters;
+mod monitor;
 mod ring;
 pub mod sigmf;
 mod sweep;
@@ -23,6 +24,8 @@ use sdr_core::{Capabilities, Complex32, Device, DeviceInfo, Samples, StreamEvent
 pub use bursts::{BurstDetector, DetectorConfig, SignalRecord};
 pub use classify::ClassifierLoad;
 pub use emitters::Emitter;
+pub use monitor::{GrantEvent, MonitorInfo};
+pub use detect::p25::SystemInfo as P25System;
 pub use ring::IqRing;
 pub use sweep::{SweepPlan, SweepStatus};
 
@@ -125,6 +128,7 @@ struct Shared {
     sweep: Mutex<Option<SweepStatus>>,
     ffts_per_sec: Mutex<f64>,
     classifier_load: Mutex<classify::ClassifierLoad>,
+    p25: Mutex<monitor::P25Book>,
 }
 
 impl Shared {
@@ -232,6 +236,7 @@ impl Source {
             sweep: Mutex::new(None),
             ffts_per_sec: Mutex::new(0.0),
             classifier_load: Mutex::new(Default::default()),
+            p25: Mutex::new(Default::default()),
         });
         device.start(Box::new(RingSink { shared: shared.clone() }))?;
         let info = device.info().clone();
@@ -258,6 +263,8 @@ impl Source {
                 let (sh, c, s) = (shared.clone(), cfg.clone(), st.clone());
                 handles.push(std::thread::Builder::new().name("spectrum".into()).spawn(move || live_worker(sh, c, s, det)));
                 let rate = self.device.lock().sample_rate();
+                let (sh, s) = (shared.clone(), st.clone());
+                handles.push(std::thread::Builder::new().name("monitor".into()).spawn(move || monitor::run(sh, s, rate)));
                 handles.push(std::thread::Builder::new().name("classify".into()).spawn(move || classify::run(shared, cfg, st, rate)));
             }
             Mode::Sweep(plan) => {
@@ -364,6 +371,22 @@ impl Source {
     pub fn ring_range(&self) -> (u64, u64) {
         let r = self.shared.ring.lock();
         (r.oldest(), r.head())
+    }
+
+    /// P25 systems learned by the control-channel monitors, keyed by NAC.
+    pub fn p25_systems(&self) -> Vec<(u16, P25System)> {
+        let mut v: Vec<(u16, P25System)> = self.shared.p25.lock().systems.iter().map(|(k, v)| (*k, v.clone())).collect();
+        v.sort_by_key(|(k, _)| *k);
+        v
+    }
+
+    /// The newest `n` talkgroup grants, newest first.
+    pub fn p25_grants(&self, n: usize) -> Vec<GrantEvent> {
+        self.shared.p25.lock().grants.iter().rev().take(n).cloned().collect()
+    }
+
+    pub fn monitors(&self) -> Vec<MonitorInfo> {
+        self.shared.p25.lock().monitors.clone()
     }
 
     pub fn classifier_load(&self) -> ClassifierLoad {

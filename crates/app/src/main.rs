@@ -109,20 +109,23 @@ const FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(16_667)
 enum ListTab {
     Emitters,
     Records,
+    P25,
 }
 
 /// Command line: `--sim` (simulator only), `--freq <MHz>` (focus centre),
-/// `--serial <hex>` (focus device), `--no-sweep`, `--sweep <lo> <hi>` (MHz).
+/// `--serial <hex>` (focus device), `--no-sweep`, `--sweep <lo> <hi>` (MHz),
+/// `--tab emitters|records|p25` (bottom panel).
 struct Args {
     sim: bool,
     freq_mhz: Option<f64>,
     serial: Option<String>,
     sweep: bool,
     sweep_range: Option<(f64, f64)>,
+    tab: Option<ListTab>,
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { sim: false, freq_mhz: None, serial: None, sweep: true, sweep_range: None };
+    let mut a = Args { sim: false, freq_mhz: None, serial: None, sweep: true, sweep_range: None, tab: None };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -130,6 +133,13 @@ fn parse_args() -> Args {
             "--freq" => a.freq_mhz = it.next().and_then(|v| v.parse().ok()),
             "--serial" => a.serial = it.next(),
             "--no-sweep" => a.sweep = false,
+            "--tab" => {
+                a.tab = match it.next().as_deref() {
+                    Some("records") => Some(ListTab::Records),
+                    Some("p25") => Some(ListTab::P25),
+                    _ => Some(ListTab::Emitters),
+                }
+            }
             "--sweep" => {
                 let lo = it.next().and_then(|v| v.parse().ok());
                 let hi = it.next().and_then(|v| v.parse().ok());
@@ -163,7 +173,7 @@ impl App {
             error: None,
             selected: None,
             selected_emitter: None,
-            list_tab: ListTab::Emitters,
+            list_tab: args.tab.unwrap_or(ListTab::Emitters),
             emitter_cache: (std::time::Instant::now() - std::time::Duration::from_secs(1), Vec::new()),
             last_frame: std::time::Instant::now(),
             export: None,
@@ -460,6 +470,7 @@ impl App {
     fn central(&mut self, ui: &mut egui::Ui) {
         for p in self.panes.iter_mut() {
             p.view.paused = self.paused;
+            p.view.markers = p.source.monitors().iter().map(|m| (m.center_hz, m.label.clone())).collect();
         }
         if !self.paused {
             for p in self.panes.iter_mut() {
@@ -683,11 +694,13 @@ impl App {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.list_tab, ListTab::Emitters, "Emitters");
             ui.selectable_value(&mut self.list_tab, ListTab::Records, "Records");
+            ui.selectable_value(&mut self.list_tab, ListTab::P25, "P25");
             ui.label(egui::RichText::new("click to select · double-click to tune Focus A").small().color(theme::MUTED));
         });
         match self.list_tab {
             ListTab::Emitters => self.emitter_list(ui),
             ListTab::Records => self.signal_list(ui),
+            ListTab::P25 => self.p25_panel(ui),
         }
     }
 
@@ -776,6 +789,100 @@ impl App {
             self.selected_emitter = Some(sel);
             self.selected = None;
         }
+        if let Some(f) = tune {
+            self.retune_focus((f / 1e3).round() / 1e3);
+        }
+    }
+
+    /// P25 systems and talkgroup grants learned by the control-channel monitors.
+    fn p25_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(focus) = self.panes.iter().find(|p| p.role == Role::Focus) else {
+            ui.label(egui::RichText::new("Open a Focus device to decode P25 control channels.").color(theme::MUTED));
+            return;
+        };
+        let systems = focus.source.p25_systems();
+        let grants = focus.source.p25_grants(2000);
+        let monitors = focus.source.monitors();
+        if systems.is_empty() {
+            ui.label(
+                egui::RichText::new(if monitors.is_empty() {
+                    "No P25 control channel identified in this span yet. Monitors start automatically once one is."
+                } else {
+                    "Monitoring a control channel; waiting for its first messages…"
+                })
+                .color(theme::MUTED),
+            );
+            return;
+        }
+        let p25 = egui::Color32::from_rgb(0xf2, 0xa3, 0x3a);
+        let hex = |v: Option<u32>, w: usize| v.map(|v| format!("0x{v:0w$X}")).unwrap_or("?".into());
+        for (nac, s) in &systems {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("P25").strong().color(p25));
+                let mut parts = vec![
+                    format!("NAC 0x{nac:03X}"),
+                    format!("WACN {}", hex(s.wacn, 5)),
+                    format!("SYS {}", hex(s.system.map(u32::from), 3)),
+                    format!("RFSS {} · SITE {}", s.rfss.map(|v| v.to_string()).unwrap_or("?".into()), s.site.map(|v| v.to_string()).unwrap_or("?".into())),
+                ];
+                if let Some(cc) = s.control_hz {
+                    parts.push(format!("CC {:.5} MHz", cc / 1e6));
+                }
+                ui.label(egui::RichText::new(parts.join(" · ")).monospace().color(theme::TEXT));
+                let adj: Vec<String> = s
+                    .adjacent
+                    .iter()
+                    .map(|((_, rfss, site), ch)| format!("{rfss}-{site} {}", s.freq(*ch).map(|f| format!("{:.4}", f / 1e6)).unwrap_or(ch.to_string())))
+                    .collect();
+                if !adj.is_empty() {
+                    ui.label(egui::RichText::new(format!("adjacent: {}", adj.join(", "))).small().color(theme::MUTED));
+                }
+            });
+        }
+        let mut tune = None;
+        let row_h = 18.0;
+        egui_extras::TableBuilder::new(ui)
+            .id_salt("p25grants")
+            .striped(true)
+            .sense(egui::Sense::click())
+            .auto_shrink([false, false])
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(egui_extras::Column::exact(72.0))
+            .column(egui_extras::Column::exact(72.0))
+            .column(egui_extras::Column::exact(80.0))
+            .column(egui_extras::Column::exact(110.0))
+            .column(egui_extras::Column::exact(44.0))
+            .column(egui_extras::Column::exact(90.0))
+            .column(egui_extras::Column::exact(44.0))
+            .column(egui_extras::Column::remainder())
+            .header(row_h, |mut h| {
+                for t in ["Last", "First", "Talkgroup", "Voice MHz", "Slot", "Radio ID", "×", "System"] {
+                    h.col(|ui| {
+                        ui.label(egui::RichText::new(t).small().color(theme::MUTED));
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(row_h, grants.len(), |mut row| {
+                    let g = &grants[row.index()];
+                    let text = |ui: &mut egui::Ui, s: String, c: egui::Color32| {
+                        ui.add(egui::Label::new(egui::RichText::new(s).monospace().color(c)).selectable(false).truncate());
+                    };
+                    let recent = std::time::SystemTime::now().duration_since(g.last).map(|d| d.as_secs() < 5).unwrap_or(true);
+                    let c = if recent { theme::TEXT } else { theme::TEXT2 };
+                    row.col(|ui| text(ui, hms(g.last), c));
+                    row.col(|ui| text(ui, hms(g.first), theme::MUTED));
+                    row.col(|ui| text(ui, g.talkgroup.to_string(), if recent { p25 } else { c }));
+                    row.col(|ui| text(ui, g.freq_hz.map(|f| format!("{:.5}", f / 1e6)).unwrap_or("?".into()), c));
+                    row.col(|ui| text(ui, g.slot.map(|s| s.to_string()).unwrap_or_default(), c));
+                    row.col(|ui| text(ui, g.source.map(|s| s.to_string()).unwrap_or_default(), c));
+                    row.col(|ui| text(ui, g.count.to_string(), theme::MUTED));
+                    row.col(|ui| text(ui, format!("NAC 0x{:03X}", g.nac), theme::MUTED));
+                    if row.response().double_clicked() {
+                        tune = g.freq_hz;
+                    }
+                });
+            });
         if let Some(f) = tune {
             self.retune_focus((f / 1e3).round() / 1e3);
         }
