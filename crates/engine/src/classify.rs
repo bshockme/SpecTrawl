@@ -51,7 +51,11 @@ pub(crate) fn run(shared: Arc<Shared>, cfg: SourceConfig, stop: Arc<AtomicBool>,
             (win_start, jobs, work) = (Instant::now(), 0, Duration::ZERO);
         }
         let t0 = Instant::now();
-        if let Some(rec) = pick(&shared) {
+        if let Some(w) = follow_window(&shared, rate) {
+            // Trunk following: a granted call's voice channel comes first.
+            let class = classify_window(&shared, rate, &radio, &w, &mut chunk, &stop);
+            log_call(&shared, w.center_hz, &class);
+        } else if let Some(rec) = pick(&shared) {
             let class = Arc::new(classify_record(&shared, &cfg, rate, &radio, &rec, &mut chunk, &stop));
             log_call(&shared, rec.center_hz(), &class);
             let mut st = shared.records.lock();
@@ -71,6 +75,27 @@ pub(crate) fn run(shared: Arc<Shared>, cfg: SourceConfig, stop: Arc<AtomicBool>,
         // Rest so that work / (work + rest) stays within the budget.
         std::thread::sleep(spent.mul_f64(1.0 / BUDGET - 1.0));
     }
+}
+
+/// How much of a followed voice channel to look at: enough for P25 link
+/// control (an LDU1 every 360 ms) or a Phase 2 superframe (360 ms).
+const FOLLOW_WINDOW_S: f64 = 1.0;
+
+/// The newest second of a granted call's voice channel, if one is due
+/// (see `CallLog::follow`) and inside the tuned span.
+fn follow_window(shared: &Shared, rate: f64) -> Option<Window> {
+    let tuner = shared.state.lock().center_hz;
+    let half = rate * 0.45;
+    let f = shared.calls.lock().follow(std::time::SystemTime::now(), tuner - half, tuner + half)?;
+    let end = shared.ring.lock().head();
+    Some(Window {
+        emitter: 0,
+        start: end.saturating_sub((FOLLOW_WINDOW_S * rate) as u64),
+        end,
+        center_hz: f,
+        bandwidth_hz: 12_500.0,
+        tuner_center_hz: tuner,
+    })
 }
 
 /// A call named in a classification goes to the call log.

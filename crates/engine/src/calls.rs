@@ -17,6 +17,10 @@ const SAME_CALL: Duration = Duration::from_secs(8);
 /// Frequencies this close are the same channel.
 const SAME_FREQ_HZ: f64 = 3_000.0;
 const MAX_CALLS: usize = 5000;
+/// Follow a call's voice channel while its grant is this fresh...
+const FOLLOW_FRESH: Duration = Duration::from_secs(3);
+/// ...sampling it this often.
+const FOLLOW_EVERY: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct CallEvent {
@@ -32,6 +36,10 @@ pub struct CallEvent {
     pub granted: bool,
     /// Its voice channel was heard carrying it.
     pub heard: bool,
+    /// When a control channel last (re)announced it.
+    pub granted_at: Option<SystemTime>,
+    /// When the classifier last looked at its voice channel for it.
+    pub(crate) followed_at: Option<SystemTime>,
 }
 
 #[derive(Default)]
@@ -42,7 +50,10 @@ pub(crate) struct CallLog {
 impl CallLog {
     /// A control channel granted `call` on `freq`.
     pub fn granted(&mut self, freq: Option<f64>, system: &str, call: Call, now: SystemTime) {
-        self.merge(freq, call, now, system, |e| e.granted = true);
+        self.merge(freq, call, now, system, |e| {
+            e.granted = true;
+            e.granted_at = Some(now);
+        });
     }
 
     /// A voice channel at `freq` was heard carrying `call`.
@@ -79,11 +90,42 @@ impl CallLog {
                     self.calls.pop_front();
                 }
                 let mut e =
-                    CallEvent { first: now, last: now, center_hz: freq, protocol: label.to_string(), call, granted: false, heard: false };
+                    CallEvent {
+                        first: now,
+                        last: now,
+                        center_hz: freq,
+                        protocol: label.to_string(),
+                        call,
+                        granted: false,
+                        heard: false,
+                        granted_at: None,
+                        followed_at: None,
+                    };
                 mark(&mut e);
                 self.calls.push_back(e);
             }
         }
+    }
+}
+
+impl CallLog {
+    /// Trunk following: the voice channel to look at next, if any. A
+    /// granted call whose grant is still being announced, on a frequency
+    /// inside `lo..hi`, not looked at within `FOLLOW_EVERY`; the one waiting
+    /// longest goes first. Marks it as looked at.
+    pub fn follow(&mut self, now: SystemTime, lo: f64, hi: f64) -> Option<f64> {
+        let age = |t: Option<SystemTime>| t.and_then(|t| now.duration_since(t).ok());
+        let e = self
+            .calls
+            .iter_mut()
+            .rev()
+            .take(256)
+            .filter(|e| e.center_hz.is_some_and(|f| (lo..hi).contains(&f)))
+            .filter(|e| age(e.granted_at).is_some_and(|a| a < FOLLOW_FRESH))
+            .filter(|e| age(e.followed_at).is_none_or(|a| a >= FOLLOW_EVERY))
+            .max_by_key(|e| age(e.followed_at).unwrap_or(Duration::MAX))?;
+        e.followed_at = Some(now);
+        e.center_hz
     }
 }
 
@@ -114,5 +156,22 @@ mod tests {
         log.heard(770.3198e6, "P25 Phase 1", call(10025, Some(2121604)), t0 + Duration::from_secs(6));
         log.heard(770.3198e6, "P25 Phase 1", call(10025, Some(2121592)), t0 + Duration::from_secs(30));
         assert_eq!(log.calls.len(), 3);
+    }
+
+    #[test]
+    fn follows_fresh_grants_in_span() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let mut log = CallLog::default();
+        log.granted(Some(770.31875e6), "NAC 0x2A5", call(10025, Some(1)), t0);
+        log.granted(Some(860.0e6), "NAC 0x2A5", call(10044, Some(2)), t0);
+        let (lo, hi) = (766e6, 776e6);
+        assert_eq!(log.follow(t0, lo, hi), Some(770.31875e6));
+        // Just looked at; out of span; so nothing until FOLLOW_EVERY.
+        assert_eq!(log.follow(t0 + Duration::from_secs(1), lo, hi), None);
+        // The grant is re-announced, so it's followed again...
+        log.granted(Some(770.31875e6), "NAC 0x2A5", call(10025, Some(1)), t0 + Duration::from_secs(2));
+        assert_eq!(log.follow(t0 + Duration::from_secs(2), lo, hi), Some(770.31875e6));
+        // ...until the grants stop.
+        assert_eq!(log.follow(t0 + Duration::from_secs(6), lo, hi), None);
     }
 }
