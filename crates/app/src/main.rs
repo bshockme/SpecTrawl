@@ -95,6 +95,10 @@ struct App {
     selected_emitter: Option<(Role, u64)>,
     list_tab: ListTab,
     last_frame: std::time::Instant,
+    /// Imported names (DSD+, trunk-recorder). Labels only: never replaces
+    /// anything decoded.
+    catalog: catalog::Catalog,
+    catalog_msg: Option<(std::time::Instant, String)>,
     /// Running SigMF export (description, handle) and the last result.
     export: Option<(String, std::thread::JoinHandle<Result<engine::sigmf::ExportResult, String>>)>,
     export_msg: Option<String>,
@@ -176,6 +180,8 @@ impl App {
             list_tab: args.tab.unwrap_or(ListTab::Emitters),
             emitter_cache: (std::time::Instant::now() - std::time::Duration::from_secs(1), Vec::new()),
             last_frame: std::time::Instant::now(),
+            catalog: catalog::Catalog::load(&catalog_path()),
+            catalog_msg: None,
             export: None,
             export_msg: None,
         };
@@ -300,8 +306,58 @@ impl App {
                 if ui.button(if self.paused { "▶ Resume" } else { "⏸ Pause" }).clicked() {
                     self.paused = !self.paused;
                 }
+                ui.menu_button("Import names", |ui| self.import_menu(ui));
+                if let Some((t, m)) = &self.catalog_msg {
+                    if t.elapsed() < std::time::Duration::from_secs(12) {
+                        ui.label(egui::RichText::new(m).small().color(theme::TEXT2));
+                    }
+                }
             });
         });
+    }
+
+    /// Talkgroup/radio/site names from other tools. Shown beside decoded
+    /// values, never instead of them (imported files can be out of date).
+    fn import_menu(&mut self, ui: &mut egui::Ui) {
+        let mut result: Option<Result<String, String>> = None;
+        if ui.button("DSD+ folder…").on_hover_text("Reads DSDPlus.groups, .radios, .sites and .networks").clicked() {
+            if let Some(dir) = rfd::FileDialog::new().set_title("DSD+ folder").pick_folder() {
+                result = Some(self.catalog.import_dsdplus_dir(&dir).map(|s| format!("DSD+: {s}")).map_err(|e| e.to_string()));
+            }
+        }
+        if ui.button("trunk-recorder config.json…").on_hover_text("Systems, control channels, and the talkgroup/unit files they reference").clicked() {
+            if let Some(f) = rfd::FileDialog::new().add_filter("trunk-recorder config", &["json"]).pick_file() {
+                result = Some(self.catalog.import_tr_config(&f).map(|s| format!("trunk-recorder: {s}")).map_err(|e| e.to_string()));
+            }
+        }
+        if ui.button("Talkgroup or unit CSV…").on_hover_text("trunk-recorder / RadioReference-style talkgroup CSV, or unit tags").clicked() {
+            if let Some(f) = rfd::FileDialog::new().add_filter("CSV", &["csv", "txt"]).pick_file() {
+                result = Some(self.catalog.import_csv(&f).map(|s| format!("CSV: {s}")).map_err(|e| e.to_string()));
+            }
+        }
+        ui.separator();
+        if self.catalog.sources.is_empty() {
+            ui.label(egui::RichText::new("Nothing imported yet").small().color(theme::MUTED));
+        } else {
+            for s in &self.catalog.sources {
+                ui.label(egui::RichText::new(s).small().color(theme::MUTED));
+            }
+            if ui.button("Clear imported names").clicked() {
+                self.catalog = catalog::Catalog::default();
+                result = Some(Ok("Imported names cleared".into()));
+            }
+        }
+        if let Some(r) = result {
+            let msg = match r {
+                Ok(m) => match self.catalog.save(&catalog_path()) {
+                    Ok(()) => m,
+                    Err(e) => format!("{m} (not saved: {e})"),
+                },
+                Err(e) => format!("Import failed: {e}"),
+            };
+            self.catalog_msg = Some((std::time::Instant::now(), msg));
+            ui.close();
+        }
     }
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
@@ -816,9 +872,19 @@ impl App {
         }
         let p25 = egui::Color32::from_rgb(0xf2, 0xa3, 0x3a);
         let hex = |v: Option<u32>, w: usize| v.map(|v| format!("0x{v:0w$X}")).unwrap_or("?".into());
+        let cat = &self.catalog;
+        let site_name = |s: &engine::P25System, rfss: u8, site: u8| match (s.wacn, s.system) {
+            (Some(w), Some(y)) => cat.p25_site(w, y, rfss, site).map(str::to_string),
+            _ => None,
+        };
         for (nac, s) in &systems {
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new("P25").strong().color(p25));
+                if let (Some(w), Some(y)) = (s.wacn, s.system) {
+                    if let Some(n) = cat.p25_network(w, y) {
+                        ui.label(egui::RichText::new(n).strong().color(theme::TEXT));
+                    }
+                }
                 let mut parts = vec![
                     format!("NAC 0x{nac:03X}"),
                     format!("WACN {}", hex(s.wacn, 5)),
@@ -829,16 +895,28 @@ impl App {
                     parts.push(format!("CC {:.5} MHz", cc / 1e6));
                 }
                 ui.label(egui::RichText::new(parts.join(" · ")).monospace().color(theme::TEXT));
+                if let (Some(r), Some(t)) = (s.rfss, s.site) {
+                    if let Some(n) = site_name(s, r, t) {
+                        ui.label(egui::RichText::new(format!("“{n}”")).color(theme::TEXT2));
+                    }
+                }
                 let adj: Vec<String> = s
                     .adjacent
                     .iter()
-                    .map(|((_, rfss, site), ch)| format!("{rfss}-{site} {}", s.freq(*ch).map(|f| format!("{:.4}", f / 1e6)).unwrap_or(ch.to_string())))
+                    .map(|((_, rfss, site), ch)| {
+                        let f = s.freq(*ch).map(|f| format!("{:.4}", f / 1e6)).unwrap_or(ch.to_string());
+                        match site_name(s, *rfss, *site) {
+                            Some(n) => format!("{rfss}-{site} {n} {f}"),
+                            None => format!("{rfss}-{site} {f}"),
+                        }
+                    })
                     .collect();
                 if !adj.is_empty() {
                     ui.label(egui::RichText::new(format!("adjacent: {}", adj.join(", "))).small().color(theme::MUTED));
                 }
             });
         }
+        let by_nac: std::collections::HashMap<u16, &engine::P25System> = systems.iter().map(|(n, s)| (*n, s)).collect();
         let mut tune = None;
         let row_h = 18.0;
         egui_extras::TableBuilder::new(ui)
@@ -850,13 +928,15 @@ impl App {
             .column(egui_extras::Column::exact(72.0))
             .column(egui_extras::Column::exact(72.0))
             .column(egui_extras::Column::exact(80.0))
+            .column(egui_extras::Column::exact(300.0))
             .column(egui_extras::Column::exact(110.0))
             .column(egui_extras::Column::exact(44.0))
             .column(egui_extras::Column::exact(90.0))
+            .column(egui_extras::Column::exact(160.0))
             .column(egui_extras::Column::exact(44.0))
             .column(egui_extras::Column::remainder())
             .header(row_h, |mut h| {
-                for t in ["Last", "First", "Talkgroup", "Voice MHz", "Slot", "Radio ID", "×", "System"] {
+                for t in ["Last", "First", "Talkgroup", "Name (imported)", "Voice MHz", "Slot", "Radio ID", "Radio (imported)", "×", "System"] {
                     h.col(|ui| {
                         ui.label(egui::RichText::new(t).small().color(theme::MUTED));
                     });
@@ -872,10 +952,16 @@ impl App {
                     let c = if recent { theme::TEXT } else { theme::TEXT2 };
                     row.col(|ui| text(ui, hms(g.last), c));
                     row.col(|ui| text(ui, hms(g.first), theme::MUTED));
+                    let sys = by_nac.get(&g.nac);
+                    let (w, y, cc) = (sys.and_then(|s| s.wacn), sys.and_then(|s| s.system), sys.and_then(|s| s.control_hz));
+                    let tg_name = cat.p25_group(w, y, cc, g.talkgroup).map(|i| i.name().to_string()).unwrap_or_default();
+                    let radio_name = g.source.and_then(|r| cat.p25_radio(w, y, cc, r)).unwrap_or("").to_string();
                     row.col(|ui| text(ui, g.talkgroup.to_string(), if recent { p25 } else { c }));
+                    row.col(|ui| text(ui, tg_name, theme::TEXT2));
                     row.col(|ui| text(ui, g.freq_hz.map(|f| format!("{:.5}", f / 1e6)).unwrap_or("?".into()), c));
                     row.col(|ui| text(ui, g.slot.map(|s| s.to_string()).unwrap_or_default(), c));
                     row.col(|ui| text(ui, g.source.map(|s| s.to_string()).unwrap_or_default(), c));
+                    row.col(|ui| text(ui, radio_name, theme::TEXT2));
                     row.col(|ui| text(ui, g.count.to_string(), theme::MUTED));
                     row.col(|ui| text(ui, format!("NAC 0x{:03X}", g.nac), theme::MUTED));
                     if row.response().double_clicked() {
@@ -1065,6 +1151,11 @@ fn spawn_deadlock_watchdog() {
             }
         })
         .expect("spawn watchdog");
+}
+
+/// `<Documents>/SpecTrawl/catalog.json`
+fn catalog_path() -> std::path::PathBuf {
+    engine::sigmf::default_dir().parent().map(|p| p.join("catalog.json")).unwrap_or_else(|| "catalog.json".into())
 }
 
 fn hms(t: SystemTime) -> String {

@@ -27,6 +27,10 @@ Ideas and known rough edges that aren't scheduled yet. Newest at the top of each
 - **Bandwidth of FM broadcast/voice varies with modulation**, so a record's extent is the union over its lifetime. Fine for now; a per-row occupied-bandwidth average would be steadier.
 - **Wideband signals that fill a floor block** (e.g. an LTE carrier filling most of a 10 MHz focus span) raise the floor estimate and can go undetected. Needs a floor that also looks at neighbouring blocks or history.
 
+## Data sources
+
+- **RadioReference database import** (as SDRTrunk does): download a trunked system's sites, frequencies, band plans and talkgroups by system ID. RadioReference's database web service (SOAP) needs the user's **Premium** subscription credentials plus an **application key** the software author requests from RadioReference. Plan: a settings page for the RR login (stored with the OS credential store, not plain text), "Import from RadioReference…" by system ID or by matching a decoded WACN/SYSID, merged into the same catalog as the DSD+/trunk-recorder imports. Check RR's terms on caching and redistribution before storing the data.
+
 ## Hardware
 
 - **Manual Airspy gain stages** (LNA/Mixer/VGA individually). The UI has the linearity/sensitivity presets and AGC.
