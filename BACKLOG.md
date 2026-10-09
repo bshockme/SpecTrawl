@@ -12,6 +12,8 @@ Ideas and known rough edges that aren't scheduled yet. Newest at the top of each
 ## Sweep / survey
 
 - **Survey detection is dense.** Every persistent emitter (TV, LTE, paging) becomes a long record, so the survey shows many boxes (now drawn faintly). Needs a "new since baseline" view rather than boxes for everything.
+  - Emitter table shows Focus by default. Next: show the survey as busy *bands* (one row per stretch, "451–455 MHz, 37 channels") rather than emitters, and a "new since baseline" filter.
+  - A fast survey (200–605 MHz, a pass every 0.3 s, 12 kHz bins) makes ~40 records/s, 78% one-pass 8–11 dB noise blips. Those no longer confirm emitters; ~290–330 confirmed remain after 6 min, mostly steady weak activity (200–260 MHz) and land mobile.
   - Survey emitters now group by overlap, and unconfirmed blips (once, weak, brief) are hidden and expire. A full-band survey settles to ~220 confirmed emitters after 5 min, still adding ~0.2/s (new land-mobile activity, varying LTE/TV blobs). Humps of raised floor (e.g. 685–688 MHz) still split into ~300 kHz pieces.
 - **Hop profile is estimated live** (median across hops, smoothed across passes). It removes passband ripple and fixed-offset spurs. Consider saving it per serial and gain so a fresh sweep starts clean.
 - **Sweep is now one hop per USB transfer** on an Airspy (retune as a transfer arrives, 3 ms latency, R820T lock flag for slow VCO searches): about 2x the old 9.5 ms guard. What's left:
@@ -29,6 +31,7 @@ Ideas and known rough edges that aren't scheduled yet. Newest at the top of each
 - **TDMA single-slot traffic fragments into many short records** (e.g. 47 records in 45 s at 856.3375), each too short to hold two syncs, so they stay unidentified. Group records by channel/emitter and classify the group, or lengthen the hangover for slotted signals.
 - **Unverified labels:** ProVoice (binary sync, 2-bit tolerance) seen ×3 at 854.71 MHz, and the X2-TDMA patterns. Treat as provisional until checked against a known transmitter.
 
+- **Broadcast FM fragments in Focus.** The narrowband detector cuts a ±75 kHz station into pieces (4–98 kHz wide, centres ±20 kHz) that become 4–9 emitters per station (99.5, 99.9, 100.7, 101.5 MHz in one export). No emitter-matching rule fixed it in replay; needs detector-side handling (wider merge gap / recognising a broadcast channel).
 - **Bandwidth of FM broadcast/voice varies with modulation**, so a record's extent is the union over its lifetime. Fine for now; a per-row occupied-bandwidth average would be steadier.
 - **Wideband signals that fill a floor block** (e.g. an LTE carrier filling most of a 10 MHz focus span) raise the floor estimate and can go undetected. Needs a floor that also looks at neighbouring blocks or history.
 

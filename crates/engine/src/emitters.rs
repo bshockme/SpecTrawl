@@ -22,8 +22,12 @@ use crate::SignalRecord;
 /// Most emitters kept per source; the least recently seen inactive ones go first.
 const MAX_EMITTERS: usize = 5000;
 
-/// An emitter is confirmed once it has had this many records...
+/// An emitter is confirmed once it has had this many records that weren't
+/// weak one-row blips (rows >= 2 or SNR >= `BLIP_SNR_DB`): a survey pass
+/// every 0.3 s puts noise blips on any one patch of band several times a
+/// minute...
 const CONFIRM_RECORDS: u32 = 3;
+const BLIP_SNR_DB: f32 = 12.0;
 /// ...or one record lasting this long over at least `CONFIRM_ROWS` rows (two
 /// survey passes in a row can still be noise)...
 const CONFIRM_DURATION_S: f64 = 0.5;
@@ -78,6 +82,8 @@ pub struct Emitter {
     pub(crate) tuner_center_hz: f64,
     /// Bin width of the rows its records came from.
     pub(crate) bin_hz: f64,
+    /// Finished records that weren't weak one-row blips.
+    pub(crate) solid_records: u32,
 }
 
 impl Emitter {
@@ -203,8 +209,11 @@ impl EmitterBook {
             e.tuner_center_hz = r.tuner_center_hz;
             if closed {
                 e.on_time_s += r.duration_s();
+                if r.rows >= 2 || r.max_snr_db >= BLIP_SNR_DB {
+                    e.solid_records += 1;
+                }
             }
-            e.confirmed |= e.records >= CONFIRM_RECORDS
+            e.confirmed |= e.solid_records >= CONFIRM_RECORDS
                 || (r.duration_s() >= CONFIRM_DURATION_S && r.rows >= CONFIRM_ROWS)
                 || r.max_snr_db >= CONFIRM_SNR_DB;
         }
@@ -226,6 +235,7 @@ impl EmitterBook {
         self.by_record.insert(r.id, to);
         let Some(e) = self.map.get_mut(&to) else { return to };
         e.records += from.records;
+        e.solid_records += from.solid_records;
         e.center_hz += (c - e.center_hz) * 0.1;
         e.bandwidth_hz += (bw - e.bandwidth_hz) * 0.1;
         e.on_time_s += from.on_time_s;
@@ -259,6 +269,7 @@ impl EmitterBook {
             first_seen: r.t_start,
             last_seen: r.t_end,
             records: 0,
+            solid_records: 0,
             on_time_s: 0.0,
             active: false,
             confirmed: false,
@@ -449,7 +460,14 @@ mod tests {
         let mut b = EmitterBook::default();
         let mut blip = rec(1, 300.0, 54.1, 0);
         blip.max_snr_db = 9.0;
+        blip.rows = 1;
         let id = b.observe(&blip, true);
+        // Weak one-row blips landing on the same patch again don't confirm it.
+        for i in 0..5 {
+            let mut again = blip.clone();
+            again.id = 100 + i;
+            assert_eq!(b.observe(&again, true), id);
+        }
         assert!(!b.get(id).unwrap().confirmed);
         // A strong one is confirmed at once.
         let strong = rec(2, 400.0, 54.1, 0);

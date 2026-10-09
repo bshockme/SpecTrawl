@@ -120,7 +120,9 @@ struct EmitterView {
 
 impl Default for EmitterView {
     fn default() -> Self {
-        Self { sort: EmitterSort::Freq, descending: false, source: None, unconfirmed: false }
+        // The survey's coarse bins can't separate channels and its emitters
+        // run to hundreds; it marks activity on its waterfall instead.
+        Self { sort: EmitterSort::Freq, descending: false, source: Some(Role::Focus), unconfirmed: false }
     }
 }
 
@@ -873,13 +875,29 @@ impl App {
             }
             ui.separator();
             refresh |= ui.checkbox(&mut v.unconfirmed, egui::RichText::new("show unconfirmed").small()).changed();
+            ui.separator();
+            if ui
+                .button(egui::RichText::new("Export CSV").small())
+                .on_hover_text("All emitters and records, every source, unfiltered")
+                .clicked()
+            {
+                self.export_msg = Some(match export_emitters(&self.panes) {
+                    Ok((path, e, r)) => format!("Exported {e} emitters, {r} records to {}", path.display()),
+                    Err(err) => format!("Emitter export failed: {err}"),
+                });
+            }
+            if let Some(m) = self.export_msg.as_deref().filter(|m| m.contains("mitter")) {
+                ui.label(egui::RichText::new(m).small().color(theme::TEXT2));
+            }
         });
         if refresh || self.emitter_cache.0.elapsed() > std::time::Duration::from_millis(300) {
             let v = &self.emitter_view;
             let focus_span = self.panes.iter().find(|q| q.role == Role::Focus).and_then(|q| q.view.span());
             let mut rows: Vec<(Role, engine::Emitter)> = Vec::new();
             let mut hidden = 0;
-            for p in self.panes.iter().filter(|p| v.source.is_none_or(|r| r == p.role)) {
+            // With no pane of the chosen kind open, show every pane rather than nothing.
+            let source = v.source.filter(|r| self.panes.iter().any(|p| p.role == *r));
+            for p in self.panes.iter().filter(|p| source.is_none_or(|r| r == p.role)) {
                 for e in p.source.emitters() {
                     if p.role == Role::Survey && in_focus_zone(e.center_hz, focus_span) {
                         continue;
@@ -1343,6 +1361,91 @@ fn survey_outside_focus(
 }
 
 /// `<Documents>/SpecTrawl/catalog.json`
+/// Writes every pane's emitters and records (unfiltered, unconfirmed
+/// included) to two CSVs next to the SigMF exports. Returns the emitter
+/// file's path and the counts.
+fn export_emitters(panes: &[Pane]) -> std::io::Result<(std::path::PathBuf, usize, usize)> {
+    use std::io::Write;
+    let dir = engine::sigmf::default_dir();
+    std::fs::create_dir_all(&dir)?;
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let unix = |t: SystemTime| t.duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+    // Labels and tallies can hold commas.
+    let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let role = |r: Role| if r == Role::Survey { "survey" } else { "focus" };
+
+    let em_path = dir.join(format!("emitters_{stamp}.csv"));
+    let mut f = std::io::BufWriter::new(std::fs::File::create(&em_path)?);
+    writeln!(
+        f,
+        "source,serial,emitter,center_mhz,bw_khz,records,confirmed,active,duty,on_time_s,first_seen,last_seen,peak_snr_db,label,system_id,tally"
+    )?;
+    let mut n_em = 0;
+    for p in panes {
+        let serial = p.source.info().serial.clone();
+        let mut em = p.source.emitters();
+        em.sort_by(|a, b| a.center_hz.total_cmp(&b.center_hz));
+        for e in &em {
+            let tally: Vec<String> = e.tally.iter().map(|(k, n)| format!("{k}x{n}")).collect();
+            writeln!(
+                f,
+                "{},{serial},{},{:.6},{:.2},{},{},{},{:.4},{:.3},{:.3},{:.3},{:.1},{},{},{}",
+                role(p.role),
+                e.id,
+                e.center_hz / 1e6,
+                e.bandwidth_hz / 1e3,
+                e.records,
+                e.confirmed as u8,
+                e.active as u8,
+                e.duty(),
+                e.on_time_s,
+                unix(e.first_seen),
+                unix(e.last_seen),
+                e.peak_snr_db,
+                q(&e.label().unwrap_or_default()),
+                q(e.id().unwrap_or("")),
+                q(&tally.join("; "))
+            )?;
+        }
+        n_em += em.len();
+    }
+    f.flush()?;
+
+    let mut f = std::io::BufWriter::new(std::fs::File::create(dir.join(format!("records_{stamp}.csv")))?);
+    writeln!(
+        f,
+        "source,record,emitter,center_mhz,bw_khz,bin_hz,t_start,t_end,rows,mean_snr_db,max_snr_db,peak_dbfs,active,tuner_mhz,class"
+    )?;
+    let mut n_rec = 0;
+    for p in panes {
+        let recs = p.source.records_since(0);
+        for r in &recs {
+            writeln!(
+                f,
+                "{},{},{},{:.6},{:.2},{:.1},{:.3},{:.3},{},{:.1},{:.1},{:.1},{},{:.6},{}",
+                role(p.role),
+                r.id,
+                r.emitter.map(|e| e.to_string()).unwrap_or_default(),
+                r.center_hz() / 1e6,
+                r.bandwidth_hz() / 1e3,
+                r.bin_hz,
+                unix(r.t_start),
+                unix(r.t_end),
+                r.rows,
+                r.mean_snr_db,
+                r.max_snr_db,
+                r.peak_dbfs,
+                r.active as u8,
+                r.tuner_center_hz / 1e6,
+                q(r.display_class().map(|c| c.label.as_str()).unwrap_or(""))
+            )?;
+        }
+        n_rec += recs.len();
+    }
+    f.flush()?;
+    Ok((em_path, n_em, n_rec))
+}
+
 fn catalog_path() -> std::path::PathBuf {
     engine::sigmf::default_dir().parent().map(|p| p.join("catalog.json")).unwrap_or_else(|| "catalog.json".into())
 }
