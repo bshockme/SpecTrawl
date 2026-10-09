@@ -306,7 +306,14 @@ pub fn parse(t: &Tsbk) -> Message {
                 5 => (12.5e3, 2),
                 _ => (0.0, 1),
             };
-            Message::IdenUpdate(BandPlan { iden: t.arg(0, 4) as u8, bandwidth_hz: bw, tx_offset_hz: off, spacing_hz: spacing, base_hz: t.arg(32, 32) as f64 * 5.0, slots })
+            Message::IdenUpdate(BandPlan {
+                iden: t.arg(0, 4) as u8,
+                bandwidth_hz: bw,
+                tx_offset_hz: off,
+                spacing_hz: spacing,
+                base_hz: t.arg(32, 32) as f64 * 5.0,
+                slots,
+            })
         }
         // IDEN_UP_VU (VHF/UHF): iden 4, bw 4, tx offset sign 1 + 13, spacing 10, base 32.
         0x34 => {
@@ -317,7 +324,14 @@ pub fn parse(t: &Tsbk) -> Message {
                 0x5 => 12.5e3,
                 _ => 0.0,
             };
-            Message::IdenUpdate(BandPlan { iden: t.arg(0, 4) as u8, bandwidth_hz: bw, tx_offset_hz: off, spacing_hz: spacing, base_hz: t.arg(32, 32) as f64 * 5.0, slots: 1 })
+            Message::IdenUpdate(BandPlan {
+                iden: t.arg(0, 4) as u8,
+                bandwidth_hz: bw,
+                tx_offset_hz: off,
+                spacing_hz: spacing,
+                base_hz: t.arg(32, 32) as f64 * 5.0,
+                slots: 1,
+            })
         }
         // RFSS_STS_BCST: LRA 8, flags 4, sysid 12, rfss 8, site 8, channel 16, class 8.
         0x3A => Message::RfssStatus {

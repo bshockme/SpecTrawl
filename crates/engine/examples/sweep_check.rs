@@ -10,28 +10,15 @@ use sdr_core::Backend;
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let (serial, lo, hi, secs) = (
-        &a[1],
-        a[2].parse::<f64>().unwrap(),
-        a[3].parse::<f64>().unwrap(),
-        a[4].parse::<u64>().unwrap(),
-    );
-    let guard_s = a
-        .get(5)
-        .map(|g| g.parse::<f64>().unwrap() / 1e3)
-        .unwrap_or(SweepPlan::default().guard_s);
+    let (serial, lo, hi, secs) = (&a[1], a[2].parse::<f64>().unwrap(), a[3].parse::<f64>().unwrap(), a[4].parse::<u64>().unwrap());
+    let guard_s = a.get(5).map(|g| g.parse::<f64>().unwrap() / 1e3).unwrap_or(SweepPlan::default().guard_s);
     let b = backend_airspy::AirspyBackend::new();
     let _ = b.enumerate();
     let d = b.open(serial).expect("open");
     let src = Source::start(
         d,
         SourceConfig::default(),
-        Mode::Sweep(SweepPlan {
-            start_hz: lo * 1e6,
-            stop_hz: hi * 1e6,
-            guard_s,
-            ..Default::default()
-        }),
+        Mode::Sweep(SweepPlan { start_hz: lo * 1e6, stop_hz: hi * 1e6, guard_s, ..Default::default() }),
     )
     .unwrap();
     std::thread::sleep(Duration::from_secs(secs));

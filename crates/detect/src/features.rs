@@ -138,7 +138,8 @@ fn symbol_rate(disc: &[f32], fs: f64) -> (Option<f64>, Option<f64>) {
     let n = 1usize << avail.ilog2();
     let e: Vec<f32> = disc[..n].windows(2).map(|w| (w[1] - w[0]).powi(2)).collect();
     let mean = e.iter().sum::<f32>() / e.len() as f32;
-    let mut buf: Vec<num_complex::Complex32> = e.iter().map(|&v| num_complex::Complex32::new(v - mean, 0.0)).chain(std::iter::once(Default::default())).collect();
+    let mut buf: Vec<num_complex::Complex32> =
+        e.iter().map(|&v| num_complex::Complex32::new(v - mean, 0.0)).chain(std::iter::once(Default::default())).collect();
     buf.truncate(n);
     FftPlanner::new().plan_fft_forward(n).process(&mut buf);
     let bin_hz = fs / n as f64;

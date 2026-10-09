@@ -82,7 +82,8 @@ impl Ddc {
                 let x = i as f64 - m / 2.0;
                 let sinc = if x == 0.0 { 2.0 * fc } else { (2.0 * std::f64::consts::PI * fc * x).sin() / (std::f64::consts::PI * x) };
                 // Blackman window.
-                let w = 0.42 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / m).cos() + 0.08 * (4.0 * std::f64::consts::PI * i as f64 / m).cos();
+                let w = 0.42 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / m).cos()
+                    + 0.08 * (4.0 * std::f64::consts::PI * i as f64 / m).cos();
                 (sinc * w) as f32
             })
             .collect();

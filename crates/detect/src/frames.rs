@@ -2,7 +2,7 @@
 //! around it at the sync's phase and slice them with levels taken from the
 //! sync itself (levels set per sync, simplified).
 
-use crate::sync::{SyncHit, PHASES};
+use crate::sync::{PHASES, SyncHit};
 
 /// One sync occurrence with the symbols around it.
 #[derive(Debug, Clone)]
@@ -29,7 +29,10 @@ pub fn slice(disc: &[f32], fs: f64, hits: &[SyncHit], before: usize, after: usiz
     for h in hits {
         match groups.iter_mut().find(|g| {
             let f = g[0];
-            f.entry.pattern == h.entry.pattern && f.entry.baud == h.entry.baud && f.inverted == h.inverted && f.symbol.abs_diff(h.symbol) <= 2
+            f.entry.pattern == h.entry.pattern
+                && f.entry.baud == h.entry.baud
+                && f.inverted == h.inverted
+                && f.symbol.abs_diff(h.symbol) <= 2
         }) {
             Some(g) => g.push(h),
             None => groups.push(vec![h]),
@@ -82,7 +85,15 @@ pub fn slice(disc: &[f32], fs: f64, hits: &[SyncHit], before: usize, after: usiz
                 }
             })
             .collect();
-        frames.push(Frame { protocol: e.protocol, detail: e.detail, pattern: e.pattern, inverted: h.inverted, dibits, sync_start: before, outer });
+        frames.push(Frame {
+            protocol: e.protocol,
+            detail: e.detail,
+            pattern: e.pattern,
+            inverted: h.inverted,
+            dibits,
+            sync_start: before,
+            outer,
+        });
     }
     frames.sort_by_key(|f| f.sync_start);
     frames

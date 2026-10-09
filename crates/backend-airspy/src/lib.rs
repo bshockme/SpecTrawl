@@ -14,8 +14,8 @@ use std::time::SystemTime;
 
 use libloading::Library;
 use sdr_core::{
-    Backend, Capabilities, Complex32, Device, DeviceInfo, Error, GainSetting, GainStage, IfArchitecture, Result,
-    SampleFormat, Samples, StreamEvent, StreamSink,
+    Backend, Capabilities, Complex32, Device, DeviceInfo, Error, GainSetting, GainStage, IfArchitecture, Result, SampleFormat, Samples,
+    StreamEvent, StreamSink,
 };
 
 #[repr(C)]

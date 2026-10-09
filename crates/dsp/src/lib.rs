@@ -111,9 +111,8 @@ mod tests {
     fn tone_lands_in_right_bin_at_0dbfs() {
         let n = 1024;
         let k = 100; // bin offset from DC
-        let tone: Vec<Complex32> = (0..n)
-            .map(|i| Complex32::from_polar(1.0, 2.0 * std::f32::consts::PI * k as f32 * i as f32 / n as f32))
-            .collect();
+        let tone: Vec<Complex32> =
+            (0..n).map(|i| Complex32::from_polar(1.0, 2.0 * std::f32::consts::PI * k as f32 * i as f32 / n as f32)).collect();
         let mut sa = SpectrumAnalyzer::new(n);
         sa.push(&tone);
         let mut out = Vec::new();

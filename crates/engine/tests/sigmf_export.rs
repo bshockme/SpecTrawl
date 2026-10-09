@@ -39,11 +39,16 @@ fn exports_channel_and_wideband() {
     let data = std::fs::read(&ch.data_path).unwrap();
     assert_eq!(data.len() as u64, ch.samples * 8);
     // Constant-envelope C4FM at -38 dBFS: mean |x|^2 ≈ 1.6e-4, far above noise.
-    let p: f64 = data.chunks(8).skip(1000).map(|c| {
-        let re = f32::from_le_bytes(c[0..4].try_into().unwrap()) as f64;
-        let im = f32::from_le_bytes(c[4..8].try_into().unwrap()) as f64;
-        re * re + im * im
-    }).sum::<f64>() / (ch.samples - 1000) as f64;
+    let p: f64 = data
+        .chunks(8)
+        .skip(1000)
+        .map(|c| {
+            let re = f32::from_le_bytes(c[0..4].try_into().unwrap()) as f64;
+            let im = f32::from_le_bytes(c[4..8].try_into().unwrap()) as f64;
+            re * re + im * im
+        })
+        .sum::<f64>()
+        / (ch.samples - 1000) as f64;
     let db = 10.0 * p.log10();
     assert!((-42.0..-34.0).contains(&db), "channel power {db:.1} dBFS");
 

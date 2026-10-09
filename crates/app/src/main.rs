@@ -325,12 +325,17 @@ impl App {
                 result = Some(self.catalog.import_dsdplus_dir(&dir).map(|s| format!("DSD+: {s}")).map_err(|e| e.to_string()));
             }
         }
-        if ui.button("trunk-recorder config.json…").on_hover_text("Systems, control channels, and the talkgroup/unit files they reference").clicked() {
+        if ui
+            .button("trunk-recorder config.json…")
+            .on_hover_text("Systems, control channels, and the talkgroup/unit files they reference")
+            .clicked()
+        {
             if let Some(f) = rfd::FileDialog::new().add_filter("trunk-recorder config", &["json"]).pick_file() {
                 result = Some(self.catalog.import_tr_config(&f).map(|s| format!("trunk-recorder: {s}")).map_err(|e| e.to_string()));
             }
         }
-        if ui.button("Talkgroup or unit CSV…").on_hover_text("trunk-recorder / RadioReference-style talkgroup CSV, or unit tags").clicked() {
+        if ui.button("Talkgroup or unit CSV…").on_hover_text("trunk-recorder / RadioReference-style talkgroup CSV, or unit tags").clicked()
+        {
             if let Some(f) = rfd::FileDialog::new().add_filter("CSV", &["csv", "txt"]).pick_file() {
                 result = Some(self.catalog.import_csv(&f).map(|s| format!("CSV: {s}")).map_err(|e| e.to_string()));
             }
@@ -486,11 +491,7 @@ impl App {
                 kv(ui, "FFT", &format!("{} pt · {:.0}/s · {:.0} Hz", cfg.fft_size, st.ffts_per_sec, rate / cfg.fft_size as f64));
                 kv(ui, "Look-back", &format!("{:.1} / {:.0} s", st.ring_samples as f64 / rate, cfg.ring_seconds));
                 kv(ui, "Gaps", &format!("{} ({} samples)", st.gaps, st.lost_samples));
-                kv(
-                    ui,
-                    "Classifier",
-                    &format!("{:.1}/s · {:.0} ms · {:.0}%", load.jobs_per_sec, load.avg_job_ms, load.busy * 100.0),
-                );
+                kv(ui, "Classifier", &format!("{:.1}/s · {:.0} ms · {:.0}%", load.jobs_per_sec, load.avg_job_ms, load.busy * 100.0));
                 if let Some(e) = gain_ui(ui, p) {
                     err = Some(e);
                 }
@@ -546,7 +547,9 @@ impl App {
             (true, false) => (Some(area), None),
             (false, true) => (None, Some(area)),
             (false, false) => {
-                ui.centered_and_justified(|ui| ui.label(egui::RichText::new("No sources open. Pick a device on the left.").color(theme::MUTED)));
+                ui.centered_and_justified(|ui| {
+                    ui.label(egui::RichText::new("No sources open. Pick a device on the left.").color(theme::MUTED))
+                });
                 return;
             }
         };
@@ -587,12 +590,7 @@ impl App {
         }
         if let (Some(r), Some(p)) = (focus_rect, self.pane_mut(Role::Focus)) {
             let snap = p.source.snapshot();
-            let title = format!(
-                "FOCUS A · {} · {:.3} MHz · {:.1} MS/s",
-                snap.info.label,
-                snap.center_hz / 1e6,
-                snap.sample_rate / 1e6
-            );
+            let title = format!("FOCUS A · {} · {:.3} MHz · {:.1} MS/s", snap.info.label, snap.center_hz / 1e6, snap.sample_rate / 1e6);
             let records = pane_records(p);
             let res = p.view.show(ui, r, &title, None, &records, selected, sel_focus);
             // Focus click: select a record if one was hit, otherwise recentre.
@@ -629,9 +627,9 @@ impl App {
         }
         let Some(focus) = self.panes.iter().find(|p| p.role == Role::Focus) else { return };
         let records: Vec<engine::SignalRecord> = focus.records.2.iter().cloned().collect();
-        let record = self.selected.and_then(|id| records.iter().find(|r| r.id == id).cloned().or_else(|| {
-            focus.source.recent_records(3000).into_iter().find(|r| r.id == id)
-        }));
+        let record = self.selected.and_then(|id| {
+            records.iter().find(|r| r.id == id).cloned().or_else(|| focus.source.recent_records(3000).into_iter().find(|r| r.id == id))
+        });
         let emitter = self
             .selected_emitter
             .filter(|(role, _)| *role == Role::Focus)
@@ -662,72 +660,118 @@ impl App {
                 let label = r.display_class().map(|c| c.label.clone()).unwrap_or_else(|| "unclassified".into());
                 ui.label(egui::RichText::new(format!("Record #{} · {}", r.id, label)).strong());
                 ui.label(
-                    egui::RichText::new(format!("{:.4} MHz · {:.1} kHz · {:.2} s", r.center_hz() / 1e6, r.bandwidth_hz() / 1e3, r.duration_s()))
-                        .monospace()
-                        .color(theme::TEXT2),
+                    egui::RichText::new(format!(
+                        "{:.4} MHz · {:.1} kHz · {:.2} s",
+                        r.center_hz() / 1e6,
+                        r.bandwidth_hz() / 1e3,
+                        r.duration_s()
+                    ))
+                    .monospace()
+                    .color(theme::TEXT2),
                 );
                 let stem = |kind: &str| {
                     engine::sigmf::sanitize(&format!("{}_{:.4}MHz_{}_{kind}", engine::sigmf::stamp(r.t_start), r.center_hz() / 1e6, label))
                 };
                 let (s, e) = focus.source.record_sample_range(r);
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(!busy, egui::Button::new("Export channel")).on_hover_text("Down-converted to this signal only (cf32, ~50 kS/s)").clicked() {
-                        req = Some((format!("record #{} channel", r.id), engine::sigmf::ExportRequest {
-                            start_sample: s,
-                            end_sample: e,
-                            kind: engine::sigmf::ExportKind::Channel { center_hz: r.center_hz(), bandwidth_hz: r.bandwidth_hz() },
-                            dir: dir.clone(),
-                            stem: stem("ch"),
-                            description: format!("SpecTrawl record #{} ({label}), channel", r.id),
-                            annotations: annotate(std::slice::from_ref(r)),
-                        }));
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("Export channel"))
+                        .on_hover_text("Down-converted to this signal only (cf32, ~50 kS/s)")
+                        .clicked()
+                    {
+                        req = Some((
+                            format!("record #{} channel", r.id),
+                            engine::sigmf::ExportRequest {
+                                start_sample: s,
+                                end_sample: e,
+                                kind: engine::sigmf::ExportKind::Channel { center_hz: r.center_hz(), bandwidth_hz: r.bandwidth_hz() },
+                                dir: dir.clone(),
+                                stem: stem("ch"),
+                                description: format!("SpecTrawl record #{} ({label}), channel", r.id),
+                                annotations: annotate(std::slice::from_ref(r)),
+                            },
+                        ));
                     }
-                    if ui.add_enabled(!busy, egui::Button::new("Full band")).on_hover_text("Raw 10 MHz capture for the record's time span (ci16)").clicked() {
-                        let overlapping: Vec<engine::SignalRecord> = records.iter().filter(|o| o.last_row_end_sample >= s && o.first_row_end_sample <= e).cloned().collect();
-                        req = Some((format!("record #{} full band", r.id), engine::sigmf::ExportRequest {
-                            start_sample: s,
-                            end_sample: e,
-                            kind: engine::sigmf::ExportKind::Wideband,
-                            dir: dir.clone(),
-                            stem: stem("wide"),
-                            description: format!("SpecTrawl record #{} ({label}), full band", r.id),
-                            annotations: annotate(&overlapping),
-                        }));
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("Full band"))
+                        .on_hover_text("Raw 10 MHz capture for the record's time span (ci16)")
+                        .clicked()
+                    {
+                        let overlapping: Vec<engine::SignalRecord> =
+                            records.iter().filter(|o| o.last_row_end_sample >= s && o.first_row_end_sample <= e).cloned().collect();
+                        req = Some((
+                            format!("record #{} full band", r.id),
+                            engine::sigmf::ExportRequest {
+                                start_sample: s,
+                                end_sample: e,
+                                kind: engine::sigmf::ExportKind::Wideband,
+                                dir: dir.clone(),
+                                stem: stem("wide"),
+                                description: format!("SpecTrawl record #{} ({label}), full band", r.id),
+                                annotations: annotate(&overlapping),
+                            },
+                        ));
                     }
                 });
             } else if let Some(em) = &emitter {
                 let label = em.label().unwrap_or_else(|| "unclassified".into());
                 ui.label(egui::RichText::new(format!("Emitter E{} · {}", em.id, label)).strong());
-                ui.label(egui::RichText::new(format!("{:.4} MHz · {} bursts", em.center_hz / 1e6, em.records)).monospace().color(theme::TEXT2));
-                if ui.add_enabled(!busy, egui::Button::new("Export channel (look-back)")).on_hover_text("This emitter's channel over the whole look-back buffer").clicked() {
+                ui.label(
+                    egui::RichText::new(format!("{:.4} MHz · {} bursts", em.center_hz / 1e6, em.records)).monospace().color(theme::TEXT2),
+                );
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Export channel (look-back)"))
+                    .on_hover_text("This emitter's channel over the whole look-back buffer")
+                    .clicked()
+                {
                     let (s, e) = focus.source.ring_range();
                     let mine: Vec<engine::SignalRecord> = records.iter().filter(|r| r.emitter == Some(em.id)).cloned().collect();
-                    req = Some((format!("emitter E{} channel", em.id), engine::sigmf::ExportRequest {
-                        start_sample: s,
-                        end_sample: e,
-                        kind: engine::sigmf::ExportKind::Channel { center_hz: em.center_hz, bandwidth_hz: em.bandwidth_hz },
-                        dir: dir.clone(),
-                        stem: engine::sigmf::sanitize(&format!("{}_{:.4}MHz_{}_E{}_ch", engine::sigmf::stamp(std::time::SystemTime::now()), em.center_hz / 1e6, label, em.id)),
-                        description: format!("SpecTrawl emitter E{} ({label}), channel", em.id),
-                        annotations: annotate(&mine),
-                    }));
+                    req = Some((
+                        format!("emitter E{} channel", em.id),
+                        engine::sigmf::ExportRequest {
+                            start_sample: s,
+                            end_sample: e,
+                            kind: engine::sigmf::ExportKind::Channel { center_hz: em.center_hz, bandwidth_hz: em.bandwidth_hz },
+                            dir: dir.clone(),
+                            stem: engine::sigmf::sanitize(&format!(
+                                "{}_{:.4}MHz_{}_E{}_ch",
+                                engine::sigmf::stamp(std::time::SystemTime::now()),
+                                em.center_hz / 1e6,
+                                label,
+                                em.id
+                            )),
+                            description: format!("SpecTrawl emitter E{} ({label}), channel", em.id),
+                            annotations: annotate(&mine),
+                        },
+                    ));
                 }
             } else {
                 ui.label(egui::RichText::new("Click a box or a list row (Focus A) to select it.").small().color(theme::MUTED));
             }
             ui.separator();
-            if ui.add_enabled(!busy, egui::Button::new("Export look-back (full band)")).on_hover_text("Everything in the Focus A look-back buffer (~10 s, ~400 MB)").clicked() {
+            if ui
+                .add_enabled(!busy, egui::Button::new("Export look-back (full band)"))
+                .on_hover_text("Everything in the Focus A look-back buffer (~10 s, ~400 MB)")
+                .clicked()
+            {
                 let (s, e) = focus.source.ring_range();
                 let snap = focus.source.snapshot();
-                req = Some(("look-back".into(), engine::sigmf::ExportRequest {
-                    start_sample: s,
-                    end_sample: e,
-                    kind: engine::sigmf::ExportKind::Wideband,
-                    dir: dir.clone(),
-                    stem: engine::sigmf::sanitize(&format!("{}_{:.3}MHz_lookback_wide", engine::sigmf::stamp(std::time::SystemTime::now()), snap.center_hz / 1e6)),
-                    description: "SpecTrawl look-back buffer, full band".into(),
-                    annotations: annotate(&records),
-                }));
+                req = Some((
+                    "look-back".into(),
+                    engine::sigmf::ExportRequest {
+                        start_sample: s,
+                        end_sample: e,
+                        kind: engine::sigmf::ExportKind::Wideband,
+                        dir: dir.clone(),
+                        stem: engine::sigmf::sanitize(&format!(
+                            "{}_{:.3}MHz_lookback_wide",
+                            engine::sigmf::stamp(std::time::SystemTime::now()),
+                            snap.center_hz / 1e6
+                        )),
+                        description: "SpecTrawl look-back buffer, full band".into(),
+                        annotations: annotate(&records),
+                    },
+                ));
             }
             if busy {
                 ui.horizontal(|ui| {
@@ -896,7 +940,11 @@ impl App {
                     format!("NAC 0x{nac:03X}"),
                     format!("WACN {}", hex(s.wacn, 5)),
                     format!("SYS {}", hex(s.system.map(u32::from), 3)),
-                    format!("RFSS {} · SITE {}", s.rfss.map(|v| v.to_string()).unwrap_or("?".into()), s.site.map(|v| v.to_string()).unwrap_or("?".into())),
+                    format!(
+                        "RFSS {} · SITE {}",
+                        s.rfss.map(|v| v.to_string()).unwrap_or("?".into()),
+                        s.site.map(|v| v.to_string()).unwrap_or("?".into())
+                    ),
                 ];
                 if let Some(cc) = s.control_hz {
                     parts.push(format!("CC {:.5} MHz", cc / 1e6));
@@ -943,7 +991,9 @@ impl App {
             .column(egui_extras::Column::exact(44.0))
             .column(egui_extras::Column::remainder())
             .header(row_h, |mut h| {
-                for t in ["Last", "First", "Talkgroup", "Name (imported)", "Voice MHz", "Slot", "Radio ID", "Radio (imported)", "×", "System"] {
+                for t in
+                    ["Last", "First", "Talkgroup", "Name (imported)", "Voice MHz", "Slot", "Radio ID", "Radio (imported)", "×", "System"]
+                {
                     h.col(|ui| {
                         ui.label(egui::RichText::new(t).small().color(theme::MUTED));
                     });
@@ -1085,11 +1135,7 @@ impl eframe::App for App {
                 });
             });
         });
-        egui::Panel::bottom("signals")
-            .resizable(true)
-            .default_size(210.0)
-            .frame(theme::side_frame())
-            .show(ui, |ui| self.bottom_panel(ui));
+        egui::Panel::bottom("signals").resizable(true).default_size(210.0).frame(theme::side_frame()).show(ui, |ui| self.bottom_panel(ui));
         egui::Panel::left("side").exact_size(270.0).frame(theme::side_frame()).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| self.side_panel(ui));
         });
@@ -1140,21 +1186,23 @@ fn kv(ui: &mut egui::Ui, k: &str, v: &str) {
 fn spawn_deadlock_watchdog() {
     std::thread::Builder::new()
         .name("deadlock-watchdog".into())
-        .spawn(|| loop {
-            std::thread::sleep(std::time::Duration::from_secs(5));
-            let deadlocks = parking_lot::deadlock::check_deadlock();
-            if deadlocks.is_empty() {
-                continue;
-            }
-            let mut report = format!("{} deadlock(s) detected\n", deadlocks.len());
-            for (i, threads) in deadlocks.iter().enumerate() {
-                for t in threads {
-                    report += &format!("--- deadlock {i}, thread {:?}\n{:?}\n", t.thread_id(), t.backtrace());
+        .spawn(|| {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let deadlocks = parking_lot::deadlock::check_deadlock();
+                if deadlocks.is_empty() {
+                    continue;
                 }
-            }
-            log::error!("{report}");
-            if let Ok(exe) = std::env::current_exe() {
-                let _ = std::fs::write(exe.with_file_name("spectrawl-deadlock.txt"), &report);
+                let mut report = format!("{} deadlock(s) detected\n", deadlocks.len());
+                for (i, threads) in deadlocks.iter().enumerate() {
+                    for t in threads {
+                        report += &format!("--- deadlock {i}, thread {:?}\n{:?}\n", t.thread_id(), t.backtrace());
+                    }
+                }
+                log::error!("{report}");
+                if let Ok(exe) = std::env::current_exe() {
+                    let _ = std::fs::write(exe.with_file_name("spectrawl-deadlock.txt"), &report);
+                }
             }
         })
         .expect("spawn watchdog");
@@ -1171,7 +1219,10 @@ fn in_focus_zone(f: f64, focus_span: Option<(f64, f64)>) -> bool {
     focus_span.is_some_and(|(lo, hi)| f > lo - FOCUS_ZONE_MARGIN_HZ && f < hi + FOCUS_ZONE_MARGIN_HZ)
 }
 
-fn survey_outside_focus(records: std::sync::Arc<[engine::SignalRecord]>, focus_span: Option<(f64, f64)>) -> std::sync::Arc<[engine::SignalRecord]> {
+fn survey_outside_focus(
+    records: std::sync::Arc<[engine::SignalRecord]>,
+    focus_span: Option<(f64, f64)>,
+) -> std::sync::Arc<[engine::SignalRecord]> {
     if focus_span.is_none() {
         return records;
     }

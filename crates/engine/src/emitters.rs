@@ -69,11 +69,7 @@ impl Emitter {
     }
 
     fn majority_feature_label(&self) -> Option<String> {
-        self.tally
-            .iter()
-            .filter(|(l, _)| !self.protocols.contains_key(*l))
-            .max_by_key(|(_, n)| **n)
-            .map(|(l, _)| l.clone())
+        self.tally.iter().filter(|(l, _)| !self.protocols.contains_key(*l)).max_by_key(|(_, n)| **n).map(|(l, _)| l.clone())
     }
 
     /// The protocol label seen most, if it was seen at least
@@ -136,27 +132,30 @@ impl EmitterBook {
                     .map(|e| e.id);
                 let id = found.unwrap_or_else(|| {
                     self.next_id += 1;
-                    self.map.insert(self.next_id, Emitter {
-                        id: self.next_id,
-                        center_hz: c,
-                        bandwidth_hz: bw,
-                        first_seen: r.t_start,
-                        last_seen: r.t_end,
-                        records: 0,
-                        on_time_s: 0.0,
-                        active: false,
-                        peak_snr_db: r.max_snr_db,
-                        tally: BTreeMap::new(),
-                        protocols: BTreeMap::new(),
-                        ids: BTreeMap::new(),
-                        strong: Default::default(),
-                        class: None,
-                        best: None,
-                        class_at: None,
-                        group_misses: 0,
-                        last_end_sample: r.last_row_end_sample,
-                        tuner_center_hz: r.tuner_center_hz,
-                    });
+                    self.map.insert(
+                        self.next_id,
+                        Emitter {
+                            id: self.next_id,
+                            center_hz: c,
+                            bandwidth_hz: bw,
+                            first_seen: r.t_start,
+                            last_seen: r.t_end,
+                            records: 0,
+                            on_time_s: 0.0,
+                            active: false,
+                            peak_snr_db: r.max_snr_db,
+                            tally: BTreeMap::new(),
+                            protocols: BTreeMap::new(),
+                            ids: BTreeMap::new(),
+                            strong: Default::default(),
+                            class: None,
+                            best: None,
+                            class_at: None,
+                            group_misses: 0,
+                            last_end_sample: r.last_row_end_sample,
+                            tuner_center_hz: r.tuner_center_hz,
+                        },
+                    );
                     self.next_id
                 });
                 if let Some(e) = self.map.get_mut(&id) {

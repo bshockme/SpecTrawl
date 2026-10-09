@@ -228,7 +228,11 @@ impl SpectrumView {
                 let a = if h == s.current_hop { 255 } else { (200.0 * (1.0 - age.min(1.0) * 0.8)) as u8 };
                 let x0 = strip.left() + strip.width() * h as f32 / s.hops as f32;
                 let x1 = strip.left() + strip.width() * (h + 1) as f32 / s.hops as f32;
-                p.rect_filled(Rect::from_x_y_ranges(x0..=(x1 - 1.0).max(x0 + 0.5), strip.y_range()), 0.0, Color32::from_rgba_unmultiplied(0x38, 0xd3, 0xcf, a));
+                p.rect_filled(
+                    Rect::from_x_y_ranges(x0..=(x1 - 1.0).max(x0 + 0.5), strip.y_range()),
+                    0.0,
+                    Color32::from_rgba_unmultiplied(0x38, 0xd3, 0xcf, a),
+                );
             }
             full.min.y += 6.0;
         }
@@ -304,7 +308,13 @@ impl SpectrumView {
             let x = spec.left() + ((f - f0) / span) as f32 * spec.width();
             painter.vline(x, plot.y_range(), Stroke::new(1.0, theme::GRID));
             if x > spec.left() + 30.0 && x < spec.right() - 30.0 {
-                painter.text(pos2(x, spec.bottom() - 3.0), egui::Align2::CENTER_BOTTOM, format!("{:.*}", dec, f / 1e6), mono(10.0), theme::MUTED);
+                painter.text(
+                    pos2(x, spec.bottom() - 3.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    format!("{:.*}", dec, f / 1e6),
+                    mono(10.0),
+                    theme::MUTED,
+                );
             }
             f += step;
         }
@@ -368,11 +378,15 @@ impl SpectrumView {
             boxes.push((Rect::from_min_max(pos2(x0 - 1.0, y0), pos2(x1 + 1.0, y1.max(y0 + 2.0))), r));
         }
         let hover = resp.hover_pos();
-        let hovered = hover.and_then(|p| boxes.iter().filter(|(b, _)| b.expand(2.0).contains(p)).min_by(|a, b| a.0.area().total_cmp(&b.0.area())).map(|(_, r)| r.id));
+        let hovered = hover.and_then(|p| {
+            boxes.iter().filter(|(b, _)| b.expand(2.0).contains(p)).min_by(|a, b| a.0.area().total_cmp(&b.0.area())).map(|(_, r)| r.id)
+        });
         // Detections are soft tints over the signal rather than outlines: the
         // waterfall stays readable and the protocol colour still reads. Only
         // the hovered/selected ones get an outline.
-        let focused = |r: &SignalRecord| selected == Some(r.id) || hovered == Some(r.id) || (selected_emitter.is_some() && r.emitter == selected_emitter);
+        let focused = |r: &SignalRecord| {
+            selected == Some(r.id) || hovered == Some(r.id) || (selected_emitter.is_some() && r.emitter == selected_emitter)
+        };
         for (b, r) in &boxes {
             let class = r.display_class();
             let identified = class.is_some_and(|c| c.protocol.is_some());
@@ -503,7 +517,13 @@ impl SpectrumView {
             }
             let g = painter.layout_no_wrap(text, mono(11.0), theme::TEXT);
             let at = pos2((p.x + 14.0).min(full.right() - g.size().x - 10.0), (p.y + 14.0).min(full.bottom() - g.size().y - 8.0));
-            painter.rect(Rect::from_min_size(at - vec2(6.0, 4.0), g.size() + vec2(12.0, 8.0)), 4.0, theme::BG, Stroke::new(1.0, theme::BORDER2), egui::StrokeKind::Inside);
+            painter.rect(
+                Rect::from_min_size(at - vec2(6.0, 4.0), g.size() + vec2(12.0, 8.0)),
+                4.0,
+                theme::BG,
+                Stroke::new(1.0, theme::BORDER2),
+                egui::StrokeKind::Inside,
+            );
             painter.galley(at, g, theme::TEXT);
         } else if let Some(p) = resp.hover_pos() {
             let fx = f0 + ((p.x - full.left()) / full.width()) as f64 * span;

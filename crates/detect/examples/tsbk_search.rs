@@ -62,9 +62,24 @@ fn main() {
     }
     println!("band plans:");
     for bp in plans.values() {
-        println!("  iden {:>2}: base {:.5} MHz, spacing {:.2} kHz, {} slot(s), bw {:.2} kHz, tx offset {:+.3} MHz", bp.iden, bp.base_hz / 1e6, bp.spacing_hz / 1e3, bp.slots, bp.bandwidth_hz / 1e3, bp.tx_offset_hz / 1e6);
+        println!(
+            "  iden {:>2}: base {:.5} MHz, spacing {:.2} kHz, {} slot(s), bw {:.2} kHz, tx offset {:+.3} MHz",
+            bp.iden,
+            bp.base_hz / 1e6,
+            bp.spacing_hz / 1e3,
+            bp.slots,
+            bp.bandwidth_hz / 1e3,
+            bp.tx_offset_hz / 1e6
+        );
     }
-    let f = |ch: p25::Channel| plans.get(&ch.iden).map(|bp| format!("{:.5} MHz{}", bp.freq(ch) / 1e6, if bp.slots > 1 { format!(" slot {}", bp.slot(ch)) } else { String::new() })).unwrap_or(format!("ch {ch}"));
+    let f = |ch: p25::Channel| {
+        plans
+            .get(&ch.iden)
+            .map(|bp| {
+                format!("{:.5} MHz{}", bp.freq(ch) / 1e6, if bp.slots > 1 { format!(" slot {}", bp.slot(ch)) } else { String::new() })
+            })
+            .unwrap_or(format!("ch {ch}"))
+    };
     let mut seen = std::collections::BTreeSet::new();
     for m in &msgs {
         let line = match m {
@@ -76,9 +91,15 @@ fn main() {
                 }
                 s
             }
-            p25::Message::RfssStatus { system, rfss, site, channel } => format!("THIS SITE   sys {system:#05x} rfss {rfss} site {site} control {}", f(*channel)),
-            p25::Message::NetworkStatus { wacn, system, channel } => format!("NETWORK     WACN {wacn:#07x} sys {system:#05x} control {}", f(*channel)),
-            p25::Message::AdjacentSite { system, rfss, site, channel } => format!("ADJACENT    sys {system:#05x} rfss {rfss} site {site} control {}", f(*channel)),
+            p25::Message::RfssStatus { system, rfss, site, channel } => {
+                format!("THIS SITE   sys {system:#05x} rfss {rfss} site {site} control {}", f(*channel))
+            }
+            p25::Message::NetworkStatus { wacn, system, channel } => {
+                format!("NETWORK     WACN {wacn:#07x} sys {system:#05x} control {}", f(*channel))
+            }
+            p25::Message::AdjacentSite { system, rfss, site, channel } => {
+                format!("ADJACENT    sys {system:#05x} rfss {rfss} site {site} control {}", f(*channel))
+            }
             _ => continue,
         };
         if seen.insert(line.clone()) {

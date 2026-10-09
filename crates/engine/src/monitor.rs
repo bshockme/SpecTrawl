@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use detect::p25::{self, SystemInfo};
-use detect::{decode, Ddc};
+use detect::{Ddc, decode};
 use sdr_core::Complex32;
 
 use crate::Shared;

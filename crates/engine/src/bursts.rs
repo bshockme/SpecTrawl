@@ -179,7 +179,16 @@ struct Segment {
 
 impl BurstDetector {
     pub fn new(cfg: DetectorConfig, serial: String) -> Self {
-        Self { cfg, serial: serial.into(), tuning: None, bins: 0, block_floor: Vec::new(), floor: Vec::new(), tracks: Vec::new(), scratch: Vec::new() }
+        Self {
+            cfg,
+            serial: serial.into(),
+            tuning: None,
+            bins: 0,
+            block_floor: Vec::new(),
+            floor: Vec::new(),
+            tracks: Vec::new(),
+            scratch: Vec::new(),
+        }
     }
 
     /// Feeds one row. Returns records that closed on this row.
@@ -341,8 +350,7 @@ impl BurstDetector {
         for s in segs {
             let lo = s.lo.saturating_sub(slack);
             let hi = s.hi + slack;
-            let hits: Vec<usize> =
-                self.tracks.iter().enumerate().filter(|(_, t)| t.lo <= hi && t.hi >= lo).map(|(i, _)| i).collect();
+            let hits: Vec<usize> = self.tracks.iter().enumerate().filter(|(_, t)| t.lo <= hi && t.hi >= lo).map(|(i, _)| i).collect();
             match hits.first() {
                 None => self.tracks.push(Track {
                     id: NEXT_ID.fetch_add(1, Ordering::Relaxed),

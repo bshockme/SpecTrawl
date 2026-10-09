@@ -162,9 +162,7 @@ pub(crate) fn run(
             let short = if jump > 3.0 * hop_hz { guard * 3 } else { guard };
             // First pass checks every hop; after that, one hop at a time in turn,
             // rate-limited so short sweeps don't spend their time waiting.
-            let probe = hops > 1
-                && short < long_guard
-                && (pass_no == 0 || (h == probe_hop && last_probe.elapsed() >= PROBE_INTERVAL));
+            let probe = hops > 1 && short < long_guard && (pass_no == 0 || (h == probe_hop && last_probe.elapsed() >= PROBE_INTERVAL));
             if pass_no > 0 && h == probe_hop && (probe || short >= long_guard) {
                 probe_hop = (probe_hop + 1) % hops;
             }

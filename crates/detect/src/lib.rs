@@ -75,7 +75,15 @@ pub fn frames(x: &[Complex32], fs: f64, bandwidth_hz: f64, before: usize, after:
 /// sampled at `fs`; `bandwidth_hz` is the detector's occupied bandwidth.
 pub fn classify(x: &[Complex32], fs: f64, bandwidth_hz: f64) -> Classification {
     let analysed_s = x.len() as f64 / fs;
-    let mut c = Classification { label: String::new(), protocol: None, confidence: 0.0, features: Features::default(), sync: None, fields: None, analysed_s };
+    let mut c = Classification {
+        label: String::new(),
+        protocol: None,
+        confidence: 0.0,
+        features: Features::default(),
+        sync: None,
+        fields: None,
+        analysed_s,
+    };
     if analysed_s < 0.02 {
         c.label = "too short".into();
         return c;
@@ -101,7 +109,8 @@ pub fn classify(x: &[Complex32], fs: f64, bandwidth_hz: f64) -> Classification {
         c.sync = sync::best(&hits);
         if let Some(best) = &c.sync {
             // Slice and decode the frames of the identified protocol.
-            let mine: Vec<sync::SyncHit> = hits.into_iter().filter(|h| h.entry.protocol == best.protocol && h.entry.baud == best.baud).collect();
+            let mine: Vec<sync::SyncHit> =
+                hits.into_iter().filter(|h| h.entry.protocol == best.protocol && h.entry.baud == best.baud).collect();
             let fr = frames::slice(&disc, fs, &mine, 8, 64);
             let fields = decode::summarise(&fr);
             if fields.tried > 0 {

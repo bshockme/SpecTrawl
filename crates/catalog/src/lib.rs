@@ -73,7 +73,13 @@ pub struct ImportSummary {
 impl std::fmt::Display for ImportSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut parts = Vec::new();
-        for (n, what) in [(self.groups, "talkgroups"), (self.radios, "radios"), (self.sites, "sites"), (self.networks, "networks"), (self.systems, "systems")] {
+        for (n, what) in [
+            (self.groups, "talkgroups"),
+            (self.radios, "radios"),
+            (self.sites, "sites"),
+            (self.networks, "networks"),
+            (self.systems, "systems"),
+        ] {
             if n > 0 {
                 parts.push(format!("{n} {what}"));
             }
@@ -228,14 +234,22 @@ impl Catalog {
             }
             first_f.iter().position(|h| names.iter().any(|n| h.eq_ignore_ascii_case(n))).unwrap_or(usize::MAX)
         };
-        let (c_id, c_alpha, c_desc, c_tag, c_cat) =
-            (col(&["decimal", "dec", "tgid", "talkgroup"], 0), col(&["alpha tag", "alpha", "alphatag"], 2), col(&["description"], 4), col(&["tag"], 5), col(&["category", "group"], 6));
+        let (c_id, c_alpha, c_desc, c_tag, c_cat) = (
+            col(&["decimal", "dec", "tgid", "talkgroup"], 0),
+            col(&["alpha tag", "alpha", "alphatag"], 2),
+            col(&["description"], 4),
+            col(&["tag"], 5),
+            col(&["category", "group"], 6),
+        );
         let get = |f: &[String], i: usize| f.get(i).cloned().unwrap_or_default();
         let rows = if header { None } else { Some(first) }.into_iter().chain(lines);
         for l in rows {
             let f = split_fields(l);
             let Ok(id) = get(&f, c_id).parse::<u32>() else { continue };
-            out.insert(id, GroupInfo { alias: get(&f, c_alpha), description: get(&f, c_desc), tag: get(&f, c_tag), category: get(&f, c_cat) });
+            out.insert(
+                id,
+                GroupInfo { alias: get(&f, c_alpha), description: get(&f, c_desc), tag: get(&f, c_tag), category: get(&f, c_cat) },
+            );
         }
         out
     }
@@ -344,7 +358,12 @@ impl Catalog {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.groups.is_empty() && self.radios.is_empty() && self.sites.is_empty() && self.tr_systems.is_empty() && self.loose_groups.is_empty() && self.loose_units.is_empty()
+        self.groups.is_empty()
+            && self.radios.is_empty()
+            && self.sites.is_empty()
+            && self.tr_systems.is_empty()
+            && self.loose_groups.is_empty()
+            && self.loose_units.is_empty()
     }
 
     // --------------------------------------------------------- persistence ----
@@ -412,7 +431,11 @@ P25,BEE00.2A5,2.021,"Greentop Mountain"
         let dir = std::env::temp_dir().join(format!("catalog-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("tg.csv"), "48001,bb81,PFPD DISP,D,Pigeon Forge Police Dispatch,Law Dispatch,Sevier\n").unwrap();
-        std::fs::write(dir.join("config.json"), r#"{"systems":[{"shortName":"tacn","type":"p25","control_channels":[769581250],"talkgroupsFile":"tg.csv"}]}"#).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"systems":[{"shortName":"tacn","type":"p25","control_channels":[769581250],"talkgroupsFile":"tg.csv"}]}"#,
+        )
+        .unwrap();
         let mut c = Catalog::default();
         let s = c.import_tr_config(&dir.join("config.json")).unwrap();
         assert_eq!((s.systems, s.groups), (1, 1));

@@ -11,12 +11,7 @@ use sdr_core::Backend;
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let (serial, lo, hi, secs) = (
-        &a[1],
-        a[2].parse::<f64>().unwrap(),
-        a[3].parse::<f64>().unwrap(),
-        a[4].parse::<u64>().unwrap(),
-    );
+    let (serial, lo, hi, secs) = (&a[1], a[2].parse::<f64>().unwrap(), a[3].parse::<f64>().unwrap(), a[4].parse::<u64>().unwrap());
     let b = backend_airspy::AirspyBackend::new();
     let _ = b.enumerate();
     let d = b.open(serial).expect("open");
@@ -50,9 +45,7 @@ fn main() {
         if i - w < 0 || i + w >= n as isize {
             return None;
         }
-        let pk = (i - 1..=i + 1)
-            .map(|j| db[j as usize])
-            .fold(f64::MIN, f64::max);
+        let pk = (i - 1..=i + 1).map(|j| db[j as usize]).fold(f64::MIN, f64::max);
         let mut around: Vec<f64> = (i - w..=i + w).map(|j| db[j as usize]).collect();
         around.sort_by(f64::total_cmp);
         Some(pk - around[around.len() / 2])
@@ -85,11 +78,7 @@ fn main() {
             100.0 * above as f64 / s.len() as f64
         );
         if !name.starts_with("control") {
-            let list: Vec<String> = v
-                .iter()
-                .filter(|x| x.1 > 3.0)
-                .map(|x| format!("{:.0}:{:.0}", x.0 / 1e6, x.1))
-                .collect();
+            let list: Vec<String> = v.iter().filter(|x| x.1 > 3.0).map(|x| format!("{:.0}:{:.0}", x.0 / 1e6, x.1)).collect();
             println!("    {}", list.join(" "));
         }
     }

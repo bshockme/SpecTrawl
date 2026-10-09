@@ -81,10 +81,7 @@ pub fn p25_nid(f: &Frame) -> Option<P25Nid> {
     let (info, errors) = if e0 == 0 {
         (info0, 0)
     } else {
-        (0u64..1 << 16)
-            .map(|i| (i, (rx ^ (i << 47 | parity(i, P25_BCH_GEN, 47, 16))).count_ones()))
-            .min_by_key(|&(_, e)| e)
-            .unwrap()
+        (0u64..1 << 16).map(|i| (i, (rx ^ (i << 47 | parity(i, P25_BCH_GEN, 47, 16))).count_ones())).min_by_key(|&(_, e)| e).unwrap()
     };
     (errors <= P25_MAX_ERRORS).then_some(P25Nid { nac: (info >> 4) as u16, duid: (info & 0xF) as u8, errors })
 }
@@ -132,10 +129,8 @@ pub fn dmr_slot_type(f: &Frame) -> Option<DmrSlotType> {
     let before = f.dibits.get(s.checked_sub(5)?..s)?;
     let after = f.dibits.get(s + 24..s + 29)?;
     let rx = to_u64(&bits_from_dibits(&[before, after].concat()));
-    let (info, errors) = (0u64..256)
-        .map(|i| (i, (rx ^ (i << 12 | parity(i, DMR_GOLAY_GEN, 12, 8))).count_ones()))
-        .min_by_key(|&(_, e)| e)
-        .unwrap();
+    let (info, errors) =
+        (0u64..256).map(|i| (i, (rx ^ (i << 12 | parity(i, DMR_GOLAY_GEN, 12, 8))).count_ones())).min_by_key(|&(_, e)| e).unwrap();
     (errors <= DMR_MAX_ERRORS).then_some(DmrSlotType { colour_code: (info >> 4) as u8, data_type: (info & 0xF) as u8, errors })
 }
 

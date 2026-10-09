@@ -37,7 +37,14 @@ fn main() {
     }
     let all = decode::summarise(&frames);
     let kinds: Vec<String> = all.kinds.iter().map(|(k, n)| format!("{k}×{n}")).collect();
-    println!("  whole capture: {} frames · {} · {} · decoded {}/{}", frames.len(), all.id.as_deref().unwrap_or("-"), kinds.join(", "), all.decoded, all.tried);
+    println!(
+        "  whole capture: {} frames · {} · {} · decoded {}/{}",
+        frames.len(),
+        all.id.as_deref().unwrap_or("-"),
+        kinds.join(", "),
+        all.decoded,
+        all.tried
+    );
     for (k, h) in e {
         println!("    {k} corrected-bit histogram: {h:?}");
     }

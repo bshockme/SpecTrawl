@@ -93,9 +93,8 @@ fn main() {
         let first_cross = (c0..end).find(|&c| p[c].is_finite() && crossed(p[c]));
         // Settled = start of a 10 ms run where every chunk is within 1.5 dB of the final level.
         let win = ms_to_chunks(10.0, rate);
-        let settled = first_cross.and_then(|c1| {
-            (c1..end.saturating_sub(win)).find(|&c| (c..c + win).all(|j| !p[j].is_finite() || (p[j] - after).abs() < 1.5))
-        });
+        let settled = first_cross
+            .and_then(|c1| (c1..end.saturating_sub(win)).find(|&c| (c..c + win).all(|j| !p[j].is_finite() || (p[j] - after).abs() < 1.5)));
         let f = |o: Option<usize>| o.map(|c| format!("{:.2}", ms((c - c0) as f64))).unwrap_or("-".into());
         if let Some(c) = first_cross {
             sw.push(ms((c - c0) as f64));

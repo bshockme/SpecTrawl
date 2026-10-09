@@ -8,8 +8,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
 use sdr_core::{
-    Backend, Capabilities, Complex32, Device, DeviceInfo, Error, GainSetting, IfArchitecture, Result, SampleFormat,
-    Samples, StreamEvent, StreamSink,
+    Backend, Capabilities, Complex32, Device, DeviceInfo, Error, GainSetting, IfArchitecture, Result, SampleFormat, Samples, StreamEvent,
+    StreamSink,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -84,9 +84,18 @@ pub fn nxdn_sync() -> SyncInsert {
 pub enum Keying {
     Continuous,
     /// On for `duty × period`, starting at `phase × period`.
-    Bursts { period_s: f64, duty: f64, phase: f64 },
+    Bursts {
+        period_s: f64,
+        duty: f64,
+        phase: f64,
+    },
     /// TDMA-style: bursts gated further by slots of `slot_s` on/off.
-    Slotted { period_s: f64, duty: f64, phase: f64, slot_s: f64 },
+    Slotted {
+        period_s: f64,
+        duty: f64,
+        phase: f64,
+        slot_s: f64,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -108,12 +117,37 @@ pub fn default_scenario() -> Vec<Emitter> {
         Emitter { freq_hz: 851.0125e6, level_dbfs: -38.0, modulation: p25, keying: Continuous },
         Emitter { freq_hz: 851.2625e6, level_dbfs: -44.0, modulation: p25, keying: Bursts { period_s: 9.0, duty: 0.45, phase: 0.0 } },
         Emitter { freq_hz: 851.5375e6, level_dbfs: -50.0, modulation: c4fm, keying: Bursts { period_s: 13.0, duty: 0.3, phase: 0.5 } },
-        Emitter { freq_hz: 853.6500e6, level_dbfs: -46.0, modulation: Fsk { levels: 2, sym_rate: 1200.0, dev_hz: 4500.0, sync: Some(POCSAG_SYNC) }, keying: Bursts { period_s: 11.0, duty: 0.2, phase: 0.3 } },
+        Emitter {
+            freq_hz: 853.6500e6,
+            level_dbfs: -46.0,
+            modulation: Fsk { levels: 2, sym_rate: 1200.0, dev_hz: 4500.0, sync: Some(POCSAG_SYNC) },
+            keying: Bursts { period_s: 11.0, duty: 0.2, phase: 0.3 },
+        },
         Emitter { freq_hz: 855.0000e6, level_dbfs: -62.0, modulation: Cw, keying: Continuous },
-        Emitter { freq_hz: 856.2125e6, level_dbfs: -42.0, modulation: FmTone { tone_hz: 1000.0, dev_hz: 3000.0 }, keying: Bursts { period_s: 7.0, duty: 0.35, phase: 0.6 } },
-        Emitter { freq_hz: 857.2375e6, level_dbfs: -45.0, modulation: dmr, keying: Slotted { period_s: 8.0, duty: 0.55, phase: 0.1, slot_s: 0.030 } },
-        Emitter { freq_hz: 858.8125e6, level_dbfs: -48.0, modulation: Fsk { levels: 4, sym_rate: 2400.0, dev_hz: 800.0, sync: Some(nxdn_sync()) }, keying: Bursts { period_s: 6.0, duty: 0.3, phase: 0.2 } },
-        Emitter { freq_hz: 859.4625e6, level_dbfs: -47.0, modulation: Fsk { levels: 4, sym_rate: 9600.0, dev_hz: 2900.0, sync: None }, keying: Bursts { period_s: 2.0, duty: 0.1, phase: 0.0 } },
+        Emitter {
+            freq_hz: 856.2125e6,
+            level_dbfs: -42.0,
+            modulation: FmTone { tone_hz: 1000.0, dev_hz: 3000.0 },
+            keying: Bursts { period_s: 7.0, duty: 0.35, phase: 0.6 },
+        },
+        Emitter {
+            freq_hz: 857.2375e6,
+            level_dbfs: -45.0,
+            modulation: dmr,
+            keying: Slotted { period_s: 8.0, duty: 0.55, phase: 0.1, slot_s: 0.030 },
+        },
+        Emitter {
+            freq_hz: 858.8125e6,
+            level_dbfs: -48.0,
+            modulation: Fsk { levels: 4, sym_rate: 2400.0, dev_hz: 800.0, sync: Some(nxdn_sync()) },
+            keying: Bursts { period_s: 6.0, duty: 0.3, phase: 0.2 },
+        },
+        Emitter {
+            freq_hz: 859.4625e6,
+            level_dbfs: -47.0,
+            modulation: Fsk { levels: 4, sym_rate: 9600.0, dev_hz: 2900.0, sync: None },
+            keying: Bursts { period_s: 2.0, duty: 0.1, phase: 0.0 },
+        },
     ];
     // Background traffic.
     let mut rng = XorShift(0x5eed_1234_abcd_0001);

@@ -23,9 +23,9 @@ use sdr_core::{Capabilities, Complex32, Device, DeviceInfo, Samples, StreamEvent
 
 pub use bursts::{BurstDetector, DetectorConfig, SignalRecord};
 pub use classify::ClassifierLoad;
+pub use detect::p25::SystemInfo as P25System;
 pub use emitters::Emitter;
 pub use monitor::{GrantEvent, MonitorInfo};
-pub use detect::p25::SystemInfo as P25System;
 pub use ring::IqRing;
 pub use sweep::{SweepPlan, SweepStatus};
 

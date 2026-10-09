@@ -199,13 +199,18 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 /// Default folder for captures: `<Documents>/SpecTrawl/captures`.
 pub fn default_dir() -> PathBuf {
-    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let home =
+        std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     home.join("Documents").join("SpecTrawl").join("captures")
 }
 
 /// Makes a string safe for a file name.
 pub fn sanitize(s: &str) -> String {
-    s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect::<String>().trim_matches('_').to_string()
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
 }
 
 #[cfg(test)]
