@@ -3,6 +3,7 @@
 //! steady rate) or `Sweep` (retune-and-dwell across a span, one stitched row
 //! per pass). See DESIGN.md §5.
 
+mod calls;
 mod bursts;
 mod classify;
 mod emitters;
@@ -29,6 +30,7 @@ pub use detect::demod::Mode as DemodMode;
 pub use detect::p25::SystemInfo as P25System;
 pub use emitters::Emitter;
 pub use listen::{AudioQueue, ListenSpec};
+pub use calls::CallEvent;
 pub use monitor::{GrantEvent, MonitorInfo, PageEvent};
 pub use occupancy::KnownOccupant;
 pub use ring::IqRing;
@@ -137,6 +139,7 @@ struct Shared {
     classifier_load: Mutex<classify::ClassifierLoad>,
     p25: Mutex<monitor::P25Book>,
     pager: Mutex<monitor::PagerBook>,
+    calls: Mutex<calls::CallLog>,
     occupancy: Mutex<occupancy::OccupancyTracker>,
     /// The channel being listened to, if any, and its audio.
     listen: Mutex<Option<ListenSpec>>,
@@ -254,6 +257,7 @@ impl Source {
             classifier_load: Mutex::new(Default::default()),
             p25: Mutex::new(Default::default()),
             pager: Mutex::new(Default::default()),
+            calls: Mutex::new(Default::default()),
             occupancy: Mutex::new(occupancy::OccupancyTracker::new(1)),
             listen: Mutex::new(None),
             audio: Arc::new(AudioQueue::default()),
@@ -432,6 +436,12 @@ impl Source {
     /// The newest `n` talkgroup grants, newest first.
     pub fn p25_grants(&self, n: usize) -> Vec<GrantEvent> {
         self.shared.p25.lock().grants.iter().rev().take(n).cloned().collect()
+    }
+
+    /// The newest `n` calls (grants and voice-channel sightings merged),
+    /// newest first.
+    pub fn calls(&self, n: usize) -> Vec<CallEvent> {
+        self.shared.calls.lock().calls.iter().rev().take(n).cloned().collect()
     }
 
     /// The newest `n` pager messages (FLEX, POCSAG), newest first.

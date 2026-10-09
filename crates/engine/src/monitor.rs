@@ -127,7 +127,8 @@ pub(crate) struct P25Book {
 }
 
 impl P25Book {
-    fn record(&mut self, nac: u16, msgs: &[p25::Message], now: SystemTime) {
+    /// Folds messages in; returns the grants among them.
+    fn record(&mut self, nac: u16, msgs: &[p25::Message], now: SystemTime) -> Vec<GrantEvent> {
         let sys = self.systems.entry(nac).or_insert_with(|| SystemInfo { nac: Some(nac), ..Default::default() });
         let mut new = Vec::new();
         for m in msgs {
@@ -144,6 +145,7 @@ impl P25Book {
                 });
             }
         }
+        let out = new.clone();
         for g in new {
             let same = self.grants.iter_mut().rev().take(64).find(|o| {
                 o.nac == g.nac
@@ -168,6 +170,7 @@ impl P25Book {
                 }
             }
         }
+        out
     }
 }
 
@@ -277,8 +280,21 @@ pub(crate) fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>, rate: f64) {
                 let msgs = p25::messages(&frames);
                 m.messages += msgs.len() as u64;
                 if let Some((&nac, _)) = nacs.iter().max_by_key(|(_, n)| **n) {
+                    let now = SystemTime::now();
                     let mut book = shared.p25.lock();
-                    book.record(nac, &msgs, SystemTime::now());
+                    let grants = book.record(nac, &msgs, now);
+                    let mut calls = shared.calls.lock();
+                    for g in grants {
+                        let call = decode::Call {
+                            group: true,
+                            target: g.talkgroup as u32,
+                            source: g.source,
+                            encrypted: false,
+                            emergency: false,
+                        };
+                        calls.granted(g.freq_hz, &format!("P25 NAC 0x{nac:03X}"), call, now);
+                    }
+                    drop(calls);
                     // The system identity seeds Phase 2 descrambling.
                     if let Some(s) = book.systems.get(&nac) {
                         if let (Some(w), Some(y)) = (s.wacn, s.system) {

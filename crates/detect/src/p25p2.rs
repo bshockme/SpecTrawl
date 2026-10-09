@@ -21,6 +21,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Mutex, OnceLock};
 
+use crate::decode::Call;
 use crate::frames::Frame;
 use crate::p25_lc::rs_decode_erasures;
 
@@ -258,20 +259,17 @@ pub fn parse_mac(b: &[u8]) -> Mac {
 }
 
 impl Mac {
-    /// A talk string as for Phase 1 and DMR, when the PDU names a call.
-    pub fn talk(&self) -> Option<String> {
-        let src = |s: u32| if s == 0 { String::new() } else { format!(" ← {s}") };
+    /// The call, when the PDU names one.
+    pub fn call(&self) -> Option<Call> {
+        let src = |s: u32| Some(s).filter(|&s| s != 0 && s != 0xFF_FFFF);
         match *self {
-            Mac::Ptt { group, source, end: false, .. } if group != 0 => Some(format!("TG {group}{}", src(source))),
-            Mac::GroupVoice { group, source, encrypted, emergency } => Some(format!(
-                "TG {group}{}{}{}",
-                src(source),
-                if emergency { " EMERGENCY" } else { "" },
-                if encrypted { " (enc)" } else { "" }
-            )),
-            Mac::UnitVoice { target, source, encrypted } => {
-                Some(format!("{source} → {target}{}", if encrypted { " (enc)" } else { "" }))
+            Mac::Ptt { group, source, end: false, .. } if group != 0 => {
+                Some(Call { group: true, target: group as u32, source: src(source), encrypted: false, emergency: false })
             }
+            Mac::GroupVoice { group, source, encrypted, emergency } => {
+                Some(Call { group: true, target: group as u32, source: src(source), encrypted, emergency })
+            }
+            Mac::UnitVoice { target, source, encrypted } => Some(Call { group: false, target, source: src(source), encrypted, emergency: false }),
             _ => None,
         }
     }

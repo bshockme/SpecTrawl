@@ -204,8 +204,10 @@ pub struct Fields {
     /// What the channel carried most: voice wins if any real voice was seen.
     pub activity: Option<Activity>,
     /// Who was talking, from a call header: "TG 1234 ← 5678" (group) or
-    /// "5678 → 1234" (private).
+    /// "5678 → 1234" (private); `call.summary()`.
     pub talk: Option<String>,
+    /// The same call, as fields.
+    pub call: Option<Call>,
     /// Text messages decoded (pages), oldest first.
     pub messages: Vec<String>,
     /// Capacity Plus: this channel's own repeater number, from group voice
@@ -221,24 +223,48 @@ pub struct Fields {
 /// sync can be a false match on a busy data channel).
 const MIN_VOICE_FRAMES: usize = 2;
 
-/// The call heard most: talk strings grouped by their talkgroup or target
-/// (the text before " ←" or " ("), then the variant that names the
-/// source, if any, most common first.
-fn best_talk(talks: &std::collections::BTreeMap<String, usize>) -> Option<String> {
-    let key = |t: &str| t.split(" ←").next().unwrap_or(t).split(" (").next().unwrap_or(t).to_string();
-    let mut groups: std::collections::BTreeMap<String, usize> = Default::default();
-    for (t, n) in talks {
-        *groups.entry(key(t)).or_default() += n;
+/// A call: who is talking to whom, from any protocol's call signalling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Call {
+    /// Group call (to a talkgroup) or unit-to-unit.
+    pub group: bool,
+    /// Talkgroup, or the called unit.
+    pub target: u32,
+    /// The talking radio, when the signalling names it.
+    pub source: Option<u32>,
+    pub encrypted: bool,
+    pub emergency: bool,
+}
+
+impl Call {
+    /// "TG 1234 ← 5678 (enc)" or "5678 → 1234".
+    pub fn summary(&self) -> String {
+        let flags = format!("{}{}", if self.emergency { " EMERGENCY" } else { "" }, if self.encrypted { " (enc)" } else { "" });
+        let src = self.source.map(|s| s.to_string());
+        if self.group {
+            format!("TG {}{}{flags}", self.target, src.map(|s| format!(" ← {s}")).unwrap_or_default())
+        } else {
+            format!("{} → {}{flags}", src.unwrap_or_else(|| "?".into()), self.target)
+        }
+    }
+}
+
+/// The call heard most: grouped by talkgroup or target, then the variant
+/// that names the source, if any, most common first.
+fn best_call(calls: &std::collections::BTreeMap<Call, usize>) -> Option<Call> {
+    let mut groups: std::collections::BTreeMap<(bool, u32), usize> = Default::default();
+    for (c, n) in calls {
+        *groups.entry((c.group, c.target)).or_default() += n;
     }
     let best = groups.into_iter().max_by_key(|(_, n)| *n)?.0;
-    talks.iter().filter(|(t, _)| key(t) == best).max_by_key(|(t, n)| (t.contains('←') || t.contains('→'), **n)).map(|(t, _)| t.clone())
+    calls.iter().filter(|(c, _)| (c.group, c.target) == best).max_by_key(|(c, n)| (c.source.is_some(), **n)).map(|(c, _)| *c)
 }
 
 pub fn summarise(frames: &[Frame]) -> Fields {
     use std::collections::BTreeMap;
     let mut ids: BTreeMap<String, usize> = BTreeMap::new();
     let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
-    let mut talks: BTreeMap<String, usize> = BTreeMap::new();
+    let mut talks: BTreeMap<Call, usize> = BTreeMap::new();
     let mut act: BTreeMap<Activity, usize> = BTreeMap::new();
     let mut f = Fields::default();
     // Phase 2: both syncs of a fragment make frames; decode each fragment
@@ -276,8 +302,8 @@ pub fn summarise(frames: &[Frame]) -> Fields {
                     }
                 }
                 for sig in &info.signals {
-                    if let Some(t) = sig.mac.talk() {
-                        *talks.entry(t).or_default() += 1;
+                    if let Some(c) = sig.mac.call() {
+                        *talks.entry(c).or_default() += 1;
                     }
                     if let crate::p25p2::Mac::Ptt { nac, .. } = sig.mac {
                         *ids.entry(format!("NAC 0x{nac:03X}")).or_default() += 1;
@@ -300,8 +326,8 @@ pub fn summarise(frames: &[Frame]) -> Fields {
                         if let Some(lc) = lc {
                             let name = if lc.mfid > 1 { "vendor" } else { crate::p25_lc::lco_name(lc.lco) };
                             *kinds.entry(format!("LC {name}")).or_default() += 1;
-                            if let Some(t) = lc.talk() {
-                                *talks.entry(t.summary()).or_default() += 1;
+                            if let Some(c) = lc.call() {
+                                *talks.entry(c).or_default() += 1;
                             }
                         }
                     }
@@ -334,9 +360,14 @@ pub fn summarise(frames: &[Frame]) -> Fields {
                 *act.entry(a).or_default() += 1;
                 match crate::dmr::decode_burst(fr, s.data_type) {
                     Some(crate::dmr::Burst::VoiceHeader(l) | crate::dmr::Burst::Terminator(l)) => {
-                        let t =
-                            if l.group() { format!("TG {} ← {}", l.target, l.source) } else { format!("{} → {}", l.source, l.target) };
-                        *talks.entry(t).or_default() += 1;
+                        let c = Call {
+                            group: l.group(),
+                            target: l.target,
+                            source: (l.source != 0).then_some(l.source),
+                            encrypted: false,
+                            emergency: false,
+                        };
+                        *talks.entry(c).or_default() += 1;
                         // Cap+ group voice names the voice channel it's on.
                         if let (Some((rep, _)), 0) = (l.channel, l.flco) {
                             f.capplus_repeater = Some(rep);
@@ -368,7 +399,8 @@ pub fn summarise(frames: &[Frame]) -> Fields {
         }
     }
     f.id = ids.into_iter().max_by_key(|(_, n)| *n).map(|(k, _)| k);
-    f.talk = best_talk(&talks);
+    f.call = best_call(&talks);
+    f.talk = f.call.map(|c| c.summary());
     let voice = act.get(&Activity::Voice).copied().unwrap_or(0);
     f.activity = if voice >= MIN_VOICE_FRAMES || f.talk.is_some() {
         Some(Activity::Voice)

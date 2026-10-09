@@ -10,6 +10,7 @@
 
 use std::sync::OnceLock;
 
+use crate::decode::Call;
 use crate::frames::Frame;
 use crate::p25::data_dibits;
 
@@ -332,20 +333,13 @@ pub struct LinkControl {
     pub corrected: usize,
 }
 
-/// Who is talking to whom, from a standard voice link control.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Talk {
-    Group { talkgroup: u16, source: u32, emergency: bool, encrypted: bool },
-    Unit { target: u32, source: u32, encrypted: bool },
-}
-
 impl LinkControl {
     fn from_bytes(b: &[u8; 9], corrected: usize) -> Self {
         LinkControl { lco: b[0] & 0x3F, protected: b[0] & 0x80 != 0, mfid: b[1], args: b[2..9].try_into().unwrap(), corrected }
     }
 
-    /// The talk fields, for standard (MFID 0 or 1) group and unit voice.
-    pub fn talk(&self) -> Option<Talk> {
+    /// The call, for standard (MFID 0 or 1) group and unit voice.
+    pub fn call(&self) -> Option<Call> {
         if self.protected || self.mfid > 1 {
             return None;
         }
@@ -354,8 +348,14 @@ impl LinkControl {
         // Service options: bit 7 emergency, bit 6 encrypted.
         let (emergency, encrypted) = (a[0] & 0x80 != 0, a[0] & 0x40 != 0);
         match self.lco {
-            0x00 => Some(Talk::Group { talkgroup: (a[2] as u16) << 8 | a[3] as u16, source: u24(4), emergency, encrypted }),
-            0x03 => Some(Talk::Unit { target: u24(1), source: u24(4), encrypted }),
+            0x00 => Some(Call {
+                group: true,
+                target: (a[2] as u32) << 8 | a[3] as u32,
+                source: Some(u24(4)).filter(|&s| s != 0),
+                encrypted,
+                emergency,
+            }),
+            0x03 => Some(Call { group: false, target: u24(1), source: Some(u24(4)).filter(|&s| s != 0), encrypted, emergency }),
             _ => None,
         }
     }
@@ -379,21 +379,6 @@ pub fn lco_name(lco: u8) -> &'static str {
     }
 }
 
-impl Talk {
-    /// "TG 1234 ← 5678" or "5678 → 1234", as the DMR talk strings.
-    pub fn summary(&self) -> String {
-        match *self {
-            // Source 0: not given in this link control.
-            Talk::Group { talkgroup, source, emergency, encrypted } => format!(
-                "TG {talkgroup}{}{}{}",
-                if source == 0 { String::new() } else { format!(" ← {source}") },
-                if emergency { " EMERGENCY" } else { "" },
-                if encrypted { " (enc)" } else { "" }
-            ),
-            Talk::Unit { target, source, encrypted } => format!("{source} → {target}{}", if encrypted { " (enc)" } else { "" }),
-        }
-    }
-}
 
 /// 12 data hexbits → the 9 link control bytes.
 fn hexbits_to_bytes(h: &[u8]) -> [u8; 9] {
@@ -522,7 +507,8 @@ mod tests {
     fn group_voice_fields() {
         // LCO 0, MFID 0, service options 0x40 (encrypted), TG 0x1234, source 0x00ABCD.
         let lc = LinkControl::from_bytes(&[0x00, 0x00, 0x40, 0x00, 0x12, 0x34, 0x00, 0xAB, 0xCD], 0);
-        assert_eq!(lc.talk(), Some(Talk::Group { talkgroup: 0x1234, source: 0xABCD, emergency: false, encrypted: true }));
-        assert_eq!(lc.talk().unwrap().summary(), "TG 4660 ← 43981 (enc)");
+        let c = lc.call().unwrap();
+        assert_eq!(c, Call { group: true, target: 0x1234, source: Some(0xABCD), emergency: false, encrypted: true });
+        assert_eq!(c.summary(), "TG 4660 ← 43981 (enc)");
     }
 }

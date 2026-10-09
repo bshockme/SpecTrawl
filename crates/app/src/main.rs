@@ -119,6 +119,8 @@ struct App {
     listen_mhz: f64,
     /// Pages tab filter: capcode or text.
     page_filter: String,
+    /// Calls tab filter: talkgroup, radio or name.
+    call_filter: String,
     volume: f32,
     /// Known occupants from every pane, merged: (lo Hz, hi Hz, label).
     known: (std::time::Instant, Vec<(f64, f64, String)>),
@@ -183,12 +185,13 @@ enum ListTab {
     Emitters,
     Records,
     P25,
+    Calls,
     Pages,
 }
 
 /// Command line: `--sim` (simulator only), `--freq <MHz>` (focus centre),
 /// `--serial <hex>` (focus device), `--no-sweep`, `--sweep <lo> <hi>` (MHz),
-/// `--tab emitters|records|p25|pages` (bottom panel).
+/// `--tab emitters|records|p25|calls|pages` (bottom panel).
 struct Args {
     sim: bool,
     freq_mhz: Option<f64>,
@@ -212,6 +215,7 @@ fn parse_args() -> Args {
                     Some("records") => Some(ListTab::Records),
                     Some("p25") => Some(ListTab::P25),
                     Some("pages") => Some(ListTab::Pages),
+                    Some("calls") => Some(ListTab::Calls),
                     _ => Some(ListTab::Emitters),
                 }
             }
@@ -258,6 +262,7 @@ impl App {
             listen_mode: None,
             listen_mhz: 100.0,
             page_filter: String::new(),
+            call_filter: String::new(),
             volume: 0.6,
             known: (std::time::Instant::now() - std::time::Duration::from_secs(5), Vec::new()),
             last_frame: std::time::Instant::now(),
@@ -1046,6 +1051,7 @@ impl App {
             ui.selectable_value(&mut self.list_tab, ListTab::Emitters, "Emitters");
             ui.selectable_value(&mut self.list_tab, ListTab::Records, "Records");
             ui.selectable_value(&mut self.list_tab, ListTab::P25, "P25");
+            ui.selectable_value(&mut self.list_tab, ListTab::Calls, "Calls");
             ui.selectable_value(&mut self.list_tab, ListTab::Pages, "Pages");
             ui.label(egui::RichText::new("click to select · double-click to tune Focus A").small().color(theme::MUTED));
         });
@@ -1053,6 +1059,7 @@ impl App {
             ListTab::Emitters => self.emitter_list(ui),
             ListTab::Records => self.signal_list(ui),
             ListTab::P25 => self.p25_panel(ui),
+            ListTab::Calls => self.calls_panel(ui),
             ListTab::Pages => self.pages_panel(ui),
         }
     }
@@ -1394,6 +1401,121 @@ impl App {
                     row.col(|ui| text(ui, format!("NAC 0x{:03X}", g.nac), theme::MUTED));
                     if row.response().double_clicked() {
                         tune = g.freq_hz;
+                    }
+                });
+            });
+        if let Some(f) = tune {
+            self.retune_focus((f / 1e3).round() / 1e3);
+        }
+    }
+
+    /// Calls from every pane: control-channel grants and voice-channel
+    /// signalling merged per call, newest first.
+    fn calls_panel(&mut self, ui: &mut egui::Ui) {
+        let mut calls: Vec<engine::CallEvent> = self.panes.iter().flat_map(|p| p.source.calls(5000)).collect();
+        calls.sort_by(|a, b| b.last.cmp(&a.last));
+        // Names from the imported catalog, for the first P25 system known.
+        let systems: Vec<(u16, engine::P25System)> = self.panes.iter().flat_map(|p| p.source.p25_systems()).collect();
+        let sys = systems.first().map(|(_, s)| (s.wacn, s.system, s.control_hz));
+        let cat = &self.catalog;
+        let tg_name = |c: &engine::CallEvent| -> String {
+            match (c.call.group, sys) {
+                (true, Some((w, y, cc))) => cat.p25_group(w, y, cc, c.call.target as u16).map(|i| i.name().to_string()).unwrap_or_default(),
+                _ => String::new(),
+            }
+        };
+        let radio_name = |r: Option<u32>| -> String {
+            match (r, sys) {
+                (Some(r), Some((w, y, cc))) => cat.p25_radio(w, y, cc, r).unwrap_or("").to_string(),
+                _ => String::new(),
+            }
+        };
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Filter").small().color(theme::MUTED));
+            ui.add(egui::TextEdit::singleline(&mut self.call_filter).desired_width(200.0).hint_text("talkgroup, radio or name"));
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} calls · {} heard on their voice channel · times are approximate (voice channels are sampled)",
+                    calls.len(),
+                    calls.iter().filter(|c| c.heard).count()
+                ))
+                .small()
+                .monospace()
+                .color(theme::MUTED),
+            );
+        });
+        if calls.is_empty() {
+            ui.label(
+                egui::RichText::new(
+                    "No calls yet. Calls appear from P25 control-channel grants (Focus on the control channel) and from \
+                     voice channels whose signalling names the talkgroup (P25 Phase 1/2, DMR).",
+                )
+                .color(theme::MUTED),
+            );
+            return;
+        }
+        let f = self.call_filter.trim().to_lowercase();
+        if !f.is_empty() {
+            calls.retain(|c| {
+                c.call.target.to_string().contains(&f)
+                    || c.call.source.is_some_and(|s| s.to_string().contains(&f))
+                    || tg_name(c).to_lowercase().contains(&f)
+                    || radio_name(c.call.source).to_lowercase().contains(&f)
+            });
+        }
+        let accent = egui::Color32::from_rgb(0xf2, 0xa3, 0x3a);
+        let mut tune = None;
+        let row_h = 18.0;
+        egui_extras::TableBuilder::new(ui)
+            .id_salt("calls")
+            .striped(true)
+            .sense(egui::Sense::click())
+            .auto_shrink([false, false])
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(egui_extras::Column::exact(72.0))
+            .column(egui_extras::Column::exact(48.0))
+            .column(egui_extras::Column::exact(84.0))
+            .column(egui_extras::Column::exact(110.0))
+            .column(egui_extras::Column::exact(90.0))
+            .column(egui_extras::Column::exact(220.0))
+            .column(egui_extras::Column::exact(90.0))
+            .column(egui_extras::Column::exact(160.0))
+            .column(egui_extras::Column::exact(70.0))
+            .column(egui_extras::Column::remainder())
+            .header(row_h, |mut h| {
+                for t in ["Start", "Secs", "MHz", "Protocol", "Talkgroup", "Name (imported)", "Radio", "Radio (imported)", "Flags", "Seen"] {
+                    h.col(|ui| {
+                        ui.label(egui::RichText::new(t).small().color(theme::MUTED));
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(row_h, calls.len(), |mut row| {
+                    let c = &calls[row.index()];
+                    let text = |ui: &mut egui::Ui, s: String, col: egui::Color32| {
+                        ui.add(egui::Label::new(egui::RichText::new(s).monospace().color(col)).selectable(false).truncate());
+                    };
+                    let recent = std::time::SystemTime::now().duration_since(c.last).map(|d| d.as_secs() < 10).unwrap_or(true);
+                    let col = if recent { theme::TEXT } else { theme::TEXT2 };
+                    row.col(|ui| text(ui, hms(c.first), col));
+                    row.col(|ui| text(ui, format!("{:.0}", c.last.duration_since(c.first).unwrap_or_default().as_secs_f64()), theme::MUTED));
+                    row.col(|ui| text(ui, c.center_hz.map(|f| format!("{:.5}", f / 1e6)).unwrap_or("?".into()), col));
+                    row.col(|ui| text(ui, c.protocol.clone(), theme::TEXT2));
+                    let target = if c.call.group { format!("TG {}", c.call.target) } else { format!("→ {}", c.call.target) };
+                    row.col(|ui| text(ui, target, if recent { accent } else { col }));
+                    row.col(|ui| text(ui, tg_name(c), theme::TEXT2));
+                    row.col(|ui| text(ui, c.call.source.map(|s| s.to_string()).unwrap_or_default(), col));
+                    row.col(|ui| text(ui, radio_name(c.call.source), theme::TEXT2));
+                    let flags = format!("{}{}", if c.call.emergency { "EMERG " } else { "" }, if c.call.encrypted { "enc" } else { "" });
+                    row.col(|ui| text(ui, flags, if c.call.emergency { theme::ALERT } else { theme::MUTED }));
+                    let seen = match (c.granted, c.heard) {
+                        (true, true) => "granted + heard",
+                        (true, false) => "granted",
+                        _ => "heard",
+                    };
+                    row.col(|ui| text(ui, seen.into(), theme::MUTED));
+                    if row.response().double_clicked() {
+                        tune = c.center_hz;
                     }
                 });
             });

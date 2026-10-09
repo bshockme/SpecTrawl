@@ -53,11 +53,13 @@ pub(crate) fn run(shared: Arc<Shared>, cfg: SourceConfig, stop: Arc<AtomicBool>,
         let t0 = Instant::now();
         if let Some(rec) = pick(&shared) {
             let class = Arc::new(classify_record(&shared, &cfg, rate, &radio, &rec, &mut chunk, &stop));
+            log_call(&shared, rec.center_hz(), &class);
             let mut st = shared.records.lock();
             st.emitters.tally(rec.id, &class);
             st.classes.insert(rec.id, (class, Instant::now(), rec.active));
         } else if let Some(job) = pick_emitter(&shared, rate) {
             let class = Arc::new(classify_window(&shared, rate, &radio, &job, &mut chunk, &stop));
+            log_call(&shared, job.center_hz, &class);
             shared.records.lock().emitters.set_group_class(job.emitter, class);
         } else {
             std::thread::sleep(Duration::from_millis(100));
@@ -68,6 +70,13 @@ pub(crate) fn run(shared: Arc<Shared>, cfg: SourceConfig, stop: Arc<AtomicBool>,
         work += spent;
         // Rest so that work / (work + rest) stays within the budget.
         std::thread::sleep(spent.mul_f64(1.0 / BUDGET - 1.0));
+    }
+}
+
+/// A call named in a classification goes to the call log.
+fn log_call(shared: &Shared, center_hz: f64, c: &Classification) {
+    if let Some(call) = c.fields.as_ref().and_then(|f| f.call) {
+        shared.calls.lock().heard(center_hz, &c.label, call, std::time::SystemTime::now());
     }
 }
 

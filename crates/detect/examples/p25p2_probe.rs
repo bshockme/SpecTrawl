@@ -41,8 +41,8 @@ fn main() {
                 }
                 for s in &info.signals {
                     *decoded.entry(format!("{:?}", s.burst)).or_default() += 1;
-                    match s.mac.talk() {
-                        Some(t) => *talk.entry(format!("ch{} {t}", s.channel)).or_default() += 1,
+                    match s.mac.call() {
+                        Some(c) => *talk.entry(format!("ch{} {}", s.channel, c.summary())).or_default() += 1,
                         None => *other.entry(format!("{:?}", s.mac)).or_default() += 1,
                     }
                 }

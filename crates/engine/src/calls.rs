@@ -1,0 +1,118 @@
+//! The call log: one entry per call, merged from what a control channel
+//! granted and what the voice channel's own signalling said (P25 link
+//! control, Phase 2 MAC, DMR call headers).
+//!
+//! Voice channels are only sampled by the classifier now and then, so the
+//! times are approximate: a call's span is from the first to the last time
+//! anything saw it.
+
+use std::collections::VecDeque;
+use std::time::{Duration, SystemTime};
+
+use detect::decode::Call;
+
+/// Sightings of the same call (same frequency and target, compatible
+/// source) less than this apart are one call.
+const SAME_CALL: Duration = Duration::from_secs(8);
+/// Frequencies this close are the same channel.
+const SAME_FREQ_HZ: f64 = 3_000.0;
+const MAX_CALLS: usize = 5000;
+
+#[derive(Debug, Clone)]
+pub struct CallEvent {
+    pub first: SystemTime,
+    pub last: SystemTime,
+    /// The voice channel, when known (a grant names it; a sighting is on it).
+    pub center_hz: Option<f64>,
+    /// "P25 Phase 1", "P25 Phase 2", "DMR …": the voice channel's label, or
+    /// the control channel's system for a grant not yet heard.
+    pub protocol: String,
+    pub call: Call,
+    /// A control channel granted it.
+    pub granted: bool,
+    /// Its voice channel was heard carrying it.
+    pub heard: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct CallLog {
+    pub calls: VecDeque<CallEvent>,
+}
+
+impl CallLog {
+    /// A control channel granted `call` on `freq`.
+    pub fn granted(&mut self, freq: Option<f64>, system: &str, call: Call, now: SystemTime) {
+        self.merge(freq, call, now, system, |e| e.granted = true);
+    }
+
+    /// A voice channel at `freq` was heard carrying `call`.
+    pub fn heard(&mut self, freq: f64, label: &str, call: Call, now: SystemTime) {
+        self.merge(Some(freq), call, now, label, |e| {
+            e.heard = true;
+            // The voice channel's label beats the control channel's.
+            e.protocol = label.to_string();
+        });
+    }
+
+    fn merge(&mut self, freq: Option<f64>, call: Call, now: SystemTime, label: &str, mark: impl FnOnce(&mut CallEvent)) {
+        let same = self.calls.iter_mut().rev().take(256).find(|e| {
+            e.call.group == call.group
+                && e.call.target == call.target
+                && (e.call.source.is_none() || call.source.is_none() || e.call.source == call.source)
+                && match (e.center_hz, freq) {
+                    (Some(a), Some(b)) => (a - b).abs() < SAME_FREQ_HZ,
+                    _ => true,
+                }
+                && now.duration_since(e.last).map(|d| d < SAME_CALL).unwrap_or(true)
+        });
+        match same {
+            Some(e) => {
+                e.last = e.last.max(now);
+                e.center_hz = e.center_hz.or(freq);
+                e.call.source = e.call.source.or(call.source);
+                e.call.encrypted |= call.encrypted;
+                e.call.emergency |= call.emergency;
+                mark(e);
+            }
+            None => {
+                if self.calls.len() >= MAX_CALLS {
+                    self.calls.pop_front();
+                }
+                let mut e =
+                    CallEvent { first: now, last: now, center_hz: freq, protocol: label.to_string(), call, granted: false, heard: false };
+                mark(&mut e);
+                self.calls.push_back(e);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call(tg: u32, src: Option<u32>) -> Call {
+        Call { group: true, target: tg, source: src, encrypted: false, emergency: false }
+    }
+
+    #[test]
+    fn grant_and_voice_merge_into_one_call() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let mut log = CallLog::default();
+        log.granted(Some(770.31875e6), "NAC 0x2A5", call(10025, Some(2121592)), t0);
+        // The voice channel's link control, heard 2 s later and 1 kHz off
+        // (measured centre), first without the source.
+        log.heard(770.3198e6, "P25 Phase 1", call(10025, None), t0 + Duration::from_secs(2));
+        log.heard(770.3198e6, "P25 Phase 1", call(10025, Some(2121592)), t0 + Duration::from_secs(5));
+        assert_eq!(log.calls.len(), 1);
+        let e = &log.calls[0];
+        assert!(e.granted && e.heard);
+        assert_eq!((e.protocol.as_str(), e.call.source), ("P25 Phase 1", Some(2121592)));
+        assert_eq!(e.last.duration_since(e.first).unwrap(), Duration::from_secs(5));
+        // A different talker on the same talkgroup is a new call; so is the
+        // same one after a long gap.
+        log.heard(770.3198e6, "P25 Phase 1", call(10025, Some(2121604)), t0 + Duration::from_secs(6));
+        log.heard(770.3198e6, "P25 Phase 1", call(10025, Some(2121592)), t0 + Duration::from_secs(30));
+        assert_eq!(log.calls.len(), 3);
+    }
+}
