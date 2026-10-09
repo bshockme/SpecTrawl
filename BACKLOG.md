@@ -13,7 +13,11 @@ Ideas and known rough edges that aren't scheduled yet. Newest at the top of each
 
 - **Survey detection is dense.** Every persistent emitter (TV, LTE, paging) becomes a long record, so the survey shows many boxes (now drawn faintly). Needs grouping by emitter and a "new since baseline" view rather than boxes for everything.
 - **Hop profile is estimated live** (median across hops, smoothed across passes). It removes passband ripple and fixed-offset spurs. Consider saving it per serial and gain so a fresh sweep starts clean.
-- **Tighter retune guard.** The 9.5 ms guard is conservative (the USB transfer size is the main uncertainty). Finding the actual retune edge in the data could roughly double the hop rate.
+- **Sweep is now one hop per USB transfer** on an Airspy (retune as a transfer arrives, 3 ms latency, R820T lock flag for slow VCO searches): about 2x the old 9.5 ms guard. What's left:
+  - About 6 real VCO searches per full pass (~13 ms each, at the divider boundaries near 28, 55, 110, 218, 442 and 883 MHz). Hop centres could be placed so these land on the wrap-around, or a 4th FFT skipped there.
+  - Busy hops whose carrier level moves between FFTs (LTE 700) used to trip the settle check; now only a first-FFT outlier counts. Watch for broadband stripes coming back.
+  - The band-power probe (`slow_hops`) remains for devices without a lock flag; untested on anything but the Airspy.
+  - HydraSDR RFOne should have the same R82x lock flag; check when one is on hand.
 - **Survey waterfall fills slowly** (one row per pass). Consider updating the newest row hop by hop as the pass progresses.
 
 ## Detection

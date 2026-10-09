@@ -122,6 +122,8 @@ const MAX_CLOSED_RECORDS: usize = 20_000;
 /// state→ring against a sweep read of ring→state deadlocked the app.)
 struct Shared {
     ring: Mutex<IqRing>,
+    /// Notified (with `ring`) each time a block of samples arrives.
+    arrived: parking_lot::Condvar,
     records: Mutex<RecordStore>,
     state: Mutex<StreamState>,
     rows: Mutex<VecDeque<Arc<SpectrumRow>>>,
@@ -170,6 +172,7 @@ struct RingSink {
 impl StreamSink for RingSink {
     fn on_samples(&mut self, first_sample: u64, samples: Samples<'_>) {
         self.shared.ring.lock().write(first_sample, samples);
+        self.shared.arrived.notify_all();
     }
 
     fn on_event(&mut self, event: StreamEvent) {
@@ -230,6 +233,7 @@ impl Source {
         let cap = (rate * cfg.ring_seconds).ceil() as usize;
         let shared = Arc::new(Shared {
             ring: Mutex::new(IqRing::new(cap)),
+            arrived: parking_lot::Condvar::new(),
             records: Mutex::new(RecordStore::default()),
             state: Mutex::new(StreamState { center_hz: device.center_hz(), sample_rate: rate, ..Default::default() }),
             rows: Mutex::new(VecDeque::with_capacity(cfg.row_history)),

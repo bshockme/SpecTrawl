@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use sdr_core::{Complex32, Samples};
 
 /// Fixed-capacity look-back buffer addressed by absolute sample index.
@@ -9,11 +11,13 @@ pub struct IqRing {
     buf: Vec<[i16; 2]>,
     /// Absolute index of the next sample to be written.
     head: u64,
+    /// When the last block arrived.
+    last_write: Option<Instant>,
 }
 
 impl IqRing {
     pub fn new(capacity: usize) -> Self {
-        Self { buf: vec![[0, 0]; capacity.max(1)], head: 0 }
+        Self { buf: vec![[0, 0]; capacity.max(1)], head: 0, last_write: None }
     }
 
     pub fn capacity(&self) -> usize {
@@ -22,6 +26,11 @@ impl IqRing {
 
     pub fn head(&self) -> u64 {
         self.head
+    }
+
+    /// Time since the last block arrived (`Duration::MAX` before the first).
+    pub fn since_write(&self) -> Duration {
+        self.last_write.map_or(Duration::MAX, |t| t.elapsed())
     }
 
     /// Oldest sample index still held.
@@ -34,6 +43,7 @@ impl IqRing {
     }
 
     pub fn write(&mut self, first_sample: u64, samples: Samples<'_>) {
+        self.last_write = Some(Instant::now());
         let cap = self.buf.len() as u64;
         if first_sample > self.head {
             // Zero-fill the gap (at most one ring's worth).

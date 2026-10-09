@@ -86,6 +86,23 @@ impl SpectrumAnalyzer {
         self.count = 0;
         true
     }
+
+    /// `take_db`, but linear power on the same scale (10^(dB/10)): no
+    /// logarithms, for callers that average or rank bins themselves.
+    pub fn take_power(&mut self, out: &mut Vec<f32>) -> bool {
+        if self.count == 0 {
+            return false;
+        }
+        out.resize(self.size, 0.0);
+        let half = self.size / 2;
+        let k = 10f32.powf(self.norm_db / 10.0) / self.count as f32;
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = self.acc[(i + half) % self.size] * k;
+        }
+        self.acc.iter_mut().for_each(|a| *a = 0.0);
+        self.count = 0;
+        true
+    }
 }
 
 /// Max-per-bucket decimation so narrow peaks survive when there are more bins

@@ -90,6 +90,9 @@ pub enum GainSetting {
 pub struct Capabilities {
     pub freq_ranges_hz: Vec<(f64, f64)>,
     pub tuning_step_hz: f64,
+    /// A retune issued as a block of samples arrives shows up within this
+    /// long after the start of the next block (fast steps; see
+    /// `Device::tuner_locked` for slow ones).
     pub retune_latency_s: f64,
     pub sample_rates: Vec<f64>,
     /// Fraction of the sample rate that is alias/roll-off free (0..1).
@@ -138,6 +141,12 @@ pub trait Device: Send {
     fn center_hz(&self) -> f64;
     fn sample_rate(&self) -> f64;
     fn set_center(&mut self, hz: f64) -> Result<()>;
+    /// Whether the tuner's PLL reports lock after a retune. None if the
+    /// device can't tell. Some tuners take far longer on some steps than
+    /// others (an R820T searching its VCO range: ~13 ms instead of ~1).
+    fn tuner_locked(&mut self) -> Option<bool> {
+        None
+    }
     fn set_sample_rate(&mut self, rate: f64) -> Result<()>;
     fn set_gain(&mut self, gain: GainSetting) -> Result<()>;
     fn start(&mut self, sink: Box<dyn StreamSink>) -> Result<()>;

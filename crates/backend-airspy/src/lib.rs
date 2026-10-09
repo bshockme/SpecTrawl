@@ -56,6 +56,7 @@ struct Api {
     set_sensitivity_gain: unsafe extern "C" fn(*mut AirspyDev, u8) -> c_int,
     set_lna_agc: unsafe extern "C" fn(*mut AirspyDev, u8) -> c_int,
     set_mixer_agc: unsafe extern "C" fn(*mut AirspyDev, u8) -> c_int,
+    r820t_read: unsafe extern "C" fn(*mut AirspyDev, u8, *mut u8) -> c_int,
     error_name: unsafe extern "C" fn(c_int) -> *const c_char,
 }
 
@@ -93,6 +94,7 @@ impl Api {
                 set_sensitivity_gain: sym!("airspy_set_sensitivity_gain"),
                 set_lna_agc: sym!("airspy_set_lna_agc"),
                 set_mixer_agc: sym!("airspy_set_mixer_agc"),
+                r820t_read: sym!("airspy_r820t_read"),
                 error_name: sym!("airspy_error_name"),
                 _lib: lib,
             })
@@ -213,6 +215,13 @@ impl Backend for AirspyBackend {
     }
 
     fn open(&self, serial: &str) -> Result<Box<dyn Device>> {
+        Ok(Box::new(self.open_device(serial)?))
+    }
+}
+
+impl AirspyBackend {
+    /// `open`, but keeps the concrete type for Airspy-only calls.
+    pub fn open_device(&self, serial: &str) -> Result<AirspyDevice> {
         let api = self.api()?;
         let sn = u64::from_str_radix(serial, 16).map_err(|_| Error::NotFound(serial.into()))?;
         let (dev, rates, model) = probe(&api, sn)?;
@@ -224,9 +233,9 @@ impl Backend for AirspyBackend {
             caps: Capabilities {
                 freq_ranges_hz: vec![(24e6, 1.8e9)],
                 tuning_step_hz: 1.0,
-                // Measured on an R2 (examples/retune_probe): new frequency visible
-                // 1.6-8.2 ms after set_freq returns; the spread is the USB transfer size.
-                retune_latency_s: 0.0095,
+                // Measured on an R2 (engine/examples/chunk_probe): set_freq issued as a
+                // 65536-sample transfer arrives shows up 1.4-2.4 ms into the next one.
+                retune_latency_s: 0.003,
                 sample_rates: rates,
                 usable_bandwidth_fraction: 0.9,
                 native_format: SampleFormat::Cf32,
@@ -252,7 +261,16 @@ impl Backend for AirspyBackend {
         d.api.check("set_samplerate", unsafe { (d.api.set_samplerate)(dev, rate as u32) })?;
         d.set_center(100e6)?;
         d.set_gain(GainSetting::Linearity(0.6))?;
-        Ok(Box::new(d))
+        Ok(d)
+    }
+}
+
+impl AirspyDevice {
+    /// Reads one R820T tuner register (through the Airspy's firmware).
+    pub fn r820t_read(&self, reg: u8) -> Result<u8> {
+        let mut v = 0u8;
+        self.api.check("r820t_read", unsafe { (self.api.r820t_read)(self.dev, reg, &mut v) })?;
+        Ok(v)
     }
 }
 
@@ -326,6 +344,12 @@ impl Device for AirspyDevice {
         self.api.check("set_freq", unsafe { (self.api.set_freq)(self.dev, hz.round() as u32) })?;
         self.center.store(hz.round().to_bits(), Ordering::Relaxed);
         Ok(())
+    }
+
+    fn tuner_locked(&mut self) -> Option<bool> {
+        // R820T status register 2: bit 6 = PLL locked (bits 5:0 are the VCO
+        // code, which counts through its range during a slow lock).
+        self.r820t_read(2).ok().map(|v| v & 0x40 != 0)
     }
 
     fn set_sample_rate(&mut self, rate: f64) -> Result<()> {

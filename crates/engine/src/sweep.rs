@@ -1,9 +1,10 @@
 //! Retune-and-dwell sweep (the generic Survey implementation).
 //!
-//! Each hop: note the ring's head, retune, skip a guard interval (retune
-//! latency + USB transfer granularity), average a few FFTs, keep only the
-//! alias-free middle of the band, and paste it into a stitched row. One row is
-//! published per completed pass.
+//! Each hop: retune just as a block of samples arrives, skip the device's
+//! retune latency (longer if the tuner reports a slow PLL lock), average a few
+//! FFTs, keep only the alias-free middle of the band, and paste it into a
+//! stitched row. One row is published per completed pass. On an Airspy that
+//! is one hop per 6.55 ms USB transfer.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,8 +21,9 @@ pub struct SweepPlan {
     pub stop_hz: f64,
     pub fft_size: usize,
     pub ffts_per_hop: usize,
-    /// Samples discarded after each retune, in seconds. The device's
-    /// `retune_latency_s` is used if larger.
+    /// Samples discarded after each retune, in seconds, counted from the
+    /// start of the block after the retune. The device's `retune_latency_s`
+    /// is used if larger.
     pub guard_s: f64,
     /// Published rows are max-decimated to at most this many bins.
     pub max_bins: usize,
@@ -40,7 +42,7 @@ impl Default for SweepPlan {
             stop_hz: 1800e6,
             fft_size: 4096,
             ffts_per_hop: 4,
-            guard_s: 0.0095,
+            guard_s: 0.0,
             max_bins: 32768,
             spur_grid_hz: Some(5e6),
             spur_halfwidth_hz: 5e3,
@@ -62,8 +64,13 @@ pub struct SweepStatus {
     pub redone_hops: u64,
     /// Dwells thrown away because their FFTs disagreed (tuner still settling).
     pub settle_retries: u64,
-    /// Hops that read differently after a long wait, so always get one.
+    /// Hops that read differently after a long wait, so always get one
+    /// (only for devices that can't report tuner lock).
     pub slow_hops: usize,
+    /// The device reports tuner lock, so slow steps are waited out exactly.
+    pub tuner_lock: bool,
+    /// Retunes where the tuner was still searching for lock.
+    pub lock_waits: u64,
 }
 
 impl SweepStatus {
@@ -124,11 +131,14 @@ pub(crate) fn run(
         redone_hops: 0,
         settle_retries: 0,
         slow_hops: 0,
+        tuner_lock: false,
+        lock_waits: 0,
     });
 
     let mut rate_window = (Instant::now(), 0u32);
     let mut last_center = f64::NAN;
     let mut lin = vec![0.0f32; n];
+    let (mut pw, mut band) = (Vec::with_capacity(n), Vec::with_capacity(n));
     // Some hop-to-hop steps leave the tuner sitting on a wrong, quiet frequency
     // for 10-15 ms (an R2 stepping 872.5 -> 881.5 MHz). The FFTs agree with each
     // other, so the settle check can't see it. Instead each hop is compared,
@@ -138,6 +148,9 @@ pub(crate) fn run(
     let mut agreed = vec![0u8; hops];
     let mut pass_no = 0usize;
     let (mut probe_hop, mut last_probe) = (0usize, Instant::now());
+    // Known after the first retune: whether the device reports tuner lock. If
+    // it does, slow steps are waited out exactly and the probing isn't needed.
+    let mut has_lock: Option<bool> = None;
     'passes: loop {
         let pass_start = Instant::now();
         let mut h = 0;
@@ -148,21 +161,52 @@ pub(crate) fn run(
             let center = plan.start_hz + hop_hz * (h as f64 + 0.5);
             // Separate statements: never hold two engine locks at once (a guard
             // in a tuple lives until the end of the statement).
-            let n0 = shared.ring.lock().head();
             let gaps0 = shared.state.lock().gaps;
+            // Retune just as a block arrives: then the retune shows up a fixed
+            // time into the next block, with no doubt about how many samples
+            // were already in flight. `late` covers missing the moment a little.
+            let Some((n0, late)) = sync_to_block(&shared, &stop) else { break 'passes };
+            let issued = Instant::now();
             if let Err(e) = dev.lock().set_center(center) {
                 log::warn!("sweep retune to {:.3} MHz: {e}", center / 1e6);
                 h += 1;
                 continue;
             }
+            let late = (late.as_secs_f64() * rate) as u64;
+            // A slow PLL lock (an R820T stepping through its VCO range: ~13 ms
+            // on some 9 MHz steps, ~1 ms on most) is waited out, counting from
+            // when it locked. Polling happens during the wait we'd do anyway.
+            let mut after_lock = 0u64;
+            let locked = dev.lock().tuner_locked();
+            if has_lock.is_none() {
+                has_lock = Some(locked.is_some());
+                if let Some(s) = shared.sweep.lock().as_mut() {
+                    s.tuner_lock = locked.is_some();
+                }
+            }
+            if locked == Some(false) {
+                while dev.lock().tuner_locked() == Some(false) && issued.elapsed() < LOCK_TIMEOUT {
+                    if stop.load(Ordering::Relaxed) {
+                        break 'passes;
+                    }
+                }
+                after_lock = late + ((issued.elapsed() + LOCK_MARGIN).as_secs_f64() * rate) as u64;
+                if let Some(s) = shared.sweep.lock().as_mut() {
+                    s.lock_waits += 1;
+                }
+            }
             // Big jumps (the wrap-around from the top of the span to the bottom)
-            // take longer to settle: up to ~30 ms measured on an R2.
+            // took longer to settle before lock was checked; kept as a margin.
             let jump = (center - last_center).abs();
             last_center = center;
-            let short = if jump > 3.0 * hop_hz { guard * 3 } else { guard };
-            // First pass checks every hop; after that, one hop at a time in turn,
-            // rate-limited so short sweeps don't spend their time waiting.
-            let probe = hops > 1 && short < long_guard && (pass_no == 0 || (h == probe_hop && last_probe.elapsed() >= PROBE_INTERVAL));
+            let short = (late + if jump > 3.0 * hop_hz { guard * 3 } else { guard }).max(after_lock);
+            // Without a lock flag: the first pass checks every hop; after that,
+            // one hop at a time in turn, rate-limited so short sweeps don't
+            // spend their time waiting.
+            let probe = has_lock == Some(false)
+                && hops > 1
+                && short < long_guard
+                && (pass_no == 0 || (h == probe_hop && last_probe.elapsed() >= PROBE_INTERVAL));
             if pass_no > 0 && h == probe_hop && (probe || short >= long_guard) {
                 probe_hop = (probe_hop + 1) % hops;
             }
@@ -196,46 +240,42 @@ pub(crate) fn run(
                     _ => {}
                 }
             }
-            let mut from = n0 + if slow[h] { long_guard } else { short };
+            let mut from = n0 + if slow[h] { long_guard.max(short) } else { short };
             let mut redo_hop = false;
             let mut attempts = 0;
             loop {
                 let to = from + dwell;
-                let deadline = Instant::now() + Duration::from_millis(500);
-                while shared.ring.lock().head() < to {
-                    if stop.load(Ordering::Relaxed) {
-                        break 'passes;
-                    }
-                    if Instant::now() > deadline {
-                        log::warn!("sweep: no samples for hop {h}");
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_micros(500));
+                match wait_for_samples(&shared, &stop, to, Duration::from_millis(500)) {
+                    Wait::Ready => {}
+                    Wait::Stopped => break 'passes,
+                    Wait::TimedOut => log::warn!("sweep: no samples for hop {h}"),
                 }
                 if shared.state.lock().gaps != gaps0 {
                     redo_hop = true;
                     break;
                 }
-                // Measure each FFT separately: if their noise floors disagree,
-                // the tuner was still settling (or the retune command was
-                // delayed) and the whole hop would light up as a broadband
-                // stripe. Then measure the next stretch instead - no retune.
+                // Measure each FFT separately: if the first one's noise floor
+                // is off from the rest, the tuner was still settling and the
+                // whole hop would light up as a broadband stripe. Then measure
+                // the next stretch instead - no retune. (Only the first: in a
+                // busy band, e.g. LTE, the 'floor' is a carrier whose level
+                // moves from one FFT to the next, which isn't settling.)
                 let mut ok = true;
                 let mut floors = Vec::with_capacity(plan.ffts_per_hop);
                 lin.iter_mut().for_each(|v| *v = 0.0);
                 for k in 0..plan.ffts_per_hop {
                     ok &= shared.ring.lock().read(from + (k * n) as u64, &mut block);
                     sa.push(&block);
-                    sa.take_db(&mut db);
-                    for (l, d) in lin.iter_mut().zip(&db) {
-                        *l += 10f32.powf(*d / 10.0);
+                    sa.take_power(&mut pw);
+                    for (l, p) in lin.iter_mut().zip(&pw) {
+                        *l += p;
                     }
-                    let mut band: Vec<f32> = db[first_bin..first_bin + bins_per_hop].to_vec();
+                    band.clear();
+                    band.extend_from_slice(&pw[first_bin..first_bin + bins_per_hop]);
                     let mid = band.len() / 2;
-                    floors.push(*band.select_nth_unstable_by(mid, f32::total_cmp).1);
+                    floors.push(10.0 * (*band.select_nth_unstable_by(mid, f32::total_cmp).1 + 1e-20).log10());
                 }
-                let spread = floors.iter().copied().fold(f32::MIN, f32::max) - floors.iter().copied().fold(f32::MAX, f32::min);
-                if spread > MAX_FLOOR_SPREAD_DB && attempts < MAX_SETTLE_RETRIES {
+                if settling(&floors) && attempts < MAX_SETTLE_RETRIES {
                     attempts += 1;
                     from = to;
                     if let Some(s) = shared.sweep.lock().as_mut() {
@@ -245,9 +285,8 @@ pub(crate) fn run(
                 }
                 if ok {
                     let k = plan.ffts_per_hop as f32;
-                    for (i, d) in db.iter_mut().enumerate() {
-                        *d = 10.0 * (lin[i] / k + 1e-20).log10();
-                    }
+                    db.clear();
+                    db.extend(lin.iter().map(|l| 10.0 * (l / k + 1e-20).log10()));
                     if let Some(grid) = plan.spur_grid_hz {
                         blank_grid_spurs(&mut db, center, rate, grid, plan.spur_halfwidth_hz);
                     }
@@ -327,6 +366,48 @@ fn blank_grid_spurs(db: &mut [f32], center_hz: f64, rate: f64, grid_hz: f64, hal
     }
 }
 
+enum Wait {
+    Ready,
+    Stopped,
+    TimedOut,
+}
+
+/// Waits (woken by each arriving block) until the ring holds samples up to `to`.
+fn wait_for_samples(shared: &Shared, stop: &AtomicBool, to: u64, timeout: Duration) -> Wait {
+    let deadline = Instant::now() + timeout;
+    let mut r = shared.ring.lock();
+    while r.head() < to {
+        if stop.load(Ordering::Relaxed) {
+            return Wait::Stopped;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Wait::TimedOut;
+        }
+        shared.arrived.wait_for(&mut r, (deadline - now).min(Duration::from_millis(20)));
+    }
+    Wait::Ready
+}
+
+/// Returns (ring head, time since that block arrived) at a moment just after a
+/// block arrived: immediately if one arrived within `SYNC_SLACK`, otherwise
+/// after waiting for the next. None if stopped.
+fn sync_to_block(shared: &Shared, stop: &AtomicBool) -> Option<(u64, Duration)> {
+    let mut r = shared.ring.lock();
+    if r.since_write() > SYNC_SLACK {
+        let h = r.head();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while r.head() == h && Instant::now() < deadline {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            shared.arrived.wait_for(&mut r, Duration::from_millis(20));
+        }
+    }
+    // A stalled stream carries on unsynchronised, with a bounded allowance.
+    Some((r.head(), r.since_write().min(Duration::from_millis(50))))
+}
+
 /// Total power in a hop's usable band (dB), over `ffts` FFTs starting at
 /// sample `from`; waits for the samples. None if they never arrive or have
 /// already left the ring.
@@ -344,12 +425,8 @@ fn band_power(
 ) -> Option<f32> {
     let n = block.len();
     let to = from + (n * ffts) as u64;
-    let deadline = Instant::now() + Duration::from_millis(500);
-    while shared.ring.lock().head() < to {
-        if stop.load(Ordering::Relaxed) || Instant::now() > deadline {
-            return None;
-        }
-        std::thread::sleep(Duration::from_micros(500));
+    if !matches!(wait_for_samples(shared, stop, to, Duration::from_millis(500)), Wait::Ready) {
+        return None;
     }
     let mut sum = 0.0f64;
     for k in 0..ffts {
@@ -362,6 +439,17 @@ fn band_power(
     }
     Some((10.0 * (sum / (ffts * bins) as f64 + 1e-30).log10()) as f32)
 }
+
+/// Retune immediately if a block arrived at most this long ago; otherwise wait
+/// for the next one. The lateness is added to the guard, so this only trades
+/// a little dwell room against waiting a whole block.
+const SYNC_SLACK: Duration = Duration::from_micros(1500);
+/// Give up waiting for tuner lock after this long (measure anyway).
+const LOCK_TIMEOUT: Duration = Duration::from_millis(100);
+/// Added to the time lock was seen. On an R2 the time since the retune was
+/// issued maps to the position in the next block within ~0.5 ms, and the
+/// lock happened before the read that saw it returned.
+const LOCK_MARGIN: Duration = Duration::from_micros(500);
 
 /// Wait used to check a hop, and then used for hops that need it. 15 ms was
 /// enough for every step seen on an R2; this leaves margin.
@@ -377,9 +465,20 @@ const SLOW_HOP_DB: f32 = 0.75;
 /// either way, so this needs to be long enough to outlast a lull.
 const AGREE_TO_CLEAR: u8 = 20;
 
-/// A dwell whose FFT noise floors differ by more than this was measured
-/// while the tuner was still settling.
+/// A dwell whose first FFT's noise floor is this far from the others' median
+/// was measured while the tuner was still settling.
 const MAX_FLOOR_SPREAD_DB: f32 = 3.0;
+
+/// The first FFT's floor stands apart from the rest of the dwell.
+fn settling(floors: &[f32]) -> bool {
+    if floors.len() < 2 {
+        return false;
+    }
+    let mut rest = floors[1..].to_vec();
+    let mid = rest.len() / 2;
+    let m = *rest.select_nth_unstable_by(mid, f32::total_cmp).1;
+    (floors[0] - m).abs() > MAX_FLOOR_SPREAD_DB
+}
 const MAX_SETTLE_RETRIES: u32 = 3;
 
 /// Below this many hops the across-hop median isn't a reliable profile.
@@ -419,6 +518,15 @@ fn update_hop_profile(full: &[f32], bins_per_hop: usize, profile: &mut Vec<f32>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settling_is_a_first_fft_outlier_only() {
+        assert!(settling(&[-85.0, -74.4, -73.9, -73.9]));
+        assert!(settling(&[-80.0, -80.0, -74.0, -74.0]));
+        // A busy band's carrier level moving around isn't settling.
+        assert!(!settling(&[-73.5, -73.1, -78.8, -74.4]));
+        assert!(!settling(&[-71.5, -72.5, -73.6, -81.7]));
+    }
 
     #[test]
     fn blanks_spurs_on_grid_only() {

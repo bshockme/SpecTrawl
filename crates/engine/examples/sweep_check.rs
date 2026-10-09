@@ -25,10 +25,15 @@ fn main() {
     let rows = src.rows_after(None);
     let st = src.sweep_status().unwrap();
     println!(
-        "{} passes · settle re-measured {} · slow hops {} · hop {:.1} MHz",
+        "{} passes ({:.3} s each) · {:.0} hops/s · settle re-measured {} · slow hops {} · lock waits {} (lock flag {}) · gaps redone {} · hop {:.1} MHz",
         rows.len(),
+        st.last_pass_s,
+        st.hops_per_sec,
         st.settle_retries,
         st.slow_hops,
+        st.lock_waits,
+        st.tuner_lock,
+        st.redone_hops,
         st.hop_hz / 1e6
     );
     // Average the last 10 passes, then print 0.5 MHz buckets (mean dB).

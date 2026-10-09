@@ -450,7 +450,11 @@ impl App {
                     kv(ui, "Rate", &format!("{:.0} hops/s · {:.0} MHz/s", s.hops_per_sec, s.mhz_per_sec()));
                     kv(ui, "Revisit", &format!("{:.2} s", s.last_pass_s));
                     kv(ui, "Re-measured", &format!("{} settle · {} gap", s.settle_retries, s.redone_hops));
-                    kv(ui, "Slow hops", &format!("{} of {}", s.slow_hops, s.hops));
+                    if s.tuner_lock {
+                        kv(ui, "Lock waits", &s.lock_waits.to_string());
+                    } else {
+                        kv(ui, "Slow hops", &format!("{} of {}", s.slow_hops, s.hops));
+                    }
                 }
             });
             if err.is_some() {
