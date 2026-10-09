@@ -221,6 +221,19 @@ pub struct Fields {
 /// sync can be a false match on a busy data channel).
 const MIN_VOICE_FRAMES: usize = 2;
 
+/// The call heard most: talk strings grouped by their talkgroup or target
+/// (the text before " ←" or " ("), then the variant that names the
+/// source, if any, most common first.
+fn best_talk(talks: &std::collections::BTreeMap<String, usize>) -> Option<String> {
+    let key = |t: &str| t.split(" ←").next().unwrap_or(t).split(" (").next().unwrap_or(t).to_string();
+    let mut groups: std::collections::BTreeMap<String, usize> = Default::default();
+    for (t, n) in talks {
+        *groups.entry(key(t)).or_default() += n;
+    }
+    let best = groups.into_iter().max_by_key(|(_, n)| *n)?.0;
+    talks.iter().filter(|(t, _)| key(t) == best).max_by_key(|(t, n)| (t.contains('←') || t.contains('→'), **n)).map(|(t, _)| t.clone())
+}
+
 pub fn summarise(frames: &[Frame]) -> Fields {
     use std::collections::BTreeMap;
     let mut ids: BTreeMap<String, usize> = BTreeMap::new();
@@ -236,6 +249,20 @@ pub fn summarise(frames: &[Frame]) -> Fields {
                     f.decoded += 1;
                     *ids.entry(format!("NAC 0x{:03X}", n.nac)).or_default() += 1;
                     *kinds.entry(p25_duid_name(n.duid).to_string()).or_default() += 1;
+                    let lc = match n.duid {
+                        0xF => crate::p25_lc::tdulc(fr),
+                        0x5 => crate::p25_lc::ldu1(fr),
+                        _ => None,
+                    };
+                    {
+                        if let Some(lc) = lc {
+                            let name = if lc.mfid > 1 { "vendor" } else { crate::p25_lc::lco_name(lc.lco) };
+                            *kinds.entry(format!("LC {name}")).or_default() += 1;
+                            if let Some(t) = lc.talk() {
+                                *talks.entry(t.summary()).or_default() += 1;
+                            }
+                        }
+                    }
                     let a = match n.duid {
                         0x7 => Some(Activity::Control),
                         0xC => Some(Activity::Data),
@@ -299,7 +326,7 @@ pub fn summarise(frames: &[Frame]) -> Fields {
         }
     }
     f.id = ids.into_iter().max_by_key(|(_, n)| *n).map(|(k, _)| k);
-    f.talk = talks.into_iter().max_by_key(|(_, n)| *n).map(|(k, _)| k);
+    f.talk = best_talk(&talks);
     let voice = act.get(&Activity::Voice).copied().unwrap_or(0);
     f.activity = if voice >= MIN_VOICE_FRAMES || f.talk.is_some() {
         Some(Activity::Voice)

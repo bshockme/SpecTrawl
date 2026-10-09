@@ -90,3 +90,37 @@ fn capplus_status_rest_field() {
     let f = detect::classify(&x, fs, 12_500.0).fields.expect("fields");
     assert_eq!((f.capplus_repeater, f.capplus_rest), (None, Some((3, 2))));
 }
+
+#[test]
+fn p25_traffic_channel_link_control() {
+    let Some((x, fs)) = load("771.6443MHz_P25_Phase_1") else {
+        eprintln!("skipping: capture not present");
+        return;
+    };
+    // TDULC link control (Golay + Reed-Solomon) after a call: termination,
+    // then the site's adjacent-site and RFSS broadcasts.
+    let f = detect::classify(&x, fs, 12_500.0).fields.expect("fields");
+    let n = |k: &str| f.kinds.iter().find(|(name, _)| name == k).map_or(0, |e| e.1);
+    assert!(n("LC adjacent site") >= 10 && n("LC call termination") >= 2, "{:?}", f.kinds);
+}
+
+#[test]
+fn p25_voice_link_control_matches_grants() {
+    let Some((x, fs)) = load("P25_site_770.3244") else {
+        eprintln!("skipping: capture not present");
+        return;
+    };
+    // The control channel granted TG 10025 on this channel to radios
+    // 2121592 and 2121604 (recorded at the same time); LDU1/TDULC link
+    // control on the voice channel names the same call.
+    let mut talks = Vec::new();
+    for w in x.chunks((1.5 * fs) as usize) {
+        if let Some(t) = detect::classify(w, fs, 12_500.0).fields.and_then(|f| f.talk) {
+            if t == "TG 10025 ← 2121592" || t == "TG 10025 ← 2121604" {
+                return;
+            }
+            talks.push(t);
+        }
+    }
+    panic!("TG 10025 not heard: {talks:?}");
+}

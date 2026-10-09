@@ -13,6 +13,7 @@ pub mod features;
 pub mod flex;
 pub mod frames;
 pub mod p25;
+pub mod p25_lc;
 pub mod pocsag;
 pub mod spectral;
 pub mod sync;
@@ -183,6 +184,9 @@ pub fn classify(x: &[Complex32], fs: f64, bandwidth_hz: f64) -> Classification {
                 "DMR" => (54, 80),
                 // A POCSAG batch: 16 codewords of 32 bits after the sync.
                 "POCSAG" => (0, 520),
+                // P25 link control: TDULC ends ~210 dibits after the sync,
+                // LDU1 ~860.
+                "P25" => (8, 880),
                 _ => (8, 64),
             };
             let fr = frames::slice(&d, fs, &mine, before, after);

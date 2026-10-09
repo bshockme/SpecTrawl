@@ -36,6 +36,26 @@ pub struct Coding {
 /// The combination confirmed on real captures (see `tests/real_captures.rs`).
 pub const CODING: Coding = Coding { scatter: true, transpose: false, crc_init: 0x0000, crc_xorout: 0xFFFF };
 
+/// `n` data dibits after the NID, status symbols removed (they sit after
+/// every 35 dibits, counted from the first sync dibit). None if `f.dibits`
+/// doesn't reach that far.
+pub fn data_dibits(f: &Frame, n: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(n);
+    let mut idx = 24; // frame dibit index (0 = first sync dibit)
+    let mut nid = 0;
+    while out.len() < n {
+        if (idx + 1) % 36 != 0 {
+            if nid < 32 {
+                nid += 1;
+            } else {
+                out.push(*f.dibits.get(f.sync_start + idx)?);
+            }
+        }
+        idx += 1;
+    }
+    Some(out)
+}
+
 /// The (up to three) 98-dibit TSBK blocks of a TSDU frame, status symbols
 /// removed. `f.dibits` must extend far enough past the sync.
 pub fn tsbk_blocks(f: &Frame) -> Vec<[u8; 98]> {
