@@ -206,6 +206,15 @@ pub struct Fields {
     /// Who was talking, from a call header: "TG 1234 ← 5678" (group) or
     /// "5678 → 1234" (private).
     pub talk: Option<String>,
+    /// Text messages decoded (pages), oldest first.
+    pub messages: Vec<String>,
+    /// Capacity Plus: this channel's own repeater number, from group voice
+    /// link control (a voice channel names itself).
+    pub capplus_repeater: Option<u8>,
+    /// Capacity Plus: the rest channel (repeater, timeslot) the latest
+    /// system status here announces. Unconfirmed: on an idle site the value
+    /// climbs by one every several minutes, the same on every repeater.
+    pub capplus_rest: Option<(u8, u8)>,
 }
 
 /// Frames of voice that make a channel a voice channel (one stray voice
@@ -259,9 +268,16 @@ pub fn summarise(frames: &[Frame]) -> Fields {
                         let t =
                             if l.group() { format!("TG {} ← {}", l.target, l.source) } else { format!("{} → {}", l.source, l.target) };
                         *talks.entry(t).or_default() += 1;
+                        // Cap+ group voice names the voice channel it's on.
+                        if let (Some((rep, _)), 0) = (l.channel, l.flco) {
+                            f.capplus_repeater = Some(rep);
+                        }
                     }
                     Some(crate::dmr::Burst::Csbk(c)) => {
                         *kinds.entry(format!("CSBK {}", crate::dmr::csbk_name(c.fid, c.opcode))).or_default() += 1;
+                        if let Some(st) = c.capplus_status() {
+                            f.capplus_rest = Some((st.rest_repeater, st.rest_slot));
+                        }
                     }
                     _ => {}
                 }

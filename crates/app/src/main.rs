@@ -1,3 +1,4 @@
+mod audio;
 mod spectrum_view;
 mod theme;
 
@@ -110,6 +111,15 @@ struct App {
     emitter_view: EmitterView,
     /// Spectrum squelch: hide and dim known wideband occupants.
     squelch: bool,
+    /// Audio output (opened on first listen), its error, and listen settings.
+    audio_out: Option<audio::AudioOut>,
+    audio_err: Option<String>,
+    /// None = pick the mode from the signal's label.
+    listen_mode: Option<engine::DemodMode>,
+    listen_mhz: f64,
+    /// Pages tab filter: capcode or text.
+    page_filter: String,
+    volume: f32,
     /// Known occupants from every pane, merged: (lo Hz, hi Hz, label).
     known: (std::time::Instant, Vec<(f64, f64, String)>),
 }
@@ -173,11 +183,12 @@ enum ListTab {
     Emitters,
     Records,
     P25,
+    Pages,
 }
 
 /// Command line: `--sim` (simulator only), `--freq <MHz>` (focus centre),
 /// `--serial <hex>` (focus device), `--no-sweep`, `--sweep <lo> <hi>` (MHz),
-/// `--tab emitters|records|p25` (bottom panel).
+/// `--tab emitters|records|p25|pages` (bottom panel).
 struct Args {
     sim: bool,
     freq_mhz: Option<f64>,
@@ -200,6 +211,7 @@ fn parse_args() -> Args {
                 a.tab = match it.next().as_deref() {
                     Some("records") => Some(ListTab::Records),
                     Some("p25") => Some(ListTab::P25),
+                    Some("pages") => Some(ListTab::Pages),
                     _ => Some(ListTab::Emitters),
                 }
             }
@@ -241,6 +253,12 @@ impl App {
             emitter_squelched: 0,
             emitter_view: EmitterView::default(),
             squelch: true,
+            audio_out: None,
+            audio_err: None,
+            listen_mode: None,
+            listen_mhz: 100.0,
+            page_filter: String::new(),
+            volume: 0.6,
             known: (std::time::Instant::now() - std::time::Duration::from_secs(5), Vec::new()),
             last_frame: std::time::Instant::now(),
             catalog: catalog::Catalog::load(&catalog_path()),
@@ -576,6 +594,7 @@ impl App {
             }
         }
 
+        self.listen_card(ui);
         self.selection_card(ui);
         ui.add_space(8.0);
         ui.label(egui::RichText::new("DISPLAY").small().strong().color(theme::MUTED));
@@ -592,6 +611,130 @@ impl App {
         });
         if let Some(e) = &self.error {
             ui.colored_label(egui::Color32::from_rgb(0xff, 0x70, 0x96), e);
+        }
+    }
+
+    /// Demodulated audio from the Focus pane: the selected signal (mode from
+    /// its label unless overridden) or a typed frequency.
+    fn listen_card(&mut self, ui: &mut egui::Ui) {
+        let Some(focus) = self.pane(Role::Focus) else { return };
+        let listening = focus.source.listening();
+        // What's selected, and the mode its label suggests.
+        let emitter = self
+            .selected_emitter
+            .filter(|(r, _)| *r == Role::Focus)
+            .and_then(|(_, id)| focus.source.emitters().into_iter().find(|e| e.id == id));
+        let record = self.selected.and_then(|id| focus.records.2.iter().find(|r| r.id == id).cloned());
+        let target: Option<(f64, String, f64)> =
+            emitter.as_ref().map(|e| (e.center_hz, e.label().unwrap_or_default(), e.bandwidth_hz)).or_else(|| {
+                record.as_ref().map(|r| (r.center_hz(), r.display_class().map(|c| c.label.clone()).unwrap_or_default(), r.bandwidth_hz()))
+            });
+        let known = self.known.1.clone();
+        let auto_mode = |hz: f64, label: &str, bw: f64| {
+            let broadcast = known.iter().any(|(lo, hi, k)| (*lo..=*hi).contains(&hz) && k.starts_with("FM broadcast"));
+            if broadcast || label.contains("Wideband FM") || bw > 100e3 {
+                engine::DemodMode::Wfm
+            } else if label.starts_with("AM") || label.contains(" AM") {
+                engine::DemodMode::Am
+            } else {
+                engine::DemodMode::Nfm
+            }
+        };
+        let open = focus.source.audio().open.load(std::sync::atomic::Ordering::Relaxed);
+        let mut start: Option<engine::ListenSpec> = None;
+        let mut stop = false;
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("LISTEN").small().strong().color(theme::MUTED));
+        theme::card(ui, |ui| {
+            match listening {
+                Some(l) => {
+                    ui.horizontal(|ui| {
+                        let (txt, col) = if open { ("● OPEN", theme::VOICE) } else { ("○ squelched", theme::MUTED) };
+                        ui.label(egui::RichText::new(format!("{:.4} MHz {}", l.center_hz / 1e6, l.mode.name())).monospace().strong());
+                        ui.label(egui::RichText::new(txt).small().color(col));
+                    });
+                }
+                None => {
+                    ui.label(egui::RichText::new("Not listening").color(theme::MUTED));
+                }
+            }
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Mode").small().color(theme::MUTED));
+                for (m, name) in [
+                    (None, "Auto"),
+                    (Some(engine::DemodMode::Nfm), "NFM"),
+                    (Some(engine::DemodMode::Am), "AM"),
+                    (Some(engine::DemodMode::Wfm), "WFM"),
+                ] {
+                    if ui.selectable_value(&mut self.listen_mode, m, egui::RichText::new(name).small()).changed() {
+                        // Re-apply to what's playing.
+                        if let Some(l) = listening {
+                            let mode = m.unwrap_or(l.mode);
+                            start = Some(engine::ListenSpec { center_hz: l.center_hz, mode });
+                        }
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                let sel = target.clone();
+                if ui.add_enabled(sel.is_some(), egui::Button::new("Listen to selection")).clicked() {
+                    if let Some((hz, label, bw)) = sel {
+                        start =
+                            Some(engine::ListenSpec { center_hz: hz, mode: self.listen_mode.unwrap_or_else(|| auto_mode(hz, &label, bw)) });
+                    }
+                }
+                if ui.add_enabled(listening.is_some(), egui::Button::new("Stop")).clicked() {
+                    stop = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add(egui::DragValue::new(&mut self.listen_mhz).speed(0.0125).range(24.0..=1800.0).max_decimals(4).suffix(" MHz"));
+                if ui.button("Listen here").clicked() {
+                    let hz = self.listen_mhz * 1e6;
+                    start = Some(engine::ListenSpec { center_hz: hz, mode: self.listen_mode.unwrap_or_else(|| auto_mode(hz, "", 0.0)) });
+                }
+            });
+            if ui.add(egui::Slider::new(&mut self.volume, 0.0..=1.5).text("volume")).changed() {
+                if let Some(a) = &self.audio_out {
+                    a.set_volume(self.volume);
+                }
+            }
+            if let Some(e) = &self.audio_err {
+                ui.label(egui::RichText::new(e).small().color(theme::MUTED));
+            }
+        });
+        if let Some(spec) = start {
+            if let Some(focus) = self.pane(Role::Focus) {
+                // Outside the tuned span: retune the focus there first.
+                if focus.view.span().is_none_or(|(lo, hi)| spec.center_hz < lo + 0.5e6 || spec.center_hz > hi - 0.5e6) {
+                    self.retune_focus((spec.center_hz / 1e3).round() / 1e3);
+                }
+            }
+            if self.audio_out.is_none() {
+                match audio::AudioOut::new() {
+                    Ok(a) => {
+                        a.set_volume(self.volume);
+                        self.audio_out = Some(a);
+                        self.audio_err = None;
+                    }
+                    Err(e) => self.audio_err = Some(format!("Audio output: {e}")),
+                }
+            }
+            if let Some(focus) = self.pane(Role::Focus) {
+                focus.source.listen(Some(spec));
+                if let Some(a) = &self.audio_out {
+                    a.set_source(Some(focus.source.audio()));
+                }
+                self.listen_mhz = spec.center_hz / 1e6;
+            }
+        }
+        if stop {
+            if let Some(focus) = self.pane(Role::Focus) {
+                focus.source.listen(None);
+            }
+            if let Some(a) = &self.audio_out {
+                a.set_source(None);
+            }
         }
     }
 
@@ -903,12 +1046,14 @@ impl App {
             ui.selectable_value(&mut self.list_tab, ListTab::Emitters, "Emitters");
             ui.selectable_value(&mut self.list_tab, ListTab::Records, "Records");
             ui.selectable_value(&mut self.list_tab, ListTab::P25, "P25");
+            ui.selectable_value(&mut self.list_tab, ListTab::Pages, "Pages");
             ui.label(egui::RichText::new("click to select · double-click to tune Focus A").small().color(theme::MUTED));
         });
         match self.list_tab {
             ListTab::Emitters => self.emitter_list(ui),
             ListTab::Records => self.signal_list(ui),
             ListTab::P25 => self.p25_panel(ui),
+            ListTab::Pages => self.pages_panel(ui),
         }
     }
 
@@ -1081,7 +1226,7 @@ impl App {
                     row.col(|ui| text(ui, if *role == Role::Survey { "S".into() } else { "A".into() }, c));
                     row.col(|ui| text(ui, format!("{:.4}", e.center_hz / 1e6), c));
                     row.col(|ui| text(ui, label, class_col));
-                    row.col(|ui| text(ui, e.id().unwrap_or("").to_string(), c));
+                    row.col(|ui| text(ui, e.id_label(), c));
                     // Voice / control / data, and the latest call heard.
                     let talk = e.last_talk.clone().or_else(|| grant_talk(e));
                     let act = match (e.activity(), talk) {
@@ -1249,6 +1394,88 @@ impl App {
                     row.col(|ui| text(ui, format!("NAC 0x{:03X}", g.nac), theme::MUTED));
                     if row.response().double_clicked() {
                         tune = g.freq_hz;
+                    }
+                });
+            });
+        if let Some(f) = tune {
+            self.retune_focus((f / 1e3).round() / 1e3);
+        }
+    }
+
+    /// Pager messages (FLEX, POCSAG) decoded by the monitors, newest first.
+    fn pages_panel(&mut self, ui: &mut egui::Ui) {
+        let mut pages: Vec<engine::PageEvent> = self.panes.iter().flat_map(|p| p.source.pages(5000)).collect();
+        pages.sort_by(|a, b| b.last.cmp(&a.last));
+        let pagers = self.panes.iter().flat_map(|p| p.source.monitors()).filter(|m| !m.label.starts_with("CC")).count();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Filter").small().color(theme::MUTED));
+            ui.add(egui::TextEdit::singleline(&mut self.page_filter).desired_width(200.0).hint_text("capcode or text"));
+            ui.label(
+                egui::RichText::new(format!("{} pages · {pagers} pager channel{} monitored", pages.len(), if pagers == 1 { "" } else { "s" }))
+                    .small()
+                    .monospace()
+                    .color(theme::MUTED),
+            );
+        });
+        if pages.is_empty() {
+            ui.label(
+                egui::RichText::new(if pagers == 0 {
+                    "No pager channel identified yet. FLEX and POCSAG channels are monitored automatically once identified."
+                } else {
+                    "Monitoring; waiting for the first page…"
+                })
+                .color(theme::MUTED),
+            );
+            return;
+        }
+        let f = self.page_filter.trim().to_lowercase();
+        if !f.is_empty() {
+            pages.retain(|p| format!("{:09}", p.capcode).contains(&f) || p.text.to_lowercase().contains(&f));
+        }
+        let pager = egui::Color32::from_rgb(0x6c, 0xc4, 0xe0);
+        let mut tune = None;
+        let row_h = 18.0;
+        egui_extras::TableBuilder::new(ui)
+            .id_salt("pages")
+            .striped(true)
+            .sense(egui::Sense::click())
+            .auto_shrink([false, false])
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(egui_extras::Column::exact(72.0))
+            .column(egui_extras::Column::exact(84.0))
+            .column(egui_extras::Column::exact(60.0))
+            .column(egui_extras::Column::exact(84.0))
+            .column(egui_extras::Column::exact(84.0))
+            .column(egui_extras::Column::exact(32.0))
+            .column(egui_extras::Column::remainder())
+            .header(row_h, |mut h| {
+                for t in ["Time", "MHz", "Protocol", "Capcode", "Type", "×", "Message (hover for all)"] {
+                    h.col(|ui| {
+                        ui.label(egui::RichText::new(t).small().color(theme::MUTED));
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(row_h, pages.len(), |mut row| {
+                    let p = &pages[row.index()];
+                    let text = |ui: &mut egui::Ui, s: String, c: egui::Color32| {
+                        ui.add(egui::Label::new(egui::RichText::new(s).monospace().color(c)).selectable(false).truncate());
+                    };
+                    let recent = std::time::SystemTime::now().duration_since(p.last).map(|d| d.as_secs() < 10).unwrap_or(true);
+                    let c = if recent { theme::TEXT } else { theme::TEXT2 };
+                    row.col(|ui| text(ui, hms(p.last), c));
+                    row.col(|ui| text(ui, format!("{:.4}", p.center_hz / 1e6), theme::TEXT2));
+                    row.col(|ui| text(ui, p.protocol.to_string(), pager));
+                    row.col(|ui| text(ui, format!("{:09}", p.capcode), c));
+                    row.col(|ui| text(ui, p.kind.clone(), theme::MUTED));
+                    row.col(|ui| text(ui, p.count.to_string(), theme::MUTED));
+                    row.col(|ui| {
+                        let body = format!("{}{}", if p.damaged { "[damaged] " } else { "" }, p.text);
+                        ui.add(egui::Label::new(egui::RichText::new(&body).monospace().color(c)).selectable(false).truncate())
+                            .on_hover_text(&body);
+                    });
+                    if row.response().double_clicked() {
+                        tune = Some(p.center_hz);
                     }
                 });
             });
@@ -1515,7 +1742,7 @@ fn export_emitters(panes: &[Pane]) -> std::io::Result<(std::path::PathBuf, usize
                 unix(e.last_seen),
                 e.peak_snr_db,
                 q(&e.label().unwrap_or_default()),
-                q(e.id().unwrap_or("")),
+                q(&e.id_label()),
                 q(&tally.join("; "))
             )?;
         }

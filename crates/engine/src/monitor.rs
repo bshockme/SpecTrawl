@@ -6,8 +6,9 @@
 //! overlap so frames spanning a boundary aren't lost.
 //!
 //! Today: P25 Phase 1 control channels (emitters whose decoded frames include
-//! TSDUs). Their messages build a per-source P25 book: system identity,
-//! sites, band plans, and a log of talkgroup grants.
+//! TSDUs), whose messages build a per-source P25 book (system identity,
+//! sites, band plans, a log of talkgroup grants); and pager channels (FLEX,
+//! POCSAG), whose pages go to a page log.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -15,13 +16,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use detect::p25::{self, SystemInfo};
-use detect::{Ddc, decode};
+use detect::{Ddc, decode, flex, pocsag};
 use sdr_core::Complex32;
 
 use crate::Shared;
 
 /// Most monitors per source.
-const MAX_MONITORS: usize = 2;
+const MAX_MONITORS: usize = 4;
 /// Decode once this much new channel signal has accumulated...
 const BLOCK_S: f64 = 0.6;
 /// ...keeping this much of the previous block, so boundary frames decode.
@@ -29,6 +30,72 @@ const OVERLAP_S: f64 = 0.12;
 /// Identical grants within this window are one event.
 const GRANT_DEDUP: Duration = Duration::from_secs(3);
 const MAX_GRANTS: usize = 5000;
+/// Pager channels decode in longer stretches, overlapping by more than a
+/// FLEX frame (1.9 s) so every frame is whole in at least one of them.
+const PAGER_BLOCK_S: f64 = 1.8;
+const PAGER_OVERLAP_S: f64 = 2.2;
+/// Identical pages within this window are one page: overlapping stretches
+/// decode a frame twice, and systems repeat pages. Repeats more than
+/// `PAGE_REPEAT` apart are counted.
+const PAGE_DEDUP: Duration = Duration::from_secs(30);
+const PAGE_REPEAT: Duration = Duration::from_secs(4);
+const MAX_PAGES: usize = 5000;
+
+#[derive(Debug, Clone)]
+pub struct PageEvent {
+    pub first: SystemTime,
+    pub last: SystemTime,
+    pub center_hz: f64,
+    /// "FLEX" or "POCSAG".
+    pub protocol: &'static str,
+    /// FLEX capcode or POCSAG address.
+    pub capcode: u64,
+    /// FLEX: message type and phase ("alpha A"); POCSAG: function ("func D").
+    pub kind: String,
+    pub text: String,
+    /// Some of the message failed its error check.
+    pub damaged: bool,
+    /// Times the page was sent.
+    pub count: u32,
+}
+
+/// Pages from the pager monitors.
+#[derive(Default)]
+pub(crate) struct PagerBook {
+    pub pages: VecDeque<PageEvent>,
+}
+
+impl PagerBook {
+    fn record(&mut self, p: PageEvent) {
+        let same = self.pages.iter_mut().rev().take(256).find(|o| {
+            o.protocol == p.protocol
+                && o.capcode == p.capcode
+                && o.text == p.text
+                && p.first.duration_since(o.last).map(|d| d < PAGE_DEDUP).unwrap_or(true)
+        });
+        match same {
+            Some(o) => {
+                if p.first.duration_since(o.last).is_ok_and(|d| d >= PAGE_REPEAT) {
+                    o.count += 1;
+                }
+                o.last = p.last;
+            }
+            None => {
+                if self.pages.len() >= MAX_PAGES {
+                    self.pages.pop_front();
+                }
+                self.pages.push_back(p);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    P25,
+    Flex,
+    Pocsag,
+}
 
 #[derive(Debug, Clone)]
 pub struct GrantEvent {
@@ -105,6 +172,7 @@ impl P25Book {
 }
 
 struct Mon {
+    kind: Kind,
     emitter: u64,
     center_hz: f64,
     tuner_hz: f64,
@@ -125,26 +193,41 @@ pub(crate) fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>, rate: f64) {
         mons.retain(|m| m.tuner_hz == tuner);
         if last_pick.elapsed() > Duration::from_secs(2) {
             last_pick = Instant::now();
-            let candidates: Vec<(u64, f64, String)> = {
+            let candidates: Vec<(u64, f64, Kind, String)> = {
                 let st = shared.records.lock();
                 st.emitters
                     .map
                     .values()
-                    .filter(|e| is_p25_control(e))
-                    // "CC 0x2A5": control channel and its NAC.
-                    .map(|e| (e.id, e.center_hz, format!("CC {}", e.id().map(|i| i.trim_start_matches("NAC ")).unwrap_or("P25"))))
+                    .filter_map(|e| {
+                        if is_p25_control(e) {
+                            // "CC 0x2A5": control channel and its NAC.
+                            return Some((e.id, e.center_hz, Kind::P25, format!("CC {}", e.id().map(|i| i.trim_start_matches("NAC ")).unwrap_or("P25"))));
+                        }
+                        let l = e.protocol_label()?;
+                        let kind = if l.starts_with("FLEX") {
+                            Kind::Flex
+                        } else if l.starts_with("POCSAG") {
+                            Kind::Pocsag
+                        } else {
+                            return None;
+                        };
+                        Some((e.id, e.center_hz, kind, l))
+                    })
                     .collect()
             };
-            for (id, c, label) in candidates {
+            for (id, c, kind, label) in candidates {
                 if mons.len() >= MAX_MONITORS || mons.iter().any(|m| m.emitter == id || (m.center_hz - c).abs() < 6e3) {
                     continue;
                 }
                 let head = shared.ring.lock().head();
+                // Pagers deviate up to 4.8 kHz at 3200 baud: a wider channel.
+                let cutoff = if kind == Kind::P25 { 8e3 } else { 10e3 };
                 mons.push(Mon {
+                    kind,
                     emitter: id,
                     center_hz: c,
                     tuner_hz: tuner,
-                    ddc: Ddc::new(rate, c - tuner, 8e3, 48e3),
+                    ddc: Ddc::new(rate, c - tuner, cutoff, 48e3),
                     pos: head.saturating_sub((0.5 * rate) as u64),
                     buf: Vec::new(),
                     messages: 0,
@@ -173,6 +256,15 @@ pub(crate) fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>, rate: f64) {
                 worked = true;
             }
             let fs = m.ddc.fs_out;
+            if m.kind != Kind::P25 {
+                if m.buf.len() as f64 >= (PAGER_BLOCK_S + PAGER_OVERLAP_S) * fs {
+                    decode_pages(&shared, m, fs);
+                    let keep = (PAGER_OVERLAP_S * fs) as usize;
+                    let cut = m.buf.len() - keep;
+                    m.buf.drain(..cut);
+                }
+                continue;
+            }
             if m.buf.len() as f64 >= (BLOCK_S + OVERLAP_S) * fs {
                 let frames = detect::frames(&m.buf, fs, 12_500.0, 8, 380);
                 // The NAC from the NIDs that decoded identifies the system.
@@ -200,6 +292,40 @@ pub(crate) fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>, rate: f64) {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+}
+
+/// Decodes a pager monitor's buffer into the page log.
+fn decode_pages(shared: &Shared, m: &mut Mon, fs: f64) {
+    let now = SystemTime::now();
+    let page = |protocol, capcode, kind, text, damaged| PageEvent {
+        first: now,
+        last: now,
+        center_hz: m.center_hz,
+        protocol,
+        capcode,
+        kind,
+        text,
+        damaged,
+        count: 1,
+    };
+    let pages: Vec<PageEvent> = if m.kind == Kind::Flex {
+        flex::decode(&m.buf, fs)
+            .into_iter()
+            .flat_map(|f| f.pages)
+            .map(|p| page("FLEX", p.capcode, format!("{} {}", p.kind, p.phase), p.text, p.damaged))
+            .collect()
+    } else {
+        let frames = detect::frames_with(&m.buf, fs, 6_500.0, 0, 520, Default::default());
+        pocsag::pages(&frames)
+            .into_iter()
+            .map(|p| page("POCSAG", p.address as u64, format!("func {}", (b'A' + p.function) as char), p.text, false))
+            .collect()
+    };
+    let mut book = shared.pager.lock();
+    for p in pages {
+        book.record(p);
+    }
+    m.messages = book.pages.iter().filter(|p| p.center_hz == m.center_hz).map(|p| p.count as u64).sum();
 }
 
 /// A P25 Phase 1 emitter whose decoded frames include TSDUs (trunking

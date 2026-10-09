@@ -75,6 +75,8 @@ pub struct Emitter {
     /// Calls heard ("TG 1234 ← 5678"), with counts, and the latest.
     pub talk: BTreeMap<String, u32>,
     pub last_talk: Option<String>,
+    /// Capacity Plus repeater number this transmitter was seen to be.
+    pub capplus_repeater: Option<u8>,
     /// Protocol labels seen at least once with `STRONG_SYNCS` or more syncs.
     pub strong: std::collections::BTreeSet<String>,
     /// Latest group-level classification.
@@ -110,6 +112,16 @@ impl Emitter {
     /// Most-seen decoded identity (NAC, colour code), if any.
     pub fn id(&self) -> Option<&str> {
         self.ids.iter().max_by_key(|(_, n)| **n).map(|(k, _)| k.as_str())
+    }
+
+    /// `id`, plus the Capacity Plus repeater number when known:
+    /// "CC 9 · Cap+ rep 3".
+    pub fn id_label(&self) -> String {
+        match (self.id(), self.capplus_repeater) {
+            (Some(i), Some(r)) => format!("{i} · Cap+ rep {r}"),
+            (None, Some(r)) => format!("Cap+ rep {r}"),
+            (i, None) => i.unwrap_or("").to_string(),
+        }
     }
 
     fn majority_feature_label(&self) -> Option<String> {
@@ -273,6 +285,7 @@ impl EmitterBook {
         for (k, n) in from.ids {
             *e.ids.entry(k).or_default() += n;
         }
+        e.capplus_repeater = e.capplus_repeater.or(from.capplus_repeater);
         e.strong.extend(from.strong);
         for (k, n) in from.activity {
             *e.activity.entry(k).or_default() += n;
@@ -308,6 +321,7 @@ impl EmitterBook {
             activity: BTreeMap::new(),
             talk: BTreeMap::new(),
             last_talk: None,
+            capplus_repeater: None,
             strong: Default::default(),
             class: None,
             best: None,
@@ -382,6 +396,9 @@ impl EmitterBook {
             if let Some(t) = &f.talk {
                 *e.talk.entry(t.clone()).or_default() += 1;
                 e.last_talk = Some(t.clone());
+            }
+            if f.capplus_repeater.is_some() {
+                e.capplus_repeater = f.capplus_repeater;
             }
         }
         if c.protocol.is_some() {

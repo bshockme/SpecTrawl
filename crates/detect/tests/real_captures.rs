@@ -78,3 +78,15 @@ fn p25_control_channel_messages() {
     let (tg, ch, _) = grants.iter().find(|g| g.0 == 10730).expect("grant");
     assert_eq!((*tg, sys.freq(*ch).map(|f| f.round()), sys.slot(*ch)), (10730, Some(769_193_750.0), Some(1)));
 }
+
+#[test]
+fn capplus_status_rest_field() {
+    let Some((x, fs)) = load("855.5882MHz_DMR_BS_data") else {
+        eprintln!("skipping: capture not present");
+        return;
+    };
+    // Idle site: status announcing "rest" 3/2; no voice, so the channel's
+    // own repeater number stays unknown.
+    let f = detect::classify(&x, fs, 12_500.0).fields.expect("fields");
+    assert_eq!((f.capplus_repeater, f.capplus_rest), (None, Some((3, 2))));
+}

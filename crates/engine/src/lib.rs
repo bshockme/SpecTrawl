@@ -6,6 +6,7 @@
 mod bursts;
 mod classify;
 mod emitters;
+mod listen;
 mod monitor;
 mod occupancy;
 mod ring;
@@ -24,9 +25,11 @@ use sdr_core::{Capabilities, Complex32, Device, DeviceInfo, Samples, StreamEvent
 
 pub use bursts::{BurstDetector, DetectorConfig, SignalRecord};
 pub use classify::ClassifierLoad;
+pub use detect::demod::Mode as DemodMode;
 pub use detect::p25::SystemInfo as P25System;
 pub use emitters::Emitter;
-pub use monitor::{GrantEvent, MonitorInfo};
+pub use listen::{AudioQueue, ListenSpec};
+pub use monitor::{GrantEvent, MonitorInfo, PageEvent};
 pub use occupancy::KnownOccupant;
 pub use ring::IqRing;
 pub use sweep::{SweepPlan, SweepStatus};
@@ -133,7 +136,11 @@ struct Shared {
     ffts_per_sec: Mutex<f64>,
     classifier_load: Mutex<classify::ClassifierLoad>,
     p25: Mutex<monitor::P25Book>,
+    pager: Mutex<monitor::PagerBook>,
     occupancy: Mutex<occupancy::OccupancyTracker>,
+    /// The channel being listened to, if any, and its audio.
+    listen: Mutex<Option<ListenSpec>>,
+    audio: Arc<AudioQueue>,
 }
 
 impl Shared {
@@ -246,7 +253,10 @@ impl Source {
             ffts_per_sec: Mutex::new(0.0),
             classifier_load: Mutex::new(Default::default()),
             p25: Mutex::new(Default::default()),
+            pager: Mutex::new(Default::default()),
             occupancy: Mutex::new(occupancy::OccupancyTracker::new(1)),
+            listen: Mutex::new(None),
+            audio: Arc::new(AudioQueue::default()),
         });
         device.start(Box::new(RingSink { shared: shared.clone() }))?;
         let info = device.info().clone();
@@ -281,6 +291,8 @@ impl Source {
                 let rate = self.device.lock().sample_rate();
                 let (sh, s) = (shared.clone(), st.clone());
                 handles.push(std::thread::Builder::new().name("monitor".into()).spawn(move || monitor::run(sh, s, rate)));
+                let (sh, s) = (shared.clone(), st.clone());
+                handles.push(std::thread::Builder::new().name("listen".into()).spawn(move || listen::run(sh, s, rate)));
                 let caps = self.device.lock().capabilities().clone();
                 handles.push(std::thread::Builder::new().name("classify".into()).spawn(move || classify::run(shared, cfg, st, rate, caps)));
             }
@@ -362,6 +374,21 @@ impl Source {
         v
     }
 
+    /// Starts (or changes, or with None stops) listening to a channel. Only
+    /// a live source listens; a sweep ignores it.
+    pub fn listen(&self, spec: Option<ListenSpec>) {
+        *self.shared.listen.lock() = spec;
+    }
+
+    pub fn listening(&self) -> Option<ListenSpec> {
+        *self.shared.listen.lock()
+    }
+
+    /// The audio the listener produces, for an audio output to drain.
+    pub fn audio(&self) -> Arc<AudioQueue> {
+        self.shared.audio.clone()
+    }
+
     /// Known wideband occupants (FM broadcast, TV, LTE/NR) identified so far.
     pub fn occupants(&self) -> Vec<KnownOccupant> {
         self.shared.occupancy.lock().known.clone()
@@ -405,6 +432,11 @@ impl Source {
     /// The newest `n` talkgroup grants, newest first.
     pub fn p25_grants(&self, n: usize) -> Vec<GrantEvent> {
         self.shared.p25.lock().grants.iter().rev().take(n).cloned().collect()
+    }
+
+    /// The newest `n` pager messages (FLEX, POCSAG), newest first.
+    pub fn pages(&self, n: usize) -> Vec<PageEvent> {
+        self.shared.pager.lock().pages.iter().rev().take(n).cloned().collect()
     }
 
     pub fn monitors(&self) -> Vec<MonitorInfo> {

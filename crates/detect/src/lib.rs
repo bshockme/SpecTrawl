@@ -7,10 +7,13 @@ pub mod chirp;
 pub mod context;
 pub mod ddc;
 pub mod decode;
+pub mod demod;
 pub mod dmr;
 pub mod features;
+pub mod flex;
 pub mod frames;
 pub mod p25;
+pub mod pocsag;
 pub mod spectral;
 pub mod sync;
 
@@ -45,26 +48,64 @@ pub fn prepare(x: &[Complex32], fs: f64, bandwidth_hz: f64) -> Vec<Complex32> {
     if x.len() < 64 || bandwidth_hz > 25e3 {
         return x.to_vec();
     }
+    prepare_cutoff(x, fs, (bandwidth_hz * 0.5 + 500.0).clamp(4_000.0, 6_500.0))
+}
+
+/// `prepare` with an explicit low-pass cutoff.
+pub fn prepare_cutoff(x: &[Complex32], fs: f64, cutoff_hz: f64) -> Vec<Complex32> {
+    if x.len() < 64 {
+        return x.to_vec();
+    }
     let gate = features::envelope_gate(x);
     let disc = features::discriminator(x, fs);
     let on: Vec<f32> = disc.iter().zip(&gate[1..]).filter(|(_, g)| **g).map(|(d, _)| *d).collect();
     let on_iq: Vec<Complex32> = x.iter().zip(&gate).filter(|(_, g)| **g).map(|(v, _)| *v).collect();
     let offset = features::extract(&on_iq, &on, fs).offset_hz as f64;
-    let cutoff = (bandwidth_hz * 0.5 + 500.0).clamp(4_000.0, 6_500.0);
-    let mut ddc = Ddc::new(fs, offset, cutoff, fs);
+    let mut ddc = Ddc::new(fs, offset, cutoff_hz, fs);
     let mut y = Vec::with_capacity(x.len());
     ddc.process(x, &mut y);
     y
 }
 
+/// Pre-filter cutoff for the sync search and slicing of narrowband 4FSK
+/// (P25, DMR, NXDN, dPMR): on the weak DMR capture, 4 kHz found 58 frames
+/// where 6.5 kHz found 22 (`examples/slice_tune`). Wider-deviation signals
+/// (POCSAG) fall back to `prepare`'s cutoff.
+pub const NARROW_CUTOFF_HZ: f64 = 4_000.0;
+
 /// Sync-aided frames for every sync occurrence in a channel: discriminator,
 /// envelope gate and DC removal as in `classify`, then the sync search, then
-/// slicing `before`/`after` symbols around each sync.
+/// slicing `before`/`after` symbols around each sync. Tries the narrow
+/// pre-filter first, then the one `prepare` picks for the bandwidth.
 pub fn frames(x: &[Complex32], fs: f64, bandwidth_hz: f64, before: usize, after: usize) -> Vec<frames::Frame> {
     if x.len() < 64 {
         return Vec::new();
     }
-    let x = &prepare(x, fs, bandwidth_hz)[..];
+    let narrow = frames_from(&prepare_cutoff(x, fs, NARROW_CUTOFF_HZ), fs, before, after, frames::SliceOpts::default());
+    if !narrow.is_empty() || bandwidth_hz > 25e3 {
+        return narrow;
+    }
+    frames_from(&prepare(x, fs, bandwidth_hz), fs, before, after, frames::SliceOpts::default())
+}
+
+/// `frames` with an explicit pre-filter cutoff and slicing options.
+pub fn frames_with(x: &[Complex32], fs: f64, cutoff_hz: f64, before: usize, after: usize, opts: frames::SliceOpts) -> Vec<frames::Frame> {
+    if x.len() < 64 {
+        return Vec::new();
+    }
+    frames_from(&prepare_cutoff(x, fs, cutoff_hz), fs, before, after, opts)
+}
+
+fn frames_from(x: &[Complex32], fs: f64, before: usize, after: usize, opts: frames::SliceOpts) -> Vec<frames::Frame> {
+    let disc = sync_disc(x, fs);
+    let hits = sync::search(&disc, fs, &sync::table());
+    frames::slice_with(&disc, fs, &hits, before, after, opts)
+}
+
+/// The discriminator for the sync search: residual offset removed, and
+/// zero where the envelope gate is off (TDMA off-slots and gaps between
+/// bursts are just noise; zero has no sign, so no false symbols).
+fn sync_disc(x: &[Complex32], fs: f64) -> Vec<f32> {
     let gate = features::envelope_gate(x);
     let mut disc = features::discriminator(x, fs);
     let on: Vec<f32> = disc.iter().zip(&gate[1..]).filter(|(_, g)| **g).map(|(d, _)| *d).collect();
@@ -73,8 +114,7 @@ pub fn frames(x: &[Complex32], fs: f64, bandwidth_hz: f64, before: usize, after:
     for (v, g) in disc.iter_mut().zip(&gate[1..]) {
         *v = if *g { *v - off } else { 0.0 };
     }
-    let hits = sync::search(&disc, fs, &sync::table());
-    frames::slice(&disc, fs, &hits, before, after)
+    disc
 }
 
 /// Classifies one channel: `x` is complex baseband centred on the signal,
@@ -94,37 +134,72 @@ pub fn classify(x: &[Complex32], fs: f64, bandwidth_hz: f64) -> Classification {
         c.label = "too short".into();
         return c;
     }
+    let raw = x;
     let x = &prepare(x, fs, bandwidth_hz)[..];
-    // Gate on the envelope: TDMA off-slots and gaps between bursts are just
-    // noise to the discriminator. Features use only "on" samples; for the
-    // sync search, off samples are zeroed (no sign, so no false symbols).
+    // Features use only the samples where the envelope gate is on.
     let gate = features::envelope_gate(x);
-    let mut disc = features::discriminator(x, fs);
+    let disc = features::discriminator(x, fs);
     let on: Vec<f32> = disc.iter().zip(&gate[1..]).filter(|(_, g)| **g).map(|(d, _)| *d).collect();
     let on_iq: Vec<Complex32> = x.iter().zip(&gate).filter(|(_, g)| **g).map(|(v, _)| *v).collect();
     c.features = features::extract(&on_iq, &on, fs);
     c.features.envelope_cv = features::envelope_cv(x);
-    let off = c.features.offset_hz;
-    for (v, g) in disc.iter_mut().zip(&gate[1..]) {
-        *v = if *g { *v - off } else { 0.0 };
+
+    // FLEX pagers: a 1600-baud header (sync 1 and a checked frame info
+    // word) identifies them outright; the frame after it switches speed, so
+    // it has its own decoder rather than a sync-bank entry.
+    if (8e3..60e3).contains(&bandwidth_hz) {
+        let headers = flex::headers(raw, fs);
+        if let Some(h) = headers.first() {
+            let frames = flex::decode(raw, fs);
+            let pages: Vec<&flex::Page> = frames.iter().flat_map(|f| &f.pages).collect();
+            c.protocol = Some("FLEX".into());
+            c.label = format!("FLEX {}", h.mode());
+            c.confidence = 0.95;
+            c.fields = Some(decode::Fields {
+                kinds: vec![("frame".into(), headers.len()), ("page".into(), pages.len())],
+                decoded: headers.len(),
+                tried: headers.len(),
+                activity: Some(decode::Activity::Data),
+                messages: pages.iter().map(|p| p.summary()).collect(),
+                ..Default::default()
+            });
+            return c;
+        }
     }
 
-    // Sync search for narrowband signals that aren't bare carriers.
+    // Sync search for narrowband signals that aren't bare carriers: first
+    // through the narrow 4FSK pre-filter, then the bandwidth's own.
     if (4.5e3..60e3).contains(&bandwidth_hz) {
-        let hits = sync::search(&disc, fs, &sync::table());
-        c.sync = sync::best(&hits);
-        if let Some(best) = &c.sync {
+        let narrow = bandwidth_hz <= 25e3;
+        for d in [narrow.then(|| sync_disc(&prepare_cutoff(raw, fs, NARROW_CUTOFF_HZ), fs)), Some(sync_disc(x, fs))].into_iter().flatten() {
+            let hits = sync::search(&d, fs, &sync::table());
+            let Some(best) = sync::best(&hits) else { continue };
             // Slice and decode the frames of the identified protocol.
             let mine: Vec<sync::SyncHit> =
                 hits.into_iter().filter(|h| h.entry.protocol == best.protocol && h.entry.baud == best.baud).collect();
             // DMR bursts carry their payload either side of the sync (54
             // symbols before, 78 after); others need only the header after.
-            let (before, after) = if best.protocol == "DMR" { (54, 80) } else { (8, 64) };
-            let fr = frames::slice(&disc, fs, &mine, before, after);
-            let fields = decode::summarise(&fr);
+            let (before, after) = match best.protocol {
+                "DMR" => (54, 80),
+                // A POCSAG batch: 16 codewords of 32 bits after the sync.
+                "POCSAG" => (0, 520),
+                _ => (8, 64),
+            };
+            let fr = frames::slice(&d, fs, &mine, before, after);
+            let mut fields = decode::summarise(&fr);
+            if best.protocol == "POCSAG" {
+                let pages = pocsag::pages(&fr);
+                fields.tried = fr.len();
+                fields.decoded = pages.len();
+                fields.activity = Some(decode::Activity::Data);
+                fields.kinds = vec![("page".into(), pages.len())];
+                fields.messages = pages.iter().map(|p| format!("{} ({}): {}", p.address, (b'A' + p.function) as char, p.text)).collect();
+            }
             if fields.tried > 0 {
                 c.fields = Some(fields);
             }
+            c.sync = Some(best);
+            break;
         }
     }
     let f = &c.features;
@@ -196,6 +271,49 @@ mod tests {
                 Complex32::new(phase.cos() as f32, phase.sin() as f32)
             })
             .collect()
+    }
+
+    /// 2FSK of the given bits (1 = −dev) at `baud`, with a little noise.
+    fn fsk2_bits(bits: &[bool], baud: f64, dev: f64, fs: f64) -> Vec<Complex32> {
+        let n = (bits.len() as f64 * fs / baud) as usize;
+        let mut phase = 0.0f64;
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        (0..n)
+            .map(|i| {
+                let neg = bits[((i as f64 * baud / fs) as usize).min(bits.len() - 1)];
+                phase += 2.0 * std::f64::consts::PI * if neg { -dev } else { dev } / fs;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let nz = ((x >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.3;
+                Complex32::new(phase.cos() as f32 + nz, phase.sin() as f32 - nz)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pocsag_page_decodes_end_to_end() {
+        // Preamble, then two batches: an alpha page to address 1234567.
+        let mut cws: Vec<u32> = vec![0x7A89_C197; 14];
+        cws.push(pocsag::encode((1_234_567u32 >> 3) << 2 | 3));
+        let text = "SPECTRAWL TEST";
+        let bits: Vec<u32> = text.bytes().flat_map(|c| (0..7).map(move |i| (c >> i & 1) as u32)).collect();
+        cws.extend(bits.chunks(20).map(|c| pocsag::encode(1 << 20 | c.iter().chain(std::iter::repeat(&0)).take(20).fold(0, |a, b| a << 1 | b))));
+        cws.resize(32, 0x7A89_C197);
+        let mut stream: Vec<bool> = (0..576).map(|i| i % 2 == 0).collect();
+        for batch in cws.chunks(16) {
+            stream.extend((0..32).rev().map(|i| 0x7CD2_15D8u32 >> i & 1 == 1));
+            for cw in batch {
+                stream.extend((0..32).rev().map(|i| cw >> i & 1 == 1));
+            }
+        }
+        stream.extend((0..200).map(|i| i % 2 == 0));
+        let fs = 48_000.0;
+        let x = fsk2_bits(&stream, 1200.0, 4500.0, fs);
+        let c = classify(&x, fs, 18_000.0);
+        assert_eq!(c.protocol.as_deref(), Some("POCSAG"));
+        let f = c.fields.expect("fields");
+        assert_eq!(f.messages, vec!["1234567 (D): SPECTRAWL TEST".to_string()], "{f:?}");
     }
 
     #[test]

@@ -217,11 +217,17 @@ pub struct LinkControl {
     pub options: u8,
     pub target: u32,
     pub source: u32,
+    /// Capacity Plus: the voice channel (group voice) or rest channel (wide
+    /// area voice) as (repeater 1-16, timeslot 1-2).
+    pub channel: Option<(u8, u8)>,
 }
+
+/// Motorola's feature set ID (Capacity Plus, Connect Plus).
+pub const FID_MOTOROLA: u8 = 0x10;
 
 impl LinkControl {
     pub fn group(&self) -> bool {
-        self.flco == 0
+        self.flco == 0 || (self.fid == FID_MOTOROLA && self.flco == 4)
     }
 }
 
@@ -246,7 +252,21 @@ pub enum Burst {
 
 fn lc_from(d: &[u8; 12]) -> LinkControl {
     let u24 = |i: usize| (d[i] as u32) << 16 | (d[i + 1] as u32) << 8 | d[i + 2] as u32;
-    LinkControl { flco: d[0] & 0x3F, fid: d[1], options: d[2], target: u24(3), source: u24(6) }
+    let (flco, fid) = (d[0] & 0x3F, d[1]);
+    if fid == FID_MOTOROLA && (flco == 0 || flco == 4) {
+        // Capacity Plus group voice (0) and wide-area group voice (4): an
+        // 8-bit talkgroup, then a repeater (4 bits) and timeslot, then a
+        // 16-bit radio ID (field positions as documented by SDRTrunk).
+        return LinkControl {
+            flco,
+            fid,
+            options: d[2],
+            target: d[5] as u32,
+            source: (d[7] as u32) << 8 | d[8] as u32,
+            channel: Some(((d[6] >> 1 & 0xF) + 1, (d[6] & 1) + 1)),
+        };
+    }
+    LinkControl { flco, fid, options: d[2], target: u24(3), source: u24(6), channel: None }
 }
 
 /// Decodes the payload of a data burst of the given data type (from its
@@ -268,6 +288,32 @@ pub fn decode_burst(f: &Frame, data_type: u8) -> Option<Burst> {
             source: (d[5] as u32) << 16 | (d[6] as u32) << 8 | d[7] as u32,
         }),
         _ => None,
+    }
+}
+
+/// Capacity Plus system status (Motorola CSBK 0x3E). Field positions as
+/// documented by SDRTrunk. Unconfirmed here: on the local idle site the
+/// "rest repeater" climbs by one every several minutes (3, 4, ... 7 over a
+/// day), identical on every repeater, always slot 2, so it may be a
+/// timed rest rotation or not the rest channel at all. The activity bytes
+/// aren't decoded (all zero on an idle site).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapPlusStatus {
+    /// Fragment flags (first/last of a multi-CSBK status): 3 = complete.
+    pub fragment: u8,
+    /// The rest channel: repeater 1-16 and timeslot 1-2.
+    pub rest_repeater: u8,
+    pub rest_slot: u8,
+    /// Repeater activity, still raw.
+    pub activity: [u8; 7],
+}
+
+impl Csbk {
+    pub fn capplus_status(&self) -> Option<CapPlusStatus> {
+        (self.fid == FID_MOTOROLA && self.opcode == 0x3E).then(|| {
+            let b = self.args[0];
+            CapPlusStatus { fragment: b >> 6, rest_repeater: (b >> 1 & 0xF) + 1, rest_slot: (b & 1) + 1, activity: self.args[1..8].try_into().unwrap() }
+        })
     }
 }
 
@@ -360,6 +406,15 @@ mod tests {
         }
         let b = bptc_decode(&raw);
         assert_eq!(b.data, d, "bad lines {}", b.bad_lines);
+    }
+
+    #[test]
+    fn capplus_status_rest_channel() {
+        // From the 855.588 MHz capture: byte 0xE5 = fragment 3, rest
+        // repeater 3, timeslot 2.
+        let c = Csbk { last_block: true, opcode: 0x3E, fid: 0x10, args: [0xE5, 0, 0, 0, 0, 0, 0, 0] };
+        let s = c.capplus_status().unwrap();
+        assert_eq!((s.fragment, s.rest_repeater, s.rest_slot), (3, 3, 2));
     }
 
     #[test]
