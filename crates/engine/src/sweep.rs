@@ -25,11 +25,26 @@ pub struct SweepPlan {
     pub guard_s: f64,
     /// Published rows are max-decimated to at most this many bins.
     pub max_bins: usize,
+    /// Blank narrow spurs at every multiple of this frequency. The radio's own
+    /// clocks put harmonics there (Airspy R2: 20 and 25 MHz, so a 5 MHz grid
+    /// covers both, as Airspy's Spectrum Spy does). None leaves them in.
+    pub spur_grid_hz: Option<f64>,
+    /// Half-width of each blanked spur.
+    pub spur_halfwidth_hz: f64,
 }
 
 impl Default for SweepPlan {
     fn default() -> Self {
-        Self { start_hz: 24e6, stop_hz: 1800e6, fft_size: 4096, ffts_per_hop: 4, guard_s: 0.0095, max_bins: 32768 }
+        Self {
+            start_hz: 24e6,
+            stop_hz: 1800e6,
+            fft_size: 4096,
+            ffts_per_hop: 4,
+            guard_s: 0.0095,
+            max_bins: 32768,
+            spur_grid_hz: Some(5e6),
+            spur_halfwidth_hz: 5e3,
+        }
     }
 }
 
@@ -47,6 +62,8 @@ pub struct SweepStatus {
     pub redone_hops: u64,
     /// Dwells thrown away because their FFTs disagreed (tuner still settling).
     pub settle_retries: u64,
+    /// Hops that read differently after a long wait, so always get one.
+    pub slow_hops: usize,
 }
 
 impl SweepStatus {
@@ -82,6 +99,7 @@ pub(crate) fn run(
     let first_bin = (n - bins_per_hop) / 2;
     let guard = (plan.guard_s.max(latency) * rate).ceil() as u64;
     let dwell = (n * plan.ffts_per_hop) as u64;
+    let long_guard = (LONG_GUARD_S * rate).ceil() as u64;
 
     let mut sa = SpectrumAnalyzer::new(n);
     let mut block = vec![Complex32::default(); n];
@@ -105,11 +123,21 @@ pub(crate) fn run(
         hops_per_sec: 0.0,
         redone_hops: 0,
         settle_retries: 0,
+        slow_hops: 0,
     });
 
     let mut rate_window = (Instant::now(), 0u32);
     let mut last_center = f64::NAN;
     let mut lin = vec![0.0f32; n];
+    // Some hop-to-hop steps leave the tuner sitting on a wrong, quiet frequency
+    // for 10-15 ms (an R2 stepping 872.5 -> 881.5 MHz). The FFTs agree with each
+    // other, so the settle check can't see it. Instead each hop is compared,
+    // now and then, against a reading taken after a long wait; hops that differ
+    // always get the long wait. Steps are the same every pass, so this sticks.
+    let mut slow = vec![false; hops];
+    let mut agreed = vec![0u8; hops];
+    let mut pass_no = 0usize;
+    let (mut probe_hop, mut last_probe) = (0usize, Instant::now());
     'passes: loop {
         let pass_start = Instant::now();
         let mut h = 0;
@@ -131,7 +159,46 @@ pub(crate) fn run(
             // take longer to settle: up to ~30 ms measured on an R2.
             let jump = (center - last_center).abs();
             last_center = center;
-            let mut from = n0 + if jump > 3.0 * hop_hz { guard * 3 } else { guard };
+            let short = if jump > 3.0 * hop_hz { guard * 3 } else { guard };
+            // First pass checks every hop; after that, one hop at a time in turn,
+            // rate-limited so short sweeps don't spend their time waiting.
+            let probe = hops > 1
+                && short < long_guard
+                && (pass_no == 0 || (h == probe_hop && last_probe.elapsed() >= PROBE_INTERVAL));
+            if pass_no > 0 && h == probe_hop && (probe || short >= long_guard) {
+                probe_hop = (probe_hop + 1) % hops;
+            }
+            if probe {
+                last_probe = Instant::now();
+                let (a, b) = (n0 + short, n0 + long_guard);
+                match (
+                    band_power(&shared, &stop, &mut sa, &mut block, &mut db, a, plan.ffts_per_hop, first_bin, bins_per_hop),
+                    band_power(&shared, &stop, &mut sa, &mut block, &mut db, b, plan.ffts_per_hop, first_bin, bins_per_hop),
+                ) {
+                    _ if stop.load(Ordering::Relaxed) => break 'passes,
+                    (Some(pa), Some(pb)) => {
+                        if (pa - pb).abs() > SLOW_HOP_DB {
+                            if !slow[h] {
+                                log::info!("sweep: hop {:.1} MHz needs a long settle ({pa:.1} vs {pb:.1} dB)", center / 1e6);
+                            }
+                            slow[h] = true;
+                            agreed[h] = 0;
+                        } else if slow[h] {
+                            agreed[h] += 1;
+                            if agreed[h] >= AGREE_TO_CLEAR {
+                                slow[h] = false;
+                                agreed[h] = 0;
+                            }
+                        }
+                        let count = slow.iter().filter(|s| **s).count();
+                        if let Some(s) = shared.sweep.lock().as_mut() {
+                            s.slow_hops = count;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut from = n0 + if slow[h] { long_guard } else { short };
             let mut redo_hop = false;
             let mut attempts = 0;
             loop {
@@ -183,6 +250,9 @@ pub(crate) fn run(
                     for (i, d) in db.iter_mut().enumerate() {
                         *d = 10.0 * (lin[i] / k + 1e-20).log10();
                     }
+                    if let Some(grid) = plan.spur_grid_hz {
+                        blank_grid_spurs(&mut db, center, rate, grid, plan.spur_halfwidth_hz);
+                    }
                     full[h * bins_per_hop..(h + 1) * bins_per_hop].copy_from_slice(&db[first_bin..first_bin + bins_per_hop]);
                 }
                 break;
@@ -210,6 +280,7 @@ pub(crate) fn run(
             }
             h += 1;
         }
+        pass_no += 1;
         let mut row = vec![0.0f32; out_bins];
         if hops >= MIN_HOPS_FOR_PROFILE {
             update_hop_profile(&full, bins_per_hop, &mut profile);
@@ -235,6 +306,78 @@ pub(crate) fn run(
         }
     }
 }
+
+/// Replaces the bins within `halfwidth_hz` of every multiple of `grid_hz`
+/// with the level just outside them (the quieter side, so a neighbouring
+/// signal isn't smeared over the gap). `db` is one DC-centred FFT at `center_hz`.
+fn blank_grid_spurs(db: &mut [f32], center_hz: f64, rate: f64, grid_hz: f64, halfwidth_hz: f64) {
+    let n = db.len();
+    let bin_hz = rate / n as f64;
+    let lo = center_hz - rate / 2.0;
+    let hw = ((halfwidth_hz / bin_hz).round() as isize).max(1);
+    let side = 3isize;
+    let mut f = (lo / grid_hz).ceil() * grid_hz;
+    while f < lo + rate {
+        let c = ((f - lo) / bin_hz).round() as isize;
+        let (a, b) = (c - hw, c + hw);
+        if a - side >= 0 && b + side < n as isize {
+            let mean = |r: std::ops::Range<isize>| r.clone().map(|j| db[j as usize]).sum::<f32>() / r.len() as f32;
+            let fill = mean(a - side..a).min(mean(b + 1..b + 1 + side));
+            db[a as usize..=b as usize].iter_mut().for_each(|v| *v = fill);
+        }
+        f += grid_hz;
+    }
+}
+
+/// Total power in a hop's usable band (dB), over `ffts` FFTs starting at
+/// sample `from`; waits for the samples. None if they never arrive or have
+/// already left the ring.
+#[allow(clippy::too_many_arguments)]
+fn band_power(
+    shared: &Shared,
+    stop: &AtomicBool,
+    sa: &mut SpectrumAnalyzer,
+    block: &mut [Complex32],
+    db: &mut Vec<f32>,
+    from: u64,
+    ffts: usize,
+    first_bin: usize,
+    bins: usize,
+) -> Option<f32> {
+    let n = block.len();
+    let to = from + (n * ffts) as u64;
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while shared.ring.lock().head() < to {
+        if stop.load(Ordering::Relaxed) || Instant::now() > deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_micros(500));
+    }
+    let mut sum = 0.0f64;
+    for k in 0..ffts {
+        if !shared.ring.lock().read(from + (k * n) as u64, block) {
+            return None;
+        }
+        sa.push(block);
+        sa.take_db(db);
+        sum += db[first_bin..first_bin + bins].iter().map(|d| 10f64.powf(*d as f64 / 10.0)).sum::<f64>();
+    }
+    Some((10.0 * (sum / (ffts * bins) as f64 + 1e-30).log10()) as f32)
+}
+
+/// Wait used to check a hop, and then used for hops that need it. 15 ms was
+/// enough for every step seen on an R2; this leaves margin.
+const LONG_GUARD_S: f64 = 0.02;
+/// At most one slow-hop check this often, after the first pass.
+const PROBE_INTERVAL: Duration = Duration::from_millis(250);
+/// Band power that differs by more than this between a normal and a long wait
+/// means the normal wait is too short for that hop.
+const SLOW_HOP_DB: f32 = 0.75;
+/// A slow hop goes back to the normal wait after this many agreeing checks in
+/// a row. Slowness is a property of the tuner step, so it should stick; but a
+/// burst during one check can mark a hop slow by mistake. Quiet bands agree
+/// either way, so this needs to be long enough to outlast a lull.
+const AGREE_TO_CLEAR: u8 = 20;
 
 /// A dwell whose FFT noise floors differ by more than this was measured
 /// while the tuner was still settling.
@@ -278,6 +421,21 @@ fn update_hop_profile(full: &[f32], bins_per_hop: usize, profile: &mut Vec<f32>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blanks_spurs_on_grid_only() {
+        // 1024 bins over 10 MHz around 873 MHz: 870 and 875 MHz are on the grid.
+        let (n, rate, centre) = (1024, 10e6, 873e6);
+        let bin = |f: f64| ((f - (centre - rate / 2.0)) / (rate / n as f64)).round() as usize;
+        let mut db = vec![-90.0f32; n];
+        db[bin(870e6)] = -60.0;
+        db[bin(875e6)] = -65.0;
+        db[bin(872.3e6)] = -50.0; // a real signal off the grid
+        blank_grid_spurs(&mut db, centre, rate, 5e6, 5e3);
+        assert_eq!(db[bin(870e6)], -90.0);
+        assert_eq!(db[bin(875e6)], -90.0);
+        assert_eq!(db[bin(872.3e6)], -50.0);
+    }
 
     #[test]
     fn profile_removes_repeating_spur_but_keeps_unique_signal() {
