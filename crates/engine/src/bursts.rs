@@ -93,6 +93,8 @@ pub struct SignalRecord {
     pub t_end: SystemTime,
     pub f_lo_hz: f64,
     pub f_hi_hz: f64,
+    /// Width of one spectrum bin: the resolution of `f_lo_hz`/`f_hi_hz`.
+    pub bin_hz: f64,
     pub peak_dbfs: f32,
     /// Mean over rows of (row peak − floor).
     pub mean_snr_db: f32,
@@ -250,6 +252,7 @@ impl BurstDetector {
             t_end: t.t_end,
             f_lo_hz: self.bin_hz(t.lo as f64),
             f_hi_hz: self.bin_hz(t.hi as f64 + 1.0),
+            bin_hz: self.tuning.map(|t| t.span_hz / self.bins as f64).unwrap_or(0.0),
             peak_dbfs: t.peak_db,
             mean_snr_db: t.snr_sum / t.rows.max(1) as f32,
             max_snr_db: t.snr_max,

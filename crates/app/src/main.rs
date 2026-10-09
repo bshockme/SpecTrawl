@@ -103,7 +103,58 @@ struct App {
     export: Option<(String, std::thread::JoinHandle<Result<engine::sigmf::ExportResult, String>>)>,
     export_msg: Option<String>,
     /// Emitter table, refreshed a few times a second rather than every frame.
-    emitter_cache: (std::time::Instant, Vec<(Role, engine::Emitter)>),
+    /// Also holds how many emitters the view leaves out as unconfirmed.
+    emitter_cache: (std::time::Instant, Vec<(Role, engine::Emitter)>, usize),
+    emitter_view: EmitterView,
+}
+
+/// What the emitter table shows and in what order.
+struct EmitterView {
+    sort: EmitterSort,
+    descending: bool,
+    /// None = every pane.
+    source: Option<Role>,
+    /// Also list emitters that might still be noise (seen once, weak, briefly).
+    unconfirmed: bool,
+}
+
+impl Default for EmitterView {
+    fn default() -> Self {
+        Self { sort: EmitterSort::Freq, descending: false, source: None, unconfirmed: false }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmitterSort {
+    Freq,
+    Class,
+    Bandwidth,
+    Bursts,
+    Duty,
+    First,
+    Last,
+    Snr,
+}
+
+impl EmitterSort {
+    fn cmp(self, a: &engine::Emitter, b: &engine::Emitter) -> std::cmp::Ordering {
+        match self {
+            Self::Freq => a.center_hz.total_cmp(&b.center_hz),
+            Self::Class => a.label().cmp(&b.label()),
+            Self::Bandwidth => a.bandwidth_hz.total_cmp(&b.bandwidth_hz),
+            Self::Bursts => a.records.cmp(&b.records),
+            Self::Duty => a.duty().total_cmp(&b.duty()),
+            Self::First => a.first_seen.cmp(&b.first_seen),
+            Self::Last => a.last_seen.cmp(&b.last_seen),
+            Self::Snr => a.peak_snr_db.total_cmp(&b.peak_snr_db),
+        }
+    }
+
+    /// Direction on first click: numbers and times high first, names and
+    /// frequency low first.
+    fn default_descending(self) -> bool {
+        !matches!(self, Self::Freq | Self::Class)
+    }
 }
 
 /// Target frame interval (~60 fps).
@@ -178,7 +229,8 @@ impl App {
             selected: None,
             selected_emitter: None,
             list_tab: args.tab.unwrap_or(ListTab::Emitters),
-            emitter_cache: (std::time::Instant::now() - std::time::Duration::from_secs(1), Vec::new()),
+            emitter_cache: (std::time::Instant::now() - std::time::Duration::from_secs(1), Vec::new(), 0),
+            emitter_view: EmitterView::default(),
             last_frame: std::time::Instant::now(),
             catalog: catalog::Catalog::load(&catalog_path()),
             catalog_msg: None,
@@ -808,33 +860,59 @@ impl App {
         }
     }
 
-    /// Emitters from all panes: active first, then most recently seen.
-    /// Virtualised: only rows on screen are laid out.
+    /// Emitters from the chosen panes, in a stable order (frequency unless a
+    /// column header was clicked). Unconfirmed ones (maybe noise) are left
+    /// out unless asked for. Virtualised: only rows on screen are laid out.
     fn emitter_list(&mut self, ui: &mut egui::Ui) {
-        if self.emitter_cache.0.elapsed() > std::time::Duration::from_millis(300) {
-            let mut rows: Vec<(Role, engine::Emitter)> = Vec::new();
-            for p in &self.panes {
-                let focus_span = self.panes.iter().find(|q| q.role == Role::Focus).and_then(|q| q.view.span());
-                rows.extend(
-                    p.source
-                        .emitters()
-                        .into_iter()
-                        .filter(|e| p.role != Role::Survey || !in_focus_zone(e.center_hz, focus_span))
-                        .map(|e| (p.role, e)),
-                );
+        let v = &mut self.emitter_view;
+        let mut refresh = false;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Source").small().color(theme::MUTED));
+            for (s, name) in [(None, "All"), (Some(Role::Focus), "Focus"), (Some(Role::Survey), "Survey")] {
+                refresh |= ui.selectable_value(&mut v.source, s, egui::RichText::new(name).small()).changed();
             }
-            rows.sort_by(|a, b| b.1.active.cmp(&a.1.active).then(b.1.last_seen.cmp(&a.1.last_seen)));
-            self.emitter_cache = (std::time::Instant::now(), rows);
+            ui.separator();
+            refresh |= ui.checkbox(&mut v.unconfirmed, egui::RichText::new("show unconfirmed").small()).changed();
+        });
+        if refresh || self.emitter_cache.0.elapsed() > std::time::Duration::from_millis(300) {
+            let v = &self.emitter_view;
+            let focus_span = self.panes.iter().find(|q| q.role == Role::Focus).and_then(|q| q.view.span());
+            let mut rows: Vec<(Role, engine::Emitter)> = Vec::new();
+            let mut hidden = 0;
+            for p in self.panes.iter().filter(|p| v.source.is_none_or(|r| r == p.role)) {
+                for e in p.source.emitters() {
+                    if p.role == Role::Survey && in_focus_zone(e.center_hz, focus_span) {
+                        continue;
+                    }
+                    if !e.confirmed && !v.unconfirmed {
+                        hidden += 1;
+                        continue;
+                    }
+                    rows.push((p.role, e));
+                }
+            }
+            let (sort, desc) = (v.sort, v.descending);
+            rows.sort_by(|a, b| {
+                let o = sort.cmp(&a.1, &b.1).then(a.1.center_hz.total_cmp(&b.1.center_hz));
+                if desc { o.reverse() } else { o }
+            });
+            self.emitter_cache = (std::time::Instant::now(), rows, hidden);
         }
         let rows = std::mem::take(&mut self.emitter_cache.1);
         let active = rows.iter().filter(|r| r.1.active).count();
         let identified = rows.iter().filter(|r| r.1.has_protocol()).count();
+        let hidden = self.emitter_cache.2;
         ui.label(
-            egui::RichText::new(format!("{} emitters · {active} active · {identified} identified", rows.len()))
-                .small()
-                .monospace()
-                .color(theme::MUTED),
+            egui::RichText::new(format!(
+                "{} emitters · {active} active · {identified} identified{}",
+                rows.len(),
+                if hidden > 0 { format!(" · {hidden} unconfirmed not shown") } else { String::new() }
+            ))
+            .small()
+            .monospace()
+            .color(theme::MUTED),
         );
+        let mut sort_click = None;
         let mut clicked = None;
         let mut tune = None;
         let row_h = 18.0;
@@ -854,9 +932,33 @@ impl App {
             .columns(egui_extras::Column::exact(72.0), 2)
             .column(egui_extras::Column::remainder())
             .header(row_h, |mut h| {
-                for t in ["", "Src", "MHz", "Class", "ID", "Also seen", "BW kHz", "Bursts", "Duty %", "First", "Last", "SNR dB"] {
+                use EmitterSort as S;
+                let (cur, desc) = (self.emitter_view.sort, self.emitter_view.descending);
+                for (t, key) in [
+                    ("", None),
+                    ("Src", None),
+                    ("MHz", Some(S::Freq)),
+                    ("Class", Some(S::Class)),
+                    ("ID", None),
+                    ("Also seen", None),
+                    ("BW kHz", Some(S::Bandwidth)),
+                    ("Bursts", Some(S::Bursts)),
+                    ("Duty %", Some(S::Duty)),
+                    ("First", Some(S::First)),
+                    ("Last", Some(S::Last)),
+                    ("SNR dB", Some(S::Snr)),
+                ] {
                     h.col(|ui| {
-                        ui.label(egui::RichText::new(t).small().color(theme::MUTED));
+                        let Some(key) = key else {
+                            ui.label(egui::RichText::new(t).small().color(theme::MUTED));
+                            return;
+                        };
+                        let text = if key == cur { format!("{t} {}", if desc { "▼" } else { "▲" }) } else { t.to_string() };
+                        let col = if key == cur { theme::TEXT } else { theme::MUTED };
+                        let r = ui.add(egui::Label::new(egui::RichText::new(text).small().color(col)).sense(egui::Sense::click()));
+                        if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            sort_click = Some(key);
+                        }
                     });
                 }
             })
@@ -896,6 +998,13 @@ impl App {
                 });
             });
         self.emitter_cache.1 = rows;
+        if let Some(key) = sort_click {
+            let v = &mut self.emitter_view;
+            v.descending = if v.sort == key { !v.descending } else { key.default_descending() };
+            v.sort = key;
+            // Re-sort on the next frame rather than waiting for the refresh.
+            self.emitter_cache.0 -= std::time::Duration::from_secs(1);
+        }
         if let Some(sel) = clicked {
             self.selected_emitter = Some(sel);
             self.selected = None;

@@ -1,14 +1,19 @@
 //! Groups signal records into emitters: persistent transmitters on a channel.
 //!
 //! A record joins the emitter whose centre is within tolerance and whose
-//! bandwidth is comparable; otherwise it starts a new one. Emitters keep
-//! activity stats and a tally of what their records were classified as, and
-//! can carry a classification of their own (made over a window spanning many
-//! short bursts, which single records can't support).
+//! bandwidth is comparable; otherwise it starts a new one. A record is placed
+//! from its first rows, so when one that started an emitter of its own closes,
+//! it is matched again with its final shape. Emitters keep activity stats and
+//! a tally of what their records were classified as, and can carry a
+//! classification of their own (made over a window spanning many short
+//! bursts, which single records can't support).
+//!
+//! An emitter counts as `confirmed` once it can't be a noise blip; the
+//! unconfirmed ones are dropped if they don't recur.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use detect::Classification;
 
@@ -16,6 +21,21 @@ use crate::SignalRecord;
 
 /// Most emitters kept per source; the least recently seen inactive ones go first.
 const MAX_EMITTERS: usize = 5000;
+
+/// An emitter is confirmed once it has had this many records...
+const CONFIRM_RECORDS: u32 = 3;
+/// ...or one record lasting this long over at least `CONFIRM_ROWS` rows (two
+/// survey passes in a row can still be noise)...
+const CONFIRM_DURATION_S: f64 = 0.5;
+const CONFIRM_ROWS: u32 = 3;
+/// ...or one this far above the floor.
+const CONFIRM_SNR_DB: f32 = 15.0;
+/// Unconfirmed emitters not seen again within this are dropped.
+const UNCONFIRMED_TTL: Duration = Duration::from_secs(120);
+/// Rows with bins this wide or wider (the survey's) match records by overlap.
+const COARSE_BIN_HZ: f64 = 10e3;
+/// Calls to `mark_active` between sweeps for stale unconfirmed emitters.
+const PRUNE_EVERY: u32 = 64;
 
 /// Times a protocol must be identified on an emitter before it's believed...
 const MIN_PROTOCOL_HITS: u32 = 2;
@@ -33,6 +53,8 @@ pub struct Emitter {
     /// Summed duration of finished records, seconds.
     pub on_time_s: f64,
     pub active: bool,
+    /// Seen often, long or strongly enough not to be a noise blip.
+    pub confirmed: bool,
     pub peak_snr_db: f32,
     /// Classification labels seen on this emitter's records (and its own
     /// group classifications), with counts.
@@ -54,6 +76,8 @@ pub struct Emitter {
     /// Newest record's ring position and tuner centre (for group windows).
     pub(crate) last_end_sample: u64,
     pub(crate) tuner_center_hz: f64,
+    /// Bin width of the rows its records came from.
+    pub(crate) bin_hz: f64,
 }
 
 impl Emitter {
@@ -104,13 +128,40 @@ pub(crate) struct EmitterBook {
     pub(crate) map: HashMap<u64, Emitter>,
     pub(crate) by_record: HashMap<u64, u64>,
     next_id: u64,
+    /// Newest record time seen (the book's clock, for pruning).
+    latest: Option<SystemTime>,
+    calls: u32,
 }
 
 impl EmitterBook {
     /// Frequency tolerance for joining: a quarter of the bandwidth, at least
-    /// 2.5 kHz (record centres jitter with modulation).
-    fn tolerance(bw: f64) -> f64 {
-        (bw * 0.25).max(2.5e3)
+    /// 2.5 kHz (record centres jitter with modulation) and at least 1.5 bins
+    /// (record edges are whole bins; coarse survey bins move centres by one).
+    fn tolerance(bw: f64, bin: f64) -> f64 {
+        (bw * 0.25).max(2.5e3).max(bin * 1.5)
+    }
+
+    /// Does a record of this centre and bandwidth belong to `e`? Bandwidths
+    /// must be comparable, allowing a bin either way. On coarse rows (the
+    /// survey) a record only has to touch the emitter: there a signal's
+    /// extent swings from pass to pass and weak activity flickers across a
+    /// hump of raised floor, so shape is no guide.
+    fn fits(e: &Emitter, c: f64, bw: f64, bin: f64) -> bool {
+        let bin = bin.max(e.bin_hz);
+        if bin >= COARSE_BIN_HZ {
+            return (e.center_hz - c).abs() <= (e.bandwidth_hz + bw) / 2.0 + bin;
+        }
+        let ratio = (bw + bin) / (e.bandwidth_hz.max(1.0) + bin);
+        (e.center_hz - c).abs() <= Self::tolerance(e.bandwidth_hz.max(bw), bin) && (0.33..=3.0).contains(&ratio)
+    }
+
+    /// The closest emitter a record fits, other than `except`.
+    fn find(&self, c: f64, bw: f64, bin: f64, except: Option<u64>) -> Option<u64> {
+        self.map
+            .values()
+            .filter(|e| Some(e.id) != except && Self::fits(e, c, bw, bin))
+            .min_by(|a, b| (a.center_hz - c).abs().total_cmp(&(b.center_hz - c).abs()))
+            .map(|e| e.id)
     }
 
     /// Assigns a record (open or just closed) to an emitter, creating one if
@@ -119,43 +170,12 @@ impl EmitterBook {
         let bw = r.bandwidth_hz().max(1.0);
         let c = r.center_hz();
         let id = match self.by_record.get(&r.id) {
+            Some(&id) if closed && self.map.get(&id).is_some_and(|e| e.records == 1) => self.refit(r, id, c, bw),
             Some(&id) => id,
             None => {
-                let found = self
-                    .map
-                    .values()
-                    .filter(|e| {
-                        let ratio = bw / e.bandwidth_hz.max(1.0);
-                        (e.center_hz - c).abs() <= Self::tolerance(e.bandwidth_hz.max(bw)) && (0.33..=3.0).contains(&ratio)
-                    })
-                    .min_by(|a, b| (a.center_hz - c).abs().total_cmp(&(b.center_hz - c).abs()))
-                    .map(|e| e.id);
-                let id = found.unwrap_or_else(|| {
+                let id = self.find(c, bw, r.bin_hz, None).unwrap_or_else(|| {
                     self.next_id += 1;
-                    self.map.insert(
-                        self.next_id,
-                        Emitter {
-                            id: self.next_id,
-                            center_hz: c,
-                            bandwidth_hz: bw,
-                            first_seen: r.t_start,
-                            last_seen: r.t_end,
-                            records: 0,
-                            on_time_s: 0.0,
-                            active: false,
-                            peak_snr_db: r.max_snr_db,
-                            tally: BTreeMap::new(),
-                            protocols: BTreeMap::new(),
-                            ids: BTreeMap::new(),
-                            strong: Default::default(),
-                            class: None,
-                            best: None,
-                            class_at: None,
-                            group_misses: 0,
-                            last_end_sample: r.last_row_end_sample,
-                            tuner_center_hz: r.tuner_center_hz,
-                        },
-                    );
+                    self.map.insert(self.next_id, Self::new_emitter(self.next_id, r, c, bw));
                     self.next_id
                 });
                 if let Some(e) = self.map.get_mut(&id) {
@@ -168,6 +188,9 @@ impl EmitterBook {
                 id
             }
         };
+        if self.latest.is_none_or(|t| r.t_end > t) {
+            self.latest = Some(r.t_end);
+        }
         if let Some(e) = self.map.get_mut(&id) {
             if r.t_end > e.last_seen {
                 e.last_seen = r.t_end;
@@ -181,8 +204,77 @@ impl EmitterBook {
             if closed {
                 e.on_time_s += r.duration_s();
             }
+            e.confirmed |= e.records >= CONFIRM_RECORDS
+                || (r.duration_s() >= CONFIRM_DURATION_S && r.rows >= CONFIRM_ROWS)
+                || r.max_snr_db >= CONFIRM_SNR_DB;
         }
         id
+    }
+
+    /// A record that started emitter `id` on its own has closed: if its final
+    /// shape fits another emitter, fold `id` into that one; otherwise give
+    /// `id` the final shape. Returns the record's emitter.
+    fn refit(&mut self, r: &SignalRecord, id: u64, c: f64, bw: f64) -> u64 {
+        let Some(to) = self.find(c, bw, r.bin_hz, Some(id)) else {
+            if let Some(e) = self.map.get_mut(&id) {
+                e.center_hz = c;
+                e.bandwidth_hz = bw;
+            }
+            return id;
+        };
+        let Some(from) = self.map.remove(&id) else { return id };
+        self.by_record.insert(r.id, to);
+        let Some(e) = self.map.get_mut(&to) else { return to };
+        e.records += from.records;
+        e.center_hz += (c - e.center_hz) * 0.1;
+        e.bandwidth_hz += (bw - e.bandwidth_hz) * 0.1;
+        e.on_time_s += from.on_time_s;
+        e.first_seen = e.first_seen.min(from.first_seen);
+        e.last_seen = e.last_seen.max(from.last_seen);
+        e.active |= from.active;
+        e.confirmed |= from.confirmed;
+        e.peak_snr_db = e.peak_snr_db.max(from.peak_snr_db);
+        e.last_end_sample = e.last_end_sample.max(from.last_end_sample);
+        for (k, n) in from.tally {
+            *e.tally.entry(k).or_default() += n;
+        }
+        for (k, n) in from.protocols {
+            *e.protocols.entry(k).or_default() += n;
+        }
+        for (k, n) in from.ids {
+            *e.ids.entry(k).or_default() += n;
+        }
+        e.strong.extend(from.strong);
+        if e.best.is_none() {
+            e.best = from.best;
+        }
+        to
+    }
+
+    fn new_emitter(id: u64, r: &SignalRecord, c: f64, bw: f64) -> Emitter {
+        Emitter {
+            id,
+            center_hz: c,
+            bandwidth_hz: bw,
+            first_seen: r.t_start,
+            last_seen: r.t_end,
+            records: 0,
+            on_time_s: 0.0,
+            active: false,
+            confirmed: false,
+            peak_snr_db: r.max_snr_db,
+            tally: BTreeMap::new(),
+            protocols: BTreeMap::new(),
+            ids: BTreeMap::new(),
+            strong: Default::default(),
+            class: None,
+            best: None,
+            class_at: None,
+            group_misses: 0,
+            last_end_sample: r.last_row_end_sample,
+            tuner_center_hz: r.tuner_center_hz,
+            bin_hz: r.bin_hz,
+        }
     }
 
     /// Recomputes `active` from the currently open records.
@@ -195,6 +287,15 @@ impl EmitterBook {
                 if let Some(e) = self.map.get_mut(&id) {
                     e.active = true;
                 }
+            }
+        }
+        self.calls = self.calls.wrapping_add(1);
+        if let Some(now) = self.latest.filter(|_| self.calls.is_multiple_of(PRUNE_EVERY)) {
+            let stale = |e: &Emitter| !e.confirmed && !e.active && now.duration_since(e.last_seen).is_ok_and(|d| d > UNCONFIRMED_TTL);
+            if self.map.values().any(stale) {
+                self.map.retain(|_, e| !stale(e));
+                let map = &self.map;
+                self.by_record.retain(|_, e| map.contains_key(e));
             }
         }
         if self.map.len() > MAX_EMITTERS {
@@ -278,6 +379,7 @@ mod tests {
             t_end: SystemTime::UNIX_EPOCH + Duration::from_secs(t) + Duration::from_millis(30),
             f_lo_hz: c - bw / 2.0,
             f_hi_hz: c + bw / 2.0,
+            bin_hz: 610.0,
             peak_dbfs: -60.0,
             mean_snr_db: 20.0,
             max_snr_db: 22.0,
@@ -307,5 +409,60 @@ mod tests {
         let e = b.get(b.by_record[&5]).unwrap();
         assert_eq!(e.records, 40);
         assert!((e.on_time_s - 1.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn coarse_bins_dont_split_a_signal() {
+        // Survey rows: 54 kHz bins. One FM station comes out 1, 2 or 4 bins
+        // wide with its centre moving by half a bin or a bin.
+        let bin = 54.1e3;
+        let mut b = EmitterBook::default();
+        for (i, (off, bins)) in [(0.0, 1.0), (-0.5, 2.0), (0.0, 4.0), (1.0, 1.0), (0.5, 2.0)].iter().enumerate() {
+            let mut r = rec(i as u64, 96.3 + off * bin / 1e6, bins * bin / 1e3, i as u64 * 10);
+            r.bin_hz = bin;
+            b.observe(&r, true);
+        }
+        assert_eq!(b.map.len(), 1);
+    }
+
+    #[test]
+    fn record_placed_from_narrow_onset_joins_on_close() {
+        let mut b = EmitterBook::default();
+        for i in 0..3 {
+            b.observe(&rec(i, 856.3375, 9.0, i), true);
+        }
+        // First rows of a key-up: narrow, so it starts an emitter of its own...
+        let mut r = rec(10, 856.3380, 1.8, 10);
+        b.observe(&r, false);
+        assert_eq!(b.map.len(), 2);
+        // ...and joins the channel's emitter once it closes at full width.
+        r.f_lo_hz = 856.3375e6 - 4.5e3;
+        r.f_hi_hz = 856.3375e6 + 4.5e3;
+        let id = b.observe(&r, true);
+        assert_eq!(b.map.len(), 1);
+        assert_eq!(b.by_record[&10], id);
+        assert_eq!(b.get(id).unwrap().records, 4);
+    }
+
+    #[test]
+    fn noise_blips_stay_unconfirmed_and_expire() {
+        let mut b = EmitterBook::default();
+        let mut blip = rec(1, 300.0, 54.1, 0);
+        blip.max_snr_db = 9.0;
+        let id = b.observe(&blip, true);
+        assert!(!b.get(id).unwrap().confirmed);
+        // A strong one is confirmed at once.
+        let strong = rec(2, 400.0, 54.1, 0);
+        let sid = b.observe(&strong, true);
+        assert!(b.get(sid).unwrap().confirmed);
+        // Time passes (records elsewhere); the blip never recurs and is dropped.
+        let mut later = rec(3, 400.0, 54.1, 200);
+        later.max_snr_db = 9.0;
+        b.observe(&later, true);
+        for _ in 0..PRUNE_EVERY {
+            b.mark_active(&[]);
+        }
+        assert!(b.get(id).is_none());
+        assert!(b.get(sid).is_some());
     }
 }
