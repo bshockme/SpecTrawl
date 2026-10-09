@@ -241,12 +241,54 @@ pub fn summarise(frames: &[Frame]) -> Fields {
     let mut talks: BTreeMap<String, usize> = BTreeMap::new();
     let mut act: BTreeMap<Activity, usize> = BTreeMap::new();
     let mut f = Fields::default();
+    // Phase 2: both syncs of a fragment make frames; decode each fragment
+    // once (keyed by where it starts in the input).
+    let mut p2_seen = std::collections::HashSet::new();
+    let p2_seqs = if frames.iter().any(|fr| fr.protocol == "P25" && fr.detail == "Phase 2") {
+        crate::p25p2::candidate_sequences()
+    } else {
+        Vec::new()
+    };
+    let p2_refs: Vec<&[u8]> = p2_seqs.iter().map(|s| s.as_slice()).collect();
     for fr in frames {
         match fr.protocol {
+            "P25" if fr.detail == "Phase 2" => {
+                let Some(info) = crate::p25p2::fragment(fr, &p2_refs) else { continue };
+                let at = (fr.at_symbol + info.start).saturating_sub(fr.sync_start) / 8;
+                if !p2_seen.insert(at) {
+                    continue;
+                }
+                f.tried += 1;
+                if !info.signals.is_empty() {
+                    f.decoded += 1;
+                }
+                for b in &info.bursts {
+                    use crate::p25p2::Burst;
+                    let (name, a) = match b {
+                        Burst::Voice4 | Burst::Voice2 => ("voice", Some(Activity::Voice)),
+                        Burst::Facch { .. } => ("FACCH", Some(Activity::Control)),
+                        Burst::Sacch { .. } => ("SACCH", Some(Activity::Control)),
+                        Burst::Unknown => continue,
+                    };
+                    *kinds.entry(name.into()).or_default() += 1;
+                    if let Some(a) = a {
+                        *act.entry(a).or_default() += 1;
+                    }
+                }
+                for sig in &info.signals {
+                    if let Some(t) = sig.mac.talk() {
+                        *talks.entry(t).or_default() += 1;
+                    }
+                    if let crate::p25p2::Mac::Ptt { nac, .. } = sig.mac {
+                        *ids.entry(format!("NAC 0x{nac:03X}")).or_default() += 1;
+                    }
+                }
+            }
             "P25" if fr.detail == "Phase 1" => {
                 f.tried += 1;
                 if let Some(n) = p25_nid(fr) {
                     f.decoded += 1;
+                    crate::p25p2::register_nac(n.nac);
                     *ids.entry(format!("NAC 0x{:03X}", n.nac)).or_default() += 1;
                     *kinds.entry(p25_duid_name(n.duid).to_string()).or_default() += 1;
                     let lc = match n.duid {

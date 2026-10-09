@@ -158,6 +158,89 @@ pub fn rs_encode(data: &[u8; RS_K]) -> [u8; RS_N] {
     out
 }
 
+/// Reed-Solomon over GF(64) with roots α¹..α^`nroots`, errors and
+/// erasures: `cw` is a whole (possibly shortened) codeword, first symbol
+/// the highest degree; `erasures` are indices into `cw` known to be
+/// unreliable (punctured symbols). Corrects in place while 2·errors +
+/// erasures ≤ `nroots`. Returns the symbols changed, or None.
+pub fn rs_decode_erasures(cw: &mut [u8], nroots: usize, erasures: &[usize]) -> Option<usize> {
+    let n = cw.len();
+    let deg = |i: usize| n - 1 - i;
+    let s: Vec<u8> = (1..=nroots).map(|j| eval_hi(cw, alpha(j))).collect();
+    if s.iter().all(|&v| v == 0) {
+        return Some(0);
+    }
+    let ne = erasures.len();
+    if ne > nroots {
+        return None;
+    }
+    // Erasure locator Γ(x) = ∏ (1 + X_k x), lowest degree first.
+    let mut lam = vec![0u8; nroots + 1];
+    lam[0] = 1;
+    for &e in erasures {
+        let x = alpha(deg(e));
+        for i in (1..=nroots).rev() {
+            lam[i] ^= mul(x, lam[i - 1]);
+        }
+    }
+    // Berlekamp-Massey, started from the erasure locator.
+    let mut b = lam.clone();
+    let mut el = ne;
+    for r in ne + 1..=nroots {
+        let mut d = 0u8;
+        for i in 0..r {
+            d ^= mul(lam[i], s[r - 1 - i]);
+        }
+        if d == 0 {
+            b.rotate_right(1);
+            b[0] = 0;
+            continue;
+        }
+        let mut t = lam.clone();
+        for i in 1..=nroots {
+            t[i] ^= mul(d, b[i - 1]);
+        }
+        if 2 * el < r + ne {
+            el = r + ne - el;
+            let di = inv(d);
+            b = lam.iter().map(|&c| mul(c, di)).collect();
+        } else {
+            b.rotate_right(1);
+            b[0] = 0;
+        }
+        lam = t;
+    }
+    let deg_lam = lam.iter().rposition(|&c| c != 0)?;
+    if deg_lam == 0 || 2 * (deg_lam - ne.min(deg_lam)) + ne > nroots {
+        return None;
+    }
+    lam.truncate(deg_lam + 1);
+    // Ω = S·Λ mod x^nroots; Λ' keeps the odd terms.
+    let mut om = vec![0u8; nroots];
+    for (i, &si) in s.iter().enumerate() {
+        for (j, &lj) in lam.iter().enumerate() {
+            if i + j < nroots {
+                om[i + j] ^= mul(si, lj);
+            }
+        }
+    }
+    let dlam: Vec<u8> = lam.iter().enumerate().skip(1).map(|(i, &c)| if i % 2 == 1 { c } else { 0 }).collect();
+    let mut found = 0;
+    for (i, c) in cw.iter_mut().enumerate() {
+        let xinv = alpha(63 - deg(i) % 63);
+        if eval_lo(&lam, xinv) == 0 {
+            let den = eval_lo(&dlam, xinv);
+            if den == 0 {
+                return None;
+            }
+            *c ^= mul(eval_lo(&om, xinv), inv(den));
+            found += 1;
+        }
+    }
+    // Every root must land inside the (shortened) codeword.
+    (found == deg_lam).then_some(found)
+}
+
 /// Corrects up to 6 hexbit errors in place (first hexbit = highest
 /// degree). Returns the number corrected, or None if beyond repair.
 pub fn rs_decode(h: &mut [u8; RS_N]) -> Option<usize> {
@@ -405,6 +488,23 @@ mod tests {
         assert_eq!(r, cw);
         let mut clean = cw;
         assert_eq!(rs_decode(&mut clean), Some(0));
+    }
+
+    #[test]
+    fn rs_errors_and_erasures() {
+        // RS(24,12) as a shortened (63,51) code: decode the same codeword
+        // through the general decoder, with 4 erasures and 4 errors.
+        let data: [u8; 12] = [0x18, 0x20, 0x00, 0x32, 0x29, 0x10, 0x08, 0x16, 0x05, 0x13, 0x21, 0x30];
+        let cw = rs_encode(&data);
+        let mut r = cw.to_vec();
+        for i in [20, 21, 22, 23] {
+            r[i] = 0; // punctured: unknown
+        }
+        for (i, e) in [(1, 0x11), (5, 0x3F), (12, 0x02), (17, 0x20)] {
+            r[i] ^= e;
+        }
+        assert!(rs_decode_erasures(&mut r, 12, &[20, 21, 22, 23]).is_some());
+        assert_eq!(r, cw.to_vec());
     }
 
     #[test]

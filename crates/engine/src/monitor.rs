@@ -277,7 +277,14 @@ pub(crate) fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>, rate: f64) {
                 let msgs = p25::messages(&frames);
                 m.messages += msgs.len() as u64;
                 if let Some((&nac, _)) = nacs.iter().max_by_key(|(_, n)| **n) {
-                    shared.p25.lock().record(nac, &msgs, SystemTime::now());
+                    let mut book = shared.p25.lock();
+                    book.record(nac, &msgs, SystemTime::now());
+                    // The system identity seeds Phase 2 descrambling.
+                    if let Some(s) = book.systems.get(&nac) {
+                        if let (Some(w), Some(y)) = (s.wacn, s.system) {
+                            detect::p25p2::register_system(w, y);
+                        }
+                    }
                 }
                 let keep = (OVERLAP_S * fs) as usize;
                 let cut = m.buf.len() - keep;

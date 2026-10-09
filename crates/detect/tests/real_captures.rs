@@ -124,3 +124,24 @@ fn p25_voice_link_control_matches_grants() {
     }
     panic!("TG 10025 not heard: {talks:?}");
 }
+
+#[test]
+fn p25_phase2_talkgroups_after_learning_the_nac() {
+    let Some((x, fs)) = load("P25P2_site_771.2067") else {
+        eprintln!("skipping: capture not present");
+        return;
+    };
+    // The system (from the Phase 1 control channel) is known; this site's
+    // NAC (0x2A0) is learned from unscrambled end-of-PTT messages, after
+    // which the scrambled FACCH/SACCH decode and name the calls.
+    detect::p25p2::register_system(0xBEE00, 0x2A5);
+    let mut talks = std::collections::BTreeSet::new();
+    for w in x.chunks((1.5 * fs) as usize) {
+        let c = detect::classify(w, fs, 12_500.0);
+        if let Some(t) = c.fields.and_then(|f| f.talk) {
+            talks.insert(t);
+        }
+    }
+    assert!(talks.iter().any(|t| t.starts_with("TG 47018 ← ")), "{talks:?}");
+    assert!(talks.iter().any(|t| t.starts_with("TG 47000 ← 4024312")), "{talks:?}");
+}

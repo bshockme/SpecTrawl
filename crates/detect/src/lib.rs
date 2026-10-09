@@ -14,6 +14,7 @@ pub mod flex;
 pub mod frames;
 pub mod p25;
 pub mod p25_lc;
+pub mod p25p2;
 pub mod pocsag;
 pub mod spectral;
 pub mod sync;
@@ -186,6 +187,9 @@ pub fn classify(x: &[Complex32], fs: f64, bandwidth_hz: f64) -> Classification {
                 "POCSAG" => (0, 520),
                 // P25 link control: TDULC ends ~210 dibits after the sync,
                 // LDU1 ~860.
+                // Phase 2: a fragment is 720 dibits, its syncs at 360 and
+                // 540, so take enough either side for whichever this is.
+                "P25" if best.detail == "Phase 2" => (560, 380),
                 "P25" => (8, 880),
                 _ => (8, 64),
             };
