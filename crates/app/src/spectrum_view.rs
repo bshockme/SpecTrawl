@@ -392,7 +392,17 @@ impl SpectrumView {
         // identified protocols, plus whatever is hovered/selected. Labels that
         // would overlap an earlier one are skipped.
         let mut order: Vec<&(Rect, &SignalRecord)> = boxes.iter().collect();
-        order.sort_by(|a, b| focused(b.1).cmp(&focused(a.1)).then(a.0.top().total_cmp(&b.0.top())));
+        // Deterministic order: records arrive in a different order each frame
+        // (open tracks get reshuffled), and active bursts all touch the top
+        // row, so without a full tie-break the overlap test picked a different
+        // winner each frame and labels flickered.
+        order.sort_by(|a, b| {
+            focused(b.1)
+                .cmp(&focused(a.1))
+                .then(a.0.top().total_cmp(&b.0.top()))
+                .then(a.0.left().total_cmp(&b.0.left()))
+                .then(a.1.id.cmp(&b.1.id))
+        });
         let mut labelled = std::collections::HashSet::new();
         let mut placed: Vec<Rect> = Vec::new();
         for (b, r) in order {
