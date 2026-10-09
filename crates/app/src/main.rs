@@ -105,7 +105,13 @@ struct App {
     /// Emitter table, refreshed a few times a second rather than every frame.
     /// Also holds how many emitters the view leaves out as unconfirmed.
     emitter_cache: (std::time::Instant, Vec<(Role, engine::Emitter)>, usize),
+    /// Emitters the view leaves out as known occupants (squelch on).
+    emitter_squelched: usize,
     emitter_view: EmitterView,
+    /// Spectrum squelch: hide and dim known wideband occupants.
+    squelch: bool,
+    /// Known occupants from every pane, merged: (lo Hz, hi Hz, label).
+    known: (std::time::Instant, Vec<(f64, f64, String)>),
 }
 
 /// What the emitter table shows and in what order.
@@ -232,7 +238,10 @@ impl App {
             selected_emitter: None,
             list_tab: args.tab.unwrap_or(ListTab::Emitters),
             emitter_cache: (std::time::Instant::now() - std::time::Duration::from_secs(1), Vec::new(), 0),
+            emitter_squelched: 0,
             emitter_view: EmitterView::default(),
+            squelch: true,
+            known: (std::time::Instant::now() - std::time::Duration::from_secs(5), Vec::new()),
             last_frame: std::time::Instant::now(),
             catalog: catalog::Catalog::load(&catalog_path()),
             catalog_msg: None,
@@ -360,6 +369,10 @@ impl App {
                 if ui.button(if self.paused { "▶ Resume" } else { "⏸ Pause" }).clicked() {
                     self.paused = !self.paused;
                 }
+                let n = self.known.1.len();
+                ui.toggle_value(&mut self.squelch, format!("Squelch known ({n})")).on_hover_text(
+                    "Dim FM broadcast, TV and LTE/NR carriers the app has identified, and hide their detections, so unknown signals stand out",
+                );
                 ui.menu_button("Import names", |ui| self.import_menu(ui));
                 if let Some((t, m)) = &self.catalog_msg {
                     if t.elapsed() < std::time::Duration::from_secs(12) {
@@ -582,8 +595,45 @@ impl App {
         }
     }
 
+    /// Merges every pane's known occupants (refreshed once a second). Where
+    /// panes overlap, the same occupant seen by both is kept once: the wider
+    /// extent wins (Focus sees HD sidebands the survey's bins can't).
+    fn refresh_known(&mut self) {
+        if self.known.0.elapsed() < std::time::Duration::from_secs(1) {
+            return;
+        }
+        let mut all: Vec<(f64, f64, String)> = self
+            .panes
+            .iter()
+            .flat_map(|p| p.source.occupants())
+            .map(|k| (k.occupant.lo_hz, k.occupant.hi_hz, k.occupant.kind.label()))
+            .collect();
+        all.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut merged: Vec<(f64, f64, String)> = Vec::new();
+        for k in all {
+            match merged.last_mut() {
+                // Same occupant: overlapping and centred within 50 kHz.
+                Some(m) if k.0 < m.1 && ((k.0 + k.1) / 2.0 - (m.0 + m.1) / 2.0).abs() < 50e3 => {
+                    if k.1 - k.0 > m.1 - m.0 {
+                        *m = k;
+                    }
+                }
+                _ => merged.push(k),
+            }
+        }
+        self.known = (std::time::Instant::now(), merged);
+    }
+
+    /// The known occupant covering `hz`, if any.
+    fn known_at(&self, hz: f64) -> Option<&str> {
+        self.known.1.iter().find(|(lo, hi, _)| (*lo..=*hi).contains(&hz)).map(|k| k.2.as_str())
+    }
+
     fn central(&mut self, ui: &mut egui::Ui) {
+        self.refresh_known();
         for p in self.panes.iter_mut() {
+            p.view.known = self.known.1.clone();
+            p.view.squelch = self.squelch;
             p.view.paused = self.paused;
             p.view.markers = p.source.monitors().iter().map(|m| (m.center_hz, m.label.clone())).collect();
         }
@@ -866,6 +916,19 @@ impl App {
     /// column header was clicked). Unconfirmed ones (maybe noise) are left
     /// out unless asked for. Virtualised: only rows on screen are laid out.
     fn emitter_list(&mut self, ui: &mut egui::Ui) {
+        // P25 traffic channels: the talkgroup comes from the control
+        // channel's grant for that frequency.
+        let (grants, systems) = match self.pane(Role::Focus) {
+            Some(p) => (p.source.p25_grants(500), p.source.p25_systems()),
+            None => (Vec::new(), Vec::new()),
+        };
+        let grant_talk = |e: &engine::Emitter| -> Option<String> {
+            let g = grants.iter().filter(|g| g.freq_hz.is_some_and(|f| (f - e.center_hz).abs() < 3e3)).max_by_key(|g| g.last)?;
+            let sys = systems.iter().find(|(n, _)| *n == g.nac).map(|(_, s)| s);
+            let alias =
+                sys.and_then(|s| self.catalog.p25_group(s.wacn, s.system, s.control_hz, g.talkgroup)).map(|i| format!(" {}", i.alias));
+            Some(format!("TG {}{}{}", g.talkgroup, alias.unwrap_or_default(), g.source.map(|s| format!(" ← {s}")).unwrap_or_default()))
+        };
         let v = &mut self.emitter_view;
         let mut refresh = false;
         ui.horizontal(|ui| {
@@ -895,6 +958,7 @@ impl App {
             let focus_span = self.panes.iter().find(|q| q.role == Role::Focus).and_then(|q| q.view.span());
             let mut rows: Vec<(Role, engine::Emitter)> = Vec::new();
             let mut hidden = 0;
+            let mut squelched = 0;
             // With no pane of the chosen kind open, show every pane rather than nothing.
             let source = v.source.filter(|r| self.panes.iter().any(|p| p.role == *r));
             for p in self.panes.iter().filter(|p| source.is_none_or(|r| r == p.role)) {
@@ -906,6 +970,10 @@ impl App {
                         hidden += 1;
                         continue;
                     }
+                    if self.squelch && self.known_at(e.center_hz).is_some() {
+                        squelched += 1;
+                        continue;
+                    }
                     rows.push((p.role, e));
                 }
             }
@@ -915,6 +983,7 @@ impl App {
                 if desc { o.reverse() } else { o }
             });
             self.emitter_cache = (std::time::Instant::now(), rows, hidden);
+            self.emitter_squelched = squelched;
         }
         let rows = std::mem::take(&mut self.emitter_cache.1);
         let active = rows.iter().filter(|r| r.1.active).count();
@@ -922,9 +991,10 @@ impl App {
         let hidden = self.emitter_cache.2;
         ui.label(
             egui::RichText::new(format!(
-                "{} emitters · {active} active · {identified} identified{}",
+                "{} emitters · {active} active · {identified} identified{}{}",
                 rows.len(),
-                if hidden > 0 { format!(" · {hidden} unconfirmed not shown") } else { String::new() }
+                if hidden > 0 { format!(" · {hidden} unconfirmed not shown") } else { String::new() },
+                if self.emitter_squelched > 0 { format!(" · {} known squelched", self.emitter_squelched) } else { String::new() }
             ))
             .small()
             .monospace()
@@ -945,7 +1015,8 @@ impl App {
             .column(egui_extras::Column::exact(80.0))
             .column(egui_extras::Column::exact(150.0))
             .column(egui_extras::Column::exact(90.0))
-            .column(egui_extras::Column::exact(220.0))
+            .column(egui_extras::Column::exact(170.0))
+            .column(egui_extras::Column::exact(170.0))
             .columns(egui_extras::Column::exact(64.0), 3)
             .columns(egui_extras::Column::exact(72.0), 2)
             .column(egui_extras::Column::remainder())
@@ -958,6 +1029,7 @@ impl App {
                     ("MHz", Some(S::Freq)),
                     ("Class", Some(S::Class)),
                     ("ID", None),
+                    ("Activity", None),
                     ("Also seen", None),
                     ("BW kHz", Some(S::Bandwidth)),
                     ("Bursts", Some(S::Bursts)),
@@ -989,8 +1061,19 @@ impl App {
                     let text = |ui: &mut egui::Ui, s: String, col: egui::Color32| {
                         ui.add(egui::Label::new(egui::RichText::new(s).monospace().color(col)).selectable(false).truncate());
                     };
-                    let label = e.label().unwrap_or_else(|| if *role == Role::Survey { "-".into() } else { "…".into() });
-                    let class_col = if sel { theme::SELECT } else { theme::class_color(e.best.as_deref()).unwrap_or(theme::MUTED) };
+                    // Inside a known occupant (FM, TV, LTE): that's what it is.
+                    let known = self.known_at(e.center_hz);
+                    let label = match known {
+                        Some(k) if !e.has_protocol() => k.to_string(),
+                        _ => e.label().unwrap_or_else(|| if *role == Role::Survey { "-".into() } else { "…".into() }),
+                    };
+                    let class_col = if sel {
+                        theme::SELECT
+                    } else if known.is_some() && !e.has_protocol() {
+                        theme::KNOWN
+                    } else {
+                        theme::class_color(e.best.as_deref()).unwrap_or(theme::MUTED)
+                    };
                     let mut others: Vec<(&String, &u32)> = e.tally.iter().filter(|(l, _)| **l != label).collect();
                     others.sort_by(|a, b| b.1.cmp(a.1));
                     let also: Vec<String> = others.iter().take(2).map(|(l, n)| format!("{l}×{n}")).collect();
@@ -999,6 +1082,18 @@ impl App {
                     row.col(|ui| text(ui, format!("{:.4}", e.center_hz / 1e6), c));
                     row.col(|ui| text(ui, label, class_col));
                     row.col(|ui| text(ui, e.id().unwrap_or("").to_string(), c));
+                    // Voice / control / data, and the latest call heard.
+                    let talk = e.last_talk.clone().or_else(|| grant_talk(e));
+                    let act = match (e.activity(), talk) {
+                        (Some(a), Some(t)) => format!("{} · {t}", a.name()),
+                        (Some(a), None) => a.name().to_string(),
+                        (None, _) => String::new(),
+                    };
+                    let act_col = match e.activity() {
+                        Some(detect::decode::Activity::Voice) if !sel => theme::VOICE,
+                        _ => c,
+                    };
+                    row.col(|ui| text(ui, act, act_col));
                     row.col(|ui| text(ui, also.join(", "), theme::MUTED));
                     row.col(|ui| text(ui, format!("{:.1}", e.bandwidth_hz / 1e3), c));
                     row.col(|ui| text(ui, e.records.to_string(), c));
@@ -1169,8 +1264,22 @@ impl App {
             rows.extend(p.source.recent_records(500).into_iter().map(|r| (p.role, r)));
         }
         rows.sort_by(|a, b| b.1.active.cmp(&a.1.active).then(b.1.t_end.cmp(&a.1.t_end)));
+        let before = rows.len();
+        if self.squelch {
+            rows.retain(|r| self.known_at(r.1.center_hz()).is_none());
+        }
+        let squelched = before - rows.len();
         let active = rows.iter().filter(|r| r.1.active).count();
-        ui.label(egui::RichText::new(format!("{} records shown · {active} active", rows.len())).small().monospace().color(theme::MUTED));
+        ui.label(
+            egui::RichText::new(format!(
+                "{} records shown · {active} active{}",
+                rows.len(),
+                if squelched > 0 { format!(" · {squelched} known squelched") } else { String::new() }
+            ))
+            .small()
+            .monospace()
+            .color(theme::MUTED),
+        );
         let mut clicked = None;
         let mut tune = None;
         let row_h = 18.0;
@@ -1206,7 +1315,10 @@ impl App {
                         ui.add(egui::Label::new(egui::RichText::new(s).monospace().color(col)).selectable(false).truncate());
                     };
                     let (class, class_col) = match r.display_class() {
-                        Some(k) => (k.label.clone(), if sel { theme::SELECT } else { theme::class_color(Some(k)).unwrap_or(c) }),
+                        Some(k) => {
+                            let act = k.fields.as_ref().and_then(|f| f.activity).map(|a| format!(" · {}", a.name())).unwrap_or_default();
+                            (format!("{}{act}", k.label), if sel { theme::SELECT } else { theme::class_color(Some(k)).unwrap_or(c) })
+                        }
                         None => (if *role == Role::Survey { "-".into() } else { "…".into() }, theme::MUTED),
                     };
                     row.col(|ui| text(ui, r.id.to_string(), c));

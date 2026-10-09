@@ -1,11 +1,17 @@
 //! Signal classification: features from channelised IQ, then the
 //! sync bank for protocol identification (DESIGN.md §7).
 
+pub mod bandplan;
+pub mod carrier;
+pub mod chirp;
+pub mod context;
 pub mod ddc;
 pub mod decode;
+pub mod dmr;
 pub mod features;
 pub mod frames;
 pub mod p25;
+pub mod spectral;
 pub mod sync;
 
 use num_complex::Complex32;
@@ -111,7 +117,10 @@ pub fn classify(x: &[Complex32], fs: f64, bandwidth_hz: f64) -> Classification {
             // Slice and decode the frames of the identified protocol.
             let mine: Vec<sync::SyncHit> =
                 hits.into_iter().filter(|h| h.entry.protocol == best.protocol && h.entry.baud == best.baud).collect();
-            let fr = frames::slice(&disc, fs, &mine, 8, 64);
+            // DMR bursts carry their payload either side of the sync (54
+            // symbols before, 78 after); others need only the header after.
+            let (before, after) = if best.protocol == "DMR" { (54, 80) } else { (8, 64) };
+            let fr = frames::slice(&disc, fs, &mine, before, after);
             let fields = decode::summarise(&fr);
             if fields.tried > 0 {
                 c.fields = Some(fields);
@@ -124,6 +133,17 @@ pub fn classify(x: &[Complex32], fs: f64, bandwidth_hz: f64) -> Classification {
         c.label = if s.detail.is_empty() { s.protocol.to_string() } else { format!("{} {}", s.protocol, s.detail) };
         c.confidence = s.confidence;
         return c;
+    }
+    // Chirp spread spectrum (LoRa: 125/250/500 kHz): the first few bursts'
+    // frequency follows ramps at BW²/2^SF.
+    if (50e3..600e3).contains(&bandwidth_hz) {
+        for b in chirp::bursts(x, fs).iter().take(4) {
+            if let Some((bw, sf)) = chirp::lora_params(&chirp::analyse(&x[b.0..b.1], fs)) {
+                c.label = format!("LoRa {:.0} kHz SF{sf}", bw / 1e3);
+                c.confidence = 0.8;
+                return c;
+            }
+        }
     }
     let gated = gate.iter().filter(|g| !**g).count() as f32 / gate.len() as f32;
     let (label, conf) = if bandwidth_hz > 150e3 {

@@ -18,6 +18,10 @@ pub const ACCENT: Color32 = Color32::from_rgb(0x38, 0xd3, 0xcf);
 pub const RECORD: Color32 = Color32::from_rgb(0xc8, 0xd2, 0xdc);
 /// Selected / hovered record.
 pub const SELECT: Color32 = Color32::from_rgb(0xf2, 0xa3, 0x3a);
+/// Known wideband occupants (FM broadcast, TV, LTE): the spectrum squelch.
+pub const KNOWN: Color32 = Color32::from_rgb(0x8f, 0x86, 0xc9);
+/// Digital channels carrying voice (talk activity).
+pub const VOICE: Color32 = Color32::from_rgb(0x7e, 0xe0, 0x81);
 pub const CHIP_FOCUS_BG: Color32 = Color32::from_rgb(0xe6, 0xed, 0xf3);
 pub const CHIP_FOCUS_FG: Color32 = BG;
 

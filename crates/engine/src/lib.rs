@@ -7,6 +7,7 @@ mod bursts;
 mod classify;
 mod emitters;
 mod monitor;
+mod occupancy;
 mod ring;
 pub mod sigmf;
 mod sweep;
@@ -26,6 +27,7 @@ pub use classify::ClassifierLoad;
 pub use detect::p25::SystemInfo as P25System;
 pub use emitters::Emitter;
 pub use monitor::{GrantEvent, MonitorInfo};
+pub use occupancy::KnownOccupant;
 pub use ring::IqRing;
 pub use sweep::{SweepPlan, SweepStatus};
 
@@ -131,6 +133,7 @@ struct Shared {
     ffts_per_sec: Mutex<f64>,
     classifier_load: Mutex<classify::ClassifierLoad>,
     p25: Mutex<monitor::P25Book>,
+    occupancy: Mutex<occupancy::OccupancyTracker>,
 }
 
 impl Shared {
@@ -154,6 +157,8 @@ impl Shared {
         }
         st.emitters.mark_active(&open);
         st.open = open;
+        drop(st);
+        self.occupancy.lock().push(row);
     }
 
     fn push_row(&self, row: SpectrumRow, cap: usize) {
@@ -241,6 +246,7 @@ impl Source {
             ffts_per_sec: Mutex::new(0.0),
             classifier_load: Mutex::new(Default::default()),
             p25: Mutex::new(Default::default()),
+            occupancy: Mutex::new(occupancy::OccupancyTracker::new(1)),
         });
         device.start(Box::new(RingSink { shared: shared.clone() }))?;
         let info = device.info().clone();
@@ -256,6 +262,12 @@ impl Source {
         self.shared.rows.lock().clear();
         *self.shared.records.lock() = RecordStore::default();
         *self.shared.sweep.lock() = None;
+        // Identify on ~2 s of live rows, or two sweep passes.
+        let every = match &mode {
+            Mode::Live => (2.0 * self.cfg.rows_per_sec) as u32,
+            Mode::Sweep(_) => 2,
+        };
+        *self.shared.occupancy.lock() = occupancy::OccupancyTracker::new(every);
         let stop = Arc::new(AtomicBool::new(false));
         let (shared, cfg, st) = (self.shared.clone(), self.cfg.clone(), stop.clone());
         let serial = self.info.serial.clone();
@@ -269,7 +281,8 @@ impl Source {
                 let rate = self.device.lock().sample_rate();
                 let (sh, s) = (shared.clone(), st.clone());
                 handles.push(std::thread::Builder::new().name("monitor".into()).spawn(move || monitor::run(sh, s, rate)));
-                handles.push(std::thread::Builder::new().name("classify".into()).spawn(move || classify::run(shared, cfg, st, rate)));
+                let caps = self.device.lock().capabilities().clone();
+                handles.push(std::thread::Builder::new().name("classify".into()).spawn(move || classify::run(shared, cfg, st, rate, caps)));
             }
             Mode::Sweep(plan) => {
                 let (dev, plan) = (self.device.clone(), plan.clone());
@@ -347,6 +360,11 @@ impl Source {
         let mut v: Vec<Emitter> = self.shared.records.lock().emitters.map.values().cloned().collect();
         v.sort_by(|a, b| b.active.cmp(&a.active).then(b.last_seen.cmp(&a.last_seen)));
         v
+    }
+
+    /// Known wideband occupants (FM broadcast, TV, LTE/NR) identified so far.
+    pub fn occupants(&self) -> Vec<KnownOccupant> {
+        self.shared.occupancy.lock().known.clone()
     }
 
     /// Writes part of the look-back ring to SigMF on a background thread.

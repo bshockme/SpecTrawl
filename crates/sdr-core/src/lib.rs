@@ -107,6 +107,12 @@ pub struct Capabilities {
     pub ext_clock: bool,
     pub bias_tee: bool,
     pub hw_timestamps: bool,
+    /// The radio's own clock harmonics land on multiples of this: narrow
+    /// spurs that aren't signals (Airspy R2: 20 and 25 MHz, so 5 MHz).
+    pub spur_grid_hz: Option<f64>,
+    /// Samples per USB transfer. Internal spurs are often modulated at
+    /// sample rate / this (152.6 Hz for an Airspy at 10 MS/s).
+    pub transfer_samples: Option<usize>,
 }
 
 #[derive(Debug, Clone)]

@@ -217,6 +217,8 @@ impl SimDevice {
                 ext_clock: false,
                 bias_tee: false,
                 hw_timestamps: false,
+                spur_grid_hz: None,
+                transfer_samples: None,
             },
             emitters: Arc::new(emitters),
             // Keeps every scripted emitter inside the 90% usable band.

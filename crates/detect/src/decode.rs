@@ -170,6 +170,27 @@ pub fn nxdn_lich(f: &Frame) -> Option<NxdnLich> {
 
 // ------------------------------------------------------------ summary ----
 
+/// What a digital channel is being used for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Activity {
+    /// Someone talking: voice frames, call headers and terminators.
+    Voice,
+    /// Trunking control: TSBKs, CSBKs, control-channel messages, idle fill.
+    Control,
+    /// Packet data.
+    Data,
+}
+
+impl Activity {
+    pub fn name(self) -> &'static str {
+        match self {
+            Activity::Voice => "voice",
+            Activity::Control => "control",
+            Activity::Data => "data",
+        }
+    }
+}
+
 /// Decoded fields aggregated over a channel's frames, for display.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Fields {
@@ -180,12 +201,23 @@ pub struct Fields {
     /// Frames that decoded (passed their code) / frames tried.
     pub decoded: usize,
     pub tried: usize,
+    /// What the channel carried most: voice wins if any real voice was seen.
+    pub activity: Option<Activity>,
+    /// Who was talking, from a call header: "TG 1234 ← 5678" (group) or
+    /// "5678 → 1234" (private).
+    pub talk: Option<String>,
 }
+
+/// Frames of voice that make a channel a voice channel (one stray voice
+/// sync can be a false match on a busy data channel).
+const MIN_VOICE_FRAMES: usize = 2;
 
 pub fn summarise(frames: &[Frame]) -> Fields {
     use std::collections::BTreeMap;
     let mut ids: BTreeMap<String, usize> = BTreeMap::new();
     let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
+    let mut talks: BTreeMap<String, usize> = BTreeMap::new();
+    let mut act: BTreeMap<Activity, usize> = BTreeMap::new();
     let mut f = Fields::default();
     for fr in frames {
         match fr.protocol {
@@ -195,14 +227,43 @@ pub fn summarise(frames: &[Frame]) -> Fields {
                     f.decoded += 1;
                     *ids.entry(format!("NAC 0x{:03X}", n.nac)).or_default() += 1;
                     *kinds.entry(p25_duid_name(n.duid).to_string()).or_default() += 1;
+                    let a = match n.duid {
+                        0x7 => Some(Activity::Control),
+                        0xC => Some(Activity::Data),
+                        0x0 | 0x3 | 0x5 | 0xA | 0xF => Some(Activity::Voice),
+                        _ => None,
+                    };
+                    if let Some(a) = a {
+                        *act.entry(a).or_default() += 1;
+                    }
                 }
+            }
+            "DMR" if fr.detail.contains("voice") => {
+                *kinds.entry("voice".into()).or_default() += 1;
+                *act.entry(Activity::Voice).or_default() += 1;
             }
             "DMR" if fr.detail.contains("data") => {
                 f.tried += 1;
-                if let Some(s) = dmr_slot_type(fr) {
-                    f.decoded += 1;
-                    *ids.entry(format!("CC {}", s.colour_code)).or_default() += 1;
-                    *kinds.entry(dmr_data_type_name(s.data_type).to_string()).or_default() += 1;
+                let Some(s) = dmr_slot_type(fr) else { continue };
+                f.decoded += 1;
+                *ids.entry(format!("CC {}", s.colour_code)).or_default() += 1;
+                *kinds.entry(dmr_data_type_name(s.data_type).to_string()).or_default() += 1;
+                let a = match s.data_type {
+                    0..=2 => Activity::Voice,
+                    3..=5 | 9 => Activity::Control,
+                    _ => Activity::Data,
+                };
+                *act.entry(a).or_default() += 1;
+                match crate::dmr::decode_burst(fr, s.data_type) {
+                    Some(crate::dmr::Burst::VoiceHeader(l) | crate::dmr::Burst::Terminator(l)) => {
+                        let t =
+                            if l.group() { format!("TG {} ← {}", l.target, l.source) } else { format!("{} → {}", l.source, l.target) };
+                        *talks.entry(t).or_default() += 1;
+                    }
+                    Some(crate::dmr::Burst::Csbk(c)) => {
+                        *kinds.entry(format!("CSBK {}", crate::dmr::csbk_name(c.fid, c.opcode))).or_default() += 1;
+                    }
+                    _ => {}
                 }
             }
             "NXDN" => {
@@ -210,14 +271,27 @@ pub fn summarise(frames: &[Frame]) -> Fields {
                     f.tried += 1;
                     f.decoded += 1;
                     *kinds.entry(nxdn_rf_channel_name(l.rf_channel).to_string()).or_default() += 1;
+                    let a = match l.rf_channel {
+                        0 => Activity::Control,
+                        2 => Activity::Data,
+                        _ => Activity::Voice,
+                    };
+                    *act.entry(a).or_default() += 1;
                 }
             }
             _ => {}
         }
     }
     f.id = ids.into_iter().max_by_key(|(_, n)| *n).map(|(k, _)| k);
+    f.talk = talks.into_iter().max_by_key(|(_, n)| *n).map(|(k, _)| k);
+    let voice = act.get(&Activity::Voice).copied().unwrap_or(0);
+    f.activity = if voice >= MIN_VOICE_FRAMES || f.talk.is_some() {
+        Some(Activity::Voice)
+    } else {
+        act.into_iter().filter(|(a, _)| *a != Activity::Voice).max_by_key(|(_, n)| *n).map(|(a, _)| a)
+    };
     let mut k: Vec<(String, usize)> = kinds.into_iter().collect();
-    k.sort_by(|a, b| b.1.cmp(&a.1));
+    k.sort_by_key(|e| std::cmp::Reverse(e.1));
     f.kinds = k;
     f
 }

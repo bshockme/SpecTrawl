@@ -29,6 +29,10 @@ pub struct SpectrumView {
     pub paused: bool,
     /// Channels being continuously decoded: (centre Hz, short label).
     pub markers: Vec<(f64, String)>,
+    /// Known wideband occupants (FM, TV, LTE): (lo Hz, hi Hz, label).
+    pub known: Vec<(f64, f64, String)>,
+    /// Spectrum squelch: dim known occupants and hide their records.
+    pub squelch: bool,
     /// Rows scrolled back from the newest (0 = live edge).
     scroll: usize,
     /// Wall time of each history row, newest first (parallel to `history`).
@@ -56,6 +60,8 @@ impl SpectrumView {
             subtle_boxes: false,
             paused: false,
             markers: Vec::new(),
+            known: Vec::new(),
+            squelch: false,
             scroll: 0,
             row_times: VecDeque::with_capacity(ROWS),
             trace: Vec::new(),
@@ -285,6 +291,16 @@ impl SpectrumView {
             }
             painter.add(Shape::mesh(mesh));
         }
+        let x_known = |f: f64| full.left() + ((f - f0) / (f1 - f0)) as f32 * full.width();
+        if self.squelch {
+            for (lo, hi, _) in &self.known {
+                if *hi < f0 || *lo > f1 {
+                    continue;
+                }
+                let r = Rect::from_x_y_ranges(x_known(*lo).max(wf.left())..=x_known(*hi).min(wf.right()), wf.y_range());
+                painter.rect_filled(r, 0.0, Color32::from_black_alpha(175));
+            }
+        }
 
         // --- spectrum ---
         painter.rect_filled(spec, 0.0, theme::PLOT_BG);
@@ -342,6 +358,34 @@ impl SpectrumView {
         painter.add(Shape::mesh(fill));
         painter.add(Shape::line(hold_pts, Stroke::new(1.0, Color32::from_rgba_unmultiplied(242, 163, 58, 110))));
         painter.add(Shape::line(pts, Stroke::new(1.3, theme::ACCENT)));
+        // Known occupants: a bar along the bottom of the plot, labelled
+        // where there's room.
+        let mut known_chips: Vec<Rect> = Vec::new();
+        for (lo, hi, label) in &self.known {
+            if *hi < f0 || *lo > f1 {
+                continue;
+            }
+            let (x0, x1) = (x_known(*lo).max(plot.left()), x_known(*hi).min(plot.right()));
+            if self.squelch {
+                painter.rect_filled(Rect::from_x_y_ranges(x0..=x1, plot.y_range()), 0.0, Color32::from_black_alpha(110));
+            }
+            painter.rect_filled(Rect::from_x_y_ranges(x0..=x1.max(x0 + 1.0), plot.bottom() - 3.0..=plot.bottom()), 0.0, theme::KNOWN);
+            let g = painter.layout_no_wrap(label.clone(), mono(9.5), theme::BG);
+            if g.size().x + 6.0 > (x1 - x0).max(0.0) + 60.0 {
+                continue;
+            }
+            let at = pos2(
+                ((x0 + x1) / 2.0 - g.size().x / 2.0).clamp(plot.left() + 2.0, plot.right() - g.size().x - 2.0),
+                plot.bottom() - 4.0 - g.size().y,
+            );
+            let chip = Rect::from_min_size(at - vec2(3.0, 0.0), g.size() + vec2(6.0, 0.0));
+            if known_chips.iter().any(|c| c.intersects(chip)) {
+                continue;
+            }
+            painter.rect_filled(chip, 2.0, theme::KNOWN);
+            painter.galley(at, g, theme::BG);
+            known_chips.push(chip);
+        }
         painter.hline(full.x_range(), spec.bottom() + 0.5, Stroke::new(1.0, theme::BORDER));
 
         // --- record boxes ---
@@ -359,8 +403,9 @@ impl SpectrumView {
         let row_h = wf.height() / visible as f32;
         let x_hz = |f: f64| full.left() + ((f - f0) / span) as f32 * full.width();
         let mut boxes: Vec<(Rect, &SignalRecord)> = Vec::new();
+        let squelched = |r: &SignalRecord| self.squelch && self.known.iter().any(|(lo, hi, _)| (*lo..=*hi).contains(&r.center_hz()));
         for r in records {
-            if r.f_hi_hz < f0 || r.f_lo_hz > f1 || r.first_seq > newest {
+            if r.f_hi_hz < f0 || r.f_lo_hz > f1 || r.first_seq > newest || squelched(r) {
                 continue;
             }
             let back_end = newest.saturating_sub(r.last_seq) as f32;
@@ -428,10 +473,21 @@ impl SpectrumView {
                 continue;
             }
             let text = match class {
-                Some(c) => match c.fields.as_ref().and_then(|f| f.id.as_deref()) {
-                    Some(id) => format!("{} · {id}", c.label),
-                    None => c.label.clone(),
-                },
+                Some(c) => {
+                    let mut t = c.label.clone();
+                    if let Some(f) = &c.fields {
+                        if let Some(id) = &f.id {
+                            t += &format!(" · {id}");
+                        }
+                        if let Some(a) = f.activity {
+                            t += &format!(" · {}", a.name());
+                        }
+                        if let Some(talk) = &f.talk {
+                            t += &format!(" · {talk}");
+                        }
+                    }
+                    t
+                }
                 None => format!("#{}", r.id),
             };
             let g = painter.layout_no_wrap(text, mono(10.0), theme::BG);
@@ -495,6 +551,14 @@ impl SpectrumView {
                         text += &format!("\nsync ×{}{}", s.count, if s.inverted { " (inverted)" } else { "" });
                     }
                     if let Some(f) = &c.fields {
+                        if let Some(a) = f.activity {
+                            text += &format!(
+                                "
+{}{}",
+                                a.name(),
+                                f.talk.as_deref().map(|t| format!(" · {t}")).unwrap_or_default()
+                            );
+                        }
                         let kinds: Vec<String> = f.kinds.iter().take(3).map(|(k, n)| format!("{k}×{n}")).collect();
                         text += &format!(
                             "\n{} · {} · {}/{} frames decoded",
@@ -530,7 +594,10 @@ impl SpectrumView {
             painter.vline(p.x, full.y_range(), Stroke::new(1.0, Color32::from_rgba_unmultiplied(230, 237, 243, 90)));
             let i = (((p.x - spec.left()) / spec.width()) * self.trace.len() as f32) as usize;
             let db = self.trace.get(i.min(self.trace.len().saturating_sub(1))).copied().unwrap_or(f32::NAN);
-            let label = format!("{:.4} MHz  {:.1} dBFS", fx / 1e6, db);
+            let mut label = format!("{:.4} MHz  {:.1} dBFS", fx / 1e6, db);
+            if let Some((_, _, k)) = self.known.iter().find(|(lo, hi, _)| (*lo..=*hi).contains(&fx)) {
+                label += &format!("  ·  {k}");
+            }
             let galley = painter.layout_no_wrap(label, mono(11.0), theme::TEXT);
             let at = pos2((p.x + 10.0).min(full.right() - galley.size().x - 8.0), spec.top() + 6.0);
             painter.rect_filled(Rect::from_min_size(at - vec2(5.0, 2.0), galley.size() + vec2(10.0, 4.0)), 3.0, theme::BG);

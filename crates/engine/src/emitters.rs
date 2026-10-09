@@ -41,6 +41,9 @@ const COARSE_BIN_HZ: f64 = 10e3;
 /// Calls to `mark_active` between sweeps for stale unconfirmed emitters.
 const PRUNE_EVERY: u32 = 64;
 
+/// See `Emitter::label`.
+const STICKY_LABELS: [&str; 2] = ["Internal spur", "DC offset"];
+
 /// Times a protocol must be identified on an emitter before it's believed...
 const MIN_PROTOCOL_HITS: u32 = 2;
 /// ...unless one identification alone contained this many syncs.
@@ -67,6 +70,11 @@ pub struct Emitter {
     pub protocols: BTreeMap<String, u32>,
     /// Decoded system identities ("NAC 0x2A5", "CC 9"), weighted by frames.
     pub ids: BTreeMap<String, usize>,
+    /// What its records were used for (voice / control / data), with counts.
+    pub activity: BTreeMap<detect::decode::Activity, u32>,
+    /// Calls heard ("TG 1234 ← 5678"), with counts, and the latest.
+    pub talk: BTreeMap<String, u32>,
+    pub last_talk: Option<String>,
     /// Protocol labels seen at least once with `STRONG_SYNCS` or more syncs.
     pub strong: std::collections::BTreeSet<String>,
     /// Latest group-level classification.
@@ -90,6 +98,12 @@ impl Emitter {
     /// Best single label: the most frequent protocol label once it has been
     /// seen at least twice, else the most frequent feature label.
     pub fn label(&self) -> Option<String> {
+        // Labels fixed by where the signal sits (the tuner's DC, the radio's
+        // own spur grid) beat any feature vote: early looks at a record can
+        // see it wider than it is and vote otherwise.
+        if let Some(l) = STICKY_LABELS.iter().find(|l| self.tally.contains_key(**l)) {
+            return Some(l.to_string());
+        }
         self.protocol_label().or_else(|| self.majority_feature_label())
     }
 
@@ -110,6 +124,11 @@ impl Emitter {
             .filter(|(l, n)| **n >= MIN_PROTOCOL_HITS || self.strong.contains(*l))
             .max_by_key(|(_, n)| **n)
             .map(|(l, _)| l.clone())
+    }
+
+    /// What the emitter is mostly used for.
+    pub fn activity(&self) -> Option<detect::decode::Activity> {
+        self.activity.iter().max_by_key(|(_, n)| **n).map(|(a, _)| *a)
     }
 
     pub fn has_protocol(&self) -> bool {
@@ -255,6 +274,15 @@ impl EmitterBook {
             *e.ids.entry(k).or_default() += n;
         }
         e.strong.extend(from.strong);
+        for (k, n) in from.activity {
+            *e.activity.entry(k).or_default() += n;
+        }
+        for (k, n) in from.talk {
+            *e.talk.entry(k).or_default() += n;
+        }
+        if e.last_talk.is_none() {
+            e.last_talk = from.last_talk;
+        }
         if e.best.is_none() {
             e.best = from.best;
         }
@@ -277,6 +305,9 @@ impl EmitterBook {
             tally: BTreeMap::new(),
             protocols: BTreeMap::new(),
             ids: BTreeMap::new(),
+            activity: BTreeMap::new(),
+            talk: BTreeMap::new(),
+            last_talk: None,
             strong: Default::default(),
             class: None,
             best: None,
@@ -343,6 +374,15 @@ impl EmitterBook {
         *e.tally.entry(c.label.clone()).or_default() += 1;
         if let Some(id) = c.fields.as_ref().and_then(|f| f.id.clone().map(|id| (id, f.decoded))) {
             *e.ids.entry(id.0).or_default() += id.1;
+        }
+        if let Some(f) = &c.fields {
+            if let Some(a) = f.activity {
+                *e.activity.entry(a).or_default() += 1;
+            }
+            if let Some(t) = &f.talk {
+                *e.talk.entry(t.clone()).or_default() += 1;
+                e.last_talk = Some(t.clone());
+            }
         }
         if c.protocol.is_some() {
             *e.protocols.entry(c.label.clone()).or_default() += 1;

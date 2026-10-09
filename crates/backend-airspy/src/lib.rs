@@ -252,6 +252,8 @@ impl AirspyBackend {
                 ext_clock: false,
                 bias_tee: true,
                 hw_timestamps: false,
+                spur_grid_hz: Some(5e6),
+                transfer_samples: Some(65536),
             },
             center: Arc::new(AtomicU64::new(100e6f64.to_bits())),
             rate,

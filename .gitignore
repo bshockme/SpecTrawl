@@ -2,3 +2,5 @@
 *.sigmf-data
 /testdata/large/
 /testdata/captures/
+/testdata/trawl*/
+/testdata/*.log

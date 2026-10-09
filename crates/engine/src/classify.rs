@@ -36,7 +36,8 @@ pub struct ClassifierLoad {
     pub busy: f64,
 }
 
-pub(crate) fn run(shared: Arc<Shared>, cfg: SourceConfig, stop: Arc<AtomicBool>, rate: f64) {
+pub(crate) fn run(shared: Arc<Shared>, cfg: SourceConfig, stop: Arc<AtomicBool>, rate: f64, caps: sdr_core::Capabilities) {
+    let radio = Radio { spur_grid_hz: caps.spur_grid_hz, transfer_tone_hz: caps.transfer_samples.map(|n| rate / n as f64) };
     let mut chunk = vec![Complex32::default(); 1 << 18];
     let (mut win_start, mut jobs, mut work) = (Instant::now(), 0u32, Duration::ZERO);
     while !stop.load(Ordering::Relaxed) {
@@ -51,12 +52,12 @@ pub(crate) fn run(shared: Arc<Shared>, cfg: SourceConfig, stop: Arc<AtomicBool>,
         }
         let t0 = Instant::now();
         if let Some(rec) = pick(&shared) {
-            let class = Arc::new(classify_record(&shared, &cfg, rate, &rec, &mut chunk, &stop));
+            let class = Arc::new(classify_record(&shared, &cfg, rate, &radio, &rec, &mut chunk, &stop));
             let mut st = shared.records.lock();
             st.emitters.tally(rec.id, &class);
             st.classes.insert(rec.id, (class, Instant::now(), rec.active));
         } else if let Some(job) = pick_emitter(&shared, rate) {
-            let class = Arc::new(classify_window(&shared, rate, &job, &mut chunk, &stop));
+            let class = Arc::new(classify_window(&shared, rate, &radio, &job, &mut chunk, &stop));
             shared.records.lock().emitters.set_group_class(job.emitter, class);
         } else {
             std::thread::sleep(Duration::from_millis(100));
@@ -157,10 +158,17 @@ fn label_only(label: &str) -> Classification {
     }
 }
 
+/// What the radio is known to do to its own spectrum (see `detect::context`).
+struct Radio {
+    spur_grid_hz: Option<f64>,
+    transfer_tone_hz: Option<f64>,
+}
+
 fn classify_record(
     shared: &Shared,
     cfg: &SourceConfig,
     rate: f64,
+    radio: &Radio,
     r: &SignalRecord,
     chunk: &mut [Complex32],
     stop: &AtomicBool,
@@ -179,10 +187,10 @@ fn classify_record(
         bandwidth_hz: r.bandwidth_hz(),
         tuner_center_hz: r.tuner_center_hz,
     };
-    classify_window(shared, rate, &w, chunk, stop)
+    classify_window(shared, rate, radio, &w, chunk, stop)
 }
 
-fn classify_window(shared: &Shared, rate: f64, w: &Window, chunk: &mut [Complex32], stop: &AtomicBool) -> Classification {
+fn classify_window(shared: &Shared, rate: f64, radio: &Radio, w: &Window, chunk: &mut [Complex32], stop: &AtomicBool) -> Classification {
     let bw = w.bandwidth_hz.max(5e3);
     if bw > MAX_DDC_BW_HZ {
         return label_only("Wideband");
@@ -214,5 +222,14 @@ fn classify_window(shared: &Shared, rate: f64, w: &Window, chunk: &mut [Complex3
     if chan.is_empty() {
         return label_only("IQ expired");
     }
-    detect::classify(&chan, ddc.fs_out, w.bandwidth_hz)
+    let mut c = detect::classify(&chan, ddc.fs_out, w.bandwidth_hz);
+    let ctx = detect::context::Context {
+        center_hz: w.center_hz,
+        tuner_hz: w.tuner_center_hz,
+        bandwidth_hz: w.bandwidth_hz,
+        spur_grid_hz: radio.spur_grid_hz,
+        transfer_tone_hz: radio.transfer_tone_hz,
+    };
+    detect::context::refine(&mut c, &ctx, &chan, ddc.fs_out);
+    c
 }
