@@ -45,6 +45,8 @@ pub struct SweepStatus {
     pub last_pass_s: f64,
     pub hops_per_sec: f64,
     pub redone_hops: u64,
+    /// Dwells thrown away because their FFTs disagreed (tuner still settling).
+    pub settle_retries: u64,
 }
 
 impl SweepStatus {
@@ -102,9 +104,12 @@ pub(crate) fn run(
         last_pass_s: 0.0,
         hops_per_sec: 0.0,
         redone_hops: 0,
+        settle_retries: 0,
     });
 
     let mut rate_window = (Instant::now(), 0u32);
+    let mut last_center = f64::NAN;
+    let mut lin = vec![0.0f32; n];
     'passes: loop {
         let pass_start = Instant::now();
         let mut h = 0;
@@ -122,34 +127,72 @@ pub(crate) fn run(
                 h += 1;
                 continue;
             }
-            let from = n0 + guard;
-            let to = from + dwell;
-            let deadline = Instant::now() + Duration::from_millis(500);
-            while shared.ring.lock().head() < to {
-                if stop.load(Ordering::Relaxed) {
-                    break 'passes;
+            // Big jumps (the wrap-around from the top of the span to the bottom)
+            // take longer to settle: up to ~30 ms measured on an R2.
+            let jump = (center - last_center).abs();
+            last_center = center;
+            let mut from = n0 + if jump > 3.0 * hop_hz { guard * 3 } else { guard };
+            let mut redo_hop = false;
+            let mut attempts = 0;
+            loop {
+                let to = from + dwell;
+                let deadline = Instant::now() + Duration::from_millis(500);
+                while shared.ring.lock().head() < to {
+                    if stop.load(Ordering::Relaxed) {
+                        break 'passes;
+                    }
+                    if Instant::now() > deadline {
+                        log::warn!("sweep: no samples for hop {h}");
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_micros(500));
                 }
-                if Instant::now() > deadline {
-                    log::warn!("sweep: no samples for hop {h}");
+                if shared.state.lock().gaps != gaps0 {
+                    redo_hop = true;
                     break;
                 }
-                std::thread::sleep(Duration::from_micros(500));
+                // Measure each FFT separately: if their noise floors disagree,
+                // the tuner was still settling (or the retune command was
+                // delayed) and the whole hop would light up as a broadband
+                // stripe. Then measure the next stretch instead - no retune.
+                let mut ok = true;
+                let mut floors = Vec::with_capacity(plan.ffts_per_hop);
+                lin.iter_mut().for_each(|v| *v = 0.0);
+                for k in 0..plan.ffts_per_hop {
+                    ok &= shared.ring.lock().read(from + (k * n) as u64, &mut block);
+                    sa.push(&block);
+                    sa.take_db(&mut db);
+                    for (l, d) in lin.iter_mut().zip(&db) {
+                        *l += 10f32.powf(*d / 10.0);
+                    }
+                    let mut band: Vec<f32> = db[first_bin..first_bin + bins_per_hop].to_vec();
+                    let mid = band.len() / 2;
+                    floors.push(*band.select_nth_unstable_by(mid, f32::total_cmp).1);
+                }
+                let spread = floors.iter().copied().fold(f32::MIN, f32::max) - floors.iter().copied().fold(f32::MAX, f32::min);
+                if spread > MAX_FLOOR_SPREAD_DB && attempts < MAX_SETTLE_RETRIES {
+                    attempts += 1;
+                    from = to;
+                    if let Some(s) = shared.sweep.lock().as_mut() {
+                        s.settle_retries += 1;
+                    }
+                    continue;
+                }
+                if ok {
+                    let k = plan.ffts_per_hop as f32;
+                    for (i, d) in db.iter_mut().enumerate() {
+                        *d = 10.0 * (lin[i] / k + 1e-20).log10();
+                    }
+                    full[h * bins_per_hop..(h + 1) * bins_per_hop].copy_from_slice(&db[first_bin..first_bin + bins_per_hop]);
+                }
+                break;
             }
-            if shared.state.lock().gaps != gaps0 {
+            if redo_hop {
                 // Samples were dropped somewhere in this hop: measure it again.
                 if let Some(s) = shared.sweep.lock().as_mut() {
                     s.redone_hops += 1;
                 }
                 continue;
-            }
-            let mut ok = true;
-            for k in 0..plan.ffts_per_hop {
-                ok &= shared.ring.lock().read(from + (k * n) as u64, &mut block);
-                sa.push(&block);
-            }
-            sa.take_db(&mut db);
-            if ok {
-                full[h * bins_per_hop..(h + 1) * bins_per_hop].copy_from_slice(&db[first_bin..first_bin + bins_per_hop]);
             }
             let now = Instant::now();
             rate_window.1 += 1;
@@ -192,6 +235,11 @@ pub(crate) fn run(
         }
     }
 }
+
+/// A dwell whose FFT noise floors differ by more than this was measured
+/// while the tuner was still settling.
+const MAX_FLOOR_SPREAD_DB: f32 = 3.0;
+const MAX_SETTLE_RETRIES: u32 = 3;
 
 /// Below this many hops the across-hop median isn't a reliable profile.
 const MIN_HOPS_FOR_PROFILE: usize = 8;

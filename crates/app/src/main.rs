@@ -426,7 +426,6 @@ impl App {
         // Borrow the pane field-wise so the closures can also touch other fields.
         if let Some(p) = self.panes.iter_mut().find(|p| p.role == Role::Survey) {
             let st = p.source.sweep_status();
-            let stats = p.source.stats();
             let mut apply = false;
             let mut err = None;
             ui.add_space(8.0);
@@ -445,7 +444,7 @@ impl App {
                     kv(ui, "Hops", &format!("{} × {:.1} MHz", s.hops, s.hop_hz / 1e6));
                     kv(ui, "Rate", &format!("{:.0} hops/s · {:.0} MHz/s", s.hops_per_sec, s.mhz_per_sec()));
                     kv(ui, "Revisit", &format!("{:.2} s", s.last_pass_s));
-                    kv(ui, "Re-done hops", &format!("{} · gaps {}", s.redone_hops, stats.gaps));
+                    kv(ui, "Re-measured", &format!("{} settle · {} gap", s.settle_retries, s.redone_hops));
                 }
             });
             if err.is_some() {
@@ -571,7 +570,7 @@ impl App {
                 ),
                 None => format!("SURVEY · {}", p.source.info().label),
             };
-            let records = pane_records(p);
+            let records = survey_outside_focus(pane_records(p), focus_span);
             let res = p.view.show(ui, r, &title, st.as_ref(), &records, selected, sel_survey);
             if let Some((lo, hi)) = focus_span {
                 p.view.bracket(ui, r, lo, hi, "A");
@@ -766,7 +765,14 @@ impl App {
         if self.emitter_cache.0.elapsed() > std::time::Duration::from_millis(300) {
             let mut rows: Vec<(Role, engine::Emitter)> = Vec::new();
             for p in &self.panes {
-                rows.extend(p.source.emitters().into_iter().map(|e| (p.role, e)));
+                let focus_span = self.panes.iter().find(|q| q.role == Role::Focus).and_then(|q| q.view.span());
+                rows.extend(
+                    p.source
+                        .emitters()
+                        .into_iter()
+                        .filter(|e| p.role != Role::Survey || !in_focus_zone(e.center_hz, focus_span))
+                        .map(|e| (p.role, e)),
+                );
             }
             rows.sort_by(|a, b| b.1.active.cmp(&a.1.active).then(b.1.last_seen.cmp(&a.1.last_seen)));
             self.emitter_cache = (std::time::Instant::now(), rows);
@@ -1151,6 +1157,24 @@ fn spawn_deadlock_watchdog() {
             }
         })
         .expect("spawn watchdog");
+}
+
+/// Inside the Focus span the focus device is the better witness: it listens
+/// continuously with no hop artifacts, and the survey device hears the focus
+/// R2's own local-oscillator leakage there (at the top edge, centre + 5 MHz,
+/// plus weaker spurs) - confirmed by swapping the two R2s' roles. So survey
+/// detections in that zone aren't drawn or listed.
+const FOCUS_ZONE_MARGIN_HZ: f64 = 0.5e6;
+
+fn in_focus_zone(f: f64, focus_span: Option<(f64, f64)>) -> bool {
+    focus_span.is_some_and(|(lo, hi)| f > lo - FOCUS_ZONE_MARGIN_HZ && f < hi + FOCUS_ZONE_MARGIN_HZ)
+}
+
+fn survey_outside_focus(records: std::sync::Arc<[engine::SignalRecord]>, focus_span: Option<(f64, f64)>) -> std::sync::Arc<[engine::SignalRecord]> {
+    if focus_span.is_none() {
+        return records;
+    }
+    records.iter().filter(|r| !in_focus_zone(r.center_hz(), focus_span)).cloned().collect()
 }
 
 /// `<Documents>/SpecTrawl/catalog.json`
