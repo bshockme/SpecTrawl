@@ -68,10 +68,6 @@ pub fn bar_frame() -> Frame {
     Frame::new().fill(BAR).inner_margin(Margin::symmetric(12, 0)).stroke(Stroke::new(1.0, BORDER))
 }
 
-pub fn side_frame() -> Frame {
-    Frame::new().fill(BG).inner_margin(Margin::same(6))
-}
-
 pub fn central_frame() -> Frame {
     Frame::new().fill(BG).inner_margin(Margin::same(6))
 }

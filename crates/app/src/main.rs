@@ -4,8 +4,10 @@ mod theme;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use egui_dock::{DockState, NodeIndex, SurfaceIndex};
 use engine::{Mode, Source, SourceConfig, SweepPlan};
 use sdr_core::{Backend, DeviceInfo, GainSetting};
+use serde::{Deserialize, Serialize};
 use spectrum_view::SpectrumView;
 
 fn main() -> eframe::Result {
@@ -21,7 +23,7 @@ fn main() -> eframe::Result {
 
 /// A receiver's letter, the handle for it everywhere in the UI: `S` is the
 /// sweeper, `A`, `B`, ... are live receivers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 struct ReceiverId(char);
 
 impl ReceiverId {
@@ -156,7 +158,12 @@ struct App {
     sweep_hi_mhz: f64,
     error: Option<String>,
     selection: Selection,
-    list_tab: ListTab,
+    /// The dock tree, lent to the tab viewer while it draws (None then).
+    dock: Option<DockState<Tab>>,
+    dock_requests: Vec<DockReq>,
+    /// `--tab`: shown once the dock exists.
+    start_tab: Option<Tab>,
+    frame: FrameInfo,
     last_frame: std::time::Instant,
     /// Imported names (DSD+, trunk-recorder). Labels only: never replaces
     /// anything decoded.
@@ -250,8 +257,13 @@ impl EmitterSort {
 /// Target frame interval (~60 fps).
 const FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(16_667);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ListTab {
+/// A dockable pane. Plain identifiers: the dock tree serialises as these
+/// and the bodies are `App` methods.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+enum Tab {
+    Receiver(ReceiverId),
+    Sources,
+    Inspector,
     Emitters,
     Records,
     P25,
@@ -259,16 +271,63 @@ enum ListTab {
     Pages,
 }
 
+impl Tab {
+    /// Every pane that isn't a receiver.
+    const PANELS: [Tab; 7] = [Tab::Sources, Tab::Inspector, Tab::Emitters, Tab::Records, Tab::P25, Tab::Calls, Tab::Pages];
+
+    fn name(&self) -> String {
+        match self {
+            Tab::Receiver(id) => format!("Receiver {id}"),
+            Tab::Sources => "Sources".into(),
+            Tab::Inspector => "Inspector".into(),
+            Tab::Emitters => "Emitters".into(),
+            Tab::Records => "Records".into(),
+            Tab::P25 => "P25".into(),
+            Tab::Calls => "Calls".into(),
+            Tab::Pages => "Pages".into(),
+        }
+    }
+
+    fn is_table(&self) -> bool {
+        matches!(self, Tab::Emitters | Tab::Records | Tab::P25 | Tab::Calls | Tab::Pages)
+    }
+}
+
+/// A change to the dock, queued while the dock is on loan to the viewer.
+enum DockReq {
+    /// Focus the tab, adding it if it isn't open.
+    Show(Tab),
+    Remove(Tab),
+    AddReceiver(ReceiverId),
+    Reset,
+}
+
+/// Saved layout: `Documents/SpecTrawl/workspaces/last.json`.
+#[derive(Serialize, Deserialize)]
+struct Workspace {
+    main: DockState<Tab>,
+    tune_target: char,
+}
+
+/// Per-frame facts the receiver panes share (live spans for the survey's
+/// brackets, the next tune target).
+#[derive(Default)]
+struct FrameInfo {
+    live_spans: Vec<(ReceiverId, (f64, f64))>,
+    spans: Vec<(f64, f64)>,
+    next_target: Option<ReceiverId>,
+}
+
 /// Command line: `--sim` (simulator only), `--freq <MHz>` (focus centre),
 /// `--serial <hex>` (focus device), `--no-sweep`, `--sweep <lo> <hi>` (MHz),
-/// `--tab emitters|records|p25|calls|pages` (bottom panel).
+/// `--tab emitters|records|p25|calls|pages` (the table shown first).
 struct Args {
     sim: bool,
     freq_mhz: Option<f64>,
     serial: Option<String>,
     sweep: bool,
     sweep_range: Option<(f64, f64)>,
-    tab: Option<ListTab>,
+    tab: Option<Tab>,
 }
 
 fn parse_args() -> Args {
@@ -282,11 +341,11 @@ fn parse_args() -> Args {
             "--no-sweep" => a.sweep = false,
             "--tab" => {
                 a.tab = match it.next().as_deref() {
-                    Some("records") => Some(ListTab::Records),
-                    Some("p25") => Some(ListTab::P25),
-                    Some("pages") => Some(ListTab::Pages),
-                    Some("calls") => Some(ListTab::Calls),
-                    _ => Some(ListTab::Emitters),
+                    Some("records") => Some(Tab::Records),
+                    Some("p25") => Some(Tab::P25),
+                    Some("pages") => Some(Tab::Pages),
+                    Some("calls") => Some(Tab::Calls),
+                    _ => Some(Tab::Emitters),
                 }
             }
             "--sweep" => {
@@ -322,7 +381,10 @@ impl App {
             sweep_hi_mhz: hi,
             error: None,
             selection: Selection::None,
-            list_tab: args.tab.unwrap_or(ListTab::Emitters),
+            dock: None,
+            dock_requests: Vec::new(),
+            start_tab: args.tab.clone(),
+            frame: FrameInfo::default(),
             emitter_cache: (std::time::Instant::now() - std::time::Duration::from_secs(1), Vec::new(), 0),
             emitter_squelched: 0,
             emitter_view: EmitterView::default(),
@@ -372,7 +434,73 @@ impl App {
                 app.open_as(&s, ReceiverId::SWEEP);
             }
         }
+        // The last layout, if there is one (else the default, built on the
+        // first frame when the window's width is known).
+        if let Some(w) = load_workspace() {
+            let t = ReceiverId(w.tune_target);
+            if app.receiver(t).is_some() {
+                app.tune_target = t;
+            }
+            app.dock = Some(w.main);
+            let open: Vec<ReceiverId> = app.panes.iter().map(|p| p.id).collect();
+            app.dock_requests.extend(open.into_iter().map(DockReq::AddReceiver));
+            if let Some(t) = app.start_tab.take() {
+                app.dock_requests.push(DockReq::Show(t));
+            }
+        }
         app
+    }
+
+    fn save_workspace(&self) {
+        let Some(main) = &self.dock else { return };
+        let w = Workspace { main: main.clone(), tune_target: self.tune_target.0 };
+        let path = workspace_path();
+        if let Some(d) = path.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        match serde_json::to_vec(&w) {
+            Ok(b) => {
+                if let Err(e) = std::fs::write(&path, b) {
+                    log::warn!("{}: {e}", path.display());
+                }
+            }
+            Err(e) => log::warn!("workspace: {e}"),
+        }
+    }
+
+    /// Applies queued dock changes (the dock must be home, not on loan).
+    fn apply_dock_requests(&mut self, width: f32) {
+        if self.dock_requests.is_empty() {
+            return;
+        }
+        let reqs = std::mem::take(&mut self.dock_requests);
+        let Some(dock) = self.dock.as_mut() else { return };
+        for r in reqs {
+            match r {
+                DockReq::Reset => {
+                    let ids: Vec<ReceiverId> = self.panes.iter().map(|p| p.id).collect();
+                    *dock = default_dock(width, &ids);
+                }
+                DockReq::Show(tab) => match dock.find_tab(&tab) {
+                    Some(path) => {
+                        let _ = dock.set_active_tab(path);
+                    }
+                    None => place_tab(dock, tab),
+                },
+                DockReq::Remove(tab) => {
+                    if let Some(path) = dock.find_tab(&tab) {
+                        dock.remove_tab(path);
+                    }
+                }
+                DockReq::AddReceiver(id) => {
+                    let tab = Tab::Receiver(id);
+                    if dock.find_tab(&tab).is_none() {
+                        place_tab(dock, tab);
+                    }
+                }
+            }
+        }
+        self.save_workspace();
     }
 
     fn rescan(&mut self) {
@@ -396,10 +524,6 @@ impl App {
     /// The live receiver tuning lands on.
     fn target(&self) -> Option<&Receiver> {
         self.receiver(self.tune_target)
-    }
-
-    fn sweeper(&self) -> Option<&Receiver> {
-        self.receiver(ReceiverId::SWEEP)
     }
 
     /// Live receivers' letters, in order.
@@ -475,6 +599,7 @@ impl App {
                     gain_step: 13,
                 });
                 self.panes.sort_by_key(|p| (!p.id.is_sweep(), p.id));
+                self.dock_requests.push(DockReq::AddReceiver(id));
                 self.error = None;
             }
             Err(e) => self.error = Some(format!("{}: {e}", info.label)),
@@ -519,6 +644,26 @@ impl App {
                     "Dim FM broadcast, TV and LTE/NR carriers the app has identified, and hide their detections, so unknown signals stand out",
                 );
                 ui.menu_button("Import names", |ui| self.import_menu(ui));
+                ui.menu_button("Layout ⏷", |ui| {
+                    if ui.button("Reset layout").on_hover_text("The default arrangement for this window width").clicked() {
+                        self.dock_requests.push(DockReq::Reset);
+                        ui.close();
+                    }
+                    let next = self.next_live_id();
+                    if ui.button(format!("Add receiver slot {next}")).clicked() {
+                        self.dock_requests.push(DockReq::AddReceiver(next));
+                        ui.close();
+                    }
+                    ui.separator();
+                    let present: Vec<Tab> = self.dock.as_ref().map(|d| d.iter_all_tabs().map(|(_, t)| t.clone()).collect()).unwrap_or_default();
+                    for t in Tab::PANELS {
+                        if !present.contains(&t) && ui.button(format!("Show {}", t.name())).clicked() {
+                            self.dock_requests.push(DockReq::Show(t));
+                            ui.close();
+                        }
+                    }
+                    ui.label(egui::RichText::new("Drag a tab to move it, or off the strip to float it").small().color(theme::MUTED));
+                });
                 if let Some((t, m)) = &self.catalog_msg {
                     if t.elapsed() < std::time::Duration::from_secs(12) {
                         ui.label(egui::RichText::new(m).small().color(theme::TEXT2));
@@ -577,7 +722,8 @@ impl App {
         }
     }
 
-    fn side_panel(&mut self, ui: &mut egui::Ui) {
+    /// Devices, and which receiver slot each one fills.
+    fn sources_panel(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("SOURCES").small().strong().color(theme::MUTED));
@@ -642,7 +788,6 @@ impl App {
             None => {}
         }
 
-        self.inspector(ui);
         if let Some(e) = &self.error {
             ui.colored_label(egui::Color32::from_rgb(0xff, 0x70, 0x96), e);
         }
@@ -938,7 +1083,9 @@ impl App {
         self.known.1.iter().find(|(lo, hi, _)| (*lo..=*hi).contains(&hz)).map(|k| k.2.as_str())
     }
 
-    fn central(&mut self, ui: &mut egui::Ui) {
+    /// Once a frame, before the panes draw: feed the views, and note the
+    /// live spans (for the survey's brackets) and the next tune target.
+    fn frame_prep(&mut self) {
         self.refresh_known();
         for p in self.panes.iter_mut() {
             p.view.known = self.known.1.clone();
@@ -951,34 +1098,48 @@ impl App {
                 p.view.ingest(&p.source);
             }
         }
-        let area = ui.available_rect_before_wrap();
-        if self.panes.is_empty() {
-            ui.centered_and_justified(|ui| {
-                ui.label(egui::RichText::new("No sources open. Pick a device on the left.").color(theme::MUTED))
+        let live = self.live_ids();
+        let target = self.tune_target;
+        let live_spans: Vec<(ReceiverId, (f64, f64))> = live.iter().filter_map(|id| Some((*id, self.receiver(*id)?.view.span()?))).collect();
+        self.frame = FrameInfo {
+            spans: live_spans.iter().map(|(_, s)| *s).collect(),
+            live_spans,
+            next_target: live.iter().position(|i| *i == target).map(|k| live[(k + 1) % live.len()]).or(live.first().copied()),
+        };
+    }
+
+    /// One receiver's pane: spectrum and waterfall with the header toolbar,
+    /// or a device picker for an empty slot.
+    fn receiver_pane(&mut self, ui: &mut egui::Ui, id: ReceiverId) {
+        if self.receiver(id).is_none() {
+            let mut open = None;
+            ui.vertical_centered(|ui| {
+                ui.add_space(24.0);
+                ui.label(egui::RichText::new(format!("Receiver {id}: no device")).strong());
+                let free: Vec<DeviceInfo> =
+                    self.devices.iter().filter(|d| !self.panes.iter().any(|p| same_device(p.source.info(), d))).cloned().collect();
+                if free.is_empty() {
+                    ui.label(egui::RichText::new("Every device is in use; close one from its pane menu (…).").small().color(theme::MUTED));
+                }
+                for d in free {
+                    if ui.button(format!("Open {} ({}) as {id}", d.label, d.serial)).clicked() {
+                        open = Some(d);
+                    }
+                }
+                ui.add_space(8.0);
+                if ui.small_button("Remove this slot").clicked() {
+                    self.dock_requests.push(DockReq::Remove(Tab::Receiver(id)));
+                }
             });
+            if let Some(d) = open {
+                self.open_as(&d, id);
+            }
             return;
         }
-        // The sweeper on top, live receivers sharing the rest.
-        let live = self.live_ids();
-        let mut rects: Vec<(ReceiverId, egui::Rect)> = Vec::new();
-        let mut top = area.top();
-        if self.sweeper().is_some() {
-            let h = if live.is_empty() { area.height() } else { (area.height() * 0.38).round() };
-            rects.push((ReceiverId::SWEEP, egui::Rect::from_min_size(egui::pos2(area.left(), top), egui::vec2(area.width(), h))));
-            top += h + 6.0;
-        }
-        let n = live.len() as f32;
-        let h = ((area.bottom() - top) - 6.0 * (n - 1.0).max(0.0)) / n.max(1.0);
-        for id in &live {
-            rects.push((*id, egui::Rect::from_min_size(egui::pos2(area.left(), top), egui::vec2(area.width(), h))));
-            top += h + 6.0;
-        }
-
-        let live_spans: Vec<(ReceiverId, (f64, f64))> = live.iter().filter_map(|id| Some((*id, self.receiver(*id)?.view.span()?))).collect();
-        let spans: Vec<(f64, f64)> = live_spans.iter().map(|(_, s)| *s).collect();
+        let r = ui.available_rect_before_wrap();
         let selection = self.selection.clone();
         let target = self.tune_target;
-        let next_target = live.iter().position(|i| *i == target).map(|k| live[(k + 1) % live.len()]).or(live.first().copied());
+        let next_target = self.frame.next_target;
         enum Act {
             Tune(ReceiverId, f64),
             Select(Selection),
@@ -988,10 +1149,10 @@ impl App {
             Err(String),
         }
         let mut acts: Vec<Act> = Vec::new();
-        let App { panes, sweep_lo_mhz, sweep_hi_mhz, .. } = &mut *self;
-        for (id, r) in rects {
-            let Some(p) = panes.iter_mut().find(|p| p.id == id) else { continue };
-            let records = if id.is_sweep() { survey_outside_focus(pane_records(p), &spans) } else { pane_records(p) };
+        {
+            let App { panes, sweep_lo_mhz, sweep_hi_mhz, frame, .. } = &mut *self;
+            let Some(p) = panes.iter_mut().find(|p| p.id == id) else { return };
+            let records = if id.is_sweep() { survey_outside_focus(pane_records(p), &frame.spans) } else { pane_records(p) };
             // Highlight the selected record, and its emitter (or the
             // selected emitter), on this receiver only.
             let sel_record = selection.record().filter(|(rx, _)| *rx == id).map(|(_, rid)| rid);
@@ -1017,7 +1178,7 @@ impl App {
                     None => format!("S · {}", info.label),
                 };
                 let res = p.view.show(ui, r, &title, st.as_ref(), &records, sel_record, sel_emitter);
-                for (rx, (lo, hi)) in &live_spans {
+                for (rx, (lo, hi)) in &frame.live_spans {
                     p.view.bracket(ui, r, *lo, *hi, &rx.to_string());
                 }
                 // Survey click: tune the target there; on a record, also
@@ -1517,7 +1678,7 @@ impl App {
         }
         if ui.small_button("Show in Pages").clicked() {
             self.page_filter = format!("{capcode:09}");
-            self.list_tab = ListTab::Pages;
+            self.dock_requests.push(DockReq::Show(Tab::Pages));
         }
         ui.separator();
         ui.label(egui::RichText::new(format!("{} pages · last:", pages.len())).small().color(theme::MUTED));
@@ -1538,24 +1699,6 @@ impl App {
         }
         self.policy_gen.0 += 1;
         save_follow_policy(&self.follow_policy);
-    }
-
-    fn bottom_panel(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.list_tab, ListTab::Emitters, "Emitters");
-            ui.selectable_value(&mut self.list_tab, ListTab::Records, "Records");
-            ui.selectable_value(&mut self.list_tab, ListTab::P25, "P25");
-            ui.selectable_value(&mut self.list_tab, ListTab::Calls, "Calls");
-            ui.selectable_value(&mut self.list_tab, ListTab::Pages, "Pages");
-            ui.label(egui::RichText::new(format!("click to select · double-click to tune {}", self.tune_target)).small().color(theme::MUTED));
-        });
-        match self.list_tab {
-            ListTab::Emitters => self.emitter_list(ui),
-            ListTab::Records => self.signal_list(ui),
-            ListTab::P25 => self.p25_panel(ui),
-            ListTab::Calls => self.calls_panel(ui),
-            ListTab::Pages => self.pages_panel(ui),
-        }
     }
 
     /// Emitters from the chosen panes, in a stable order (frequency unless a
@@ -1639,10 +1782,11 @@ impl App {
         let hidden = self.emitter_cache.2;
         ui.label(
             egui::RichText::new(format!(
-                "{} emitters · {active} active · {identified} identified{}{}",
+                "{} emitters · {active} active · {identified} identified{}{} · click selects · double-click tunes {}",
                 rows.len(),
                 if hidden > 0 { format!(" · {hidden} unconfirmed not shown") } else { String::new() },
-                if self.emitter_squelched > 0 { format!(" · {} known squelched", self.emitter_squelched) } else { String::new() }
+                if self.emitter_squelched > 0 { format!(" · {} known squelched", self.emitter_squelched) } else { String::new() },
+                self.tune_target
             ))
             .small()
             .monospace()
@@ -2298,11 +2442,27 @@ impl eframe::App for App {
         }
         egui::Panel::top("top").exact_size(40.0).frame(theme::bar_frame()).show(ui, |ui| self.top_bar(ui));
         egui::Panel::bottom("transport").exact_size(26.0).frame(theme::bar_frame()).show(ui, |ui| self.transport_bar(ui, &ctx));
-        egui::Panel::bottom("signals").resizable(true).default_size(210.0).frame(theme::side_frame()).show(ui, |ui| self.bottom_panel(ui));
-        egui::Panel::left("side").exact_size(270.0).frame(theme::side_frame()).show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| self.side_panel(ui));
+        self.frame_prep();
+        let width = ctx.content_rect().width();
+        if self.dock.is_none() {
+            let ids: Vec<ReceiverId> = self.panes.iter().map(|p| p.id).collect();
+            self.dock = Some(default_dock(width, &ids));
+            if let Some(t) = self.start_tab.take() {
+                self.dock_requests.push(DockReq::Show(t));
+            }
+        }
+        self.apply_dock_requests(width);
+        // The dock is lent to the viewer (us) while it draws.
+        let mut dock = self.dock.take().expect("dock");
+        egui::CentralPanel::default().frame(theme::central_frame()).show(ui, |ui| {
+            egui_dock::DockArea::new(&mut dock)
+                .style(dock_style(ui))
+                .show_add_buttons(false)
+                .show_leaf_close_all_buttons(false)
+                .show_leaf_collapse_buttons(false)
+                .show_inside(ui, self);
         });
-        egui::CentralPanel::default().frame(theme::central_frame()).show(ui, |ui| self.central(ui));
+        self.dock = Some(dock);
         // ~60 fps is plenty for a waterfall; uncapped it ran at the monitor's
         // rate (165 Hz here) and cost a full core. egui repaints at once when
         // the requested delay is under its frame time, so pace frames here.
@@ -2312,6 +2472,157 @@ impl eframe::App for App {
         }
         self.last_frame = std::time::Instant::now();
         ctx.request_repaint();
+    }
+
+    fn on_exit(&mut self) {
+        self.save_workspace();
+    }
+}
+
+impl egui_dock::TabViewer for App {
+    type Tab = Tab;
+
+    fn id(&mut self, tab: &mut Tab) -> egui::Id {
+        egui::Id::new(&*tab)
+    }
+
+    fn title(&mut self, tab: &mut Tab) -> egui::WidgetText {
+        match tab {
+            Tab::Receiver(id) => match self.receiver(*id) {
+                Some(p) => format!("{id} · {}", p.source.info().label),
+                None => format!("{id} · empty"),
+            }
+            .into(),
+            t => t.name().into(),
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab) {
+        match tab {
+            Tab::Receiver(id) => self.receiver_pane(ui, *id),
+            Tab::Sources => {
+                egui::ScrollArea::vertical().show(ui, |ui| self.sources_panel(ui));
+            }
+            Tab::Inspector => {
+                egui::ScrollArea::vertical().show(ui, |ui| self.inspector(ui));
+            }
+            Tab::Emitters => self.emitter_list(ui),
+            Tab::Records => self.signal_list(ui),
+            Tab::P25 => self.p25_panel(ui),
+            Tab::Calls => self.calls_panel(ui),
+            Tab::Pages => self.pages_panel(ui),
+        }
+    }
+
+    /// Receiver slots are closed from the pane itself, not the tab.
+    fn closeable(&mut self, tab: &mut Tab) -> bool {
+        !matches!(tab, Tab::Receiver(_))
+    }
+
+    fn allowed_in_windows(&self, _tab: &mut Tab) -> bool {
+        true
+    }
+
+    /// Tables and spectrum views manage their own scrolling.
+    fn scroll_bars(&self, _tab: &Tab) -> [bool; 2] {
+        [false, false]
+    }
+}
+
+/// The default arrangement for a window `width` px wide: Sources over the
+/// inspector at the left, receivers stacked in the middle, the tables
+/// below (beside, on a very wide window).
+fn default_dock(width: f32, receivers: &[ReceiverId]) -> DockState<Tab> {
+    let mut rx: Vec<ReceiverId> = receivers.to_vec();
+    rx.sort_by_key(|r| (!r.is_sweep(), *r));
+    if rx.is_empty() {
+        rx.push(ReceiverId::live(0));
+    }
+    let mut ds = DockState::new(vec![Tab::Receiver(rx[0])]);
+    let tree = ds.main_surface_mut();
+    let [center, left] = tree.split_left(NodeIndex::root(), if width < 1600.0 { 0.22 } else { 0.16 }, vec![Tab::Sources]);
+    tree.split_below(left, 0.38, vec![Tab::Inspector]);
+    let tables: Vec<Tab> = Tab::PANELS.iter().filter(|t| t.is_table()).cloned().collect();
+    let [mut node, _] = if width > 2560.0 { tree.split_right(center, 0.62, tables) } else { tree.split_below(center, 0.64, tables) };
+    // Receivers stack: the sweeper keeps 38%, live receivers share equally.
+    for (k, id) in rx.iter().enumerate().skip(1) {
+        let remaining = (rx.len() - k) as f32;
+        let frac = if rx[k - 1].is_sweep() { 0.38 } else { 1.0 / (remaining + 1.0) };
+        let [_, new] = tree.split_below(node, frac, vec![Tab::Receiver(*id)]);
+        node = new;
+    }
+    ds
+}
+
+/// Adds a tab the layout lacks: a receiver below the last receiver pane,
+/// anything else beside the tables.
+fn place_tab(dock: &mut DockState<Tab>, tab: Tab) {
+    let last_of = |pred: &dyn Fn(&Tab) -> bool| {
+        dock.iter_all_tabs().filter(|(path, t)| path.surface == SurfaceIndex::main() && pred(t)).map(|(path, _)| path).last()
+    };
+    match &tab {
+        Tab::Receiver(_) => match last_of(&|t| matches!(t, Tab::Receiver(_))) {
+            Some(path) => {
+                dock.main_surface_mut().split_below(path.node, 0.5, vec![tab]);
+            }
+            None => dock.push_to_first_leaf(tab),
+        },
+        _ => match last_of(&|t| t.is_table()) {
+            Some(path) => {
+                dock.set_focused_node_and_surface(egui_dock::NodePath { surface: path.surface, node: path.node });
+                dock.push_to_focused_leaf(tab);
+            }
+            None => dock.push_to_first_leaf(tab),
+        },
+    }
+}
+
+fn dock_style(ui: &egui::Ui) -> egui_dock::Style {
+    let mut st = egui_dock::Style::from_egui(ui.style());
+    st.tab_bar.height = 24.0;
+    st.tab_bar.bg_fill = theme::BAR;
+    st
+}
+
+fn workspace_path() -> std::path::PathBuf {
+    catalog_path().with_file_name("workspaces").join("last.json")
+}
+
+fn load_workspace() -> Option<Workspace> {
+    let b = std::fs::read(workspace_path()).ok()?;
+    let mut v: serde_json::Value = match serde_json::from_slice(&b) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("workspace: {e}; using the default layout");
+            return None;
+        }
+    };
+    // egui_dock saves its (not yet laid out) rects as NaN, which JSON
+    // writes as null and can't read back as a number; they're recomputed
+    // on the first frame anyway.
+    fn unnull(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::Object(m) => {
+                if m.contains_key("x") && m.contains_key("y") {
+                    for k in ["x", "y"] {
+                        if m[k].is_null() {
+                            m[k] = serde_json::json!(0.0);
+                        }
+                    }
+                }
+                m.values_mut().for_each(unnull);
+            }
+            serde_json::Value::Array(a) => a.iter_mut().for_each(unnull),
+            _ => {}
+        }
+    }
+    unnull(&mut v);
+    match serde_json::from_value::<Workspace>(v) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            log::warn!("workspace: {e}; using the default layout");
+            None
+        }
     }
 }
 
