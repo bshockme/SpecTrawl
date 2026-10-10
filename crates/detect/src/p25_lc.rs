@@ -57,6 +57,15 @@ fn golay_table() -> &'static [u32; 2048] {
     })
 }
 
+/// Corrects a received Golay (23,12) word (data in bits 22..11, parity in
+/// 10..0): (12 data bits, bits fixed). Always succeeds (the code is
+/// perfect); more than 3 errors decode to the wrong word.
+pub fn golay23_decode(cw: u32) -> (u32, u32) {
+    let cw = cw & 0x7F_FFFF;
+    let e = golay_table()[((golay_parity(cw >> 11) ^ cw) & 0x7FF) as usize];
+    ((cw ^ e) >> 11, e.count_ones())
+}
+
 /// Corrects a received Golay (24,12) word: (12 data bits, bits fixed), or
 /// None when it's beyond repair (4 errors, caught by the parity bit).
 pub fn golay_decode(w: u32) -> Option<(u32, u32)> {
@@ -428,6 +437,62 @@ pub fn ldu1(f: &Frame) -> Option<LinkControl> {
     }
     let corrected = rs_decode(&mut h)?;
     Some(LinkControl::from_bytes(&hexbits_to_bytes(&h), corrected))
+}
+
+/// The encryption sync of an LDU2: the message indicator (the cipher's IV),
+/// algorithm and key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncryptionSync {
+    pub mi: [u8; 9],
+    pub algid: u8,
+    pub kid: u16,
+    /// Hexbits Reed-Solomon corrected.
+    pub corrected: usize,
+}
+
+impl EncryptionSync {
+    /// ALGID 0x80 is "unencrypted".
+    pub fn encrypted(&self) -> bool {
+        self.algid != 0x80
+    }
+
+    pub fn algorithm(&self) -> &'static str {
+        match self.algid {
+            0x80 => "clear",
+            0x81 => "DES-OFB",
+            0x83 => "3DES",
+            0x84 => "AES-256",
+            0x85 => "AES-128",
+            0x9F => "DES-XL",
+            0xA0 => "DVI-XL",
+            0xA1 => "DVP-XL",
+            0xAA => "ADP",
+            _ => "other",
+        }
+    }
+}
+
+/// The encryption sync of an LDU2 frame (sliced as for `ldu1`): 16
+/// hexbits of MI, ALGID and KID plus 8 Reed-Solomon (24,16,9) parity, in
+/// the same six Hamming-coded pieces as LDU1's link control.
+pub fn ldu2(f: &Frame) -> Option<EncryptionSync> {
+    let d = data_dibits(f, 784)?;
+    let bits: Vec<u16> = d.iter().flat_map(|&v| [(v >> 1) as u16, (v & 1) as u16]).collect();
+    let mut h = [0u8; RS_N];
+    for k in 0..6 {
+        let seg = &bits[288 + k * 184..288 + k * 184 + 40];
+        for (j, c) in seg.chunks(10).enumerate() {
+            h[4 * k + j] = hamming10_decode(c.iter().fold(0, |a, b| a << 1 | b)).unwrap_or(0);
+        }
+    }
+    let corrected = rs_decode_erasures(&mut h, 8, &[])?;
+    // 16 hexbits = 96 bits: MI (72), ALGID (8), KID (16).
+    let v = h[..16].iter().fold(0u128, |a, &x| a << 6 | x as u128);
+    let mut mi = [0u8; 9];
+    for (i, b) in mi.iter_mut().enumerate() {
+        *b = (v >> (88 - 8 * i)) as u8;
+    }
+    Some(EncryptionSync { mi, algid: (v >> 16) as u8, kid: v as u16, corrected })
 }
 
 /// The link control of a TDULC frame (sliced with at least ~190 dibits

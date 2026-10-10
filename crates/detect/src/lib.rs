@@ -12,6 +12,9 @@ pub mod dmr;
 pub mod features;
 pub mod flex;
 pub mod frames;
+pub mod imbe;
+mod imbe_tables;
+pub mod mbe;
 pub mod p25;
 pub mod p25_lc;
 pub mod p25p2;
@@ -96,6 +99,48 @@ pub fn frames_with(x: &[Complex32], fs: f64, cutoff_hz: f64, before: usize, afte
         return Vec::new();
     }
     frames_from(&prepare_cutoff(x, fs, cutoff_hz), fs, before, after, opts)
+}
+
+/// The P25 Phase 1 voice frames (LDU1 and LDU2) in `x`, in time order,
+/// sliced for `imbe::ldu_frames`. LDUs follow each other every 864
+/// symbols, so a sync the search missed is recovered from its neighbours:
+/// slicing where it must be is accepted when the NID there says LDU.
+pub fn p25_voice_frames(x: &[Complex32], fs: f64) -> Vec<frames::Frame> {
+    const LDU: usize = 864;
+    if x.len() < 64 {
+        return Vec::new();
+    }
+    let disc = sync_disc(&prepare_cutoff(x, fs, NARROW_CUTOFF_HZ), fs);
+    let hits: Vec<sync::SyncHit> =
+        sync::search(&disc, fs, &sync::table()).into_iter().filter(|h| h.entry.protocol == "P25" && h.entry.detail == "Phase 1").collect();
+    let is_ldu = |f: &frames::Frame| matches!(decode::p25_nid(f).map(|n| n.duid), Some(0x5 | 0xA));
+    let slice = |hs: &[sync::SyncHit]| frames::slice_with(&disc, fs, hs, 8, 880, frames::SliceOpts::default());
+    let mut found: Vec<frames::Frame> = slice(&hits).into_iter().filter(is_ldu).collect();
+    let max_symbol = (x.len() as f64 / fs * 4800.0) as usize;
+    let mut frontier: Vec<sync::SyncHit> = found
+        .iter()
+        .filter_map(|f| hits.iter().find(|h| h.symbol.abs_diff(f.at_symbol + 23) <= 3).cloned())
+        .collect();
+    // Walk out from every LDU in both directions while LDUs keep turning up.
+    while !frontier.is_empty() {
+        let mut next = Vec::new();
+        for h in &frontier {
+            for s in [h.symbol + LDU, h.symbol.wrapping_sub(LDU)] {
+                if s >= max_symbol || s < LDU || found.iter().any(|f| (f.at_symbol + 23).abs_diff(s) < LDU / 2) {
+                    continue;
+                }
+                let mut g = h.clone();
+                g.symbol = s;
+                if let Some(f) = slice(std::slice::from_ref(&g)).into_iter().find(is_ldu) {
+                    found.push(f);
+                    next.push(g);
+                }
+            }
+        }
+        frontier = next;
+    }
+    found.sort_by_key(|f| f.at_symbol);
+    found
 }
 
 fn frames_from(x: &[Complex32], fs: f64, before: usize, after: usize, opts: frames::SliceOpts) -> Vec<frames::Frame> {
