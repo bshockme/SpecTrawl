@@ -298,12 +298,50 @@ pub struct VoiceBurst {
     /// Which of the fragment's four timeslots.
     pub slot: usize,
     pub frames: Vec<Vec<u8>>,
+    /// Encryption sync bits: ESS-B (24 bits, a 4V burst) or ESS-A (168
+    /// bits, a 2V burst).
+    pub ess: Vec<u8>,
 }
 
 /// Where a voice burst's frames sit in its 320 bits: four (4V, with the
 /// encryption sync at 148..172) or two (2V) around the DUID bits.
 const VOICE4_AT: [usize; 4] = [2, 76, 172, 246];
 const VOICE2_AT: [usize; 2] = [2, 76];
+
+/// The encryption sync of a Phase 2 voice superframe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ess {
+    pub algid: u8,
+    pub kid: u16,
+    pub mi: [u8; 9],
+    /// Hexbits Reed-Solomon corrected.
+    pub corrected: usize,
+}
+
+/// Decodes the encryption sync from a superframe's four ESS-B pieces (the
+/// 24 bits of each 4V burst, in order) and its ESS-A (the 168 bits of the
+/// 2V burst): 16 data hexbits (ALGID, KID, MI) and 28 parity form a
+/// Reed-Solomon (44,16) word. Checked on real recordings against MAC_PTT
+/// (`examples/p2_ess_probe`).
+pub fn ess(ess_b: &[&[u8]; 4], ess_a: &[u8]) -> Option<Ess> {
+    let hexbits = |b: &[u8]| -> Vec<u8> { b.chunks(6).map(|c| c.iter().fold(0, |a, &x| a << 1 | x)).collect() };
+    let mut cw = [0u8; 63];
+    let sent: Vec<u8> = ess_b.iter().flat_map(|b| hexbits(b)).chain(hexbits(ess_a)).collect();
+    if sent.len() != 44 {
+        return None;
+    }
+    cw[19..].copy_from_slice(&sent);
+    let corrected = rs_decode_erasures(&mut cw, 28, &[])?;
+    if cw[..19].iter().any(|&h| h != 0) {
+        return None;
+    }
+    let v = cw[19..35].iter().fold(0u128, |a, &h| a << 6 | h as u128);
+    let mut mi = [0u8; 9];
+    for (i, m) in mi.iter_mut().enumerate() {
+        *m = (v >> (64 - 8 * i)) as u8;
+    }
+    Some(Ess { algid: (v >> 88) as u8, kid: (v >> 72) as u16, mi, corrected })
+}
 
 /// What one fragment held: its ISCHs and each burst.
 #[derive(Debug, Clone)]
@@ -370,13 +408,14 @@ pub fn fragment(f: &Frame, seqs: &[&[u8]]) -> Option<FragmentInfo> {
                     let t: Vec<u8> = ts.iter().zip(slot_sequence(seq, fr as usize * 4 + k)).map(|(b, s)| b ^ s).collect();
                     let frames: Vec<Vec<u8>> = at.iter().map(|&a| t[a..a + 72].to_vec()).collect();
                     let errs: u32 = frames.iter().map(|f| crate::ambe::decode(f).errors.iter().map(|&e| e as u32).sum::<u32>()).sum();
-                    (errs, frames)
+                    let ess = if burst == Burst::Voice4 { t[148..172].to_vec() } else { [&t[148..244], &t[246..318]].concat() };
+                    (errs, frames, ess)
                 })
-                .min_by_key(|(e, _)| *e);
-            if let Some((errs, frames)) = best {
+                .min_by_key(|(e, _, _)| *e);
+            if let Some((errs, frames, ess)) = best {
                 // Wrongly descrambled frames average ~3 errors per Golay word.
                 if (errs as usize) < 3 * at.len() {
-                    out.voice.push(VoiceBurst { channel, slot: k, frames });
+                    out.voice.push(VoiceBurst { channel, slot: k, frames, ess });
                 }
             }
             continue;

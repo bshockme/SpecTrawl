@@ -199,8 +199,11 @@ pub struct Phase2Stream {
     last_burst: Option<u64>,
     dec: crate::ambe::Decoder,
     pub call: Option<Call>,
-    /// The current transmission's algorithm ID (MAC_PTT), 0x80 = clear.
+    /// The current transmission's algorithm ID (MAC_PTT or the voice
+    /// bursts' encryption sync), 0x80 = clear.
     pub algid: Option<u8>,
+    /// ESS-B pieces of the current superframe: (symbol, bits).
+    ess_b: Vec<(u64, Vec<u8>)>,
 }
 
 impl Phase2Stream {
@@ -218,6 +221,7 @@ impl Phase2Stream {
             dec: Default::default(),
             call: None,
             algid: None,
+            ess_b: Vec::new(),
         }
     }
 
@@ -229,6 +233,7 @@ impl Phase2Stream {
         self.dec = Default::default();
         self.call = None;
         self.algid = None;
+        self.ess_b.clear();
         self.channel = self.want;
     }
 
@@ -304,6 +309,19 @@ impl LiveVoice for Phase2Stream {
                 }
                 self.last_burst = Some(at);
                 out.ldus += 1;
+                // Encryption sync: four ESS-B pieces, then ESS-A in the 2V
+                // burst ending the superframe.
+                if v.ess.len() == 24 {
+                    self.ess_b.push((at, v.ess.clone()));
+                    if self.ess_b.len() > 4 {
+                        self.ess_b.remove(0);
+                    }
+                } else if self.ess_b.len() == 4 && at - self.ess_b[0].0 < 2200 {
+                    let b: [&[u8]; 4] = std::array::from_fn(|i| self.ess_b[i].1.as_slice());
+                    if let Some(e) = crate::p25p2::ess(&b, &v.ess).filter(|e| p25_lc::algorithm_name(e.algid) != "other") {
+                        self.algid = Some(e.algid);
+                    }
+                }
                 if self.cipher().is_some() {
                     continue;
                 }

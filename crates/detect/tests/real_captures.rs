@@ -145,3 +145,48 @@ fn p25_phase2_talkgroups_after_learning_the_nac() {
     assert!(talks.iter().any(|t| t.starts_with("TG 47018 ← ")), "{talks:?}");
     assert!(talks.iter().any(|t| t.starts_with("TG 47000 ← 4024312")), "{talks:?}");
 }
+
+#[test]
+fn p25_phase1_voice_frames_and_encryption() {
+    let Some((x, fs)) = load("P25_site_770.3244") else {
+        eprintln!("skipping: capture not present");
+        return;
+    };
+    // LDUs recovered from their spacing where the sync search missed them
+    // (114 found by sync alone), and their IMBE frames mostly clean.
+    let frames = detect::p25_voice_frames(&x, fs);
+    assert!(frames.len() >= 170, "{} LDUs", frames.len());
+    let coded: Vec<_> = frames.iter().filter_map(detect::imbe::ldu_frames).flatten().collect();
+    let clean = coded.iter().filter(|c| c.total_errors() <= 3).count();
+    assert!(clean * 10 >= coded.len() * 8, "{clean}/{}", coded.len());
+    // Both clear and ADP-encrypted calls, from LDU2 encryption sync.
+    let algs: std::collections::BTreeSet<u8> = frames.iter().filter_map(detect::p25_lc::ldu2).map(|e| e.algid).collect();
+    assert!(algs.contains(&0x80) && algs.contains(&0xAA), "{algs:x?}");
+}
+
+#[test]
+fn p25_phase2_voice_and_encryption_sync() {
+    use detect::p25_voice::{LiveVoice, Phase2Stream};
+    let Some((x, fs)) = load("P25P2_site_769.1885") else {
+        eprintln!("skipping: capture not present");
+        return;
+    };
+    detect::p25p2::register_system(0xBEE00, 0x2A5);
+    detect::p25p2::register_nac(0x2A5);
+    // Channel 0 carries an ADP call (named by MAC_PTT and by the voice
+    // bursts' encryption sync) and stays silent; channel 1 a clear one.
+    let run = |ch: u8| {
+        let mut vs = Phase2Stream::new(fs, Some(ch));
+        let (mut audio, mut ciphers) = (0, std::collections::BTreeSet::new());
+        for c in x.chunks((fs / 50.0) as usize) {
+            audio += vs.push(c).audio.len();
+            ciphers.extend(vs.cipher());
+        }
+        (audio as f64 / 8000.0, ciphers)
+    };
+    let (a0, c0) = run(0);
+    assert!(c0.contains("ADP"), "{c0:?}");
+    assert!(a0 < 5.0, "{a0} s of channel 0 audio");
+    let (a1, c1) = run(1);
+    assert!(a1 > 8.0 && c1.is_empty(), "{a1} s, {c1:?}");
+}
