@@ -161,6 +161,14 @@ struct App {
     /// The dock tree, lent to the tab viewer while it draws (None then).
     dock: Option<DockState<Tab>>,
     dock_requests: Vec<DockReq>,
+    popouts: Vec<PopOut>,
+    next_popout: u64,
+    /// Which pop-out window is being drawn (None: the main window), for
+    /// the tab context menu.
+    drawing: Option<u64>,
+    /// (id, title) of every pop-out, for the context menu while they're
+    /// on loan.
+    popout_names: Vec<(u64, String)>,
     /// `--tab`: shown once the dock exists.
     start_tab: Option<Tab>,
     frame: FrameInfo,
@@ -300,6 +308,20 @@ enum DockReq {
     Remove(Tab),
     AddReceiver(ReceiverId),
     Reset,
+    /// Into a new OS window of its own.
+    PopOut(Tab),
+    /// Into the window with that id, or the main window.
+    MoveTo(Tab, Option<u64>),
+}
+
+/// A popped-out OS window: its own dock, so it can hold several tabs.
+#[derive(Serialize, Deserialize)]
+struct PopOut {
+    id: u64,
+    title: String,
+    dock: DockState<Tab>,
+    /// Outer position and inner size, in points, once the window has shown.
+    rect: Option<[f32; 4]>,
 }
 
 /// Saved layout: `Documents/SpecTrawl/workspaces/last.json`.
@@ -307,6 +329,8 @@ enum DockReq {
 struct Workspace {
     main: DockState<Tab>,
     tune_target: char,
+    #[serde(default)]
+    popouts: Vec<PopOut>,
 }
 
 /// Per-frame facts the receiver panes share (live spans for the survey's
@@ -383,6 +407,10 @@ impl App {
             selection: Selection::None,
             dock: None,
             dock_requests: Vec::new(),
+            popouts: Vec::new(),
+            next_popout: 1,
+            drawing: None,
+            popout_names: Vec::new(),
             start_tab: args.tab.clone(),
             frame: FrameInfo::default(),
             emitter_cache: (std::time::Instant::now() - std::time::Duration::from_secs(1), Vec::new(), 0),
@@ -442,6 +470,8 @@ impl App {
                 app.tune_target = t;
             }
             app.dock = Some(w.main);
+            app.popouts = w.popouts.into_iter().filter(|p| p.dock.iter_all_tabs().next().is_some()).collect();
+            app.next_popout = app.popouts.iter().map(|p| p.id + 1).max().unwrap_or(1);
             let open: Vec<ReceiverId> = app.panes.iter().map(|p| p.id).collect();
             app.dock_requests.extend(open.into_iter().map(DockReq::AddReceiver));
             if let Some(t) = app.start_tab.take() {
@@ -453,7 +483,7 @@ impl App {
 
     fn save_workspace(&self) {
         let Some(main) = &self.dock else { return };
-        let w = Workspace { main: main.clone(), tune_target: self.tune_target.0 };
+        let w = Workspace { main: main.clone(), tune_target: self.tune_target.0, popouts: self.popouts.iter().map(|p| PopOut { id: p.id, title: p.title.clone(), dock: p.dock.clone(), rect: p.rect }).collect() };
         let path = workspace_path();
         if let Some(d) = path.parent() {
             let _ = std::fs::create_dir_all(d);
@@ -474,33 +504,64 @@ impl App {
             return;
         }
         let reqs = std::mem::take(&mut self.dock_requests);
-        let Some(dock) = self.dock.as_mut() else { return };
+        if self.dock.is_none() {
+            return;
+        }
         for r in reqs {
             match r {
                 DockReq::Reset => {
                     let ids: Vec<ReceiverId> = self.panes.iter().map(|p| p.id).collect();
-                    *dock = default_dock(width, &ids);
+                    self.dock = Some(default_dock(width, &ids));
+                    self.popouts.clear();
                 }
-                DockReq::Show(tab) => match dock.find_tab(&tab) {
-                    Some(path) => {
-                        let _ = dock.set_active_tab(path);
-                    }
-                    None => place_tab(dock, tab),
-                },
-                DockReq::Remove(tab) => {
-                    if let Some(path) = dock.find_tab(&tab) {
-                        dock.remove_tab(path);
+                DockReq::Show(tab) => {
+                    let dock = self.dock.as_mut().unwrap();
+                    match dock.find_tab(&tab) {
+                        Some(path) => {
+                            let _ = dock.set_active_tab(path);
+                        }
+                        None if self.popouts.iter().any(|p| p.dock.find_tab(&tab).is_some()) => {}
+                        None => place_tab(dock, tab),
                     }
                 }
+                DockReq::Remove(tab) => self.take_tab(&tab),
                 DockReq::AddReceiver(id) => {
                     let tab = Tab::Receiver(id);
-                    if dock.find_tab(&tab).is_none() {
-                        place_tab(dock, tab);
+                    if self.dock.as_ref().unwrap().find_tab(&tab).is_none() && !self.popouts.iter().any(|p| p.dock.find_tab(&tab).is_some()) {
+                        place_tab(self.dock.as_mut().unwrap(), tab);
+                    }
+                }
+                DockReq::PopOut(tab) => {
+                    self.take_tab(&tab);
+                    let id = self.next_popout;
+                    self.next_popout += 1;
+                    self.popouts.push(PopOut { id, title: tab.name(), dock: DockState::new(vec![tab]), rect: None });
+                }
+                DockReq::MoveTo(tab, to) => {
+                    self.take_tab(&tab);
+                    match to.and_then(|id| self.popouts.iter_mut().find(|p| p.id == id)) {
+                        Some(po) => po.dock.push_to_first_leaf(tab),
+                        None => place_tab(self.dock.as_mut().unwrap(), tab),
                     }
                 }
             }
         }
         self.save_workspace();
+    }
+
+    /// Removes a tab from wherever it is; a pop-out left empty closes.
+    fn take_tab(&mut self, tab: &Tab) {
+        if let Some(d) = self.dock.as_mut() {
+            if let Some(p) = d.find_tab(tab) {
+                d.remove_tab(p);
+            }
+        }
+        for po in &mut self.popouts {
+            if let Some(p) = po.dock.find_tab(tab) {
+                po.dock.remove_tab(p);
+            }
+        }
+        self.popouts.retain(|po| po.dock.iter_all_tabs().next().is_some());
     }
 
     fn rescan(&mut self) {
@@ -662,7 +723,7 @@ impl App {
                             ui.close();
                         }
                     }
-                    ui.label(egui::RichText::new("Drag a tab to move it, or off the strip to float it").small().color(theme::MUTED));
+                    ui.label(egui::RichText::new("Drag a tab to move it, or off the strip to float it;\nright-click a tab to pop it out to its own window").small().color(theme::MUTED));
                 });
                 if let Some((t, m)) = &self.catalog_msg {
                     if t.elapsed() < std::time::Duration::from_secs(12) {
@@ -2430,6 +2491,13 @@ impl eframe::App for App {
                 if i.key_pressed(egui::Key::Escape) {
                     self.selection = Selection::None;
                 }
+                if i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::P) {
+                    if let Some(d) = self.dock.as_mut() {
+                        if let Some((_, t)) = d.find_active_focused() {
+                            self.dock_requests.push(DockReq::PopOut(t.clone()));
+                        }
+                    }
+                }
             });
         }
         // Give the follow policy to every source when it changes (or a
@@ -2453,9 +2521,12 @@ impl eframe::App for App {
         }
         self.apply_dock_requests(width);
         // The dock is lent to the viewer (us) while it draws.
+        self.popout_names = self.popouts.iter().map(|p| (p.id, p.title.clone())).collect();
+        self.drawing = None;
         let mut dock = self.dock.take().expect("dock");
         egui::CentralPanel::default().frame(theme::central_frame()).show(ui, |ui| {
             egui_dock::DockArea::new(&mut dock)
+                .id(egui::Id::new("main_dock"))
                 .style(dock_style(ui))
                 .show_add_buttons(false)
                 .show_leaf_close_all_buttons(false)
@@ -2463,6 +2534,50 @@ impl eframe::App for App {
                 .show_inside(ui, self);
         });
         self.dock = Some(dock);
+        // Popped-out windows, each an immediate viewport with its own dock
+        // (an embedded window where the backend can't open OS windows).
+        let mut pops = std::mem::take(&mut self.popouts);
+        let mut closed: Vec<usize> = Vec::new();
+        for (i, po) in pops.iter_mut().enumerate() {
+            let pid = po.id;
+            let vid = egui::ViewportId::from_hash_of(("popout", pid));
+            let mut vb = egui::ViewportBuilder::default().with_title(format!("SpecTrawl · {}", po.title));
+            vb = match po.rect {
+                Some([x, y, w, h]) => vb.with_position([x, y]).with_inner_size([w, h]),
+                None => vb.with_inner_size([900.0, 600.0]),
+            };
+            self.drawing = Some(pid);
+            let mut dock = std::mem::replace(&mut po.dock, DockState::new(Vec::new()));
+            let (close, rect) = ctx.show_viewport_immediate(vid, vb, |ui, _class| {
+                let (close, rect) = ui.input(|i| (i.viewport().close_requested(), i.viewport().outer_rect.zip(i.viewport().inner_rect)));
+                egui::CentralPanel::default().frame(theme::central_frame()).show(ui, |ui| {
+                    egui_dock::DockArea::new(&mut dock)
+                        .id(egui::Id::new(("popout_dock", pid)))
+                        .style(dock_style(ui))
+                        .show_add_buttons(false)
+                        .show_leaf_close_all_buttons(false)
+                        .show_leaf_collapse_buttons(false)
+                        .show_inside(ui, self);
+                });
+                (close, rect)
+            });
+            po.dock = dock;
+            if let Some((outer, inner)) = rect {
+                po.rect = Some([outer.min.x, outer.min.y, inner.width(), inner.height()]);
+            }
+            if close || po.dock.iter_all_tabs().next().is_none() {
+                closed.push(i);
+            }
+        }
+        self.drawing = None;
+        // A closed window's tabs come home.
+        for i in closed.into_iter().rev() {
+            let po = pops.remove(i);
+            for (_, t) in po.dock.iter_all_tabs() {
+                self.dock_requests.push(DockReq::Show(t.clone()));
+            }
+        }
+        self.popouts = pops;
         // ~60 fps is plenty for a waterfall; uncapped it ran at the monitor's
         // rate (165 Hz here) and cost a full core. egui repaints at once when
         // the requested delay is under its frame time, so pace frames here.
@@ -2511,6 +2626,23 @@ impl egui_dock::TabViewer for App {
             Tab::P25 => self.p25_panel(ui),
             Tab::Calls => self.calls_panel(ui),
             Tab::Pages => self.pages_panel(ui),
+        }
+    }
+
+    fn context_menu(&mut self, ui: &mut egui::Ui, tab: &mut Tab, _path: egui_dock::NodePath) {
+        if ui.button("Pop out to a new window").on_hover_text("Ctrl+Shift+P on the focused tab").clicked() {
+            self.dock_requests.push(DockReq::PopOut(tab.clone()));
+            ui.close();
+        }
+        if self.drawing.is_some() && ui.button("Move to the main window").clicked() {
+            self.dock_requests.push(DockReq::MoveTo(tab.clone(), None));
+            ui.close();
+        }
+        for (id, title) in self.popout_names.clone() {
+            if Some(id) != self.drawing && ui.button(format!("Move to window: {title}")).clicked() {
+                self.dock_requests.push(DockReq::MoveTo(tab.clone(), Some(id)));
+                ui.close();
+            }
         }
     }
 
