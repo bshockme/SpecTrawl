@@ -106,6 +106,8 @@ pub struct GrantEvent {
     pub freq_hz: Option<f64>,
     pub slot: Option<u8>,
     pub source: Option<u32>,
+    /// The grant's service options say encrypted.
+    pub encrypted: bool,
     /// Times the grant was (re)announced.
     pub count: u32,
 }
@@ -132,6 +134,7 @@ impl P25Book {
         let sys = self.systems.entry(nac).or_insert_with(|| SystemInfo { nac: Some(nac), ..Default::default() });
         let mut new = Vec::new();
         for m in msgs {
+            let encrypted = matches!(m, p25::Message::GroupGrant { options, .. } if options & 0x40 != 0);
             for (tg, ch, src) in sys.apply(m) {
                 new.push(GrantEvent {
                     first: now,
@@ -141,6 +144,7 @@ impl P25Book {
                     freq_hz: sys.freq(ch),
                     slot: sys.slot(ch),
                     source: src,
+                    encrypted,
                     count: 1,
                 });
             }
@@ -289,10 +293,11 @@ pub(crate) fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>, rate: f64) {
                             group: true,
                             target: g.talkgroup as u32,
                             source: g.source,
-                            encrypted: false,
+                            encrypted: g.encrypted,
                             emergency: false,
                         };
-                        calls.granted(g.freq_hz, &format!("P25 NAC 0x{nac:03X}"), call, now);
+                        let label = if g.slot.is_some() { format!("P25 Phase 2 NAC 0x{nac:03X}") } else { format!("P25 NAC 0x{nac:03X}") };
+                        calls.granted(g.freq_hz, g.slot, &label, call, now);
                     }
                     drop(calls);
                     // The system identity seeds Phase 2 descrambling.

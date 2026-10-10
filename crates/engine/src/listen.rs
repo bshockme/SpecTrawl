@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime};
 use detect::Ddc;
 use detect::decode::Call;
 use detect::demod::{AUDIO_RATE, Demod, Mode};
-use detect::p25_voice::VoiceStream;
+use detect::p25_voice::{LiveVoice, Phase2Stream, VoiceStream};
 use parking_lot::Mutex;
 use sdr_core::Complex32;
 
@@ -29,12 +29,18 @@ pub struct ListenSpec {
     /// Follow granted calls (P25): the engine chooses the channel, and
     /// `center_hz` is only where it starts.
     pub follow: bool,
+    /// P25 Phase 2 (TDMA): which logical channel (timeslot) to play, None
+    /// for whichever starts talking. Phase 1 when `tdma` is false.
+    pub tdma: bool,
+    pub slot: Option<u8>,
 }
 
 /// The digital voice channel being played, for the UI.
 #[derive(Debug, Clone, Default)]
 pub struct VoiceStatus {
     pub center_hz: Option<f64>,
+    /// Phase 2: the timeslot (logical channel) being played.
+    pub slot: Option<u8>,
     /// Who is talking (from the voice channel's link control).
     pub call: Option<Call>,
     /// The cipher, when the transmission is encrypted (and so silent).
@@ -127,7 +133,9 @@ const ENCRYPTED_LOCKOUT_S: f64 = 600.0;
 
 /// The P25 chain: decoder, 8 → 48 kHz, level control, recorder.
 struct P25Chain {
-    voice: VoiceStream,
+    voice: Box<dyn LiveVoice>,
+    /// Phase 2: the decoder, for its timeslot (`voice` is the same object).
+    tdma: bool,
     agc: Agc,
     /// Last 8 kHz sample, for interpolation.
     last: f32,
@@ -137,8 +145,9 @@ struct P25Chain {
 }
 
 impl P25Chain {
-    fn new(fs: f64) -> Self {
-        P25Chain { voice: VoiceStream::new(fs), agc: Agc::default(), last: 0.0, rec: Recorder::default(), since: SystemTime::now() }
+    fn new(fs: f64, tdma: bool, slot: Option<u8>) -> Self {
+        let voice: Box<dyn LiveVoice> = if tdma { Box::new(Phase2Stream::new(fs, slot)) } else { Box::new(VoiceStream::new(fs)) };
+        P25Chain { voice, tdma, agc: Agc::default(), last: 0.0, rec: Recorder::default(), since: SystemTime::now() }
     }
 }
 
@@ -258,16 +267,22 @@ fn wav(pcm: &[i16]) -> Vec<u8> {
 /// voice (or hasn't had time to); otherwise the call most recently
 /// (re)granted inside the span, skipping Phase 2 (TDMA, not decoded yet)
 /// and calls known to be encrypted.
-fn follow_target(shared: &Shared, current: Option<(f64, &P25Chain)>, lo: f64, hi: f64, locked: &HashMap<(bool, u32), SystemTime>) -> Option<f64> {
+fn follow_target(
+    shared: &Shared,
+    current: Option<(f64, Option<u8>, &P25Chain)>,
+    lo: f64,
+    hi: f64,
+    locked: &HashMap<(bool, u32), SystemTime>,
+) -> Option<(f64, Option<u8>)> {
     let now = SystemTime::now();
     let age = |t: SystemTime| now.duration_since(t).map(|d| d.as_secs_f64()).unwrap_or(0.0);
-    if let Some((hz, c)) = current {
+    if let Some((hz, slot, c)) = current {
         let busy = match c.voice.idle_s() {
-            Some(idle) => idle < HOLD_S && !c.voice.encrypted(),
+            Some(idle) => idle < HOLD_S && c.voice.cipher().is_none(),
             None => age(c.since) < HOLD_S,
         };
         if busy {
-            return Some(hz);
+            return Some((hz, slot));
         }
     }
     let calls = shared.calls.lock();
@@ -277,13 +292,13 @@ fn follow_target(shared: &Shared, current: Option<(f64, &P25Chain)>, lo: f64, hi
         .rev()
         .take(256)
         .filter(|e| e.granted_at.is_some_and(|t| age(t) < GRANT_FRESH_S))
-        .filter(|e| !e.call.encrypted && !e.protocol.contains("Phase 2"))
+        .filter(|e| !e.call.encrypted)
         .filter(|e| locked.get(&(e.call.group, e.call.target)).is_none_or(|&t| age(t) > ENCRYPTED_LOCKOUT_S))
-        .filter_map(|e| e.center_hz.filter(|f| (lo..hi).contains(f)).map(|f| (f, e.granted_at)))
-        .filter(|(f, _)| current.is_none_or(|(hz, _)| (hz - f).abs() > 1.0))
+        .filter_map(|e| e.center_hz.filter(|f| (lo..hi).contains(f)).map(|f| ((f, e.slot), e.granted_at)))
+        .filter(|(t, _)| current.is_none_or(|(hz, slot, _)| (hz - t.0).abs() > 1.0 || slot != t.1))
         .max_by_key(|(_, t)| *t)
-        .map(|(f, _)| f)
-        .or(current.map(|(hz, _)| hz))
+        .map(|(t, _)| t)
+        .or(current.map(|(hz, slot, _)| (hz, slot)))
 }
 
 pub(crate) fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>, rate: f64) {
@@ -311,11 +326,15 @@ pub(crate) fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>, rate: f64) {
             spec.mode = Mode::P25;
             let half = rate * 0.45;
             let current = active.as_ref().and_then(|(s, _, _, c, _)| match c {
-                Chain::P25(p) if s.follow => Some((s.center_hz, p.as_ref())),
+                Chain::P25(p) if s.follow => Some((s.center_hz, s.tdma.then_some(s.slot).flatten(), p.as_ref())),
                 _ => None,
             });
             match follow_target(&shared, current, tuner - half, tuner + half, &locked) {
-                Some(hz) => spec.center_hz = hz,
+                Some((hz, slot)) => {
+                    spec.center_hz = hz;
+                    spec.tdma = slot.is_some();
+                    spec.slot = slot;
+                }
                 None => {
                     // Nothing granted yet: wait.
                     *shared.voice.lock() = VoiceStatus::default();
@@ -331,7 +350,7 @@ pub(crate) fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>, rate: f64) {
             let (cutoff, fs) = spec.mode.channel();
             let ddc = Ddc::new(rate, spec.center_hz - tuner, cutoff, fs);
             let chain = match spec.mode {
-                Mode::P25 => Chain::P25(Box::new(P25Chain::new(ddc.fs_out))),
+                Mode::P25 => Chain::P25(Box::new(P25Chain::new(ddc.fs_out, spec.tdma, spec.slot))),
                 m => Chain::Analog(Box::new(Demod::new(m, ddc.fs_out))),
             };
             let behind = match chain {
@@ -369,7 +388,7 @@ pub(crate) fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>, rate: f64) {
                 Chain::Analog(demod) => demod.process(&chan, &mut audio),
                 Chain::P25(c) => {
                     p25_audio(&shared, spec.center_hz, c, &chan, &mut audio);
-                    if let Some(call) = c.voice.call.filter(|_| c.voice.encrypted()) {
+                    if let Some(call) = c.voice.call().filter(|_| c.voice.cipher().is_some()) {
                         locked.insert((call.group, call.target), SystemTime::now());
                     }
                 }
@@ -395,7 +414,7 @@ pub(crate) fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>, rate: f64) {
 /// Decodes channel IQ to 48 kHz speech, records it, and tells the call log
 /// and the UI who is talking.
 fn p25_audio(shared: &Shared, center_hz: f64, c: &mut P25Chain, chan: &[Complex32], out: &mut Vec<f32>) {
-    let call_before = c.voice.call;
+    let call_before = c.voice.call();
     let v = c.voice.push(chan);
     if v.started {
         // A previous transmission on this channel ended.
@@ -414,14 +433,16 @@ fn p25_audio(shared: &Shared, center_hz: f64, c: &mut P25Chain, chan: &[Complex3
         }
         c.last = s;
     }
-    if let Some(mut call) = c.voice.call.filter(|_| v.ldus > 0) {
-        call.encrypted |= c.voice.encrypted();
-        shared.calls.lock().heard(center_hz, "P25 Phase 1", call, SystemTime::now());
+    let label = if c.tdma { "P25 Phase 2" } else { "P25 Phase 1" };
+    if let Some(mut call) = c.voice.call().filter(|_| v.ldus > 0) {
+        call.encrypted |= c.voice.cipher().is_some();
+        shared.calls.lock().heard(center_hz, label, call, SystemTime::now());
     }
     *shared.voice.lock() = VoiceStatus {
         center_hz: Some(center_hz),
-        call: c.voice.call,
-        encrypted: c.voice.encrypted().then(|| c.voice.encryption.map(|e| e.algorithm()).unwrap_or("encrypted")),
+        slot: slot_of(c),
+        call: c.voice.call(),
+        encrypted: c.voice.cipher(),
         active: c.voice.idle_s().is_some_and(|s| s < VOICE_ACTIVE_S),
         recording: c.rec.open.is_some(),
     };
@@ -431,8 +452,13 @@ fn p25_audio(shared: &Shared, center_hz: f64, c: &mut P25Chain, chan: &[Complex3
     }
 }
 
+/// The Phase 2 timeslot a chain is playing.
+fn slot_of(c: &P25Chain) -> Option<u8> {
+    c.voice.slot()
+}
+
 fn finish_recording(shared: &Shared, center_hz: f64, c: &mut P25Chain) {
-    let call = c.voice.call;
+    let call = c.voice.call();
     if let Some(path) = c.rec.finish(call) {
         attach(shared, center_hz, call, path);
     }

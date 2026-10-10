@@ -116,6 +116,8 @@ struct App {
     audio_err: Option<String>,
     /// None = pick the mode from the signal's label.
     listen_mode: Option<engine::DemodMode>,
+    /// P25: Phase 2 TDMA (picked from the label when the mode is Auto).
+    listen_tdma: bool,
     listen_mhz: f64,
     /// Pages tab filter: capcode or text.
     page_filter: String,
@@ -260,6 +262,7 @@ impl App {
             audio_out: None,
             audio_err: None,
             listen_mode: None,
+            listen_tdma: false,
             listen_mhz: 100.0,
             page_filter: String::new(),
             call_filter: String::new(),
@@ -659,9 +662,11 @@ impl App {
                 Some(l) if l.mode == engine::DemodMode::P25 => {
                     let v = &voice;
                     ui.horizontal(|ui| {
-                        let what = match v.center_hz {
-                            Some(hz) => format!("{:.5} MHz P25", hz / 1e6),
-                            None => "waiting for a granted call".into(),
+                        let what = match (v.center_hz, v.slot) {
+                            (Some(hz), Some(ts)) => format!("{:.5} MHz P25 Phase 2 TS{}", hz / 1e6, ts + 1),
+                            (Some(hz), None) if l.tdma => format!("{:.5} MHz P25 Phase 2", hz / 1e6),
+                            (Some(hz), None) => format!("{:.5} MHz P25", hz / 1e6),
+                            (None, _) => "waiting for a granted call".into(),
                         };
                         let head = if l.follow { format!("Following · {what}") } else { what };
                         ui.label(egui::RichText::new(head).monospace().strong());
@@ -705,20 +710,22 @@ impl App {
                         // Re-apply to what's playing.
                         if let Some(l) = listening.filter(|l| !l.follow) {
                             let mode = m.unwrap_or(l.mode);
-                            start = Some(engine::ListenSpec { center_hz: l.center_hz, mode, follow: false });
+                            start = Some(engine::ListenSpec { center_hz: l.center_hz, mode, follow: false, tdma: self.listen_tdma, slot: None });
                         }
                     }
+                }
+                if self.listen_mode == Some(engine::DemodMode::P25) {
+                    ui.checkbox(&mut self.listen_tdma, egui::RichText::new("Phase 2").small())
+                        .on_hover_text("TDMA: plays whichever timeslot starts talking");
                 }
             });
             ui.horizontal(|ui| {
                 let sel = target.clone();
                 if ui.add_enabled(sel.is_some(), egui::Button::new("Listen to selection")).clicked() {
                     if let Some((hz, label, bw)) = sel {
-                        start = Some(engine::ListenSpec {
-                            center_hz: hz,
-                            mode: self.listen_mode.unwrap_or_else(|| auto_mode(hz, &label, bw)),
-                            follow: false,
-                        });
+                        let tdma = if self.listen_mode.is_none() { label.contains("Phase 2") } else { self.listen_tdma };
+                        let mode = self.listen_mode.unwrap_or_else(|| if tdma { engine::DemodMode::P25 } else { auto_mode(hz, &label, bw) });
+                        start = Some(engine::ListenSpec { center_hz: hz, mode, follow: false, tdma, slot: None });
                     }
                 }
                 if ui.add_enabled(listening.is_some(), egui::Button::new("Stop")).clicked() {
@@ -729,11 +736,11 @@ impl App {
                 let following = listening.is_some_and(|l| l.follow);
                 if ui
                     .add_enabled(!following, egui::Button::new("Follow calls"))
-                    .on_hover_text("Play P25 Phase 1 calls as the control channel grants them (Focus on the control channel's span)")
+                    .on_hover_text("Play P25 calls (Phase 1 and 2) as the control channel grants them (Focus on the control channel's span)")
                     .clicked()
                 {
                     let hz = span_mid.unwrap_or(self.listen_mhz * 1e6);
-                    start = Some(engine::ListenSpec { center_hz: hz, mode: engine::DemodMode::P25, follow: true });
+                    start = Some(engine::ListenSpec { center_hz: hz, mode: engine::DemodMode::P25, follow: true, tdma: false, slot: None });
                 }
                 if ui.small_button("Recordings").on_hover_text(engine::recordings_dir().display().to_string()).clicked() {
                     let dir = engine::recordings_dir();
@@ -749,6 +756,8 @@ impl App {
                         center_hz: hz,
                         mode: self.listen_mode.unwrap_or_else(|| auto_mode(hz, "", 0.0)),
                         follow: false,
+                        tdma: self.listen_tdma && self.listen_mode == Some(engine::DemodMode::P25),
+                        slot: None,
                     });
                 }
             });

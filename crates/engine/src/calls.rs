@@ -29,6 +29,8 @@ pub struct CallEvent {
     pub last: SystemTime,
     /// The voice channel, when known (a grant names it; a sighting is on it).
     pub center_hz: Option<f64>,
+    /// The TDMA timeslot (logical channel 0 or 1) a Phase 2 grant named.
+    pub slot: Option<u8>,
     /// "P25 Phase 1", "P25 Phase 2", "DMR …": the voice channel's label, or
     /// the control channel's system for a grant not yet heard.
     pub protocol: String,
@@ -52,8 +54,9 @@ pub(crate) struct CallLog {
 
 impl CallLog {
     /// A control channel granted `call` on `freq`.
-    pub fn granted(&mut self, freq: Option<f64>, system: &str, call: Call, now: SystemTime) {
+    pub fn granted(&mut self, freq: Option<f64>, slot: Option<u8>, system: &str, call: Call, now: SystemTime) {
         self.merge(freq, call, now, system, |e| {
+            e.slot = slot.or(e.slot);
             e.granted = true;
             e.granted_at = Some(now);
             // The grant's channel is exact; a voice sighting's is measured.
@@ -104,6 +107,7 @@ impl CallLog {
                         first: now,
                         last: now,
                         center_hz: freq,
+                        slot: None,
                         protocol: label.to_string(),
                         call,
                         granted: false,
@@ -152,7 +156,7 @@ mod tests {
     fn grant_and_voice_merge_into_one_call() {
         let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
         let mut log = CallLog::default();
-        log.granted(Some(770.31875e6), "NAC 0x2A5", call(10025, Some(2121592)), t0);
+        log.granted(Some(770.31875e6), None, "NAC 0x2A5", call(10025, Some(2121592)), t0);
         // The voice channel's link control, heard 2 s later and 1 kHz off
         // (measured centre), first without the source.
         log.heard(770.3198e6, "P25 Phase 1", call(10025, None), t0 + Duration::from_secs(2));
@@ -173,14 +177,14 @@ mod tests {
     fn follows_fresh_grants_in_span() {
         let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
         let mut log = CallLog::default();
-        log.granted(Some(770.31875e6), "NAC 0x2A5", call(10025, Some(1)), t0);
-        log.granted(Some(860.0e6), "NAC 0x2A5", call(10044, Some(2)), t0);
+        log.granted(Some(770.31875e6), None, "NAC 0x2A5", call(10025, Some(1)), t0);
+        log.granted(Some(860.0e6), None, "NAC 0x2A5", call(10044, Some(2)), t0);
         let (lo, hi) = (766e6, 776e6);
         assert_eq!(log.follow(t0, lo, hi), Some(770.31875e6));
         // Just looked at; out of span; so nothing until FOLLOW_EVERY.
         assert_eq!(log.follow(t0 + Duration::from_secs(1), lo, hi), None);
         // The grant is re-announced, so it's followed again...
-        log.granted(Some(770.31875e6), "NAC 0x2A5", call(10025, Some(1)), t0 + Duration::from_secs(2));
+        log.granted(Some(770.31875e6), None, "NAC 0x2A5", call(10025, Some(1)), t0 + Duration::from_secs(2));
         assert_eq!(log.follow(t0 + Duration::from_secs(2), lo, hi), Some(770.31875e6));
         // ...until the grants stop.
         assert_eq!(log.follow(t0 + Duration::from_secs(6), lo, hi), None);

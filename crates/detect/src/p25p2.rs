@@ -225,9 +225,10 @@ fn mac_bits(ts: &[u8], layout: &[[usize; 6]], info: usize) -> Option<(Vec<u8>, u
 /// What a MAC PDU said about the call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mac {
-    /// MAC_PTT / MAC_END_PTT: the call starting or ending, with the
-    /// channel's colour code (its NAC).
-    Ptt { end: bool, source: u32, group: u16, nac: u16 },
+    /// MAC_PTT / MAC_END_PTT: the call starting (with its encryption
+    /// algorithm, 0x80 for clear) or ending (with the channel's colour code,
+    /// its NAC; 0 on a start, where those bits are the message indicator).
+    Ptt { end: bool, source: u32, group: u16, nac: u16, algid: u8 },
     GroupVoice { group: u16, source: u32, encrypted: bool, emergency: bool },
     UnitVoice { target: u32, source: u32, encrypted: bool },
     /// Any other PDU: its type and first opcode.
@@ -241,7 +242,8 @@ fn field(b: &[u8], start: usize, len: usize) -> u32 {
 pub fn parse_mac(b: &[u8]) -> Mac {
     let pdu = field(b, 0, 3) as u8;
     match pdu {
-        1 | 2 => Mac::Ptt { end: pdu == 2, source: field(b, 104, 24), group: field(b, 128, 16) as u16, nac: field(b, 12, 12) as u16 },
+        1 => Mac::Ptt { end: false, source: field(b, 104, 24), group: field(b, 128, 16) as u16, nac: 0, algid: field(b, 80, 8) as u8 },
+        2 => Mac::Ptt { end: true, source: field(b, 104, 24), group: field(b, 128, 16) as u16, nac: field(b, 12, 12) as u16, algid: 0 },
         3 | 4 | 6 => {
             // IDLE / ACTIVE / HANGTIME: the first MAC structure follows the
             // 8-bit header.
@@ -263,8 +265,8 @@ impl Mac {
     pub fn call(&self) -> Option<Call> {
         let src = |s: u32| Some(s).filter(|&s| s != 0 && s != 0xFF_FFFF);
         match *self {
-            Mac::Ptt { group, source, end: false, .. } if group != 0 => {
-                Some(Call { group: true, target: group as u32, source: src(source), encrypted: false, emergency: false })
+            Mac::Ptt { group, source, end: false, algid, .. } if group != 0 => {
+                Some(Call { group: true, target: group as u32, source: src(source), encrypted: algid != 0x80, emergency: false })
             }
             Mac::GroupVoice { group, source, encrypted, emergency } => {
                 Some(Call { group: true, target: group as u32, source: src(source), encrypted, emergency })
@@ -288,6 +290,21 @@ pub struct Signal {
     pub corrected: usize,
 }
 
+/// The voice frames of one voice burst, descrambled: 72 bits each, first
+/// in time first (`ambe::decode`).
+#[derive(Debug, Clone)]
+pub struct VoiceBurst {
+    pub channel: u8,
+    /// Which of the fragment's four timeslots.
+    pub slot: usize,
+    pub frames: Vec<Vec<u8>>,
+}
+
+/// Where a voice burst's frames sit in its 320 bits: four (4V, with the
+/// encryption sync at 148..172) or two (2V) around the DUID bits.
+const VOICE4_AT: [usize; 4] = [2, 76, 172, 246];
+const VOICE2_AT: [usize; 2] = [2, 76];
+
 /// What one fragment held: its ISCHs and each burst.
 #[derive(Debug, Clone)]
 pub struct FragmentInfo {
@@ -296,6 +313,7 @@ pub struct FragmentInfo {
     pub start: usize,
     pub bursts: Vec<Burst>,
     pub signals: Vec<Signal>,
+    pub voice: Vec<VoiceBurst>,
 }
 
 fn bits_of(d: &[u8]) -> Vec<u8> {
@@ -331,7 +349,7 @@ pub fn fragment(f: &Frame, seqs: &[&[u8]]) -> Option<FragmentInfo> {
     let fragment = [i0, i1].iter().filter(|i| i.errors <= 6).map(|i| i.fragment).find(|&f| f < 3);
     // The last fragment of a superframe swaps channels in its second half.
     let last = fragment == Some(2);
-    let mut out = FragmentInfo { fragment, start, bursts: Vec::new(), signals: Vec::new() };
+    let mut out = FragmentInfo { fragment, start, bursts: Vec::new(), signals: Vec::new(), voice: Vec::new() };
     for (k, ts_start) in [40usize, 400, 760, 1120].into_iter().enumerate() {
         let ts = bits[ts_start..ts_start + 320].to_vec();
         let burst = duid(&ts);
@@ -342,6 +360,27 @@ pub fn fragment(f: &Frame, seqs: &[&[u8]]) -> Option<FragmentInfo> {
             (2, false) | (3, true) => 0,
             _ => 1,
         };
+        if let (Burst::Voice4 | Burst::Voice2, Some(fr)) = (burst, fragment) {
+            let at: &[usize] = if burst == Burst::Voice4 { &VOICE4_AT } else { &VOICE2_AT };
+            // Voice is always scrambled; the right sequence is the one whose
+            // frames need the fewest Golay corrections.
+            let best = seqs
+                .iter()
+                .map(|seq| {
+                    let t: Vec<u8> = ts.iter().zip(slot_sequence(seq, fr as usize * 4 + k)).map(|(b, s)| b ^ s).collect();
+                    let frames: Vec<Vec<u8>> = at.iter().map(|&a| t[a..a + 72].to_vec()).collect();
+                    let errs: u32 = frames.iter().map(|f| crate::ambe::decode(f).errors.iter().map(|&e| e as u32).sum::<u32>()).sum();
+                    (errs, frames)
+                })
+                .min_by_key(|(e, _)| *e);
+            if let Some((errs, frames)) = best {
+                // Wrongly descrambled frames average ~3 errors per Golay word.
+                if (errs as usize) < 3 * at.len() {
+                    out.voice.push(VoiceBurst { channel, slot: k, frames });
+                }
+            }
+            continue;
+        }
         let decode = |ts: &[u8]| match burst {
             Burst::Facch { .. } => mac_bits(ts, facch_hexbits(), 26),
             Burst::Sacch { .. } => mac_bits(ts, sacch_hexbits(), 30),
@@ -359,7 +398,7 @@ pub fn fragment(f: &Frame, seqs: &[&[u8]]) -> Option<FragmentInfo> {
         };
         if let Some((mac, corrected)) = decoded {
             let mac = parse_mac(&mac);
-            if let Mac::Ptt { nac, .. } = mac {
+            if let Mac::Ptt { nac, end: true, .. } = mac {
                 register_nac(nac);
             }
             out.signals.push(Signal { channel, burst, mac, corrected });

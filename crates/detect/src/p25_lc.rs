@@ -457,18 +457,23 @@ impl EncryptionSync {
     }
 
     pub fn algorithm(&self) -> &'static str {
-        match self.algid {
-            0x80 => "clear",
-            0x81 => "DES-OFB",
-            0x83 => "3DES",
-            0x84 => "AES-256",
-            0x85 => "AES-128",
-            0x9F => "DES-XL",
-            0xA0 => "DVI-XL",
-            0xA1 => "DVP-XL",
-            0xAA => "ADP",
-            _ => "other",
-        }
+        algorithm_name(self.algid)
+    }
+}
+
+/// A P25 encryption algorithm ID's name.
+pub fn algorithm_name(algid: u8) -> &'static str {
+    match algid {
+        0x80 => "clear",
+        0x81 => "DES-OFB",
+        0x83 => "3DES",
+        0x84 => "AES-256",
+        0x85 => "AES-128",
+        0x9F => "DES-XL",
+        0xA0 => "DVI-XL",
+        0xA1 => "DVP-XL",
+        0xAA => "ADP",
+        _ => "other",
     }
 }
 

@@ -1,6 +1,8 @@
 //! Signal classification: features from channelised IQ, then the
 //! sync bank for protocol identification (DESIGN.md §7).
 
+pub mod ambe;
+mod ambe_tables;
 pub mod bandplan;
 pub mod carrier;
 pub mod chirp;

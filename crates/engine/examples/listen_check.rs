@@ -1,6 +1,6 @@
 //! Listens to one channel and writes the audio to a WAV file.
 //!
-//!     cargo run --release -p engine --example listen_check -- <serial> <tune MHz> <channel MHz> <nfm|am|wfm|p25|follow> <seconds> <out.wav>
+//!     cargo run --release -p engine --example listen_check -- <serial> <tune MHz> <channel MHz> <nfm|am|wfm|p25|p25p2|follow> <seconds> <out.wav>
 
 use std::io::Write;
 use std::time::Duration;
@@ -15,7 +15,7 @@ fn main() {
     let mode = match a[4].as_str() {
         "am" => DemodMode::Am,
         "wfm" => DemodMode::Wfm,
-        "p25" | "follow" => DemodMode::P25,
+        "p25" | "p25p2" | "follow" => DemodMode::P25,
         _ => DemodMode::Nfm,
     };
     let follow = a[4] == "follow";
@@ -25,7 +25,7 @@ fn main() {
     d.set_center(tune).unwrap();
     let src = Source::start(d, SourceConfig::default(), Mode::Live).unwrap();
     std::thread::sleep(Duration::from_millis(500));
-    src.listen(Some(ListenSpec { center_hz: chan, mode, follow }));
+    src.listen(Some(ListenSpec { center_hz: chan, mode, follow, tdma: a[4] == "p25p2", slot: None }));
     let mut last_status = String::new();
     let q = src.audio();
     let mut pcm: Vec<f32> = Vec::new();
