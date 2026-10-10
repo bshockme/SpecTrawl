@@ -64,6 +64,11 @@ pub fn apply(ctx: &egui::Context) {
     });
 }
 
+/// The icon rail: a bar with no side margin so 36 px fits an icon.
+pub fn rail_frame() -> Frame {
+    Frame::new().fill(BAR).inner_margin(Margin::symmetric(0, 4)).stroke(Stroke::new(1.0, BORDER))
+}
+
 pub fn bar_frame() -> Frame {
     Frame::new().fill(BAR).inner_margin(Margin::symmetric(12, 0)).stroke(Stroke::new(1.0, BORDER))
 }

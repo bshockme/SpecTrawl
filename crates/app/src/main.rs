@@ -163,6 +163,12 @@ struct App {
     dock_requests: Vec<DockReq>,
     popouts: Vec<PopOut>,
     next_popout: u64,
+    /// The named workspace in use, if one was loaded or saved.
+    workspace_name: Option<String>,
+    workspace_new_name: String,
+    calls_view: CallsView,
+    /// Talkgroup typed into the follow-list flyout.
+    follow_add: u32,
     /// Which pop-out window is being drawn (None: the main window), for
     /// the tab context menu.
     drawing: Option<u64>,
@@ -274,14 +280,15 @@ enum Tab {
     Inspector,
     Emitters,
     Records,
-    P25,
+    #[serde(alias = "P25")]
+    Trunking,
     Calls,
     Pages,
 }
 
 impl Tab {
     /// Every pane that isn't a receiver.
-    const PANELS: [Tab; 7] = [Tab::Sources, Tab::Inspector, Tab::Emitters, Tab::Records, Tab::P25, Tab::Calls, Tab::Pages];
+    const PANELS: [Tab; 7] = [Tab::Sources, Tab::Inspector, Tab::Emitters, Tab::Records, Tab::Trunking, Tab::Calls, Tab::Pages];
 
     fn name(&self) -> String {
         match self {
@@ -290,14 +297,14 @@ impl Tab {
             Tab::Inspector => "Inspector".into(),
             Tab::Emitters => "Emitters".into(),
             Tab::Records => "Records".into(),
-            Tab::P25 => "P25".into(),
+            Tab::Trunking => "Trunking".into(),
             Tab::Calls => "Calls".into(),
             Tab::Pages => "Pages".into(),
         }
     }
 
     fn is_table(&self) -> bool {
-        matches!(self, Tab::Emitters | Tab::Records | Tab::P25 | Tab::Calls | Tab::Pages)
+        matches!(self, Tab::Emitters | Tab::Records | Tab::Trunking | Tab::Calls | Tab::Pages)
     }
 }
 
@@ -333,6 +340,17 @@ struct Workspace {
     popouts: Vec<PopOut>,
 }
 
+/// What the Calls tab shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallsView {
+    Calls,
+    /// The raw control-channel grants the calls are built from.
+    Grants,
+}
+
+/// Built-in layouts, listed with the saved workspaces.
+const PRESETS: [&str; 3] = ["survey", "trunking", "paging"];
+
 /// Per-frame facts the receiver panes share (live spans for the survey's
 /// brackets, the next tune target).
 #[derive(Default)]
@@ -344,7 +362,7 @@ struct FrameInfo {
 
 /// Command line: `--sim` (simulator only), `--freq <MHz>` (focus centre),
 /// `--serial <hex>` (focus device), `--no-sweep`, `--sweep <lo> <hi>` (MHz),
-/// `--tab emitters|records|p25|calls|pages` (the table shown first).
+/// `--tab emitters|records|trunking|calls|pages` (the table shown first).
 struct Args {
     sim: bool,
     freq_mhz: Option<f64>,
@@ -366,7 +384,7 @@ fn parse_args() -> Args {
             "--tab" => {
                 a.tab = match it.next().as_deref() {
                     Some("records") => Some(Tab::Records),
-                    Some("p25") => Some(Tab::P25),
+                    Some("p25") | Some("trunking") => Some(Tab::Trunking),
                     Some("pages") => Some(Tab::Pages),
                     Some("calls") => Some(Tab::Calls),
                     _ => Some(Tab::Emitters),
@@ -409,6 +427,10 @@ impl App {
             dock_requests: Vec::new(),
             popouts: Vec::new(),
             next_popout: 1,
+            workspace_name: None,
+            workspace_new_name: String::new(),
+            calls_view: CallsView::Calls,
+            follow_add: 0,
             drawing: None,
             popout_names: Vec::new(),
             start_tab: args.tab.clone(),
@@ -481,21 +503,200 @@ impl App {
         app
     }
 
+    fn workspace(&self) -> Option<Workspace> {
+        let main = self.dock.as_ref()?;
+        Some(Workspace {
+            main: main.clone(),
+            tune_target: self.tune_target.0,
+            popouts: self.popouts.iter().map(|p| PopOut { id: p.id, title: p.title.clone(), dock: p.dock.clone(), rect: p.rect }).collect(),
+        })
+    }
+
+    /// Writes the layout as `last.json` (what the next start loads).
     fn save_workspace(&self) {
-        let Some(main) = &self.dock else { return };
-        let w = Workspace { main: main.clone(), tune_target: self.tune_target.0, popouts: self.popouts.iter().map(|p| PopOut { id: p.id, title: p.title.clone(), dock: p.dock.clone(), rect: p.rect }).collect() };
-        let path = workspace_path();
-        if let Some(d) = path.parent() {
-            let _ = std::fs::create_dir_all(d);
+        if let Some(w) = self.workspace() {
+            write_workspace(&workspace_path(), &w);
         }
-        match serde_json::to_vec(&w) {
-            Ok(b) => {
-                if let Err(e) = std::fs::write(&path, b) {
-                    log::warn!("{}: {e}", path.display());
-                }
+    }
+
+    fn save_workspace_as(&mut self, name: &str) {
+        let name = engine::sigmf::sanitize(name.trim());
+        if name.is_empty() {
+            return;
+        }
+        if let Some(w) = self.workspace() {
+            write_workspace(&workspace_dir().join(format!("{name}.json")), &w);
+            self.workspace_name = Some(name);
+        }
+    }
+
+    /// Switches to a saved workspace, or a preset, by name.
+    fn load_workspace_named(&mut self, name: &str, width: f32) {
+        let ids: Vec<ReceiverId> = self.panes.iter().map(|p| p.id).collect();
+        let w = match read_workspace(&workspace_dir().join(format!("{name}.json"))) {
+            Some(w) => w,
+            None if PRESETS.contains(&name) => Workspace { main: preset_dock(name, width, &ids), tune_target: self.tune_target.0, popouts: Vec::new() },
+            None => return,
+        };
+        self.dock = Some(w.main);
+        self.popouts = w.popouts.into_iter().filter(|p| p.dock.iter_all_tabs().next().is_some()).collect();
+        self.next_popout = self.popouts.iter().map(|p| p.id + 1).max().unwrap_or(1);
+        self.dock_requests.extend(ids.into_iter().map(DockReq::AddReceiver));
+        self.workspace_name = Some(name.to_string());
+    }
+
+    /// The workspace menu: the layout in use, saved and preset layouts,
+    /// and the panels that can be shown.
+    fn workspace_menu(&mut self, ui: &mut egui::Ui, width: f32) {
+        ui.set_min_width(220.0);
+        let current = self.workspace_name.clone();
+        ui.label(egui::RichText::new(format!("Workspace: {}", current.as_deref().unwrap_or("unsaved"))).small().color(theme::MUTED));
+        if let Some(n) = &current {
+            if ui.button(format!("Save \"{n}\"")).clicked() {
+                self.save_workspace_as(&n.clone());
+                ui.close();
             }
-            Err(e) => log::warn!("workspace: {e}"),
         }
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.workspace_new_name).desired_width(120.0).hint_text("name"));
+            if ui.button("Save as").clicked() && !self.workspace_new_name.trim().is_empty() {
+                let n = self.workspace_new_name.clone();
+                self.save_workspace_as(&n);
+                self.workspace_new_name.clear();
+                ui.close();
+            }
+        });
+        ui.separator();
+        let saved = list_workspaces();
+        let mut load: Option<String> = None;
+        let mut delete: Option<String> = None;
+        for n in &saved {
+            ui.horizontal(|ui| {
+                if ui.selectable_label(current.as_deref() == Some(n.as_str()), n).clicked() {
+                    load = Some(n.clone());
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("✖").on_hover_text("Delete this workspace").clicked() {
+                        delete = Some(n.clone());
+                    }
+                });
+            });
+        }
+        for n in PRESETS {
+            if !saved.iter().any(|s| s == n) && ui.selectable_label(current.as_deref() == Some(n), format!("{n} (preset)")).clicked() {
+                load = Some(n.to_string());
+            }
+        }
+        if let Some(n) = load {
+            self.load_workspace_named(&n, width);
+            ui.close();
+        }
+        if let Some(n) = delete {
+            let _ = std::fs::remove_file(workspace_dir().join(format!("{n}.json")));
+            if current.as_deref() == Some(n.as_str()) {
+                self.workspace_name = None;
+            }
+        }
+        ui.separator();
+        if ui.button("Reset layout").on_hover_text("The default arrangement for this window width").clicked() {
+            self.dock_requests.push(DockReq::Reset);
+            self.workspace_name = None;
+            ui.close();
+        }
+        let next = self.next_live_id();
+        if ui.button(format!("Add receiver slot {next}")).clicked() {
+            self.dock_requests.push(DockReq::AddReceiver(next));
+            ui.close();
+        }
+        let present: Vec<Tab> = self.dock.as_ref().map(|d| d.iter_all_tabs().map(|(_, t)| t.clone()).collect()).unwrap_or_default();
+        let present: Vec<Tab> = present.into_iter().chain(self.popouts.iter().flat_map(|p| p.dock.iter_all_tabs().map(|(_, t)| t.clone()))).collect();
+        for t in Tab::PANELS {
+            if !present.contains(&t) && ui.button(format!("Show {}", t.name())).clicked() {
+                self.dock_requests.push(DockReq::Show(t));
+                ui.close();
+            }
+        }
+        ui.label(egui::RichText::new("Drag a tab to move it, or off the strip to float it;\nright-click a tab to pop it out to its own window").small().color(theme::MUTED));
+    }
+
+    /// Priority and lockout talkgroups, editable.
+    fn follow_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(220.0);
+        ui.label(egui::RichText::new("Call following").small().color(theme::MUTED));
+        let mut toggle: Option<(u32, bool)> = None;
+        for (list, mark, what, priority) in [
+            (self.follow_policy.priority.clone(), "★", "Priority (followed first, interrupting others)", true),
+            (self.follow_policy.lockout.clone(), "⊘", "Locked out (never followed)", false),
+        ] {
+            ui.label(egui::RichText::new(format!("{mark} {what}")).small());
+            if list.is_empty() {
+                ui.label(egui::RichText::new("none").small().color(theme::MUTED));
+            }
+            ui.horizontal_wrapped(|ui| {
+                for tg in list {
+                    if ui.small_button(format!("TG {tg} ✖")).on_hover_text("Remove").clicked() {
+                        toggle = Some((tg, priority));
+                    }
+                }
+            });
+        }
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.add(egui::DragValue::new(&mut self.follow_add).range(0..=65535).prefix("TG "));
+            if ui.small_button("★ add").clicked() && !self.follow_policy.priority.contains(&self.follow_add) {
+                toggle = Some((self.follow_add, true));
+            }
+            if ui.small_button("⊘ add").clicked() && !self.follow_policy.lockout.contains(&self.follow_add) {
+                toggle = Some((self.follow_add, false));
+            }
+        });
+        ui.label(egui::RichText::new("Also: right-click a call in the Calls tab, or select a talkgroup").small().color(theme::MUTED));
+        if let Some((tg, priority)) = toggle {
+            self.toggle_policy(tg, priority);
+        }
+    }
+
+    /// Where SpecTrawl keeps its files.
+    fn settings_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(300.0);
+        ui.label(egui::RichText::new("Folders").small().color(theme::MUTED));
+        for (what, path) in [
+            ("Recordings", engine::recordings_dir()),
+            ("Captures (SigMF, CSV)", engine::sigmf::default_dir()),
+            ("Workspaces", workspace_dir()),
+            ("Names catalog", catalog_path()),
+            ("Follow lists", follow_policy_path()),
+        ] {
+            ui.horizontal(|ui| {
+                if ui.small_button("Open").clicked() {
+                    let dir = if path.is_dir() || path.extension().is_none() { path.clone() } else { path.parent().map(|p| p.to_path_buf()).unwrap_or(path.clone()) };
+                    let _ = std::fs::create_dir_all(&dir);
+                    open_path(&dir);
+                }
+                ui.label(egui::RichText::new(what).small());
+                ui.label(egui::RichText::new(path.display().to_string()).small().color(theme::MUTED));
+            });
+        }
+    }
+
+    /// The icon rail: devices, names, follow lists, workspaces, settings.
+    fn rail(&mut self, ui: &mut egui::Ui, width: f32) {
+        ui.add_space(4.0);
+        ui.spacing_mut().button_padding = egui::vec2(4.0, 4.0);
+        ui.vertical_centered(|ui| {
+            let icon = |ui: &mut egui::Ui, glyph: &str, tip: &str, add: &mut dyn FnMut(&mut egui::Ui)| {
+                ui.menu_button(egui::RichText::new(glyph).size(15.0), |ui| add(ui)).response.on_hover_text(tip);
+                ui.add_space(6.0);
+            };
+            icon(ui, "📡", "Devices", &mut |ui| {
+                ui.set_min_width(280.0);
+                self.sources_panel(ui);
+            });
+            icon(ui, "🏷", "Imported names", &mut |ui| self.import_menu(ui));
+            icon(ui, "★", "Follow lists", &mut |ui| self.follow_menu(ui));
+            icon(ui, "☰", "Workspaces", &mut |ui| self.workspace_menu(ui, width));
+            icon(ui, "⚙", "Settings", &mut |ui| self.settings_menu(ui));
+        });
     }
 
     /// Applies queued dock changes (the dock must be home, not on loan).
@@ -704,31 +905,16 @@ impl App {
                 ui.toggle_value(&mut self.squelch, format!("Squelch known ({n})")).on_hover_text(
                     "Dim FM broadcast, TV and LTE/NR carriers the app has identified, and hide their detections, so unknown signals stand out",
                 );
-                ui.menu_button("Import names", |ui| self.import_menu(ui));
-                ui.menu_button("Layout ⏷", |ui| {
-                    if ui.button("Reset layout").on_hover_text("The default arrangement for this window width").clicked() {
-                        self.dock_requests.push(DockReq::Reset);
-                        ui.close();
-                    }
-                    let next = self.next_live_id();
-                    if ui.button(format!("Add receiver slot {next}")).clicked() {
-                        self.dock_requests.push(DockReq::AddReceiver(next));
-                        ui.close();
-                    }
-                    ui.separator();
-                    let present: Vec<Tab> = self.dock.as_ref().map(|d| d.iter_all_tabs().map(|(_, t)| t.clone()).collect()).unwrap_or_default();
-                    for t in Tab::PANELS {
-                        if !present.contains(&t) && ui.button(format!("Show {}", t.name())).clicked() {
-                            self.dock_requests.push(DockReq::Show(t));
-                            ui.close();
-                        }
-                    }
-                    ui.label(egui::RichText::new("Drag a tab to move it, or off the strip to float it;\nright-click a tab to pop it out to its own window").small().color(theme::MUTED));
-                });
+                let width = ui.ctx().content_rect().width();
+                let ws = format!("Workspace: {} ⏷", self.workspace_name.as_deref().unwrap_or("default"));
+                ui.menu_button(ws, |ui| self.workspace_menu(ui, width));
                 if let Some((t, m)) = &self.catalog_msg {
                     if t.elapsed() < std::time::Duration::from_secs(12) {
                         ui.label(egui::RichText::new(m).small().color(theme::TEXT2));
                     }
+                }
+                if let Some(e) = &self.error {
+                    ui.label(egui::RichText::new(e).small().color(theme::ALERT));
                 }
             });
         });
@@ -1979,19 +2165,20 @@ impl App {
         }
     }
 
-    /// P25 systems and talkgroup grants learned by the control-channel monitors.
-    fn p25_panel(&mut self, ui: &mut egui::Ui) {
-        let Some(focus) = self.target() else {
-            ui.label(egui::RichText::new("Open a Focus device to decode P25 control channels.").color(theme::MUTED));
-            return;
-        };
-        let systems = focus.source.p25_systems();
-        let grants = focus.source.p25_grants(2000);
-        let monitors = focus.source.monitors();
-        if systems.is_empty() {
+    /// Every trunked system identified on any receiver, any protocol, with
+    /// the name imports that label them.
+    fn trunking_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.menu_button(egui::RichText::new("Import names ⏷").small(), |ui| self.import_menu(ui));
+            let names = if self.catalog.sources.is_empty() { "no names imported".to_string() } else { format!("names: {}", self.catalog.sources.join(" · ")) };
+            ui.label(egui::RichText::new(names).small().color(theme::MUTED));
+        });
+        let rows: Vec<(ReceiverId, engine::TrunkSystem)> = self.panes.iter().flat_map(|p| p.source.systems().into_iter().map(move |s| (p.id, s))).collect();
+        if rows.is_empty() {
+            let monitors = self.panes.iter().flat_map(|p| p.source.monitors()).filter(|m| m.label.starts_with("CC")).count();
             ui.label(
-                egui::RichText::new(if monitors.is_empty() {
-                    "No P25 control channel identified in this span yet. Monitors start automatically once one is."
+                egui::RichText::new(if monitors == 0 {
+                    "No control channel identified yet. P25 control channels are monitored automatically once one is in a receiver's span; DMR, NXDN, LTR and EDACS systems will list here as their decoders arrive."
                 } else {
                     "Monitoring a control channel; waiting for its first messages…"
                 })
@@ -1999,61 +2186,98 @@ impl App {
             );
             return;
         }
-        let p25 = egui::Color32::from_rgb(0xf2, 0xa3, 0x3a);
-        let hex = |v: Option<u32>, w: usize| v.map(|v| format!("0x{v:0w$X}")).unwrap_or("?".into());
         let cat = &self.catalog;
-        let site_name = |s: &engine::P25System, rfss: u8, site: u8| match (s.wacn, s.system) {
-            (Some(w), Some(y)) => cat.p25_site(w, y, rfss, site).map(str::to_string),
-            _ => None,
-        };
-        for (nac, s) in &systems {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new("P25").strong().color(p25));
-                if let (Some(w), Some(y)) = (s.wacn, s.system) {
-                    if let Some(n) = cat.p25_network(w, y) {
-                        ui.label(egui::RichText::new(n).strong().color(theme::TEXT));
-                    }
-                }
-                let mut parts = vec![
-                    format!("NAC 0x{nac:03X}"),
-                    format!("WACN {}", hex(s.wacn, 5)),
-                    format!("SYS {}", hex(s.system.map(u32::from), 3)),
-                    format!(
-                        "RFSS {} · SITE {}",
-                        s.rfss.map(|v| v.to_string()).unwrap_or("?".into()),
-                        s.site.map(|v| v.to_string()).unwrap_or("?".into())
-                    ),
-                ];
-                if let Some(cc) = s.control_hz {
-                    parts.push(format!("CC {:.5} MHz", cc / 1e6));
-                }
-                ui.label(egui::RichText::new(parts.join(" · ")).monospace().color(theme::TEXT));
-                if let (Some(r), Some(t)) = (s.rfss, s.site) {
-                    if let Some(n) = site_name(s, r, t) {
-                        ui.label(egui::RichText::new(format!("“{n}”")).color(theme::TEXT2));
-                    }
-                }
-                let adj: Vec<String> = s
-                    .adjacent
-                    .iter()
-                    .map(|((_, rfss, site), ch)| {
-                        let f = s.freq(*ch).map(|f| format!("{:.4}", f / 1e6)).unwrap_or(ch.to_string());
-                        match site_name(s, *rfss, *site) {
-                            Some(n) => format!("{rfss}-{site} {n} {f}"),
-                            None => format!("{rfss}-{site} {f}"),
-                        }
-                    })
-                    .collect();
-                if !adj.is_empty() {
-                    ui.label(egui::RichText::new(format!("adjacent: {}", adj.join(", "))).small().color(theme::MUTED));
-                }
-            });
-        }
-        let by_nac: std::collections::HashMap<u16, &engine::P25System> = systems.iter().map(|(n, s)| (*n, s)).collect();
         let mut tune = None;
         let row_h = 18.0;
         egui_extras::TableBuilder::new(ui)
-            .id_salt("p25grants")
+            .id_salt("trunking")
+            .striped(true)
+            .sense(egui::Sense::click())
+            .auto_shrink([false, false])
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(egui_extras::Column::exact(28.0))
+            .column(egui_extras::Column::exact(90.0))
+            .column(egui_extras::Column::exact(330.0))
+            .column(egui_extras::Column::exact(220.0))
+            .column(egui_extras::Column::exact(100.0))
+            .column(egui_extras::Column::exact(56.0))
+            .column(egui_extras::Column::exact(72.0))
+            .column(egui_extras::Column::remainder())
+            .header(row_h, |mut h| {
+                for t in ["Src", "System", "Identity", "Site · network (imported)", "Control MHz", "Grants", "Last", "Adjacent sites"] {
+                    h.col(|ui| {
+                        ui.label(egui::RichText::new(t).small().color(theme::MUTED));
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(row_h, rows.len(), |mut row| {
+                    let (rx, sys) = &rows[row.index()];
+                    let text = |ui: &mut egui::Ui, s: String, c: egui::Color32| {
+                        ui.add(egui::Label::new(egui::RichText::new(s).monospace().color(c)).selectable(false).truncate());
+                    };
+                    let recent = sys.last_activity.is_some_and(|t| std::time::SystemTime::now().duration_since(t).map(|d| d.as_secs() < 10).unwrap_or(true));
+                    let c = if recent { theme::TEXT } else { theme::TEXT2 };
+                    let site = sys.site.and_then(|(r, t)| cat.site(&sys.key, r, t)).unwrap_or("");
+                    let net = cat.network(&sys.key).unwrap_or("");
+                    let names = match (site.is_empty(), net.is_empty()) {
+                        (false, false) => format!("{site} · {net}"),
+                        (false, true) => site.to_string(),
+                        (true, false) => net.to_string(),
+                        (true, true) => String::new(),
+                    };
+                    let adjacent: Vec<String> = sys
+                        .adjacent
+                        .iter()
+                        .map(|(l, f)| {
+                            let name = l
+                                .split_once('-')
+                                .and_then(|(r, t)| Some((r.parse::<u8>().ok()?, t.parse::<u8>().ok()?)))
+                                .and_then(|(r, t)| cat.site(&sys.key, r, t))
+                                .map(|n| format!(" {n}"))
+                                .unwrap_or_default();
+                            match f {
+                                Some(f) => format!("{l}{name} {:.4}", f / 1e6),
+                                None => format!("{l}{name}"),
+                            }
+                        })
+                        .collect();
+                    row.col(|ui| text(ui, rx.to_string(), c));
+                    row.col(|ui| text(ui, sys.kind.name().to_string(), theme::class_color(None).unwrap_or(egui::Color32::from_rgb(0xf2, 0xa3, 0x3a))));
+                    row.col(|ui| text(ui, sys.identity.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(" · "), c));
+                    row.col(|ui| text(ui, names, theme::TEXT2));
+                    row.col(|ui| text(ui, sys.control_hz.iter().map(|f| format!("{:.5}", f / 1e6)).collect::<Vec<_>>().join(", "), c));
+                    row.col(|ui| text(ui, sys.grants.to_string(), theme::MUTED));
+                    row.col(|ui| text(ui, sys.last_activity.map(hms).unwrap_or_default(), theme::MUTED));
+                    row.col(|ui| {
+                        let a = adjacent.join(", ");
+                        ui.add(egui::Label::new(egui::RichText::new(&a).monospace().color(theme::MUTED)).selectable(false).truncate()).on_hover_text(&a);
+                    });
+                    if row.response().double_clicked() {
+                        tune = sys.control_hz.first().copied();
+                    }
+                });
+            });
+        if let Some(f) = tune {
+            self.retune_target((f / 1e3).round() / 1e3);
+        }
+    }
+
+    /// The raw control-channel grants, every receiver, newest first.
+    fn grants_table(&mut self, ui: &mut egui::Ui) {
+        let systems: Vec<engine::TrunkSystem> = self.panes.iter().flat_map(|p| p.source.systems()).collect();
+        let mut grants: Vec<engine::GrantEvent> = self.panes.iter().flat_map(|p| p.source.p25_grants(2000)).collect();
+        grants.sort_by(|a, b| b.last.cmp(&a.last));
+        if grants.is_empty() {
+            ui.label(egui::RichText::new("No grants yet.").color(theme::MUTED));
+            return;
+        }
+        let cat = &self.catalog;
+        let p25 = egui::Color32::from_rgb(0xf2, 0xa3, 0x3a);
+        let mut tune = None;
+        let row_h = 18.0;
+        egui_extras::TableBuilder::new(ui)
+            .id_salt("grants")
             .striped(true)
             .sense(egui::Sense::click())
             .auto_shrink([false, false])
@@ -2069,9 +2293,7 @@ impl App {
             .column(egui_extras::Column::exact(44.0))
             .column(egui_extras::Column::remainder())
             .header(row_h, |mut h| {
-                for t in
-                    ["Last", "First", "Talkgroup", "Name (imported)", "Voice MHz", "Slot", "Radio ID", "Radio (imported)", "×", "System"]
-                {
+                for t in ["Last", "First", "Talkgroup", "Name (imported)", "Voice MHz", "Slot", "Radio ID", "Radio (imported)", "×", "System"] {
                     h.col(|ui| {
                         ui.label(egui::RichText::new(t).small().color(theme::MUTED));
                     });
@@ -2085,12 +2307,16 @@ impl App {
                     };
                     let recent = std::time::SystemTime::now().duration_since(g.last).map(|d| d.as_secs() < 5).unwrap_or(true);
                     let c = if recent { theme::TEXT } else { theme::TEXT2 };
+                    let key = engine::SystemKey::P25 { wacn: None, system: None, nac: g.nac };
+                    let sys = systems.iter().find(|s| s.key.same(&key));
+                    let (key, cc) = match sys {
+                        Some(s) => (s.key.clone(), s.control_hz.first().copied()),
+                        None => (key, None),
+                    };
+                    let tg_name = cat.group(&key, cc, g.talkgroup as u32).map(|i| i.name().to_string()).unwrap_or_default();
+                    let radio_name = g.source.and_then(|r| cat.radio(&key, cc, r)).unwrap_or("").to_string();
                     row.col(|ui| text(ui, hms(g.last), c));
                     row.col(|ui| text(ui, hms(g.first), theme::MUTED));
-                    let sys = by_nac.get(&g.nac);
-                    let (w, y, cc) = (sys.and_then(|s| s.wacn), sys.and_then(|s| s.system), sys.and_then(|s| s.control_hz));
-                    let tg_name = cat.p25_group(w, y, cc, g.talkgroup).map(|i| i.name().to_string()).unwrap_or_default();
-                    let radio_name = g.source.and_then(|r| cat.p25_radio(w, y, cc, r)).unwrap_or("").to_string();
                     row.col(|ui| text(ui, g.talkgroup.to_string(), if recent { p25 } else { c }));
                     row.col(|ui| text(ui, tg_name, theme::TEXT2));
                     row.col(|ui| text(ui, g.freq_hz.map(|f| format!("{:.5}", f / 1e6)).unwrap_or("?".into()), c));
@@ -2098,7 +2324,7 @@ impl App {
                     row.col(|ui| text(ui, g.source.map(|s| s.to_string()).unwrap_or_default(), c));
                     row.col(|ui| text(ui, radio_name, theme::TEXT2));
                     row.col(|ui| text(ui, g.count.to_string(), theme::MUTED));
-                    row.col(|ui| text(ui, format!("NAC 0x{:03X}", g.nac), theme::MUTED));
+                    row.col(|ui| text(ui, key.short(), theme::MUTED));
                     if row.response().double_clicked() {
                         tune = g.freq_hz;
                     }
@@ -2137,20 +2363,35 @@ impl App {
                 _ => String::new(),
             }
         };
+        let following = self.panes.iter().find(|p| p.source.listening().is_some_and(|l| l.follow)).map(|p| p.id);
+        let mut view = self.calls_view;
         ui.horizontal(|ui| {
+            ui.selectable_value(&mut view, CallsView::Calls, egui::RichText::new("Calls").small());
+            ui.selectable_value(&mut view, CallsView::Grants, egui::RichText::new("Grants").small()).on_hover_text("The raw control-channel grants calls are built from");
+            ui.separator();
             ui.label(egui::RichText::new("Filter").small().color(theme::MUTED));
             ui.add(egui::TextEdit::singleline(&mut self.call_filter).desired_width(200.0).hint_text("talkgroup, radio or name"));
             ui.label(
-                egui::RichText::new(format!(
-                    "{} calls · {} heard on their voice channel · times are approximate (voice channels are sampled)",
-                    calls.len(),
-                    calls.iter().filter(|c| c.heard).count()
-                ))
-                .small()
-                .monospace()
-                .color(theme::MUTED),
+                egui::RichText::new(format!("{} calls · {} heard on their voice channel", calls.len(), calls.iter().filter(|c| c.heard).count()))
+                    .small()
+                    .monospace()
+                    .color(theme::MUTED),
             );
+            ui.separator();
+            let fp = &self.follow_policy;
+            let list = |s: &std::collections::BTreeSet<u32>| s.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ");
+            let state = match following {
+                Some(rx) => format!("following on {rx}"),
+                None => "not following".to_string(),
+            };
+            ui.label(egui::RichText::new(format!("{state} · ★ {} · ⊘ {}", list(&fp.priority), list(&fp.lockout))).small().color(theme::MUTED))
+                .on_hover_text("Priority (★) and locked-out (⊘) talkgroups: right-click a call, or the ★ rail button");
         });
+        self.calls_view = view;
+        if view == CallsView::Grants {
+            self.grants_table(ui);
+            return;
+        }
         if calls.is_empty() {
             ui.label(
                 egui::RichText::new(
@@ -2185,6 +2426,7 @@ impl App {
             .column(egui_extras::Column::exact(84.0))
             .column(egui_extras::Column::exact(110.0))
             .column(egui_extras::Column::exact(90.0))
+            .column(egui_extras::Column::exact(36.0))
             .column(egui_extras::Column::exact(220.0))
             .column(egui_extras::Column::exact(90.0))
             .column(egui_extras::Column::exact(160.0))
@@ -2192,7 +2434,7 @@ impl App {
             .column(egui_extras::Column::exact(48.0))
             .column(egui_extras::Column::remainder())
             .header(row_h, |mut h| {
-                for t in ["Start", "Secs", "MHz", "Protocol", "Talkgroup", "Name (imported)", "Radio", "Radio (imported)", "Flags", "Audio", "Seen"] {
+                for t in ["Start", "Secs", "MHz", "Protocol", "Talkgroup", "★⊘", "Name (imported)", "Radio", "Radio (imported)", "Flags", "Audio", "Seen"] {
                     h.col(|ui| {
                         ui.label(egui::RichText::new(t).small().color(theme::MUTED));
                     });
@@ -2216,12 +2458,13 @@ impl App {
                     row.col(|ui| text(ui, c.center_hz.map(|f| format!("{:.5}", f / 1e6)).unwrap_or("?".into()), col));
                     row.col(|ui| text(ui, c.protocol.clone(), theme::TEXT2));
                     let mark = match (c.call.group, prio.contains(&c.call.target), locked.contains(&c.call.target)) {
-                        (true, true, _) => "★ ",
-                        (true, _, true) => "⊘ ",
+                        (true, true, _) => "★",
+                        (true, _, true) => "⊘",
                         _ => "",
                     };
-                    let target = if c.call.group { format!("{mark}TG {}", c.call.target) } else { format!("→ {}", c.call.target) };
+                    let target = if c.call.group { format!("TG {}", c.call.target) } else { format!("→ {}", c.call.target) };
                     row.col(|ui| text(ui, target, if recent { accent } else { col }));
+                    row.col(|ui| text(ui, mark.into(), if mark == "★" { theme::SELECT } else { theme::MUTED }));
                     row.col(|ui| text(ui, tg_name(c), theme::TEXT2));
                     row.col(|ui| text(ui, c.call.source.map(|s| s.to_string()).unwrap_or_default(), col));
                     row.col(|ui| text(ui, radio_name(c), theme::TEXT2));
@@ -2510,8 +2753,9 @@ impl eframe::App for App {
         }
         egui::Panel::top("top").exact_size(40.0).frame(theme::bar_frame()).show(ui, |ui| self.top_bar(ui));
         egui::Panel::bottom("transport").exact_size(26.0).frame(theme::bar_frame()).show(ui, |ui| self.transport_bar(ui, &ctx));
-        self.frame_prep();
         let width = ctx.content_rect().width();
+        egui::Panel::left("rail").exact_size(36.0).frame(theme::rail_frame()).show(ui, |ui| self.rail(ui, width));
+        self.frame_prep();
         if self.dock.is_none() {
             let ids: Vec<ReceiverId> = self.panes.iter().map(|p| p.id).collect();
             self.dock = Some(default_dock(width, &ids));
@@ -2623,7 +2867,7 @@ impl egui_dock::TabViewer for App {
             }
             Tab::Emitters => self.emitter_list(ui),
             Tab::Records => self.signal_list(ui),
-            Tab::P25 => self.p25_panel(ui),
+            Tab::Trunking => self.trunking_panel(ui),
             Tab::Calls => self.calls_panel(ui),
             Tab::Pages => self.pages_panel(ui),
         }
@@ -2716,12 +2960,62 @@ fn dock_style(ui: &egui::Ui) -> egui_dock::Style {
     st
 }
 
+fn workspace_dir() -> std::path::PathBuf {
+    catalog_path().with_file_name("workspaces")
+}
+
 fn workspace_path() -> std::path::PathBuf {
-    catalog_path().with_file_name("workspaces").join("last.json")
+    workspace_dir().join("last.json")
+}
+
+/// Saved workspace names (files in the workspaces folder, without `last`).
+fn list_workspaces() -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(workspace_dir())
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .filter_map(|e| e.path().file_stem().map(|s| s.to_string_lossy().to_string()).filter(|_| e.path().extension().is_some_and(|x| x == "json")))
+                .filter(|n| n != "last")
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+fn write_workspace(path: &std::path::Path, w: &Workspace) {
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    match serde_json::to_vec(w) {
+        Ok(b) => {
+            if let Err(e) = std::fs::write(path, b) {
+                log::warn!("{}: {e}", path.display());
+            }
+        }
+        Err(e) => log::warn!("workspace: {e}"),
+    }
+}
+
+/// A built-in layout: the default with the table that matters in front.
+fn preset_dock(name: &str, width: f32, receivers: &[ReceiverId]) -> DockState<Tab> {
+    let mut ds = default_dock(width, receivers);
+    let front = match name {
+        "trunking" => Tab::Calls,
+        "paging" => Tab::Pages,
+        _ => Tab::Emitters,
+    };
+    if let Some(path) = ds.find_tab(&front) {
+        let _ = ds.set_active_tab(path);
+    }
+    ds
 }
 
 fn load_workspace() -> Option<Workspace> {
-    let b = std::fs::read(workspace_path()).ok()?;
+    read_workspace(&workspace_path())
+}
+
+fn read_workspace(path: &std::path::Path) -> Option<Workspace> {
+    let b = std::fs::read(path).ok()?;
     let mut v: serde_json::Value = match serde_json::from_slice(&b) {
         Ok(v) => v,
         Err(e) => {

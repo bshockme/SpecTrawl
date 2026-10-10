@@ -4,7 +4,7 @@ Ideas and known rough edges that aren't scheduled yet. Newest at the top of each
 
 ## UI
 
-- **UI restructure** per `docs/ui-design.md`: receiver ids and a selection model first, then the transport bar and inspector, receiver pane headers, egui_dock, pop-out windows, the Trunking tab (any trunking system, not only P25), the icon rail, workspaces, and a command palette.
+- **UI restructure** per `docs/ui-design.md`: done through step 6 (receiver letters and selection, transport bar, inspector, receiver pane headers, egui_dock with saved/named workspaces, pop-out OS windows with their own docks, Trunking tab over `TrunkSystem`, Calls/Grants toggle, icon rail). Left: the command palette and keys (step 7), a Diagnostics tab, and `TrunkSystem` entries for DMR Cap+/Con+/Tier III, NXDN, LTR and EDACS as their decoders arrive. The new UI has only been smoke-tested on the simulator (screenshots), not clicked through on air.
 - **Show the span click-to-tune will land on.** When hovering the survey (or the focus pane), draw the bracket the focus device would cover if clicked (centre ± usable bandwidth), not just a centre-frequency cursor.
 - **Backfill the focus waterfall from survey history after a click-to-tune.** Copy the survey rows covering the new focus span into the focus waterfall so it doesn't start blank.
   - Survey rows are coarse (~54 kHz bins over 24–1800 MHz) and ~2.6 s apart. Stretch each one over the matching stretch of focus rows (≈130 rows at 50 rows/s) and resample the bins.
