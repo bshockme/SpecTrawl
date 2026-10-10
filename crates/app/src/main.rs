@@ -725,8 +725,7 @@ impl App {
             }
         }
 
-        self.listen_card(ui);
-        self.selection_card(ui);
+        self.inspector(ui);
         ui.add_space(8.0);
         ui.label(egui::RichText::new("DISPLAY").small().strong().color(theme::MUTED));
         theme::card(ui, |ui| {
@@ -745,58 +744,93 @@ impl App {
         }
     }
 
-    /// Demodulated audio from a live receiver (the selection's, else the
-    /// tune target): the selected signal (mode from its label unless
-    /// overridden) or a typed frequency.
-    fn listen_card(&mut self, ui: &mut egui::Ui) {
-        let rx = self.working_id();
-        let Some(focus) = self.receiver(rx) else { return };
-        let listening = focus.source.listening();
-        // What's selected, and the mode its label suggests.
-        let emitter = self.selection.emitter().filter(|(r, _)| *r == rx).and_then(|(_, id)| focus.source.emitters().into_iter().find(|e| e.id == id));
-        let record = self.selection.record().filter(|(r, _)| *r == rx).and_then(|(_, id)| focus.records.2.iter().find(|r| r.id == id).cloned());
-        let target: Option<(f64, String, f64)> =
-            emitter.as_ref().map(|e| (e.center_hz, e.label().unwrap_or_default(), e.bandwidth_hz)).or_else(|| {
-                record.as_ref().map(|r| (r.center_hz(), r.display_class().map(|c| c.label.clone()).unwrap_or_default(), r.bandwidth_hz()))
-            });
-        let known = self.known.1.clone();
-        let auto_mode = |hz: f64, label: &str, bw: f64| {
-            let broadcast = known.iter().any(|(lo, hi, k)| (*lo..=*hi).contains(&hz) && k.starts_with("FM broadcast"));
-            if broadcast || label.contains("Wideband FM") || bw > 100e3 {
-                engine::DemodMode::Wfm
-            } else if label.contains("P25") && !label.contains("Phase 2") {
-                engine::DemodMode::P25
-            } else if label.starts_with("AM") || label.contains(" AM") {
-                engine::DemodMode::Am
-            } else {
-                engine::DemodMode::Nfm
+    /// The demodulation a signal's label suggests.
+    fn auto_mode(&self, hz: f64, label: &str, bw: f64) -> engine::DemodMode {
+        let broadcast = self.known.1.iter().any(|(lo, hi, k)| (*lo..=*hi).contains(&hz) && k.starts_with("FM broadcast"));
+        if broadcast || label.contains("Wideband FM") || bw > 100e3 {
+            engine::DemodMode::Wfm
+        } else if label.contains("P25") && !label.contains("Phase 2") {
+            engine::DemodMode::P25
+        } else if label.starts_with("AM") || label.contains(" AM") {
+            engine::DemodMode::Am
+        } else {
+            engine::DemodMode::Nfm
+        }
+    }
+
+    /// How to listen to a signal: the chosen mode, else the one its label
+    /// suggests.
+    fn spec_for(&self, hz: f64, label: &str, bw: f64) -> engine::ListenSpec {
+        let tdma = if self.listen_mode.is_none() { label.contains("Phase 2") } else { self.listen_tdma };
+        let mode = self.listen_mode.unwrap_or_else(|| if tdma { engine::DemodMode::P25 } else { self.auto_mode(hz, label, bw) });
+        engine::ListenSpec { center_hz: hz, mode, follow: false, tdma, slot: None }
+    }
+
+    /// Plays receiver `rx` demodulated as `spec` (retuning it there first if
+    /// the channel is outside its span). One audio output: any other
+    /// receiver's listener and a playing recording stop.
+    fn start_listen(&mut self, rx: ReceiverId, spec: engine::ListenSpec) {
+        if let Some(focus) = self.receiver(rx).filter(|_| !spec.follow) {
+            if focus.view.span().is_none_or(|(lo, hi)| spec.center_hz < lo + 0.5e6 || spec.center_hz > hi - 0.5e6) {
+                self.retune(rx, (spec.center_hz / 1e3).round() / 1e3);
             }
-        };
-        let open = focus.source.audio().open.load(std::sync::atomic::Ordering::Relaxed);
-        let voice = focus.source.voice();
-        let span_mid = focus.view.span().map(|(lo, hi)| (lo + hi) / 2.0);
-        let mut start: Option<engine::ListenSpec> = None;
+        }
+        if self.audio_out.is_none() {
+            match audio::AudioOut::new() {
+                Ok(a) => {
+                    a.set_volume(self.volume);
+                    self.audio_out = Some(a);
+                    self.audio_err = None;
+                }
+                Err(e) => self.audio_err = Some(format!("Audio output: {e}")),
+            }
+        }
+        self.playback = None;
+        for p in self.panes.iter().filter(|p| p.id != rx && p.source.listening().is_some()) {
+            p.source.listen(None);
+        }
+        if let Some(focus) = self.receiver(rx) {
+            focus.source.listen(Some(spec));
+            if let Some(a) = &self.audio_out {
+                a.set_source(Some(focus.source.audio()));
+            }
+            self.listen_mhz = spec.center_hz / 1e6;
+        }
+    }
+
+    fn stop_listen(&mut self) {
+        for p in self.panes.iter().filter(|p| p.source.listening().is_some()) {
+            p.source.listen(None);
+        }
+        if let Some(a) = &self.audio_out {
+            a.set_source(None);
+        }
+    }
+
+    /// What's playing, on one line: live listening or a recording, with
+    /// the mode popover, volume and Stop; the engine summary at the right.
+    fn transport_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let listening: Option<(ReceiverId, engine::ListenSpec)> = self.panes.iter().find_map(|p| p.source.listening().map(|l| (p.id, l)));
+        let rx = listening.map(|(r, _)| r).unwrap_or(self.working_id());
+        let mut start: Option<(ReceiverId, engine::ListenSpec)> = None;
         let mut stop = false;
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("LISTEN").small().strong().color(theme::MUTED));
-            ui.label(egui::RichText::new(format!("on {rx}")).small().color(theme::MUTED));
-        });
-        theme::card(ui, |ui| {
-            match listening {
-                Some(l) if l.mode == engine::DemodMode::P25 => {
-                    let v = &voice;
-                    ui.horizontal(|ui| {
+        ui.horizontal_centered(|ui| {
+            if let Some(pb) = &self.playback {
+                let name = pb.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                ui.label(egui::RichText::new(format!("♪ {name} · {:.1} s", pb.seconds)).monospace().small().color(theme::VOICE));
+            } else if let Some((rx, l)) = &listening {
+                theme::chip(ui, &rx.to_string(), theme::CHIP_FOCUS_BG, theme::CHIP_FOCUS_FG);
+                if let Some(p) = self.receiver(*rx) {
+                    if l.mode == engine::DemodMode::P25 {
+                        let v = p.source.voice();
                         let what = match (v.center_hz, v.slot) {
-                            (Some(hz), Some(ts)) => format!("{:.5} MHz P25 Phase 2 TS{}", hz / 1e6, ts + 1),
-                            (Some(hz), None) if l.tdma => format!("{:.5} MHz P25 Phase 2", hz / 1e6),
-                            (Some(hz), None) => format!("{:.5} MHz P25", hz / 1e6),
+                            (Some(hz), Some(ts)) => format!("{:.5} MHz · P25 Phase 2 TS{}", hz / 1e6, ts + 1),
+                            (Some(hz), None) if l.tdma => format!("{:.5} MHz · P25 Phase 2", hz / 1e6),
+                            (Some(hz), None) => format!("{:.5} MHz · P25", hz / 1e6),
                             (None, _) => "waiting for a granted call".into(),
                         };
                         let head = if l.follow { format!("Following · {what}") } else { what };
-                        ui.label(egui::RichText::new(head).monospace().strong());
-                    });
-                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(head).monospace().small().strong());
                         let (txt, col) = match (v.encrypted, v.active) {
                             (Some(alg), _) => (format!("encrypted ({alg}), silent"), theme::ALERT),
                             (None, true) => ("● voice".to_string(), theme::VOICE),
@@ -807,145 +841,118 @@ impl App {
                             ui.label(egui::RichText::new(c.summary()).small().monospace());
                         }
                         if v.recording {
-                            ui.label(egui::RichText::new("rec").small().color(theme::ALERT));
+                            ui.label(egui::RichText::new("● rec").small().color(theme::ALERT));
                         }
-                    });
-                }
-                Some(l) => {
-                    ui.horizontal(|ui| {
+                    } else {
+                        let open = p.source.audio().open.load(std::sync::atomic::Ordering::Relaxed);
                         let (txt, col) = if open { ("● OPEN", theme::VOICE) } else { ("○ squelched", theme::MUTED) };
-                        ui.label(egui::RichText::new(format!("{:.4} MHz {}", l.center_hz / 1e6, l.mode.name())).monospace().strong());
+                        ui.label(egui::RichText::new(format!("{:.4} MHz · {}", l.center_hz / 1e6, l.mode.name())).monospace().small().strong());
                         ui.label(egui::RichText::new(txt).small().color(col));
-                    });
-                }
-                None => {
-                    ui.label(egui::RichText::new("Not listening").color(theme::MUTED));
-                }
-            }
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Mode").small().color(theme::MUTED));
-                for (m, name) in [
-                    (None, "Auto"),
-                    (Some(engine::DemodMode::Nfm), "NFM"),
-                    (Some(engine::DemodMode::Am), "AM"),
-                    (Some(engine::DemodMode::Wfm), "WFM"),
-                    (Some(engine::DemodMode::P25), "P25"),
-                ] {
-                    if ui.selectable_value(&mut self.listen_mode, m, egui::RichText::new(name).small()).changed() {
-                        // Re-apply to what's playing.
-                        if let Some(l) = listening.filter(|l| !l.follow) {
-                            let mode = m.unwrap_or(l.mode);
-                            start = Some(engine::ListenSpec { center_hz: l.center_hz, mode, follow: false, tdma: self.listen_tdma, slot: None });
-                        }
                     }
                 }
-                if self.listen_mode == Some(engine::DemodMode::P25) {
-                    ui.checkbox(&mut self.listen_tdma, egui::RichText::new("Phase 2").small())
-                        .on_hover_text("TDMA: plays whichever timeslot starts talking");
-                }
-            });
-            ui.horizontal(|ui| {
-                let sel = target.clone();
-                if ui.add_enabled(sel.is_some(), egui::Button::new("Listen to selection")).clicked() {
-                    if let Some((hz, label, bw)) = sel {
-                        let tdma = if self.listen_mode.is_none() { label.contains("Phase 2") } else { self.listen_tdma };
-                        let mode = self.listen_mode.unwrap_or_else(|| if tdma { engine::DemodMode::P25 } else { auto_mode(hz, &label, bw) });
-                        start = Some(engine::ListenSpec { center_hz: hz, mode, follow: false, tdma, slot: None });
-                    }
-                }
-                if ui.add_enabled(listening.is_some(), egui::Button::new("Stop")).clicked() {
-                    stop = true;
-                }
-            });
-            ui.horizontal(|ui| {
-                let following = listening.is_some_and(|l| l.follow);
-                if ui
-                    .add_enabled(!following, egui::Button::new("Follow calls"))
-                    .on_hover_text("Play P25 calls (Phase 1 and 2) as the control channel grants them (Focus on the control channel's span)")
-                    .clicked()
-                {
-                    let hz = span_mid.unwrap_or(self.listen_mhz * 1e6);
-                    start = Some(engine::ListenSpec { center_hz: hz, mode: engine::DemodMode::P25, follow: true, tdma: false, slot: None });
-                }
-                let fp = &self.follow_policy;
-                if !fp.priority.is_empty() || !fp.lockout.is_empty() {
-                    let list = |s: &std::collections::BTreeSet<u32>| s.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ");
-                    ui.label(egui::RichText::new(format!("★ {}  ⊘ {}", list(&fp.priority), list(&fp.lockout))).small().color(theme::MUTED))
-                        .on_hover_text("Priority (★) and locked-out (⊘) talkgroups; right-click a call in the Calls tab to change");
-                }
-                if ui.small_button("Recordings").on_hover_text(engine::recordings_dir().display().to_string()).clicked() {
-                    let dir = engine::recordings_dir();
-                    let _ = std::fs::create_dir_all(&dir);
-                    open_path(&dir);
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.add(egui::DragValue::new(&mut self.listen_mhz).speed(0.0125).range(24.0..=1800.0).max_decimals(4).suffix(" MHz"));
-                if ui.button("Listen here").clicked() {
-                    let hz = self.listen_mhz * 1e6;
-                    start = Some(engine::ListenSpec {
-                        center_hz: hz,
-                        mode: self.listen_mode.unwrap_or_else(|| auto_mode(hz, "", 0.0)),
-                        follow: false,
-                        tdma: self.listen_tdma && self.listen_mode == Some(engine::DemodMode::P25),
-                        slot: None,
-                    });
-                }
-            });
-            if ui.add(egui::Slider::new(&mut self.volume, 0.0..=1.5).text("volume")).changed() {
-                if let Some(a) = &self.audio_out {
-                    a.set_volume(self.volume);
-                }
+            } else {
+                ui.label(egui::RichText::new("■ not listening").small().color(theme::MUTED));
             }
             if let Some(e) = &self.audio_err {
-                ui.label(egui::RichText::new(e).small().color(theme::MUTED));
+                ui.label(egui::RichText::new(e).small().color(theme::ALERT));
             }
-            if let Some(pb) = &self.playback {
-                ui.horizontal(|ui| {
-                    let name = pb.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                    ui.label(egui::RichText::new(format!("▶ {name} ({:.1} s)", pb.seconds)).small().monospace().color(theme::VOICE));
-                    if ui.small_button("Stop").clicked() {
-                        pb.stop();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (mut ring_mb, mut gaps) = (0.0, 0);
+                for p in &self.panes {
+                    let st = p.source.stats();
+                    ring_mb += st.ring_capacity as f64 * 4.0 / 1e6;
+                    gaps += st.gaps;
+                }
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} rx · rings {:.0} MB · drops {gaps} · {:.0} fps",
+                        self.panes.len(),
+                        ring_mb,
+                        1.0 / ctx.input(|i| i.stable_dt).max(1e-3)
+                    ))
+                    .monospace()
+                    .small()
+                    .color(theme::MUTED),
+                );
+                ui.separator();
+                if ui.add_enabled(listening.is_some() || self.playback.is_some(), egui::Button::new("Stop").small()).clicked() {
+                    stop = true;
+                }
+                ui.spacing_mut().slider_width = 80.0;
+                if ui.add(egui::Slider::new(&mut self.volume, 0.0..=1.5).show_value(false)).changed() {
+                    if let Some(a) = &self.audio_out {
+                        a.set_volume(self.volume);
+                    }
+                }
+                ui.label(egui::RichText::new("vol").small().color(theme::MUTED));
+                let mode_name = self.listen_mode.map(|m| m.name()).unwrap_or("Auto");
+                ui.menu_button(egui::RichText::new(format!("{mode_name} ▾")).small(), |ui| {
+                    ui.set_min_width(240.0);
+                    ui.label(egui::RichText::new(format!("Mode (listening on {rx})")).small().color(theme::MUTED));
+                    ui.horizontal(|ui| {
+                        for (m, name) in [
+                            (None, "Auto"),
+                            (Some(engine::DemodMode::Nfm), "NFM"),
+                            (Some(engine::DemodMode::Am), "AM"),
+                            (Some(engine::DemodMode::Wfm), "WFM"),
+                            (Some(engine::DemodMode::P25), "P25"),
+                        ] {
+                            if ui.selectable_value(&mut self.listen_mode, m, egui::RichText::new(name).small()).changed() {
+                                // Re-apply to what's playing.
+                                if let Some((r, l)) = listening.filter(|(_, l)| !l.follow) {
+                                    let mode = m.unwrap_or(l.mode);
+                                    start = Some((r, engine::ListenSpec { center_hz: l.center_hz, mode, follow: false, tdma: self.listen_tdma, slot: None }));
+                                }
+                            }
+                        }
+                    });
+                    if self.listen_mode == Some(engine::DemodMode::P25) {
+                        ui.checkbox(&mut self.listen_tdma, egui::RichText::new("Phase 2").small())
+                            .on_hover_text("TDMA: plays whichever timeslot starts talking");
+                    }
+                    ui.separator();
+                    let following = listening.is_some_and(|(_, l)| l.follow);
+                    if ui
+                        .add_enabled(!following, egui::Button::new(format!("Follow calls on {rx}")))
+                        .on_hover_text("Play P25 calls (Phase 1 and 2) as the control channel grants them (the receiver on the control channel's span)")
+                        .clicked()
+                    {
+                        let hz = self.receiver(rx).and_then(|p| p.view.span()).map(|(lo, hi)| (lo + hi) / 2.0).unwrap_or(self.listen_mhz * 1e6);
+                        start = Some((rx, engine::ListenSpec { center_hz: hz, mode: engine::DemodMode::P25, follow: true, tdma: false, slot: None }));
+                        ui.close();
+                    }
+                    let fp = &self.follow_policy;
+                    if !fp.priority.is_empty() || !fp.lockout.is_empty() {
+                        let list = |s: &std::collections::BTreeSet<u32>| s.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ");
+                        ui.label(egui::RichText::new(format!("★ {}  ⊘ {}", list(&fp.priority), list(&fp.lockout))).small().color(theme::MUTED))
+                            .on_hover_text("Priority (★) and locked-out (⊘) talkgroups; right-click a call in the Calls tab to change");
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut self.listen_mhz).speed(0.0125).range(24.0..=1800.0).max_decimals(4).suffix(" MHz"));
+                        if ui.button("Listen here").clicked() {
+                            let hz = self.listen_mhz * 1e6;
+                            start = Some((rx, self.spec_for(hz, "", 0.0)));
+                            ui.close();
+                        }
+                    });
+                    if ui.small_button("Recordings folder").on_hover_text(engine::recordings_dir().display().to_string()).clicked() {
+                        let dir = engine::recordings_dir();
+                        let _ = std::fs::create_dir_all(&dir);
+                        open_path(&dir);
+                        ui.close();
                     }
                 });
-            }
+            });
         });
-        if let Some(spec) = start {
-            if let Some(focus) = self.receiver(rx).filter(|_| !spec.follow) {
-                // Outside the tuned span: retune the focus there first.
-                if focus.view.span().is_none_or(|(lo, hi)| spec.center_hz < lo + 0.5e6 || spec.center_hz > hi - 0.5e6) {
-                    self.retune(rx, (spec.center_hz / 1e3).round() / 1e3);
-                }
-            }
-            if self.audio_out.is_none() {
-                match audio::AudioOut::new() {
-                    Ok(a) => {
-                        a.set_volume(self.volume);
-                        self.audio_out = Some(a);
-                        self.audio_err = None;
-                    }
-                    Err(e) => self.audio_err = Some(format!("Audio output: {e}")),
-                }
-            }
-            self.playback = None;
-            // One audio output: another receiver's listener stops.
-            for p in self.panes.iter().filter(|p| p.id != rx && p.source.listening().is_some()) {
-                p.source.listen(None);
-            }
-            if let Some(focus) = self.receiver(rx) {
-                focus.source.listen(Some(spec));
-                if let Some(a) = &self.audio_out {
-                    a.set_source(Some(focus.source.audio()));
-                }
-                self.listen_mhz = spec.center_hz / 1e6;
-            }
+        if let Some((rx, spec)) = start {
+            self.start_listen(rx, spec);
         }
         if stop {
-            if let Some(focus) = self.receiver(rx) {
-                focus.source.listen(None);
-            }
-            if let Some(a) = &self.audio_out {
-                a.set_source(None);
+            if let Some(pb) = &self.playback {
+                pb.stop();
+            } else {
+                self.stop_listen();
             }
         }
     }
@@ -1127,9 +1134,8 @@ impl App {
         }
     }
 
-    /// What's selected, and SigMF export for it.
-    fn selection_card(&mut self, ui: &mut egui::Ui) {
-        // Poll a running export.
+    /// Finishes a SigMF export that has completed.
+    fn poll_export(&mut self) {
         if self.export.as_ref().is_some_and(|(_, h)| h.is_finished()) {
             let (what, h) = self.export.take().unwrap();
             self.export_msg = Some(match h.join() {
@@ -1143,131 +1149,239 @@ impl App {
                 Err(_) => "Export crashed".into(),
             });
         }
-        let rx = self.working_id();
-        let Some(focus) = self.receiver(rx) else { return };
-        let records: Vec<engine::SignalRecord> = focus.records.2.iter().cloned().collect();
-        let record = self.selection.record().filter(|(r, _)| *r == rx).and_then(|(_, id)| {
-            records.iter().find(|r| r.id == id).cloned().or_else(|| focus.source.recent_records(3000).into_iter().find(|r| r.id == id))
-        });
-        let emitter = self.selection.emitter().filter(|(r, _)| *r == rx).and_then(|(_, id)| focus.source.emitters().into_iter().find(|e| e.id == id));
-        let busy = self.export.is_some();
-        let mut req: Option<(String, engine::sigmf::ExportRequest)> = None;
-        let annotate = |rs: &[engine::SignalRecord]| -> Vec<engine::sigmf::ExportAnnotation> {
-            rs.iter()
-                .map(|r| {
-                    let (s, e) = focus.source.record_sample_range(r);
-                    let label = r.display_class().map(|c| c.label.clone()).unwrap_or_else(|| format!("#{}", r.id));
-                    engine::sigmf::ExportAnnotation {
-                        start_sample: s,
-                        end_sample: e,
-                        f_lo_hz: r.f_lo_hz,
-                        f_hi_hz: r.f_hi_hz,
-                        label,
-                        comment: format!("SpecTrawl record #{} · SNR {:.0} dB · peak {:.1} dBFS", r.id, r.max_snr_db, r.peak_dbfs),
-                    }
-                })
-                .collect()
-        };
-        let dir = engine::sigmf::default_dir();
+    }
+
+    /// One panel for whatever is selected: a receiver, a detection, an
+    /// emitter, a talkgroup, a radio or a capcode.
+    fn inspector(&mut self, ui: &mut egui::Ui) {
+        self.poll_export();
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("SELECTION").small().strong().color(theme::MUTED));
-            ui.label(egui::RichText::new(format!("on {rx}")).small().color(theme::MUTED));
-        });
-        theme::card(ui, |ui| {
-            if let Some(r) = &record {
-                let label = r.display_class().map(|c| c.label.clone()).unwrap_or_else(|| "unclassified".into());
-                ui.label(egui::RichText::new(format!("Record #{} · {}", r.id, label)).strong());
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{:.4} MHz · {:.1} kHz · {:.2} s",
-                        r.center_hz() / 1e6,
-                        r.bandwidth_hz() / 1e3,
-                        r.duration_s()
-                    ))
-                    .monospace()
-                    .color(theme::TEXT2),
-                );
-                let stem = |kind: &str| {
-                    engine::sigmf::sanitize(&format!("{}_{:.4}MHz_{}_{kind}", engine::sigmf::stamp(r.t_start), r.center_hz() / 1e6, label))
-                };
-                let (s, e) = focus.source.record_sample_range(r);
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(!busy, egui::Button::new("Export channel"))
-                        .on_hover_text("Down-converted to this signal only (cf32, ~50 kS/s)")
-                        .clicked()
-                    {
-                        req = Some((
-                            format!("record #{} channel", r.id),
-                            engine::sigmf::ExportRequest {
-                                start_sample: s,
-                                end_sample: e,
-                                kind: engine::sigmf::ExportKind::Channel { center_hz: r.center_hz(), bandwidth_hz: r.bandwidth_hz() },
-                                dir: dir.clone(),
-                                stem: stem("ch"),
-                                description: format!("SpecTrawl record #{} ({label}), channel", r.id),
-                                annotations: annotate(std::slice::from_ref(r)),
-                            },
-                        ));
-                    }
-                    if ui
-                        .add_enabled(!busy, egui::Button::new("Full band"))
-                        .on_hover_text("Raw 10 MHz capture for the record's time span (ci16)")
-                        .clicked()
-                    {
-                        let overlapping: Vec<engine::SignalRecord> =
-                            records.iter().filter(|o| o.last_row_end_sample >= s && o.first_row_end_sample <= e).cloned().collect();
-                        req = Some((
-                            format!("record #{} full band", r.id),
-                            engine::sigmf::ExportRequest {
-                                start_sample: s,
-                                end_sample: e,
-                                kind: engine::sigmf::ExportKind::Wideband,
-                                dir: dir.clone(),
-                                stem: stem("wide"),
-                                description: format!("SpecTrawl record #{} ({label}), full band", r.id),
-                                annotations: annotate(&overlapping),
-                            },
-                        ));
+            ui.label(egui::RichText::new("INSPECTOR").small().strong().color(theme::MUTED));
+            if self.selection != Selection::None {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("×").on_hover_text("Clear the selection (Esc)").clicked() {
+                        self.selection = Selection::None;
                     }
                 });
-            } else if let Some(em) = &emitter {
-                let label = em.label().unwrap_or_else(|| "unclassified".into());
-                ui.label(egui::RichText::new(format!("Emitter E{} · {}", em.id, label)).strong());
-                ui.label(
-                    egui::RichText::new(format!("{:.4} MHz · {} bursts", em.center_hz / 1e6, em.records)).monospace().color(theme::TEXT2),
-                );
+            }
+        });
+        let sel = self.selection.clone();
+        theme::card(ui, |ui| match sel {
+            Selection::None => {
+                ui.label(egui::RichText::new("Click a box, a list row or a receiver heading to select it.").small().color(theme::MUTED));
+                ui.separator();
+                let rx = self.working_id();
+                self.export_footer(ui, rx);
+            }
+            Selection::Receiver(id) => self.inspect_receiver(ui, id),
+            Selection::Record(rx, id) => self.inspect_signal(ui, rx, Some(id), None),
+            Selection::Emitter(rx, id) => self.inspect_signal(ui, rx, None, Some(id)),
+            Selection::Talkgroup { system, tg } => self.inspect_call_party(ui, system, tg, true),
+            Selection::Radio { system, id } => self.inspect_call_party(ui, system, id, false),
+            Selection::Capcode { protocol, capcode } => self.inspect_capcode(ui, &protocol, capcode),
+        });
+    }
+
+    /// A receiver: identity, its tuning, and diagnostics folded away.
+    fn inspect_receiver(&mut self, ui: &mut egui::Ui, id: ReceiverId) {
+        let Some(p) = self.receiver(id) else {
+            ui.label(egui::RichText::new(format!("Receiver {id} is not open.")).color(theme::MUTED));
+            return;
+        };
+        let info = p.source.info().clone();
+        let snap = p.source.snapshot();
+        let st = p.source.stats();
+        let cfg = p.source.config().clone();
+        let load = p.source.classifier_load();
+        let sweep = p.source.sweep_status();
+        ui.horizontal(|ui| {
+            let (bg, fg) = if id.is_sweep() {
+                (egui::Color32::from_rgb(0x0f, 0x2b, 0x2b), egui::Color32::from_rgb(0x7f, 0xe9, 0xe5))
+            } else {
+                (theme::CHIP_FOCUS_BG, theme::CHIP_FOCUS_FG)
+            };
+            theme::chip(ui, &id.chip(), bg, fg);
+            ui.label(egui::RichText::new(&info.label).strong());
+        });
+        ui.label(egui::RichText::new(format!("{} · {}", info.backend, info.serial)).small().color(theme::MUTED));
+        match &sweep {
+            Some(s) => kv(ui, "Sweep", &format!("{:.0}–{:.0} MHz · {} hops", s.start_hz / 1e6, s.stop_hz() / 1e6, s.hops)),
+            None => kv(ui, "Centre", &format!("{:.4} MHz", snap.center_hz / 1e6)),
+        }
+        kv(ui, "Rate", &format!("{:.1} MS/s · {}-bit", snap.sample_rate / 1e6, snap.caps.adc_bits));
+        egui::CollapsingHeader::new(egui::RichText::new("Diagnostics").small()).id_salt(("diag", id)).show(ui, |ui| match &sweep {
+            Some(s) => {
+                kv(ui, "Hop", &format!("{:.1} MHz", s.hop_hz / 1e6));
+                kv(ui, "Rate", &format!("{:.0} hops/s · {:.0} MHz/s", s.hops_per_sec, s.mhz_per_sec()));
+                kv(ui, "Revisit", &format!("{:.2} s", s.last_pass_s));
+                kv(ui, "Re-measured", &format!("{} settle · {} gap", s.settle_retries, s.redone_hops));
+                if s.tuner_lock {
+                    kv(ui, "Lock waits", &s.lock_waits.to_string());
+                } else {
+                    kv(ui, "Slow hops", &format!("{} of {}", s.slow_hops, s.hops));
+                }
+                kv(ui, "Gaps", &format!("{} ({} samples)", st.gaps, st.lost_samples));
+            }
+            None => {
+                let rate = snap.sample_rate;
+                kv(ui, "FFT", &format!("{} pt · {:.0}/s · {:.0} Hz", cfg.fft_size, st.ffts_per_sec, rate / cfg.fft_size as f64));
+                kv(ui, "Look-back", &format!("{:.1} / {:.0} s", st.ring_samples as f64 / rate, cfg.ring_seconds));
+                kv(ui, "Gaps", &format!("{} ({} samples)", st.gaps, st.lost_samples));
+                kv(ui, "Classifier", &format!("{:.1}/s · {:.0} ms · {:.0}%", load.jobs_per_sec, load.avg_job_ms, load.busy * 100.0));
+            }
+        });
+        if !id.is_sweep() {
+            ui.separator();
+            self.export_footer(ui, id);
+        }
+    }
+
+    /// A detection (record) or an emitter on receiver `rx`: what it is,
+    /// Listen, and SigMF export of its channel.
+    fn inspect_signal(&mut self, ui: &mut egui::Ui, rx: ReceiverId, record: Option<u64>, emitter: Option<u64>) {
+        let Some(focus) = self.receiver(rx) else {
+            ui.label(egui::RichText::new(format!("Receiver {rx} is not open.")).color(theme::MUTED));
+            return;
+        };
+        let records: Vec<engine::SignalRecord> = focus.records.2.iter().cloned().collect();
+        let record = record.and_then(|id| {
+            records.iter().find(|r| r.id == id).cloned().or_else(|| focus.source.recent_records(3000).into_iter().find(|r| r.id == id))
+        });
+        let emitter = emitter.and_then(|id| focus.source.emitters().into_iter().find(|e| e.id == id));
+        let busy = self.export.is_some();
+        let dir = engine::sigmf::default_dir();
+        let mut req: Option<(String, engine::sigmf::ExportRequest)> = None;
+        let mut listen: Option<(f64, String, f64)> = None;
+        if let Some(r) = &record {
+            let label = r.display_class().map(|c| c.label.clone()).unwrap_or_else(|| "unclassified".into());
+            ui.label(egui::RichText::new(format!("Record #{} · {}", r.id, label)).strong());
+            ui.label(
+                egui::RichText::new(format!("{:.4} MHz · {:.1} kHz · {:.2} s · on {rx}", r.center_hz() / 1e6, r.bandwidth_hz() / 1e3, r.duration_s()))
+                    .monospace()
+                    .color(theme::TEXT2),
+            );
+            kv(ui, "SNR", &format!("{:.0} / {:.0} dB · peak {:.1} dBFS", r.mean_snr_db, r.max_snr_db, r.peak_dbfs));
+            kv(ui, "Seen", &format!("{} – {}{}", hms(r.t_start), hms(r.t_end), if r.active { " · active" } else { "" }));
+            if let Some(e) = r.emitter {
+                kv(ui, "Emitter", &format!("E{e}"));
+            }
+            if ui.button("Listen").clicked() {
+                listen = Some((r.center_hz(), label.clone(), r.bandwidth_hz()));
+            }
+            let stem = |kind: &str| {
+                engine::sigmf::sanitize(&format!("{}_{:.4}MHz_{}_{kind}", engine::sigmf::stamp(r.t_start), r.center_hz() / 1e6, label))
+            };
+            let (s, e) = focus.source.record_sample_range(r);
+            ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(!busy, egui::Button::new("Export channel (look-back)"))
-                    .on_hover_text("This emitter's channel over the whole look-back buffer")
+                    .add_enabled(!busy, egui::Button::new("Export channel"))
+                    .on_hover_text("Down-converted to this signal only (cf32, ~50 kS/s)")
                     .clicked()
                 {
-                    let (s, e) = focus.source.ring_range();
-                    let mine: Vec<engine::SignalRecord> = records.iter().filter(|r| r.emitter == Some(em.id)).cloned().collect();
                     req = Some((
-                        format!("emitter E{} channel", em.id),
+                        format!("record #{} channel", r.id),
                         engine::sigmf::ExportRequest {
                             start_sample: s,
                             end_sample: e,
-                            kind: engine::sigmf::ExportKind::Channel { center_hz: em.center_hz, bandwidth_hz: em.bandwidth_hz },
+                            kind: engine::sigmf::ExportKind::Channel { center_hz: r.center_hz(), bandwidth_hz: r.bandwidth_hz() },
                             dir: dir.clone(),
-                            stem: engine::sigmf::sanitize(&format!(
-                                "{}_{:.4}MHz_{}_E{}_ch",
-                                engine::sigmf::stamp(std::time::SystemTime::now()),
-                                em.center_hz / 1e6,
-                                label,
-                                em.id
-                            )),
-                            description: format!("SpecTrawl emitter E{} ({label}), channel", em.id),
-                            annotations: annotate(&mine),
+                            stem: stem("ch"),
+                            description: format!("SpecTrawl record #{} ({label}), channel", r.id),
+                            annotations: annotations(focus, std::slice::from_ref(r)),
                         },
                     ));
                 }
-            } else {
-                ui.label(egui::RichText::new("Click a box or a list row to select it.").small().color(theme::MUTED));
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Full band"))
+                    .on_hover_text("Raw 10 MHz capture for the record's time span (ci16)")
+                    .clicked()
+                {
+                    let overlapping: Vec<engine::SignalRecord> =
+                        records.iter().filter(|o| o.last_row_end_sample >= s && o.first_row_end_sample <= e).cloned().collect();
+                    req = Some((
+                        format!("record #{} full band", r.id),
+                        engine::sigmf::ExportRequest {
+                            start_sample: s,
+                            end_sample: e,
+                            kind: engine::sigmf::ExportKind::Wideband,
+                            dir: dir.clone(),
+                            stem: stem("wide"),
+                            description: format!("SpecTrawl record #{} ({label}), full band", r.id),
+                            annotations: annotations(focus, &overlapping),
+                        },
+                    ));
+                }
+            });
+        } else if let Some(em) = &emitter {
+            let label = em.label().unwrap_or_else(|| "unclassified".into());
+            ui.label(egui::RichText::new(format!("Emitter E{} · {}", em.id, label)).strong());
+            ui.label(
+                egui::RichText::new(format!("{:.4} MHz · {:.1} kHz · {} bursts · on {rx}", em.center_hz / 1e6, em.bandwidth_hz / 1e3, em.records))
+                    .monospace()
+                    .color(theme::TEXT2),
+            );
+            kv(ui, "Seen", &format!("{} – {}{}", hms(em.first_seen), hms(em.last_seen), if em.active { " · active" } else { "" }));
+            kv(ui, "Duty", &format!("{:.0}% · peak SNR {:.0} dB", em.duty() * 100.0, em.peak_snr_db));
+            if let Some(a) = em.activity() {
+                kv(ui, "Activity", &format!("{}{}", a.name(), em.last_talk.as_deref().map(|t| format!(" · {t}")).unwrap_or_default()));
             }
-            ui.separator();
+            let mut others: Vec<(&String, &u32)> = em.tally.iter().filter(|(l, _)| **l != label).collect();
+            others.sort_by(|a, b| b.1.cmp(a.1));
+            if !others.is_empty() {
+                let also: Vec<String> = others.iter().take(3).map(|(l, n)| format!("{l}×{n}")).collect();
+                kv(ui, "Also seen", &also.join(", "));
+            }
+            if ui.button("Listen").clicked() {
+                listen = Some((em.center_hz, label.clone(), em.bandwidth_hz));
+            }
+            if ui
+                .add_enabled(!busy, egui::Button::new("Export channel (look-back)"))
+                .on_hover_text("This emitter's channel over the whole look-back buffer")
+                .clicked()
+            {
+                let (s, e) = focus.source.ring_range();
+                let mine: Vec<engine::SignalRecord> = records.iter().filter(|r| r.emitter == Some(em.id)).cloned().collect();
+                req = Some((
+                    format!("emitter E{} channel", em.id),
+                    engine::sigmf::ExportRequest {
+                        start_sample: s,
+                        end_sample: e,
+                        kind: engine::sigmf::ExportKind::Channel { center_hz: em.center_hz, bandwidth_hz: em.bandwidth_hz },
+                        dir: dir.clone(),
+                        stem: engine::sigmf::sanitize(&format!(
+                            "{}_{:.4}MHz_{}_E{}_ch",
+                            engine::sigmf::stamp(std::time::SystemTime::now()),
+                            em.center_hz / 1e6,
+                            label,
+                            em.id
+                        )),
+                        description: format!("SpecTrawl emitter E{} ({label}), channel", em.id),
+                        annotations: annotations(focus, &mine),
+                    },
+                ));
+            }
+        } else {
+            ui.label(egui::RichText::new("Gone: the selection is no longer in the receiver's history.").small().color(theme::MUTED));
+        }
+        if let Some((what, r)) = req {
+            let h = focus.source.export(r);
+            self.export = Some((what, h));
+            self.export_msg = None;
+        }
+        if let Some((hz, label, bw)) = listen {
+            let spec = self.spec_for(hz, &label, bw);
+            self.start_listen(rx, spec);
+        }
+        ui.separator();
+        self.export_footer(ui, rx);
+    }
+
+    /// Look-back export of receiver `rx`'s whole buffer, and export status.
+    fn export_footer(&mut self, ui: &mut egui::Ui, rx: ReceiverId) {
+        let busy = self.export.is_some();
+        let dir = engine::sigmf::default_dir();
+        if let Some(focus) = self.receiver(rx) {
             if ui
                 .add_enabled(!busy, egui::Button::new("Export look-back (full band)"))
                 .on_hover_text(format!("Everything in the {rx} look-back buffer (~10 s, ~400 MB)"))
@@ -1275,38 +1389,131 @@ impl App {
             {
                 let (s, e) = focus.source.ring_range();
                 let snap = focus.source.snapshot();
-                req = Some((
-                    "look-back".into(),
-                    engine::sigmf::ExportRequest {
-                        start_sample: s,
-                        end_sample: e,
-                        kind: engine::sigmf::ExportKind::Wideband,
-                        dir: dir.clone(),
-                        stem: engine::sigmf::sanitize(&format!(
-                            "{}_{:.3}MHz_lookback_wide",
-                            engine::sigmf::stamp(std::time::SystemTime::now()),
-                            snap.center_hz / 1e6
-                        )),
-                        description: "SpecTrawl look-back buffer, full band".into(),
-                        annotations: annotate(&records),
-                    },
-                ));
+                let records: Vec<engine::SignalRecord> = focus.records.2.iter().cloned().collect();
+                let r = engine::sigmf::ExportRequest {
+                    start_sample: s,
+                    end_sample: e,
+                    kind: engine::sigmf::ExportKind::Wideband,
+                    dir: dir.clone(),
+                    stem: engine::sigmf::sanitize(&format!(
+                        "{}_{:.3}MHz_lookback_wide",
+                        engine::sigmf::stamp(std::time::SystemTime::now()),
+                        snap.center_hz / 1e6
+                    )),
+                    description: "SpecTrawl look-back buffer, full band".into(),
+                    annotations: annotations(focus, &records),
+                };
+                let h = focus.source.export(r);
+                self.export = Some(("look-back".into(), h));
+                self.export_msg = None;
             }
-            if busy {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(egui::RichText::new("exporting…").small().color(theme::MUTED));
-                });
-            } else if let Some(m) = &self.export_msg {
-                ui.label(egui::RichText::new(m).small().color(theme::TEXT2));
-            }
-            ui.label(egui::RichText::new(format!("Saves to {}", dir.display())).small().color(theme::MUTED));
-        });
-        if let Some((what, r)) = req {
-            let h = focus.source.export(r);
-            self.export = Some((what, h));
-            self.export_msg = None;
         }
+        if busy {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(egui::RichText::new("exporting…").small().color(theme::MUTED));
+            });
+        } else if let Some(m) = &self.export_msg {
+            ui.label(egui::RichText::new(m).small().color(theme::TEXT2));
+        }
+        ui.label(egui::RichText::new(format!("Saves to {}", dir.display())).small().color(theme::MUTED));
+    }
+
+    /// A talkgroup (`group`) or a radio: its imported name, following
+    /// controls, and its last calls.
+    fn inspect_call_party(&mut self, ui: &mut egui::Ui, system: Option<engine::SystemKey>, id: u32, group: bool) {
+        let systems: Vec<engine::TrunkSystem> = self.panes.iter().flat_map(|p| p.source.systems()).collect();
+        let sys = system_for(&systems, &system);
+        let name = match (&sys, group) {
+            (Some((k, cc)), true) => self.catalog.group(k, *cc, id).map(|g| g.name().to_string()),
+            (Some((k, cc)), false) => self.catalog.radio(k, *cc, id).map(str::to_string),
+            (None, _) => None,
+        }
+        .filter(|n| !n.is_empty());
+        let head = if group { format!("TG {id}") } else { format!("Radio {id}") };
+        ui.label(egui::RichText::new(match &name {
+            Some(n) => format!("{head} · {n}"),
+            None => head,
+        })
+        .strong());
+        if let Some((k, _)) = &sys {
+            ui.label(egui::RichText::new(format!("{} · {}", k.kind().name(), k.short())).small().color(theme::MUTED));
+        }
+        let mut toggle: Option<(u32, bool)> = None;
+        if group {
+            let fp = &self.follow_policy;
+            ui.horizontal(|ui| {
+                if ui.selectable_label(fp.priority.contains(&id), "★ Priority").on_hover_text("Followed first, interrupting other talkgroups").clicked() {
+                    toggle = Some((id, true));
+                }
+                if ui.selectable_label(fp.lockout.contains(&id), "⊘ Lock out").on_hover_text("Never followed").clicked() {
+                    toggle = Some((id, false));
+                }
+            });
+        }
+        let mut calls: Vec<engine::CallEvent> = self
+            .panes
+            .iter()
+            .flat_map(|p| p.source.calls(2000))
+            .filter(|c| c.call.group == group && c.call.target == id || (!group && c.call.source == Some(id)))
+            .collect();
+        calls.sort_by(|a, b| b.last.cmp(&a.last));
+        calls.dedup_by(|a, b| a.first == b.first && a.call.target == b.call.target);
+        ui.separator();
+        ui.label(egui::RichText::new(format!("{} calls · last:", calls.len())).small().color(theme::MUTED));
+        let mut play = None;
+        for c in calls.iter().take(5) {
+            ui.horizontal(|ui| {
+                let secs = c.last.duration_since(c.first).unwrap_or_default().as_secs();
+                let who = if group { c.call.source.map(|s| format!("← {s}")).unwrap_or_default() } else { format!("TG {}", c.call.target) };
+                let flags = format!("{}{}", if c.call.emergency { " EMERG" } else { "" }, if c.call.encrypted { " enc" } else { "" });
+                ui.label(egui::RichText::new(format!("{} · {secs}s · {who}{flags}", hms(c.first))).monospace().small().color(theme::TEXT2));
+                if let Some(last) = c.recordings.last() {
+                    if ui.small_button("▶").on_hover_text(last.display().to_string()).clicked() {
+                        play = Some(last.clone());
+                    }
+                }
+            });
+        }
+        if let Some((tg, priority)) = toggle {
+            self.toggle_policy(tg, priority);
+        }
+        if let Some(p) = play {
+            self.play_recording(&p);
+        }
+    }
+
+    /// A pager capcode: its protocol and last messages.
+    fn inspect_capcode(&mut self, ui: &mut egui::Ui, protocol: &str, capcode: u64) {
+        ui.label(egui::RichText::new(format!("Capcode {capcode:09} · {protocol}")).strong());
+        let mut pages: Vec<engine::PageEvent> = self.panes.iter().flat_map(|p| p.source.pages(5000)).filter(|p| p.capcode == capcode).collect();
+        pages.sort_by(|a, b| b.last.cmp(&a.last));
+        if let Some(p) = pages.first() {
+            ui.label(egui::RichText::new(format!("{:.4} MHz", p.center_hz / 1e6)).small().color(theme::MUTED));
+        }
+        if ui.small_button("Show in Pages").clicked() {
+            self.page_filter = format!("{capcode:09}");
+            self.list_tab = ListTab::Pages;
+        }
+        ui.separator();
+        ui.label(egui::RichText::new(format!("{} pages · last:", pages.len())).small().color(theme::MUTED));
+        for p in pages.iter().take(5) {
+            let body = format!("{} · {}{}", hms(p.last), if p.damaged { "[damaged] " } else { "" }, p.text);
+            ui.add(egui::Label::new(egui::RichText::new(&body).monospace().small().color(theme::TEXT2)).truncate()).on_hover_text(&body);
+        }
+    }
+
+    /// Moves a talkgroup in or out of the priority (`true`) or lockout list
+    /// and tells the sources.
+    fn toggle_policy(&mut self, tg: u32, priority: bool) {
+        let fp = &mut self.follow_policy;
+        let (list, other) = if priority { (&mut fp.priority, &mut fp.lockout) } else { (&mut fp.lockout, &mut fp.priority) };
+        if !list.remove(&tg) {
+            list.insert(tg);
+            other.remove(&tg);
+        }
+        self.policy_gen.0 += 1;
+        save_follow_policy(&self.follow_policy);
     }
 
     fn bottom_panel(&mut self, ui: &mut egui::Ui) {
@@ -1688,18 +1895,7 @@ impl App {
         // known, it's that one.
         let systems: Vec<engine::TrunkSystem> = self.panes.iter().flat_map(|p| p.source.systems()).collect();
         let cat = &self.catalog;
-        let system_of = |c: &engine::CallEvent| -> Option<(engine::SystemKey, Option<f64>)> {
-            let s = match &c.system {
-                Some(k) => systems.iter().find(|s| s.key.same(k)),
-                None if systems.len() == 1 => systems.first(),
-                None => None,
-            };
-            match (s, &c.system) {
-                (Some(s), _) => Some((s.key.clone(), s.control_hz.first().copied())),
-                (None, Some(k)) => Some((k.clone(), None)),
-                (None, None) => None,
-            }
-        };
+        let system_of = |c: &engine::CallEvent| system_for(&systems, &c.system);
         let tg_name = |c: &engine::CallEvent| -> String {
             match (c.call.group, system_of(c)) {
                 (true, Some((k, cc))) => cat.group(&k, cc, c.call.target).map(|i| i.name().to_string()).unwrap_or_default(),
@@ -1851,14 +2047,7 @@ impl App {
                 });
             });
         if let Some((tg, priority)) = toggle {
-            let fp = &mut self.follow_policy;
-            let (list, other) = if priority { (&mut fp.priority, &mut fp.lockout) } else { (&mut fp.lockout, &mut fp.priority) };
-            if !list.remove(&tg) {
-                list.insert(tg);
-                other.remove(&tg);
-            }
-            self.policy_gen.0 += 1;
-            save_follow_policy(&self.follow_policy);
+            self.toggle_policy(tg, priority);
         }
         if let Some(sel) = select {
             self.selection = sel;
@@ -2084,30 +2273,7 @@ impl eframe::App for App {
             self.policy_gen = (self.policy_gen.0, self.policy_gen.0, self.panes.len());
         }
         egui::Panel::top("top").exact_size(40.0).frame(theme::bar_frame()).show(ui, |ui| self.top_bar(ui));
-        egui::Panel::bottom("status").exact_size(24.0).frame(theme::bar_frame()).show(ui, |ui| {
-            ui.horizontal_centered(|ui| {
-                let (mut ring_mb, mut gaps) = (0.0, 0);
-                for p in &self.panes {
-                    let st = p.source.stats();
-                    ring_mb += st.ring_capacity as f64 * 4.0 / 1e6;
-                    gaps += st.gaps;
-                }
-                ui.label(
-                    egui::RichText::new(format!("{} sources · rings {:.0} MB · drops {}", self.panes.len(), ring_mb, gaps))
-                        .monospace()
-                        .small()
-                        .color(theme::MUTED),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(format!("{:.0} fps", 1.0 / ctx.input(|i| i.stable_dt).max(1e-3)))
-                            .monospace()
-                            .small()
-                            .color(theme::MUTED),
-                    );
-                });
-            });
-        });
+        egui::Panel::bottom("transport").exact_size(26.0).frame(theme::bar_frame()).show(ui, |ui| self.transport_bar(ui, &ctx));
         egui::Panel::bottom("signals").resizable(true).default_size(210.0).frame(theme::side_frame()).show(ui, |ui| self.bottom_panel(ui));
         egui::Panel::left("side").exact_size(270.0).frame(theme::side_frame()).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| self.side_panel(ui));
@@ -2142,6 +2308,40 @@ fn survey_view() -> SpectrumView {
     v.row_px = Some(3.0);
     v.subtle_boxes = true;
     v
+}
+
+/// SigMF annotations for records on a receiver.
+fn annotations(focus: &Receiver, rs: &[engine::SignalRecord]) -> Vec<engine::sigmf::ExportAnnotation> {
+    rs.iter()
+        .map(|r| {
+            let (s, e) = focus.source.record_sample_range(r);
+            let label = r.display_class().map(|c| c.label.clone()).unwrap_or_else(|| format!("#{}", r.id));
+            engine::sigmf::ExportAnnotation {
+                start_sample: s,
+                end_sample: e,
+                f_lo_hz: r.f_lo_hz,
+                f_hi_hz: r.f_hi_hz,
+                label,
+                comment: format!("SpecTrawl record #{} · SNR {:.0} dB · peak {:.1} dBFS", r.id, r.max_snr_db, r.peak_dbfs),
+            }
+        })
+        .collect()
+}
+
+/// The identified system a call belongs to (its key and control channel,
+/// for name lookups). A call only heard on its voice channel names no
+/// system; with one system known, it's that one.
+fn system_for(systems: &[engine::TrunkSystem], key: &Option<engine::SystemKey>) -> Option<(engine::SystemKey, Option<f64>)> {
+    let s = match key {
+        Some(k) => systems.iter().find(|s| s.key.same(k)),
+        None if systems.len() == 1 => systems.first(),
+        None => None,
+    };
+    match (s, key) {
+        (Some(s), _) => Some((s.key.clone(), s.control_hz.first().copied())),
+        (None, Some(k)) => Some((k.clone(), None)),
+        (None, None) => None,
+    }
 }
 
 fn kv(ui: &mut egui::Ui, k: &str, v: &str) {
