@@ -13,8 +13,18 @@ use spectrum_view::SpectrumView;
 fn main() -> eframe::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     spawn_deadlock_watchdog();
+    // The window opens where it was left (the workspace remembers it);
+    // the first run fills the screen, and the layout built on that first
+    // frame is sized to the monitor.
+    // (Maximizing is asked for on the first frame: a window created
+    // maximized keeps its creation size on Windows.)
+    let mut viewport = egui::ViewportBuilder::default().with_title("SpecTrawl");
+    viewport = match load_workspace().and_then(|w| w.window) {
+        Some(w) => viewport.with_position(w.pos).with_inner_size(w.size),
+        None => viewport.with_inner_size([1600.0, 960.0]),
+    };
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1600.0, 960.0]).with_title("SpecTrawl"),
+        viewport,
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
@@ -163,6 +173,10 @@ struct App {
     dock_requests: Vec<DockReq>,
     popouts: Vec<PopOut>,
     next_popout: u64,
+    /// Where the main window is, kept up to date for the workspace.
+    window: Option<WindowRect>,
+    /// Maximize on the first frame (a first run, or left maximized).
+    maximize: bool,
     /// The named workspace in use, if one was loaded or saved.
     workspace_name: Option<String>,
     workspace_new_name: String,
@@ -291,11 +305,12 @@ enum Tab {
     Trunking,
     Calls,
     Pages,
+    Diagnostics,
 }
 
 impl Tab {
     /// Every pane that isn't a receiver.
-    const PANELS: [Tab; 7] = [Tab::Sources, Tab::Inspector, Tab::Emitters, Tab::Records, Tab::Trunking, Tab::Calls, Tab::Pages];
+    const PANELS: [Tab; 8] = [Tab::Sources, Tab::Inspector, Tab::Emitters, Tab::Records, Tab::Trunking, Tab::Calls, Tab::Pages, Tab::Diagnostics];
 
     fn name(&self) -> String {
         match self {
@@ -307,11 +322,13 @@ impl Tab {
             Tab::Trunking => "Trunking".into(),
             Tab::Calls => "Calls".into(),
             Tab::Pages => "Pages".into(),
+            Tab::Diagnostics => "Diagnostics".into(),
         }
     }
 
+    /// Lives in the tables group of the default layout.
     fn is_table(&self) -> bool {
-        matches!(self, Tab::Emitters | Tab::Records | Tab::Trunking | Tab::Calls | Tab::Pages)
+        matches!(self, Tab::Emitters | Tab::Records | Tab::Trunking | Tab::Calls | Tab::Pages | Tab::Diagnostics)
     }
 }
 
@@ -338,6 +355,15 @@ struct PopOut {
     rect: Option<[f32; 4]>,
 }
 
+/// The main window's outer position and inner size in points, and whether
+/// it was maximized (then `pos`/`size` are what it restores to).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct WindowRect {
+    pos: [f32; 2],
+    size: [f32; 2],
+    maximized: bool,
+}
+
 /// Saved layout: `Documents/SpecTrawl/workspaces/last.json`.
 #[derive(Serialize, Deserialize)]
 struct Workspace {
@@ -345,6 +371,8 @@ struct Workspace {
     tune_target: char,
     #[serde(default)]
     popouts: Vec<PopOut>,
+    #[serde(default)]
+    window: Option<WindowRect>,
 }
 
 /// What the Calls tab shows.
@@ -414,6 +442,7 @@ fn parse_args() -> Args {
                     Some("p25") | Some("trunking") => Some(Tab::Trunking),
                     Some("pages") => Some(Tab::Pages),
                     Some("calls") => Some(Tab::Calls),
+                    Some("diagnostics") | Some("diag") => Some(Tab::Diagnostics),
                     _ => Some(Tab::Emitters),
                 }
             }
@@ -454,6 +483,8 @@ impl App {
             dock_requests: Vec::new(),
             popouts: Vec::new(),
             next_popout: 1,
+            window: None,
+            maximize: true,
             workspace_name: None,
             workspace_new_name: String::new(),
             calls_view: CallsView::Calls,
@@ -524,6 +555,8 @@ impl App {
                 app.tune_target = t;
             }
             app.dock = Some(w.main);
+            app.window = w.window;
+            app.maximize = w.window.is_none_or(|r| r.maximized);
             app.popouts = w.popouts.into_iter().filter(|p| p.dock.iter_all_tabs().next().is_some()).collect();
             app.next_popout = app.popouts.iter().map(|p| p.id + 1).max().unwrap_or(1);
             let open: Vec<ReceiverId> = app.panes.iter().map(|p| p.id).collect();
@@ -541,7 +574,27 @@ impl App {
             main: main.clone(),
             tune_target: self.tune_target.0,
             popouts: self.popouts.iter().map(|p| PopOut { id: p.id, title: p.title.clone(), dock: p.dock.clone(), rect: p.rect }).collect(),
+            window: self.window,
         })
+    }
+
+    /// Notes the main window's geometry (skipped while minimized, when
+    /// Windows reports it off-screen).
+    fn track_window(&mut self, ctx: &egui::Context) {
+        let (outer, inner, maximized, minimized) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.outer_rect, v.inner_rect, v.maximized.unwrap_or(false), v.minimized.unwrap_or(false))
+        });
+        if minimized {
+            return;
+        }
+        let Some((outer, inner)) = outer.zip(inner) else { return };
+        match (&mut self.window, maximized) {
+            (Some(w), true) => w.maximized = true,
+            // A maximized window's own rect hangs off the screen edge; what's
+            // noted is where it would restore to.
+            (w, max) => *w = Some(WindowRect { pos: [outer.min.x.max(0.0), outer.min.y.max(0.0)], size: [inner.width(), inner.height()], maximized: max }),
+        }
     }
 
     /// Writes the layout as `last.json` (what the next start loads).
@@ -567,7 +620,7 @@ impl App {
         let ids: Vec<ReceiverId> = self.panes.iter().map(|p| p.id).collect();
         let w = match read_workspace(&workspace_dir().join(format!("{name}.json"))) {
             Some(w) => w,
-            None if PRESETS.contains(&name) => Workspace { main: preset_dock(name, width, &ids), tune_target: self.tune_target.0, popouts: Vec::new() },
+            None if PRESETS.contains(&name) => Workspace { main: preset_dock(name, width, &ids), tune_target: self.tune_target.0, popouts: Vec::new(), window: self.window },
             None => return,
         };
         self.dock = Some(w.main);
@@ -2857,6 +2910,166 @@ impl App {
         }
     }
 
+
+    /// Every receiver's statistics in full, then audio and the UI itself.
+    fn diagnostics_panel(&mut self, ui: &mut egui::Ui) {
+        fn section(ui: &mut egui::Ui, title: &str) {
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(title).small().strong().color(theme::MUTED));
+        }
+        let fps = 1.0 / ui.ctx().input(|i| i.stable_dt).max(1e-3);
+        let (inner, monitor, ppp) = ui.ctx().input(|i| (i.viewport().inner_rect, i.viewport().monitor_size, i.pixels_per_point()));
+        egui::ScrollArea::vertical().id_salt("diagnostics").show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.columns(2, |cols| {
+                for (k, p) in self.panes.iter().enumerate() {
+                    let ui = &mut cols[k % 2];
+                    let id = p.id;
+                    let info = p.source.info();
+                    let snap = p.source.snapshot();
+                    let st = p.source.stats();
+                    let cfg = p.source.config();
+                    let load = p.source.classifier_load();
+                    let rate = snap.sample_rate;
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let (bg, fg) = if id.is_sweep() {
+                            (egui::Color32::from_rgb(0x0f, 0x2b, 0x2b), egui::Color32::from_rgb(0x7f, 0xe9, 0xe5))
+                        } else {
+                            (theme::CHIP_FOCUS_BG, theme::CHIP_FOCUS_FG)
+                        };
+                        theme::chip(ui, &id.chip(), bg, fg);
+                        ui.label(egui::RichText::new(&info.label).strong());
+                        ui.label(egui::RichText::new(format!("{} · {}", info.backend, info.serial)).small().color(theme::MUTED));
+                    });
+                    section(ui, "DEVICE");
+                    kv(ui, "Centre", &format!("{:.4} MHz", snap.center_hz / 1e6));
+                    kv(ui, "Rate", &format!("{:.2} MS/s · {}-bit", rate / 1e6, snap.caps.adc_bits));
+                    kv(ui, "Samples", &format!("{:.1} G · {:.0} s", st.total_samples as f64 / 1e9, st.total_samples as f64 / rate));
+                    kv(ui, "Overloads", &st.overloads.to_string());
+                    if st.device_lost {
+                        ui.label(egui::RichText::new("Device lost: no samples are arriving").color(theme::ALERT));
+                    }
+                    section(ui, "STREAM");
+                    kv(ui, "Gaps", &format!("{} · {} samples lost", st.gaps, st.lost_samples));
+                    kv(
+                        ui,
+                        "Look-back ring",
+                        &format!("{:.1} of {:.1} s · {:.0} MB", st.ring_samples as f64 / rate, st.ring_capacity as f64 / rate, st.ring_capacity as f64 * 4.0 / 1e6),
+                    );
+                    section(ui, "PROCESSING");
+                    kv(ui, "FFT", &format!("{} pt · {:.0}/s · {:.0} Hz/bin", cfg.fft_size, st.ffts_per_sec, rate / cfg.fft_size as f64));
+                    kv(ui, "Classifier", &format!("{:.1} jobs/s · {:.0} ms · {:.0}% busy", load.jobs_per_sec, load.avg_job_ms, load.busy * 100.0));
+                    let monitors = p.source.monitors();
+                    if monitors.is_empty() {
+                        kv(ui, "Monitors", "none");
+                    } else {
+                        let names: Vec<String> = monitors.iter().map(|m| m.label.clone()).collect();
+                        kv(ui, "Monitors", &names.join(" · "));
+                    }
+                    if let Some(s) = p.source.sweep_status() {
+                        section(ui, "SWEEP");
+                        kv(ui, "Range", &format!("{:.1} – {:.1} MHz", s.start_hz / 1e6, s.stop_hz() / 1e6));
+                        kv(ui, "Hops", &format!("{} × {:.2} MHz · at {}", s.hops, s.hop_hz / 1e6, s.current_hop));
+                        kv(ui, "Rate", &format!("{:.1} hops/s · {:.0} MHz/s", s.hops_per_sec, s.mhz_per_sec()));
+                        kv(ui, "Revisit", &format!("{:.2} s", s.last_pass_s));
+                        kv(ui, "Re-measured", &format!("{} settle · {} gap", s.settle_retries, s.redone_hops));
+                        if s.tuner_lock {
+                            kv(ui, "Tuner lock", &format!("reported · {} waits", s.lock_waits));
+                        } else {
+                            kv(ui, "Tuner lock", &format!("not reported · {} slow hops", s.slow_hops));
+                        }
+                        // Age of each hop's last measurement: bright is fresh,
+                        // fading to the floor over one pass; dark is unmeasured.
+                        let (resp, painter) = ui.allocate_painter(egui::vec2(ui.available_width(), 12.0), egui::Sense::hover());
+                        let r = resp.rect;
+                        let n = s.hop_times.len().max(1) as f32;
+                        let w = r.width() / n;
+                        let pass = s.last_pass_s.max(0.1) as f32;
+                        for (i, t) in s.hop_times.iter().enumerate() {
+                            let col = match t {
+                                Some(t) => {
+                                    let a = (t.elapsed().as_secs_f32() / pass).clamp(0.0, 1.0);
+                                    theme::ACCENT.lerp_to_gamma(theme::MUTED, a)
+                                }
+                                None => egui::Color32::from_gray(40),
+                            };
+                            let x0 = r.min.x + w * i as f32;
+                            painter.rect_filled(egui::Rect::from_min_max(egui::pos2(x0, r.min.y), egui::pos2(x0 + w - 0.5, r.max.y)), 0.0, col);
+                        }
+                        if let Some(pos) = resp.hover_pos() {
+                            let i = (((pos.x - r.min.x) / w) as usize).min(s.hop_times.len().saturating_sub(1));
+                            let age = s.hop_times.get(i).copied().flatten().map_or("not yet".to_string(), |t| format!("{:.2} s ago", t.elapsed().as_secs_f64()));
+                            resp.on_hover_text(format!("hop {i} · {:.2} MHz · {age}", (s.start_hz + s.hop_hz * (i as f64 + 0.5)) / 1e6));
+                        }
+                    }
+                    ui.add_space(6.0);
+                }
+            });
+            ui.separator();
+            ui.columns(2, |cols| {
+                let ui = &mut cols[0];
+                section(ui, "AUDIO");
+                match (&self.audio_out, &self.audio_err) {
+                    (Some(_), _) => kv(ui, "Output", &format!("open · volume {:.0}%", self.volume * 100.0)),
+                    (None, Some(e)) => kv(ui, "Output", e),
+                    (None, None) => kv(ui, "Output", "not opened yet"),
+                }
+                let mut any = false;
+                for p in &self.panes {
+                    if let Some(l) = p.source.listening() {
+                        any = true;
+                        let (depth, starved) = p.source.audio().depth();
+                        kv(
+                            ui,
+                            &format!("Listening {}", p.id),
+                            &format!("{:.4} MHz · {}{}{}", l.center_hz / 1e6, l.mode.name(), if l.follow { " · follow" } else { "" }, if l.tdma { " · TDMA" } else { "" }),
+                        );
+                        kv(ui, "Queue", &format!("{:.2} s{}", depth, if starved { " · gathering" } else { "" }));
+                        let v = p.source.voice();
+                        if v.active || v.center_hz.is_some() {
+                            let mut parts = vec![if v.active { "voice" } else { "idle" }.to_string()];
+                            if let Some(hz) = v.center_hz {
+                                parts.push(format!("{:.4} MHz", hz / 1e6));
+                            }
+                            if let Some(s) = v.slot {
+                                parts.push(format!("slot {s}"));
+                            }
+                            if let Some(e) = v.encrypted {
+                                parts.push(e.to_string());
+                            }
+                            if v.recording {
+                                parts.push("rec".into());
+                            }
+                            kv(ui, "Digital", &parts.join(" · "));
+                        }
+                    }
+                }
+                if let Some(pb) = &self.playback {
+                    any = true;
+                    let (depth, _) = pb.queue.depth();
+                    kv(ui, "Playing", &format!("{} · {:.1} s · queue {:.2} s", pb.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(), pb.seconds, depth));
+                }
+                if !any {
+                    kv(ui, "Listening", "nothing");
+                }
+                let ui = &mut cols[1];
+                section(ui, "UI");
+                kv(ui, "Frame", &format!("{fps:.0} fps"));
+                if let Some(r) = inner {
+                    kv(ui, "Window", &format!("{:.0} × {:.0} pt · {ppp:.2} px/pt", r.width(), r.height()));
+                }
+                if let Some(m) = monitor {
+                    kv(ui, "Monitor", &format!("{:.0} × {:.0} pt", m.x, m.y));
+                }
+                let tabs = self.dock.as_ref().map_or(0, |d| d.iter_all_tabs().count()) + self.popouts.iter().map(|p| p.dock.iter_all_tabs().count()).sum::<usize>();
+                kv(ui, "Layout", &format!("{} tabs · {} pop-out windows · {}", tabs, self.popouts.len(), self.workspace_name.as_deref().unwrap_or("unsaved")));
+                let names = if self.catalog.sources.is_empty() { "none".to_string() } else { self.catalog.sources.join(" · ") };
+                kv(ui, "Names", &names);
+            });
+        });
+    }
+
     /// Newest records from all panes, most recent first. Virtualised.
     fn signal_list(&mut self, ui: &mut egui::Ui) {
         let mut rows: Vec<(ReceiverId, engine::SignalRecord)> = Vec::new();
@@ -3006,9 +3219,18 @@ impl eframe::App for App {
         egui::Panel::left("rail").exact_size(36.0).frame(theme::rail_frame()).show(ui, |ui| self.rail(ui, width));
         self.palette(&ctx, width);
         self.frame_prep();
+        if std::mem::take(&mut self.maximize) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        } else {
+            self.track_window(&ctx);
+        }
         if self.dock.is_none() {
+            // No saved layout: build one for the screen this window is on
+            // (the window is maximized on a first run; the monitor's width
+            // in points is what it will have once it has settled).
             let ids: Vec<ReceiverId> = self.panes.iter().map(|p| p.id).collect();
-            self.dock = Some(default_dock(width, &ids));
+            let screen = ctx.input(|i| i.viewport().monitor_size).map_or(width, |m| m.x);
+            self.dock = Some(default_dock(screen, &ids));
             if let Some(t) = self.start_tab.take() {
                 self.dock_requests.push(DockReq::Show(t));
             }
@@ -3120,6 +3342,7 @@ impl egui_dock::TabViewer for App {
             Tab::Trunking => self.trunking_panel(ui),
             Tab::Calls => self.calls_panel(ui),
             Tab::Pages => self.pages_panel(ui),
+            Tab::Diagnostics => self.diagnostics_panel(ui),
         }
     }
 
@@ -3155,9 +3378,9 @@ impl egui_dock::TabViewer for App {
     }
 }
 
-/// The default arrangement for a window `width` px wide: Sources over the
-/// inspector at the left, receivers stacked in the middle, the tables
-/// below (beside, on a very wide window).
+/// The default arrangement for a window `width` points wide: Sources over
+/// the inspector at the left, receivers stacked in the middle, the tables
+/// below (beside, from 2560 points: 1440p, or 4K at 150%).
 fn default_dock(width: f32, receivers: &[ReceiverId]) -> DockState<Tab> {
     let mut rx: Vec<ReceiverId> = receivers.to_vec();
     rx.sort_by_key(|r| (!r.is_sweep(), *r));
@@ -3169,7 +3392,7 @@ fn default_dock(width: f32, receivers: &[ReceiverId]) -> DockState<Tab> {
     let [center, left] = tree.split_left(NodeIndex::root(), if width < 1600.0 { 0.22 } else { 0.16 }, vec![Tab::Sources]);
     tree.split_below(left, 0.38, vec![Tab::Inspector]);
     let tables: Vec<Tab> = Tab::PANELS.iter().filter(|t| t.is_table()).cloned().collect();
-    let [mut node, _] = if width > 2560.0 { tree.split_right(center, 0.62, tables) } else { tree.split_below(center, 0.64, tables) };
+    let [mut node, _] = if width >= 2560.0 { tree.split_right(center, 0.62, tables) } else { tree.split_below(center, 0.64, tables) };
     // Receivers stack: the sweeper keeps 38%, live receivers share equally.
     for (k, id) in rx.iter().enumerate().skip(1) {
         let remaining = (rx.len() - k) as f32;

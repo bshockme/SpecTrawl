@@ -125,6 +125,12 @@ impl AudioQueue {
     pub fn clear(&self) {
         self.samples.lock().clear();
     }
+
+    /// Seconds of audio waiting, and whether playback is paused to gather
+    /// the jitter buffer.
+    pub fn depth(&self) -> (f64, bool) {
+        (self.samples.lock().len() as f64 / AUDIO_RATE, self.starved.load(Ordering::Relaxed))
+    }
 }
 
 /// Follow: a granted call stays a candidate this long after its last

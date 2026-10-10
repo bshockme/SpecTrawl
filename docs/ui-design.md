@@ -1,6 +1,6 @@
 # SpecTrawl UI: receivers, docking, inspector
 
-Status: design, 2026-10-10; all of §8 is implemented (commits 1496c78 onward); the Diagnostics tab and the live-reflow breakpoints are not (see §4 and §9). Supersedes the pane list in `DESIGN.md` §9. The
+Status: design, 2026-10-10; all of §8 is implemented (commits 1496c78 onward), plus the Diagnostics tab; there is no live reflow at width breakpoints, by decision (see §4). Supersedes the pane list in `DESIGN.md` §9. The
 current UI (fixed left column of cards, two spectrum views, a tab strip at
 the bottom) is the starting point; this is where it goes and in what order.
 
@@ -217,7 +217,9 @@ target. One audio output; starting listen on B stops A.
 - **Pages**: as now; capcode cells select; `Import names ▾` shared with
   Trunking for capcode aliases later.
 - **Diagnostics**: per-receiver statistics in full (the former card
-  stats), sweep hop timing, classifier load, audio queue state.
+  stats), sweep hop timing (a strip showing each hop's age), classifier
+  load, audio queue state, and the window/layout itself. `--tab
+  diagnostics` opens it in front.
 
 ### 3.5 Icon rail
 
@@ -240,14 +242,17 @@ Not egui_tiles: no floating windows, so pop-out would be viewport-only.
   the header menu); table tabs may, and come back from the rail's
   Workspaces flyout or `View ▾`.
 - `Tab::Receiver(id)` for an unassigned slot draws the device picker.
-- Default layouts by main-window width, chosen on first launch and on
-  **Reset layout** only (no live reflow; arrangements the user made are
-  never rebuilt):
-  - **< 1600**: receivers stacked; tables below; inspector as a flyout
-    from the rail.
-  - **1600–2560**: receivers stacked centre; inspector docked left;
+- The first run opens the window maximized and builds the layout for the
+  monitor's width in points (`ViewportInfo::monitor_size`), so a 1080p
+  and a 4K screen start differently. After that the window's position,
+  size and maximized state are part of the workspace and come back on
+  the next start. **Reset layout** and the presets rebuild for the
+  window's current width. There is no live reflow: arrangements the
+  user made are never rebuilt because the window changed size.
+  - **< 1600**: receivers stacked; tables below; a wider left column.
+  - **1600–2559**: receivers stacked centre; inspector docked left;
     tables below.
-  - **> 2560**: receivers in two columns; tables docked right of the
+  - **≥ 2560** (1440p, or 4K at 150%): tables docked right of the
     receivers; inspector left.
 
 ## 5. Pop-out windows
