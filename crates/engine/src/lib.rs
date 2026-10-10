@@ -31,7 +31,8 @@ pub use detect::p25::SystemInfo as P25System;
 pub use emitters::Emitter;
 pub use listen::{AudioQueue, FollowPolicy, ListenSpec, Playback, VoiceStatus, recordings_dir};
 pub use calls::CallEvent;
-pub use monitor::{GrantEvent, MonitorInfo, PageEvent};
+pub use detect::trunk::{SystemKey, SystemKind};
+pub use monitor::{GrantEvent, MonitorInfo, PageEvent, TrunkSystem};
 pub use occupancy::KnownOccupant;
 pub use ring::IqRing;
 pub use sweep::{SweepPlan, SweepStatus};
@@ -445,6 +446,11 @@ impl Source {
         let mut v: Vec<(u16, P25System)> = self.shared.p25.lock().systems.iter().map(|(k, v)| (*k, v.clone())).collect();
         v.sort_by_key(|(k, _)| *k);
         v
+    }
+
+    /// Every trunked system the monitors have identified, any protocol.
+    pub fn systems(&self) -> Vec<TrunkSystem> {
+        self.shared.p25.lock().systems()
     }
 
     /// The newest `n` talkgroup grants, newest first.

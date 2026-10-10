@@ -605,11 +605,7 @@ impl SpectrumView {
         }
         let click = resp.interact_pointer_pos().filter(|_| resp.clicked());
         let record = click.and(hovered);
-        ShowResult {
-            freq_hz: click.map(|p| f0 + ((p.x - full.left()) / full.width()) as f64 * span),
-            record,
-            emitter: record.and_then(|id| records.iter().find(|r| r.id == id)).and_then(|r| r.emitter),
-        }
+        ShowResult { freq_hz: click.map(|p| f0 + ((p.x - full.left()) / full.width()) as f64 * span), record }
     }
 }
 
@@ -618,7 +614,6 @@ impl SpectrumView {
 pub struct ShowResult {
     pub freq_hz: Option<f64>,
     pub record: Option<u64>,
-    pub emitter: Option<u64>,
 }
 
 const HEADER_H: f32 = 26.0;

@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use detect::p25::{self, SystemInfo};
+use detect::trunk::{SystemKey, SystemKind};
 use detect::{Ddc, decode, flex, pocsag};
 use sdr_core::Complex32;
 
@@ -120,6 +121,48 @@ pub struct MonitorInfo {
     pub messages: u64,
 }
 
+/// One trunked system as the UI sees it, whatever its protocol.
+#[derive(Debug, Clone)]
+pub struct TrunkSystem {
+    pub key: SystemKey,
+    pub kind: SystemKind,
+    /// ("NAC", "0x2A5"), ("WACN", "0xBEE00"), ... in display order.
+    pub identity: Vec<(&'static str, String)>,
+    /// P25: (RFSS, site).
+    pub site: Option<(u8, u8)>,
+    /// Control channel(s); a Cap+ rest channel moves, so this can grow.
+    pub control_hz: Vec<f64>,
+    /// Neighbouring sites: (label, control channel).
+    pub adjacent: Vec<(String, Option<f64>)>,
+    /// Grants seen on it.
+    pub grants: usize,
+    pub last_activity: Option<SystemTime>,
+}
+
+impl TrunkSystem {
+    fn p25(nac: u16, s: &SystemInfo, grants: &VecDeque<GrantEvent>) -> Self {
+        let hex = |v: Option<u32>, w: usize| v.map(|v| format!("0x{v:0w$X}")).unwrap_or("?".into());
+        let num = |v: Option<u8>| v.map(|v| v.to_string()).unwrap_or("?".into());
+        let mine: Vec<&GrantEvent> = grants.iter().filter(|g| g.nac == nac).collect();
+        Self {
+            key: SystemKey::P25 { wacn: s.wacn, system: s.system, nac },
+            kind: SystemKind::P25,
+            identity: vec![
+                ("NAC", format!("0x{nac:03X}")),
+                ("WACN", hex(s.wacn, 5)),
+                ("SYS", hex(s.system.map(u32::from), 3)),
+                ("RFSS", num(s.rfss)),
+                ("SITE", num(s.site)),
+            ],
+            site: s.rfss.zip(s.site),
+            control_hz: s.control_hz.into_iter().collect(),
+            adjacent: s.adjacent.iter().map(|((_, rfss, site), ch)| (format!("{rfss}-{site}"), s.freq(*ch))).collect(),
+            grants: mine.len(),
+            last_activity: mine.iter().map(|g| g.last).max(),
+        }
+    }
+}
+
 /// What the monitors have learned on one source.
 #[derive(Default)]
 pub(crate) struct P25Book {
@@ -129,6 +172,12 @@ pub(crate) struct P25Book {
 }
 
 impl P25Book {
+    pub fn systems(&self) -> Vec<TrunkSystem> {
+        let mut v: Vec<TrunkSystem> = self.systems.iter().map(|(nac, s)| TrunkSystem::p25(*nac, s, &self.grants)).collect();
+        v.sort_by_key(|s| s.key.short());
+        v
+    }
+
     /// Folds messages in; returns the grants among them.
     fn record(&mut self, nac: u16, msgs: &[p25::Message], now: SystemTime) -> Vec<GrantEvent> {
         let sys = self.systems.entry(nac).or_insert_with(|| SystemInfo { nac: Some(nac), ..Default::default() });
@@ -287,6 +336,7 @@ pub(crate) fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>, rate: f64) {
                     let now = SystemTime::now();
                     let mut book = shared.p25.lock();
                     let grants = book.record(nac, &msgs, now);
+                    let key = book.systems.get(&nac).map(|s| SystemKey::P25 { wacn: s.wacn, system: s.system, nac });
                     let mut calls = shared.calls.lock();
                     for g in grants {
                         let call = decode::Call {
@@ -297,7 +347,7 @@ pub(crate) fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>, rate: f64) {
                             emergency: false,
                         };
                         let label = if g.slot.is_some() { format!("P25 Phase 2 NAC 0x{nac:03X}") } else { format!("P25 NAC 0x{nac:03X}") };
-                        calls.granted(g.freq_hz, g.slot, &label, call, now);
+                        calls.granted(g.freq_hz, g.slot, &label, key.clone(), call, now);
                     }
                     drop(calls);
                     // The system identity seeds Phase 2 descrambling.

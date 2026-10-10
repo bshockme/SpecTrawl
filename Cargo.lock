@@ -401,6 +401,7 @@ dependencies = [
 name = "catalog"
 version = "0.1.0"
 dependencies = [
+ "detect",
  "serde",
  "serde_json",
 ]

@@ -229,6 +229,8 @@ First protocol sets:
 
 Built with egui/eframe + wgpu, using an egui_dock layout. The bar is SDR++-level smoothness.
 
+The pane structure, inspector, transport bar, docking, pop-out windows and workspaces are specified in `docs/ui-design.md` (2026-10-10), which supersedes the pane list below.
+
 **Panes:**
 - **Spectrum + waterfall**, the main view, with signal records drawn as labelled boxes
 - **Signal list**: filter, sort, search

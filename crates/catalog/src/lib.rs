@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use detect::trunk::SystemKey;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -355,6 +356,41 @@ impl Catalog {
 
     pub fn p25_network(&self, wacn: u32, system: u16) -> Option<&str> {
         self.networks.get(&key(&["P25", &p25_net(wacn, system)])).map(String::as_str)
+    }
+
+    // ------------------------------------------------- lookups by system ----
+
+    /// A talkgroup's name on any trunked system. `control_hz` (the system's
+    /// control channel) links it to a trunk-recorder system. DMR and NXDN
+    /// DSD+ entries aren't matched yet (their network-id format needs
+    /// checking against a real DSDPlus.groups), so those fall through to
+    /// trunk-recorder and loose CSV imports.
+    pub fn group(&self, sys: &SystemKey, control_hz: Option<f64>, tg: u32) -> Option<&GroupInfo> {
+        match sys {
+            SystemKey::P25 { wacn, system, .. } => self.p25_group(*wacn, *system, control_hz, tg as u16),
+            _ => self.tr_for_control(control_hz).and_then(|t| t.groups.get(&tg)).or_else(|| self.loose_groups.get(&tg)),
+        }
+    }
+
+    pub fn radio(&self, sys: &SystemKey, control_hz: Option<f64>, radio: u32) -> Option<&str> {
+        match sys {
+            SystemKey::P25 { wacn, system, .. } => self.p25_radio(*wacn, *system, control_hz, radio),
+            _ => self.tr_for_control(control_hz).and_then(|t| t.units.get(&radio)).or_else(|| self.loose_units.get(&radio)).map(String::as_str),
+        }
+    }
+
+    pub fn site(&self, sys: &SystemKey, rfss: u8, site: u8) -> Option<&str> {
+        match sys {
+            SystemKey::P25 { wacn: Some(w), system: Some(y), .. } => self.p25_site(*w, *y, rfss, site),
+            _ => None,
+        }
+    }
+
+    pub fn network(&self, sys: &SystemKey) -> Option<&str> {
+        match sys {
+            SystemKey::P25 { wacn: Some(w), system: Some(y), .. } => self.p25_network(*w, *y),
+            _ => None,
+        }
     }
 
     pub fn is_empty(&self) -> bool {

@@ -24,6 +24,7 @@ pub mod p25p2;
 pub mod pocsag;
 pub mod spectral;
 pub mod sync;
+pub mod trunk;
 
 use num_complex::Complex32;
 
