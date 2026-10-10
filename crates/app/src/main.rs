@@ -169,6 +169,13 @@ struct App {
     calls_view: CallsView,
     /// Talkgroup typed into the follow-list flyout.
     follow_add: u32,
+    /// The command palette (Ctrl+K).
+    palette_open: bool,
+    palette_text: String,
+    palette_sel: usize,
+    palette_focus: bool,
+    /// Volume before muting (M), to come back to.
+    muted_volume: f32,
     /// Which pop-out window is being drawn (None: the main window), for
     /// the tab context menu.
     drawing: Option<u64>,
@@ -351,6 +358,26 @@ enum CallsView {
 /// Built-in layouts, listed with the saved workspaces.
 const PRESETS: [&str; 3] = ["survey", "trunking", "paging"];
 
+/// What a command-palette entry does.
+enum Cmd {
+    Tune(ReceiverId, f64),
+    Open(DeviceInfo, ReceiverId),
+    Listen(ReceiverId, engine::ListenSpec),
+    Follow(ReceiverId),
+    Stop,
+    Mute,
+    Pause,
+    Squelch,
+    Target(ReceiverId),
+    ExportEmitters,
+    Workspace(String),
+    Show(Tab),
+    PopOut(Tab),
+    Priority(u32),
+    Lockout(u32),
+    Reset,
+}
+
 /// Per-frame facts the receiver panes share (live spans for the survey's
 /// brackets, the next tune target).
 #[derive(Default)]
@@ -431,6 +458,11 @@ impl App {
             workspace_new_name: String::new(),
             calls_view: CallsView::Calls,
             follow_add: 0,
+            palette_open: false,
+            palette_text: String::new(),
+            palette_sel: 0,
+            palette_focus: false,
+            muted_volume: 0.0,
             drawing: None,
             popout_names: Vec::new(),
             start_tab: args.tab.clone(),
@@ -679,6 +711,203 @@ impl App {
         }
     }
 
+    fn toggle_mute(&mut self) {
+        if self.volume > 0.0 {
+            self.muted_volume = self.volume;
+            self.volume = 0.0;
+        } else {
+            self.volume = if self.muted_volume > 0.0 { self.muted_volume } else { 0.6 };
+        }
+        if let Some(a) = &self.audio_out {
+            a.set_volume(self.volume);
+        }
+    }
+
+    /// The commands matching `q`: fixed ones whose label or keywords hold
+    /// every word of it, plus those parsed from a number in it (a frequency
+    /// or a talkgroup) and a receiver letter.
+    fn palette_commands(&self, q: &str) -> Vec<(String, Cmd)> {
+        let ql = q.to_lowercase();
+        let words: Vec<&str> = ql.split_whitespace().collect();
+        let num = words.iter().find_map(|w| w.parse::<f64>().ok());
+        let letter = words
+            .iter()
+            .filter(|w| w.len() == 1)
+            .filter_map(|w| w.chars().next())
+            .filter(|c| c.is_ascii_alphabetic())
+            .map(|c| ReceiverId(c.to_ascii_uppercase()))
+            .find(|r| self.receiver(*r).is_some());
+        let work = letter.filter(|r| !r.is_sweep()).unwrap_or(self.working_id());
+        let live = self.live_ids();
+        let mut v: Vec<(String, &str, Cmd)> = Vec::new();
+        if let Some(n) = num {
+            if (24.0..=1800.0).contains(&n) && self.receiver(work).is_some() {
+                v.push((format!("Tune {work} to {n:.4} MHz"), "tune", Cmd::Tune(work, n)));
+                let spec = self.spec_for(n * 1e6, "", 0.0);
+                v.push((format!("Listen on {work} at {n:.4} MHz ({})", spec.mode.name()), "listen", Cmd::Listen(work, spec)));
+            }
+            if n.fract() == 0.0 && (0.0..=65535.0).contains(&n) {
+                let tg = n as u32;
+                v.push((format!("Priority: TG {tg}"), "priority star follow", Cmd::Priority(tg)));
+                v.push((format!("Lock out: TG {tg}"), "lockout lock out", Cmd::Lockout(tg)));
+            }
+        }
+        for id in &live {
+            v.push((format!("Follow calls on {id}"), "follow calls p25 trunk", Cmd::Follow(*id)));
+            v.push((format!("Tune target: {id}"), "target click tunes", Cmd::Target(*id)));
+        }
+        v.push(("Stop listening".into(), "stop audio", Cmd::Stop));
+        v.push((if self.volume > 0.0 { "Mute" } else { "Unmute" }.into(), "mute unmute volume", Cmd::Mute));
+        v.push((if self.paused { "Resume" } else { "Pause" }.into(), "pause resume freeze", Cmd::Pause));
+        v.push((format!("Squelch known: {}", if self.squelch { "off" } else { "on" }), "squelch known fm tv lte", Cmd::Squelch));
+        v.push(("Export emitters and records (CSV)".into(), "export csv emitters records", Cmd::ExportEmitters));
+        v.push(("Reset layout".into(), "reset layout", Cmd::Reset));
+        for t in Tab::PANELS {
+            v.push((format!("Show {}", t.name()), "show panel tab", Cmd::Show(t.clone())));
+            v.push((format!("Pop out {}", t.name()), "pop out window", Cmd::PopOut(t)));
+        }
+        for id in self.panes.iter().map(|p| p.id) {
+            v.push((format!("Pop out receiver {id}"), "pop out window receiver", Cmd::PopOut(Tab::Receiver(id))));
+        }
+        let next = self.next_live_id();
+        for d in self.devices.iter().filter(|d| !self.panes.iter().any(|p| same_device(p.source.info(), d))) {
+            v.push((format!("Open {} ({}) as {next}", d.label, d.serial), "open device focus live", Cmd::Open(d.clone(), next)));
+            v.push((format!("Open {} ({}) as survey", d.label, d.serial), "open device survey sweep", Cmd::Open(d.clone(), ReceiverId::SWEEP)));
+        }
+        let mut names = list_workspaces();
+        for p in PRESETS {
+            if !names.iter().any(|n| n == p) {
+                names.push(p.to_string());
+            }
+        }
+        for n in names {
+            v.push((format!("Workspace: {n}"), "workspace layout load", Cmd::Workspace(n)));
+        }
+        let filter: Vec<&str> = words.iter().copied().filter(|w| w.parse::<f64>().is_err() && letter.is_none_or(|l| *w != l.0.to_ascii_lowercase().to_string())).collect();
+        v.into_iter()
+            .filter(|(label, keys, _)| {
+                let hay = format!("{} {keys}", label.to_lowercase());
+                filter.iter().all(|w| hay.contains(w))
+            })
+            .map(|(label, _, c)| (label, c))
+            .collect()
+    }
+
+    fn run_command(&mut self, cmd: Cmd, width: f32) {
+        match cmd {
+            Cmd::Tune(rx, mhz) => self.retune(rx, mhz),
+            Cmd::Open(d, id) => self.open_as(&d, id),
+            Cmd::Listen(rx, spec) => self.start_listen(rx, spec),
+            Cmd::Follow(rx) => {
+                let hz = self.receiver(rx).and_then(|p| p.view.span()).map(|(lo, hi)| (lo + hi) / 2.0).unwrap_or(self.listen_mhz * 1e6);
+                self.start_listen(rx, engine::ListenSpec { center_hz: hz, mode: engine::DemodMode::P25, follow: true, tdma: false, slot: None });
+            }
+            Cmd::Stop => {
+                if let Some(pb) = &self.playback {
+                    pb.stop();
+                } else {
+                    self.stop_listen();
+                }
+            }
+            Cmd::Mute => self.toggle_mute(),
+            Cmd::Pause => self.paused = !self.paused,
+            Cmd::Squelch => self.squelch = !self.squelch,
+            Cmd::Target(id) => self.tune_target = id,
+            Cmd::ExportEmitters => {
+                self.export_msg = Some(match export_emitters(&self.panes) {
+                    Ok((path, e, r)) => format!("Exported {e} emitters, {r} records to {}", path.display()),
+                    Err(err) => format!("Emitter export failed: {err}"),
+                });
+            }
+            Cmd::Workspace(n) => self.load_workspace_named(&n, width),
+            Cmd::Show(t) => self.dock_requests.push(DockReq::Show(t)),
+            Cmd::PopOut(t) => self.dock_requests.push(DockReq::PopOut(t)),
+            Cmd::Priority(tg) => {
+                if !self.follow_policy.priority.contains(&tg) {
+                    self.toggle_policy(tg, true);
+                }
+            }
+            Cmd::Lockout(tg) => {
+                if !self.follow_policy.lockout.contains(&tg) {
+                    self.toggle_policy(tg, false);
+                }
+            }
+            Cmd::Reset => {
+                self.dock_requests.push(DockReq::Reset);
+                self.workspace_name = None;
+            }
+        }
+    }
+
+    /// The command palette: a text box and the commands it matches; Enter
+    /// runs the highlighted one, Esc closes.
+    fn palette(&mut self, ctx: &egui::Context, width: f32) {
+        if !self.palette_open {
+            return;
+        }
+        let cmds = self.palette_commands(&self.palette_text.clone());
+        let n = cmds.len().min(12);
+        let (up, down, enter, esc) = ctx.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+        if up {
+            self.palette_sel = self.palette_sel.saturating_sub(1);
+        }
+        if down && n > 0 {
+            self.palette_sel = (self.palette_sel + 1).min(n - 1);
+        }
+        let mut run: Option<usize> = None;
+        let mut close = esc;
+        egui::Window::new("palette")
+            .title_bar(false)
+            .resizable(false)
+            .collapsible(false)
+            .fixed_size([600.0, 0.0])
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 72.0])
+            .show(ctx, |ui| {
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.palette_text)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("tune a 772.8 · listen 155.475 · follow a · priority 1042 · workspace trunking · show pages"),
+                );
+                if self.palette_focus {
+                    r.request_focus();
+                    self.palette_focus = false;
+                }
+                if r.changed() {
+                    self.palette_sel = 0;
+                }
+                ui.separator();
+                if cmds.is_empty() {
+                    ui.label(egui::RichText::new("No matching command").small().color(theme::MUTED));
+                }
+                for (k, (label, _)) in cmds.iter().take(12).enumerate() {
+                    if ui.selectable_label(k == self.palette_sel, label).clicked() {
+                        run = Some(k);
+                    }
+                }
+                if enter && n > 0 {
+                    run = Some(self.palette_sel.min(n - 1));
+                }
+            });
+        if let Some(k) = run {
+            if let Some((_, cmd)) = cmds.into_iter().nth(k) {
+                self.run_command(cmd, width);
+            }
+            close = true;
+        }
+        if close {
+            self.palette_open = false;
+            self.palette_text.clear();
+            self.palette_sel = 0;
+        }
+    }
+
     /// The icon rail: devices, names, follow lists, workspaces, settings.
     fn rail(&mut self, ui: &mut egui::Ui, width: f32) {
         ui.add_space(4.0);
@@ -908,6 +1137,10 @@ impl App {
                 let width = ui.ctx().content_rect().width();
                 let ws = format!("Workspace: {} ⏷", self.workspace_name.as_deref().unwrap_or("default"));
                 ui.menu_button(ws, |ui| self.workspace_menu(ui, width));
+                if ui.button("Ctrl+K").on_hover_text("Command palette: tune, listen, follow, open, priority, workspace, show…").clicked() {
+                    self.palette_open = true;
+                    self.palette_focus = true;
+                }
                 if let Some((t, m)) = &self.catalog_msg {
                     if t.elapsed() < std::time::Duration::from_secs(12) {
                         ui.label(egui::RichText::new(m).small().color(theme::TEXT2));
@@ -2720,9 +2953,16 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.tick_playback(&ctx);
-        // 1/2/3 pick the live receiver tuning lands on; Esc clears the selection.
-        if !ctx.egui_wants_keyboard_input() {
+        // Ctrl+K: the command palette, from anywhere.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) {
+            self.palette_open = !self.palette_open;
+            self.palette_focus = self.palette_open;
+        }
+        // 1/2/3 pick the live receiver tuning lands on; Space pauses, M
+        // mutes; Esc clears the selection.
+        if !ctx.egui_wants_keyboard_input() && !self.palette_open {
             let live = self.live_ids();
+            let mut mute = false;
             ctx.input(|i| {
                 for (n, k) in [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3].into_iter().enumerate() {
                     if i.key_pressed(k) {
@@ -2730,6 +2970,12 @@ impl eframe::App for App {
                             self.tune_target = *id;
                         }
                     }
+                }
+                if i.key_pressed(egui::Key::Space) {
+                    self.paused = !self.paused;
+                }
+                if i.key_pressed(egui::Key::M) {
+                    mute = true;
                 }
                 if i.key_pressed(egui::Key::Escape) {
                     self.selection = Selection::None;
@@ -2742,6 +2988,9 @@ impl eframe::App for App {
                     }
                 }
             });
+            if mute {
+                self.toggle_mute();
+            }
         }
         // Give the follow policy to every source when it changes (or a
         // source is added).
@@ -2755,6 +3004,7 @@ impl eframe::App for App {
         egui::Panel::bottom("transport").exact_size(26.0).frame(theme::bar_frame()).show(ui, |ui| self.transport_bar(ui, &ctx));
         let width = ctx.content_rect().width();
         egui::Panel::left("rail").exact_size(36.0).frame(theme::rail_frame()).show(ui, |ui| self.rail(ui, width));
+        self.palette(&ctx, width);
         self.frame_prep();
         if self.dock.is_none() {
             let ids: Vec<ReceiverId> = self.panes.iter().map(|p| p.id).collect();

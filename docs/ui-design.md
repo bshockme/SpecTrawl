@@ -1,6 +1,6 @@
 # SpecTrawl UI: receivers, docking, inspector
 
-Status: design, 2026-10-10; steps 1–6 of §8 are implemented (commits 1496c78..). Supersedes the pane list in `DESIGN.md` §9. The
+Status: design, 2026-10-10; all of §8 is implemented (commits 1496c78 onward); the Diagnostics tab and the live-reflow breakpoints are not (see §4 and §9). Supersedes the pane list in `DESIGN.md` §9. The
 current UI (fixed left column of cards, two spectrum views, a tab strip at
 the bottom) is the starting point; this is where it goes and in what order.
 
