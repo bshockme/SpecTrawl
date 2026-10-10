@@ -134,6 +134,16 @@ fn gain_ui(ui: &mut egui::Ui, p: &mut Receiver) -> Option<String> {
     None
 }
 
+/// Waterfall dB range for one receiver.
+fn db_ui(ui: &mut egui::Ui, p: &mut Receiver) {
+    ui.spacing_mut().slider_width = 110.0;
+    ui.add(egui::Slider::new(&mut p.view.db_max, -80.0..=0.0).text("top dB"));
+    ui.add(egui::Slider::new(&mut p.view.db_min, -160.0..=-40.0).text("floor dB"));
+    if ui.small_button("Auto range").clicked() {
+        p.view.auto_range();
+    }
+}
+
 struct App {
     backends: Vec<Box<dyn Backend>>,
     devices: Vec<DeviceInfo>,
@@ -414,6 +424,18 @@ impl App {
         SweepPlan { start_hz: self.sweep_lo_mhz * 1e6, stop_hz: self.sweep_hi_mhz * 1e6, ..Default::default() }
     }
 
+    /// Restarts the sweeper on the current range.
+    fn apply_sweep(&mut self) {
+        if self.sweep_hi_mhz <= self.sweep_lo_mhz + 1.0 {
+            self.sweep_hi_mhz = self.sweep_lo_mhz + 10.0;
+        }
+        let plan = self.sweep_plan();
+        if let Some(p) = self.receiver_mut(ReceiverId::SWEEP) {
+            p.source.set_mode(Mode::Sweep(plan));
+            p.view = survey_view();
+        }
+    }
+
     fn close(&mut self, info: &DeviceInfo) {
         self.panes.retain(|p| !same_device(p.source.info(), info));
     }
@@ -620,125 +642,7 @@ impl App {
             None => {}
         }
 
-        // Borrow the pane field-wise so the closures can also touch other fields.
-        if let Some(p) = self.panes.iter_mut().find(|p| p.id.is_sweep()) {
-            let st = p.source.sweep_status();
-            let mut apply = false;
-            let mut err = None;
-            ui.add_space(8.0);
-            let mut pick = false;
-            ui.horizontal(|ui| {
-                let sel = self.selection == Selection::Receiver(ReceiverId::SWEEP);
-                let col = if sel { theme::ACCENT } else { theme::MUTED };
-                pick = ui.add(egui::Label::new(egui::RichText::new("SURVEY").small().strong().color(col)).sense(egui::Sense::click())).clicked();
-            });
-            theme::card(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut self.sweep_lo_mhz).speed(1.0).range(24.0..=1790.0).suffix(" MHz"));
-                    ui.label("to");
-                    ui.add(egui::DragValue::new(&mut self.sweep_hi_mhz).speed(1.0).range(34.0..=1800.0).suffix(" MHz"));
-                });
-                apply = ui.button("Apply range").clicked();
-                if let Some(e) = gain_ui(ui, p) {
-                    err = Some(e);
-                }
-                if let Some(s) = &st {
-                    kv(ui, "Hops", &format!("{} × {:.1} MHz", s.hops, s.hop_hz / 1e6));
-                    kv(ui, "Rate", &format!("{:.0} hops/s · {:.0} MHz/s", s.hops_per_sec, s.mhz_per_sec()));
-                    kv(ui, "Revisit", &format!("{:.2} s", s.last_pass_s));
-                    kv(ui, "Re-measured", &format!("{} settle · {} gap", s.settle_retries, s.redone_hops));
-                    if s.tuner_lock {
-                        kv(ui, "Lock waits", &s.lock_waits.to_string());
-                    } else {
-                        kv(ui, "Slow hops", &format!("{} of {}", s.slow_hops, s.hops));
-                    }
-                }
-            });
-            if err.is_some() {
-                self.error = err;
-            }
-            if pick {
-                self.selection = Selection::Receiver(ReceiverId::SWEEP);
-            }
-            if apply {
-                if self.sweep_hi_mhz <= self.sweep_lo_mhz + 1.0 {
-                    self.sweep_hi_mhz = self.sweep_lo_mhz + 10.0;
-                }
-                let plan = self.sweep_plan();
-                if let Some(p) = self.receiver_mut(ReceiverId::SWEEP) {
-                    p.source.set_mode(Mode::Sweep(plan));
-                    p.view = survey_view();
-                }
-            }
-        }
-
-        let live = self.live_ids();
-        for id in live {
-            let target = self.tune_target == id;
-            let Some(p) = self.panes.iter_mut().find(|p| p.id == id) else { continue };
-            let snap = p.source.snapshot();
-            let st = p.source.stats();
-            let cfg = p.source.config().clone();
-            let load = p.source.classifier_load();
-            let mut tune = None;
-            let mut err = None;
-            ui.add_space(8.0);
-            let sel = self.selection == Selection::Receiver(id);
-            let mut pick = false;
-            ui.horizontal(|ui| {
-                let col = if sel { theme::ACCENT } else { theme::MUTED };
-                pick = ui.add(egui::Label::new(egui::RichText::new(id.chip()).small().strong().color(col)).sense(egui::Sense::click())).clicked();
-                if target {
-                    ui.label(egui::RichText::new("tune target").small().color(theme::ACCENT)).on_hover_text("Survey clicks and double-clicks tune here (keys 1, 2, 3 switch)");
-                }
-            });
-            theme::card(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Centre");
-                    let mut mhz = snap.center_hz / 1e6;
-                    let r = ui.add(egui::DragValue::new(&mut mhz).speed(0.1).range(24.0..=1800.0).max_decimals(6).suffix(" MHz"));
-                    if r.changed() {
-                        tune = Some(mhz);
-                    }
-                });
-                let rate = snap.sample_rate;
-                kv(ui, "Rate", &format!("{:.1} MS/s · {}-bit", rate / 1e6, snap.caps.adc_bits));
-                kv(ui, "FFT", &format!("{} pt · {:.0}/s · {:.0} Hz", cfg.fft_size, st.ffts_per_sec, rate / cfg.fft_size as f64));
-                kv(ui, "Look-back", &format!("{:.1} / {:.0} s", st.ring_samples as f64 / rate, cfg.ring_seconds));
-                kv(ui, "Gaps", &format!("{} ({} samples)", st.gaps, st.lost_samples));
-                kv(ui, "Classifier", &format!("{:.1}/s · {:.0} ms · {:.0}%", load.jobs_per_sec, load.avg_job_ms, load.busy * 100.0));
-                if let Some(e) = gain_ui(ui, p) {
-                    err = Some(e);
-                }
-                if target {
-                    ui.label(egui::RichText::new("Tip: click the survey to tune here").small().color(theme::MUTED));
-                }
-            });
-            if err.is_some() {
-                self.error = err;
-            }
-            if pick {
-                self.selection = Selection::Receiver(id);
-            }
-            if let Some(m) = tune {
-                self.retune(id, m);
-            }
-        }
-
         self.inspector(ui);
-        ui.add_space(8.0);
-        ui.label(egui::RichText::new("DISPLAY").small().strong().color(theme::MUTED));
-        theme::card(ui, |ui| {
-            ui.spacing_mut().slider_width = 110.0;
-            for p in self.panes.iter_mut() {
-                ui.label(egui::RichText::new(p.id.chip()).small().color(theme::MUTED));
-                ui.add(egui::Slider::new(&mut p.view.db_max, -80.0..=0.0).text("top dB"));
-                ui.add(egui::Slider::new(&mut p.view.db_min, -160.0..=-40.0).text("floor dB"));
-                if ui.small_button("Auto range").clicked() {
-                    p.view.auto_range();
-                }
-            }
-        });
         if let Some(e) = &self.error {
             ui.colored_label(egui::Color32::from_rgb(0xff, 0x70, 0x96), e);
         }
@@ -886,7 +790,7 @@ impl App {
                 }
                 ui.label(egui::RichText::new("vol").small().color(theme::MUTED));
                 let mode_name = self.listen_mode.map(|m| m.name()).unwrap_or("Auto");
-                ui.menu_button(egui::RichText::new(format!("{mode_name} ▾")).small(), |ui| {
+                ui.menu_button(egui::RichText::new(format!("{mode_name} ⏷")).small(), |ui| {
                     ui.set_min_width(240.0);
                     ui.label(egui::RichText::new(format!("Mode (listening on {rx})")).small().color(theme::MUTED));
                     ui.horizontal(|ui| {
@@ -1074,10 +978,19 @@ impl App {
         let spans: Vec<(f64, f64)> = live_spans.iter().map(|(_, s)| *s).collect();
         let selection = self.selection.clone();
         let target = self.tune_target;
-        let mut tune_to: Option<(ReceiverId, f64)> = None;
-        let mut select = None;
+        let next_target = live.iter().position(|i| *i == target).map(|k| live[(k + 1) % live.len()]).or(live.first().copied());
+        enum Act {
+            Tune(ReceiverId, f64),
+            Select(Selection),
+            ApplySweep,
+            Target(ReceiverId),
+            Close(DeviceInfo),
+            Err(String),
+        }
+        let mut acts: Vec<Act> = Vec::new();
+        let App { panes, sweep_lo_mhz, sweep_hi_mhz, .. } = &mut *self;
         for (id, r) in rects {
-            let Some(p) = self.receiver_mut(id) else { continue };
+            let Some(p) = panes.iter_mut().find(|p| p.id == id) else { continue };
             let records = if id.is_sweep() { survey_outside_focus(pane_records(p), &spans) } else { pane_records(p) };
             // Highlight the selected record, and its emitter (or the
             // selected emitter), on this receiver only.
@@ -1087,19 +1000,21 @@ impl App {
                 .filter(|(rx, _)| *rx == id)
                 .map(|(_, e)| e)
                 .or_else(|| sel_record.and_then(|rid| records.iter().find(|r| r.id == rid).and_then(|r| r.emitter)));
+            let info = p.source.info().clone();
+            let center_mhz = p.source.snapshot().center_hz / 1e6;
             if id.is_sweep() {
                 let st = p.source.sweep_status();
                 let title = match &st {
                     Some(s) => format!(
-                        "SURVEY · {} · {:.0}–{:.0} MHz · {} hops · {:.0} MHz/s · revisit {:.1} s · click tunes {target}",
-                        p.source.info().label,
+                        "S · {} · {:.0}–{:.0} MHz · {} hops · {:.0} MHz/s · revisit {:.1} s",
+                        info.label,
                         s.start_hz / 1e6,
                         s.stop_hz() / 1e6,
                         s.hops,
                         s.mhz_per_sec(),
                         s.last_pass_s
                     ),
-                    None => format!("SURVEY · {}", p.source.info().label),
+                    None => format!("S · {}", info.label),
                 };
                 let res = p.view.show(ui, r, &title, st.as_ref(), &records, sel_record, sel_emitter);
                 for (rx, (lo, hi)) in &live_spans {
@@ -1108,29 +1023,95 @@ impl App {
                 // Survey click: tune the target there; on a record, also
                 // select it and centre on the record, not the click point.
                 if let Some(rid) = res.record {
-                    select = Some(Selection::Record(id, rid));
-                    tune_to = records.iter().find(|r| r.id == rid).map(|r| (target, r.center_hz()));
+                    acts.push(Act::Select(Selection::Record(id, rid)));
+                    if let Some(f) = records.iter().find(|r| r.id == rid).map(|r| r.center_hz()) {
+                        acts.push(Act::Tune(target, f));
+                    }
                 } else if let Some(f) = res.freq_hz {
-                    tune_to = Some((target, f));
+                    acts.push(Act::Tune(target, f));
                 }
             } else {
                 let snap = p.source.snapshot();
-                let title = format!("FOCUS {id} · {} · {:.3} MHz · {:.1} MS/s", snap.info.label, snap.center_hz / 1e6, snap.sample_rate / 1e6);
+                let title = format!("{id} · {} · {:.3} MHz · {:.1} MS/s", info.label, snap.center_hz / 1e6, snap.sample_rate / 1e6);
                 let res = p.view.show(ui, r, &title, None, &records, sel_record, sel_emitter);
                 // Live click: select a record if one was hit, otherwise
                 // recentre this receiver.
                 match (res.record, res.freq_hz) {
-                    (Some(rid), _) => select = Some(Selection::Record(id, rid)),
-                    (None, Some(f)) => tune_to = Some((id, f)),
+                    (Some(rid), _) => acts.push(Act::Select(Selection::Record(id, rid))),
+                    (None, Some(f)) => acts.push(Act::Tune(id, f)),
                     _ => {}
                 }
             }
+            // Clicking the title selects the receiver (the inspector shows it).
+            let hdr = egui::Rect::from_min_size(r.min, egui::vec2(r.width(), spectrum_view::HEADER_H)).shrink2(egui::vec2(6.0, 2.0));
+            let title_rect = egui::Rect::from_min_size(hdr.min, egui::vec2(hdr.width() * 0.4, hdr.height()));
+            if ui.interact(title_rect, ui.id().with(("header", id.0)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                acts.push(Act::Select(Selection::Receiver(id)));
+            }
+            if selection == Selection::Receiver(id) {
+                ui.painter_at(r).hline(r.x_range(), r.top() + spectrum_view::HEADER_H - 1.0, egui::Stroke::new(2.0, theme::ACCENT));
+            }
+            // The header toolbar: this receiver's own controls, right-aligned
+            // over the painted title.
+            ui.scope_builder(egui::UiBuilder::new().max_rect(hdr).layout(egui::Layout::right_to_left(egui::Align::Center)), |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.menu_button(egui::RichText::new("…").small(), |ui| {
+                    if ui.button("Close device").clicked() {
+                        acts.push(Act::Close(info.clone()));
+                        ui.close();
+                    }
+                });
+                ui.menu_button(egui::RichText::new("dB ⏷").small(), |ui| {
+                    ui.set_min_width(230.0);
+                    db_ui(ui, p);
+                });
+                ui.menu_button(egui::RichText::new("Gain ⏷").small(), |ui| {
+                    ui.set_min_width(260.0);
+                    if let Some(e) = gain_ui(ui, p) {
+                        acts.push(Act::Err(e));
+                    }
+                });
+                if id.is_sweep() {
+                    if let Some(next) = next_target {
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new(format!("click tunes {target}")).small()))
+                            .on_hover_text("Where a click on the survey tunes; click to pick the next receiver (keys 1, 2, 3)")
+                            .clicked()
+                        {
+                            acts.push(Act::Target(next));
+                        }
+                    }
+                    if ui.small_button("Apply").clicked() {
+                        acts.push(Act::ApplySweep);
+                    }
+                    ui.add(egui::DragValue::new(sweep_hi_mhz).speed(1.0).range(34.0..=1800.0).suffix(" MHz"));
+                    ui.label(egui::RichText::new("–").small());
+                    ui.add(egui::DragValue::new(sweep_lo_mhz).speed(1.0).range(24.0..=1790.0).suffix(" MHz"));
+                } else {
+                    let mut mhz = center_mhz;
+                    if ui.add(egui::DragValue::new(&mut mhz).speed(0.1).range(24.0..=1800.0).max_decimals(6).suffix(" MHz")).changed() {
+                        acts.push(Act::Tune(id, mhz * 1e6));
+                    }
+                    ui.label(egui::RichText::new("Centre").small().color(theme::MUTED));
+                    if ui
+                        .selectable_label(target == id, egui::RichText::new("⌖").small())
+                        .on_hover_text("Tune target: survey clicks and double-clicks land here (keys 1, 2, 3)")
+                        .clicked()
+                    {
+                        acts.push(Act::Target(id));
+                    }
+                }
+            });
         }
-        if let Some(sel) = select {
-            self.selection = sel;
-        }
-        if let Some((id, f)) = tune_to {
-            self.retune(id, (f / 1e3).round() / 1e3);
+        for a in acts {
+            match a {
+                Act::Tune(id, f) => self.retune(id, (f / 1e3).round() / 1e3),
+                Act::Select(sel) => self.selection = sel,
+                Act::ApplySweep => self.apply_sweep(),
+                Act::Target(id) => self.tune_target = id,
+                Act::Close(d) => self.close(&d),
+                Act::Err(e) => self.error = Some(e),
+            }
         }
     }
 
@@ -1183,54 +1164,97 @@ impl App {
         });
     }
 
-    /// A receiver: identity, its tuning, and diagnostics folded away.
+    /// A receiver: identity, its tuning, gain and range, and diagnostics
+    /// folded away.
     fn inspect_receiver(&mut self, ui: &mut egui::Ui, id: ReceiverId) {
-        let Some(p) = self.receiver(id) else {
-            ui.label(egui::RichText::new(format!("Receiver {id} is not open.")).color(theme::MUTED));
-            return;
-        };
-        let info = p.source.info().clone();
-        let snap = p.source.snapshot();
-        let st = p.source.stats();
-        let cfg = p.source.config().clone();
-        let load = p.source.classifier_load();
-        let sweep = p.source.sweep_status();
-        ui.horizontal(|ui| {
-            let (bg, fg) = if id.is_sweep() {
-                (egui::Color32::from_rgb(0x0f, 0x2b, 0x2b), egui::Color32::from_rgb(0x7f, 0xe9, 0xe5))
-            } else {
-                (theme::CHIP_FOCUS_BG, theme::CHIP_FOCUS_FG)
+        let target = self.tune_target;
+        let mut tune = None;
+        let mut apply = false;
+        let mut set_target = false;
+        let mut err = None;
+        {
+            let App { panes, sweep_lo_mhz, sweep_hi_mhz, .. } = &mut *self;
+            let Some(p) = panes.iter_mut().find(|p| p.id == id) else {
+                ui.label(egui::RichText::new(format!("Receiver {id} is not open.")).color(theme::MUTED));
+                return;
             };
-            theme::chip(ui, &id.chip(), bg, fg);
-            ui.label(egui::RichText::new(&info.label).strong());
-        });
-        ui.label(egui::RichText::new(format!("{} · {}", info.backend, info.serial)).small().color(theme::MUTED));
-        match &sweep {
-            Some(s) => kv(ui, "Sweep", &format!("{:.0}–{:.0} MHz · {} hops", s.start_hz / 1e6, s.stop_hz() / 1e6, s.hops)),
-            None => kv(ui, "Centre", &format!("{:.4} MHz", snap.center_hz / 1e6)),
-        }
-        kv(ui, "Rate", &format!("{:.1} MS/s · {}-bit", snap.sample_rate / 1e6, snap.caps.adc_bits));
-        egui::CollapsingHeader::new(egui::RichText::new("Diagnostics").small()).id_salt(("diag", id)).show(ui, |ui| match &sweep {
-            Some(s) => {
-                kv(ui, "Hop", &format!("{:.1} MHz", s.hop_hz / 1e6));
-                kv(ui, "Rate", &format!("{:.0} hops/s · {:.0} MHz/s", s.hops_per_sec, s.mhz_per_sec()));
-                kv(ui, "Revisit", &format!("{:.2} s", s.last_pass_s));
-                kv(ui, "Re-measured", &format!("{} settle · {} gap", s.settle_retries, s.redone_hops));
-                if s.tuner_lock {
-                    kv(ui, "Lock waits", &s.lock_waits.to_string());
+            let info = p.source.info().clone();
+            let snap = p.source.snapshot();
+            let st = p.source.stats();
+            let cfg = p.source.config().clone();
+            let load = p.source.classifier_load();
+            let sweep = p.source.sweep_status();
+            ui.horizontal(|ui| {
+                let (bg, fg) = if id.is_sweep() {
+                    (egui::Color32::from_rgb(0x0f, 0x2b, 0x2b), egui::Color32::from_rgb(0x7f, 0xe9, 0xe5))
                 } else {
-                    kv(ui, "Slow hops", &format!("{} of {}", s.slow_hops, s.hops));
+                    (theme::CHIP_FOCUS_BG, theme::CHIP_FOCUS_FG)
+                };
+                theme::chip(ui, &id.chip(), bg, fg);
+                ui.label(egui::RichText::new(&info.label).strong());
+            });
+            ui.label(egui::RichText::new(format!("{} · {}", info.backend, info.serial)).small().color(theme::MUTED));
+            if id.is_sweep() {
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(sweep_lo_mhz).speed(1.0).range(24.0..=1790.0).suffix(" MHz"));
+                    ui.label("to");
+                    ui.add(egui::DragValue::new(sweep_hi_mhz).speed(1.0).range(34.0..=1800.0).suffix(" MHz"));
+                    apply = ui.button("Apply range").clicked();
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label("Centre");
+                    let mut mhz = snap.center_hz / 1e6;
+                    if ui.add(egui::DragValue::new(&mut mhz).speed(0.1).range(24.0..=1800.0).max_decimals(6).suffix(" MHz")).changed() {
+                        tune = Some(mhz);
+                    }
+                    if target == id {
+                        ui.label(egui::RichText::new("tune target").small().color(theme::ACCENT))
+                            .on_hover_text("Survey clicks and double-clicks tune here (keys 1, 2, 3 switch)");
+                    } else if ui.small_button("Make tune target").clicked() {
+                        set_target = true;
+                    }
+                });
+            }
+            kv(ui, "Rate", &format!("{:.1} MS/s · {}-bit", snap.sample_rate / 1e6, snap.caps.adc_bits));
+            if let Some(e) = gain_ui(ui, p) {
+                err = Some(e);
+            }
+            db_ui(ui, p);
+            egui::CollapsingHeader::new(egui::RichText::new("Diagnostics").small()).id_salt(("diag", id)).show(ui, |ui| match &sweep {
+                Some(s) => {
+                    kv(ui, "Hops", &format!("{} × {:.1} MHz", s.hops, s.hop_hz / 1e6));
+                    kv(ui, "Rate", &format!("{:.0} hops/s · {:.0} MHz/s", s.hops_per_sec, s.mhz_per_sec()));
+                    kv(ui, "Revisit", &format!("{:.2} s", s.last_pass_s));
+                    kv(ui, "Re-measured", &format!("{} settle · {} gap", s.settle_retries, s.redone_hops));
+                    if s.tuner_lock {
+                        kv(ui, "Lock waits", &s.lock_waits.to_string());
+                    } else {
+                        kv(ui, "Slow hops", &format!("{} of {}", s.slow_hops, s.hops));
+                    }
+                    kv(ui, "Gaps", &format!("{} ({} samples)", st.gaps, st.lost_samples));
                 }
-                kv(ui, "Gaps", &format!("{} ({} samples)", st.gaps, st.lost_samples));
-            }
-            None => {
-                let rate = snap.sample_rate;
-                kv(ui, "FFT", &format!("{} pt · {:.0}/s · {:.0} Hz", cfg.fft_size, st.ffts_per_sec, rate / cfg.fft_size as f64));
-                kv(ui, "Look-back", &format!("{:.1} / {:.0} s", st.ring_samples as f64 / rate, cfg.ring_seconds));
-                kv(ui, "Gaps", &format!("{} ({} samples)", st.gaps, st.lost_samples));
-                kv(ui, "Classifier", &format!("{:.1}/s · {:.0} ms · {:.0}%", load.jobs_per_sec, load.avg_job_ms, load.busy * 100.0));
-            }
-        });
+                None => {
+                    let rate = snap.sample_rate;
+                    kv(ui, "FFT", &format!("{} pt · {:.0}/s · {:.0} Hz", cfg.fft_size, st.ffts_per_sec, rate / cfg.fft_size as f64));
+                    kv(ui, "Look-back", &format!("{:.1} / {:.0} s", st.ring_samples as f64 / rate, cfg.ring_seconds));
+                    kv(ui, "Gaps", &format!("{} ({} samples)", st.gaps, st.lost_samples));
+                    kv(ui, "Classifier", &format!("{:.1}/s · {:.0} ms · {:.0}%", load.jobs_per_sec, load.avg_job_ms, load.busy * 100.0));
+                }
+            });
+        }
+        if let Some(m) = tune {
+            self.retune(id, m);
+        }
+        if apply {
+            self.apply_sweep();
+        }
+        if set_target {
+            self.tune_target = id;
+        }
+        if err.is_some() {
+            self.error = err;
+        }
         if !id.is_sweep() {
             ui.separator();
             self.export_footer(ui, id);

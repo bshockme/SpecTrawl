@@ -616,7 +616,7 @@ pub struct ShowResult {
     pub record: Option<u64>,
 }
 
-const HEADER_H: f32 = 26.0;
+pub const HEADER_H: f32 = 26.0;
 
 fn mono(size: f32) -> egui::FontId {
     egui::FontId::monospace(size)
