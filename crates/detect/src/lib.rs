@@ -17,6 +17,7 @@ mod imbe_tables;
 pub mod mbe;
 pub mod p25;
 pub mod p25_lc;
+pub mod p25_voice;
 pub mod p25p2;
 pub mod pocsag;
 pub mod spectral;

@@ -16,6 +16,9 @@ pub enum Mode {
     Nfm,
     Am,
     Wfm,
+    /// P25 Phase 1 digital voice: decoded by `p25_voice`, not `Demod`
+    /// (which treats it as NFM).
+    P25,
 }
 
 impl Mode {
@@ -24,6 +27,7 @@ impl Mode {
             Mode::Nfm => "NFM",
             Mode::Am => "AM",
             Mode::Wfm => "WFM",
+            Mode::P25 => "P25",
         }
     }
 
@@ -33,13 +37,14 @@ impl Mode {
             Mode::Nfm => (7_000.0, 48_000.0),
             Mode::Am => (5_000.0, 48_000.0),
             Mode::Wfm => (100_000.0, 240_000.0),
+            Mode::P25 => (6_500.0, 48_000.0),
         }
     }
 
     /// Audio bandwidth.
     fn audio_hz(self) -> f64 {
         match self {
-            Mode::Nfm => 3_500.0,
+            Mode::Nfm | Mode::P25 => 3_500.0,
             Mode::Am => 4_500.0,
             Mode::Wfm => 13_000.0,
         }
@@ -49,7 +54,7 @@ impl Mode {
     /// discriminator, and for NFM the sub-audible CTCSS tones.
     fn highpass_hz(self) -> f64 {
         match self {
-            Mode::Nfm => 300.0,
+            Mode::Nfm | Mode::P25 => 300.0,
             Mode::Am => 30.0,
             Mode::Wfm => 20.0,
         }
@@ -176,7 +181,7 @@ impl Demod {
         let step = self.fs / AUDIO_RATE;
         for &s in x {
             let a = match self.mode {
-                Mode::Nfm | Mode::Wfm => {
+                Mode::Nfm | Mode::Wfm | Mode::P25 => {
                     let d = (s * self.prev.conj()).arg() * k;
                     self.prev = s;
                     if self.mode == Mode::Nfm {

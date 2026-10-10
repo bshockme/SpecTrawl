@@ -29,7 +29,7 @@ pub use classify::ClassifierLoad;
 pub use detect::demod::Mode as DemodMode;
 pub use detect::p25::SystemInfo as P25System;
 pub use emitters::Emitter;
-pub use listen::{AudioQueue, ListenSpec};
+pub use listen::{AudioQueue, ListenSpec, VoiceStatus, recordings_dir};
 pub use calls::CallEvent;
 pub use monitor::{GrantEvent, MonitorInfo, PageEvent};
 pub use occupancy::KnownOccupant;
@@ -144,6 +144,7 @@ struct Shared {
     /// The channel being listened to, if any, and its audio.
     listen: Mutex<Option<ListenSpec>>,
     audio: Arc<AudioQueue>,
+    voice: Mutex<VoiceStatus>,
 }
 
 impl Shared {
@@ -261,6 +262,7 @@ impl Source {
             occupancy: Mutex::new(occupancy::OccupancyTracker::new(1)),
             listen: Mutex::new(None),
             audio: Arc::new(AudioQueue::default()),
+            voice: Mutex::new(Default::default()),
         });
         device.start(Box::new(RingSink { shared: shared.clone() }))?;
         let info = device.info().clone();
@@ -386,6 +388,11 @@ impl Source {
 
     pub fn listening(&self) -> Option<ListenSpec> {
         *self.shared.listen.lock()
+    }
+
+    /// The digital voice channel being played, if any.
+    pub fn voice(&self) -> VoiceStatus {
+        self.shared.voice.lock().clone()
     }
 
     /// The audio the listener produces, for an audio output to drain.

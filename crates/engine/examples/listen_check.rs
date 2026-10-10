@@ -1,6 +1,6 @@
 //! Listens to one channel and writes the audio to a WAV file.
 //!
-//!     cargo run --release -p engine --example listen_check -- <serial> <tune MHz> <channel MHz> <nfm|am|wfm> <seconds> <out.wav>
+//!     cargo run --release -p engine --example listen_check -- <serial> <tune MHz> <channel MHz> <nfm|am|wfm|p25|follow> <seconds> <out.wav>
 
 use std::io::Write;
 use std::time::Duration;
@@ -15,15 +15,18 @@ fn main() {
     let mode = match a[4].as_str() {
         "am" => DemodMode::Am,
         "wfm" => DemodMode::Wfm,
+        "p25" | "follow" => DemodMode::P25,
         _ => DemodMode::Nfm,
     };
+    let follow = a[4] == "follow";
     let b = backend_airspy::AirspyBackend::new();
     let _ = b.enumerate();
     let mut d = b.open(serial).expect("open");
     d.set_center(tune).unwrap();
     let src = Source::start(d, SourceConfig::default(), Mode::Live).unwrap();
     std::thread::sleep(Duration::from_millis(500));
-    src.listen(Some(ListenSpec { center_hz: chan, mode }));
+    src.listen(Some(ListenSpec { center_hz: chan, mode, follow }));
+    let mut last_status = String::new();
     let q = src.audio();
     let mut pcm: Vec<f32> = Vec::new();
     let mut open_blocks = (0, 0);
@@ -36,6 +39,20 @@ fn main() {
         open_blocks.1 += 1;
         if q.open.load(std::sync::atomic::Ordering::Relaxed) {
             open_blocks.0 += 1;
+        }
+        if mode == DemodMode::P25 {
+            let v = src.voice();
+            let st = format!(
+                "{} {} {}{}",
+                v.center_hz.map(|f| format!("{:.5}", f / 1e6)).unwrap_or("-".into()),
+                v.call.map(|c| c.summary()).unwrap_or_default(),
+                if v.active { "voice" } else { "idle" },
+                v.encrypted.map(|e| format!(" enc {e}")).unwrap_or_default()
+            );
+            if st != last_status {
+                println!("{:6.1} s  {st}", t0.elapsed().as_secs_f64());
+                last_status = st;
+            }
         }
     }
     let rms = (pcm.iter().map(|v| v * v).sum::<f32>() / pcm.len() as f32).sqrt();

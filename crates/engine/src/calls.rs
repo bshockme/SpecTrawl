@@ -7,6 +7,7 @@
 //! anything saw it.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use detect::decode::Call;
@@ -40,6 +41,8 @@ pub struct CallEvent {
     pub granted_at: Option<SystemTime>,
     /// When the classifier last looked at its voice channel for it.
     pub(crate) followed_at: Option<SystemTime>,
+    /// Its audio, when it was listened to (one file per transmission).
+    pub recordings: Vec<PathBuf>,
 }
 
 #[derive(Default)]
@@ -53,6 +56,8 @@ impl CallLog {
         self.merge(freq, call, now, system, |e| {
             e.granted = true;
             e.granted_at = Some(now);
+            // The grant's channel is exact; a voice sighting's is measured.
+            e.center_hz = freq.or(e.center_hz);
         });
     }
 
@@ -63,6 +68,11 @@ impl CallLog {
             // The voice channel's label beats the control channel's.
             e.protocol = label.to_string();
         });
+    }
+
+    /// A transmission of `call` on `freq` was recorded to `path`.
+    pub fn recorded(&mut self, freq: f64, call: Call, path: PathBuf) {
+        self.merge(Some(freq), call, SystemTime::now(), "P25 Phase 1", |e| e.recordings.push(path));
     }
 
     fn merge(&mut self, freq: Option<f64>, call: Call, now: SystemTime, label: &str, mark: impl FnOnce(&mut CallEvent)) {
@@ -100,6 +110,7 @@ impl CallLog {
                         heard: false,
                         granted_at: None,
                         followed_at: None,
+                        recordings: Vec::new(),
                     };
                 mark(&mut e);
                 self.calls.push_back(e);
