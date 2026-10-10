@@ -114,6 +114,12 @@ struct App {
     /// Audio output (opened on first listen), its error, and listen settings.
     audio_out: Option<audio::AudioOut>,
     audio_err: Option<String>,
+    /// A recording being played (takes the audio output while it plays).
+    playback: Option<engine::Playback>,
+    /// Talkgroups following prefers or ignores (saved in follow.txt), and
+    /// (generation, panes) last given to the sources.
+    follow_policy: engine::FollowPolicy,
+    policy_gen: (u64, u64, usize),
     /// None = pick the mode from the signal's label.
     listen_mode: Option<engine::DemodMode>,
     /// P25: Phase 2 TDMA (picked from the label when the mode is Auto).
@@ -260,6 +266,9 @@ impl App {
             emitter_view: EmitterView::default(),
             squelch: true,
             audio_out: None,
+            playback: None,
+            follow_policy: load_follow_policy(),
+            policy_gen: (1, 0, 0),
             audio_err: None,
             listen_mode: None,
             listen_tdma: false,
@@ -742,6 +751,12 @@ impl App {
                     let hz = span_mid.unwrap_or(self.listen_mhz * 1e6);
                     start = Some(engine::ListenSpec { center_hz: hz, mode: engine::DemodMode::P25, follow: true, tdma: false, slot: None });
                 }
+                let fp = &self.follow_policy;
+                if !fp.priority.is_empty() || !fp.lockout.is_empty() {
+                    let list = |s: &std::collections::BTreeSet<u32>| s.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ");
+                    ui.label(egui::RichText::new(format!("★ {}  ⊘ {}", list(&fp.priority), list(&fp.lockout))).small().color(theme::MUTED))
+                        .on_hover_text("Priority (★) and locked-out (⊘) talkgroups; right-click a call in the Calls tab to change");
+                }
                 if ui.small_button("Recordings").on_hover_text(engine::recordings_dir().display().to_string()).clicked() {
                     let dir = engine::recordings_dir();
                     let _ = std::fs::create_dir_all(&dir);
@@ -769,6 +784,15 @@ impl App {
             if let Some(e) = &self.audio_err {
                 ui.label(egui::RichText::new(e).small().color(theme::MUTED));
             }
+            if let Some(pb) = &self.playback {
+                ui.horizontal(|ui| {
+                    let name = pb.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    ui.label(egui::RichText::new(format!("▶ {name} ({:.1} s)", pb.seconds)).small().monospace().color(theme::VOICE));
+                    if ui.small_button("Stop").clicked() {
+                        pb.stop();
+                    }
+                });
+            }
         });
         if let Some(spec) = start {
             if let Some(focus) = self.pane(Role::Focus).filter(|_| !spec.follow) {
@@ -787,6 +811,7 @@ impl App {
                     Err(e) => self.audio_err = Some(format!("Audio output: {e}")),
                 }
             }
+            self.playback = None;
             if let Some(focus) = self.pane(Role::Focus) {
                 focus.source.listen(Some(spec));
                 if let Some(a) = &self.audio_out {
@@ -802,6 +827,49 @@ impl App {
             if let Some(a) = &self.audio_out {
                 a.set_source(None);
             }
+        }
+    }
+
+    /// Plays a recording, taking the audio output from live listening until
+    /// it ends.
+    fn play_recording(&mut self, path: &std::path::Path) {
+        if self.audio_out.is_none() {
+            match audio::AudioOut::new() {
+                Ok(a) => {
+                    a.set_volume(self.volume);
+                    self.audio_out = Some(a);
+                }
+                Err(e) => {
+                    self.audio_err = Some(format!("Audio output: {e}"));
+                    return;
+                }
+            }
+        }
+        match engine::Playback::start(path) {
+            Ok(pb) => {
+                if let Some(a) = &self.audio_out {
+                    a.set_source(Some(pb.queue.clone()));
+                }
+                self.playback = Some(pb);
+                self.audio_err = None;
+            }
+            Err(e) => self.audio_err = Some(format!("{}: {e}", path.display())),
+        }
+    }
+
+    /// A finished recording gives the audio output back to live listening.
+    fn tick_playback(&mut self, ctx: &egui::Context) {
+        if !self.playback.as_ref().is_some_and(|p| p.finished()) {
+            if self.playback.is_some() {
+                // Keep repainting while it plays so the end is noticed.
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+            return;
+        }
+        self.playback = None;
+        let live = self.pane(Role::Focus).filter(|f| f.source.listening().is_some()).map(|f| f.source.audio());
+        if let Some(a) = &self.audio_out {
+            a.set_source(live);
         }
     }
 
@@ -1474,6 +1542,10 @@ impl App {
     /// Calls from every pane: control-channel grants and voice-channel
     /// signalling merged per call, newest first.
     fn calls_panel(&mut self, ui: &mut egui::Ui) {
+        let mut play: Option<std::path::PathBuf> = None;
+        // (talkgroup, list: true = priority, false = lockout) to toggle.
+        let mut toggle: Option<(u32, bool)> = None;
+        let (prio, locked) = (self.follow_policy.priority.clone(), self.follow_policy.lockout.clone());
         let mut calls: Vec<engine::CallEvent> = self.panes.iter().flat_map(|p| p.source.calls(5000)).collect();
         calls.sort_by(|a, b| b.last.cmp(&a.last));
         // Names from the imported catalog, for the first P25 system known.
@@ -1564,7 +1636,12 @@ impl App {
                     row.col(|ui| text(ui, format!("{:.0}", c.last.duration_since(c.first).unwrap_or_default().as_secs_f64()), theme::MUTED));
                     row.col(|ui| text(ui, c.center_hz.map(|f| format!("{:.5}", f / 1e6)).unwrap_or("?".into()), col));
                     row.col(|ui| text(ui, c.protocol.clone(), theme::TEXT2));
-                    let target = if c.call.group { format!("TG {}", c.call.target) } else { format!("→ {}", c.call.target) };
+                    let mark = match (c.call.group, prio.contains(&c.call.target), locked.contains(&c.call.target)) {
+                        (true, true, _) => "★ ",
+                        (true, _, true) => "⊘ ",
+                        _ => "",
+                    };
+                    let target = if c.call.group { format!("{mark}TG {}", c.call.target) } else { format!("→ {}", c.call.target) };
                     row.col(|ui| text(ui, target, if recent { accent } else { col }));
                     row.col(|ui| text(ui, tg_name(c), theme::TEXT2));
                     row.col(|ui| text(ui, c.call.source.map(|s| s.to_string()).unwrap_or_default(), col));
@@ -1575,7 +1652,11 @@ impl App {
                         if let Some(last) = c.recordings.last() {
                             let n = c.recordings.len();
                             let label = if n > 1 { format!("▶ {n}") } else { "▶".into() };
-                            if ui.small_button(label).on_hover_text(last.display().to_string()).clicked() {
+                            let b = ui.small_button(label).on_hover_text(format!("Play {}\nRight-click: open in the system player", last.display()));
+                            if b.clicked() {
+                                play = Some(last.clone());
+                            }
+                            if b.secondary_clicked() {
                                 open_path(last);
                             }
                         }
@@ -1586,11 +1667,40 @@ impl App {
                         _ => "heard",
                     };
                     row.col(|ui| text(ui, seen.into(), theme::MUTED));
-                    if row.response().double_clicked() {
+                    let resp = row.response();
+                    if resp.double_clicked() {
                         tune = c.center_hz;
+                    }
+                    if c.call.group {
+                        let tg = c.call.target;
+                        resp.context_menu(|ui| {
+                            let p = if prio.contains(&tg) { format!("Remove TG {tg} from priority") } else { format!("Priority: TG {tg}") };
+                            if ui.button(p).clicked() {
+                                toggle = Some((tg, true));
+                                ui.close();
+                            }
+                            let l = if locked.contains(&tg) { format!("Unlock TG {tg}") } else { format!("Lock out: TG {tg}") };
+                            if ui.button(l).clicked() {
+                                toggle = Some((tg, false));
+                                ui.close();
+                            }
+                        });
                     }
                 });
             });
+        if let Some((tg, priority)) = toggle {
+            let fp = &mut self.follow_policy;
+            let (list, other) = if priority { (&mut fp.priority, &mut fp.lockout) } else { (&mut fp.lockout, &mut fp.priority) };
+            if !list.remove(&tg) {
+                list.insert(tg);
+                other.remove(&tg);
+            }
+            self.policy_gen.0 += 1;
+            save_follow_policy(&self.follow_policy);
+        }
+        if let Some(p) = play {
+            self.play_recording(&p);
+        }
         if let Some(f) = tune {
             self.retune_focus((f / 1e3).round() / 1e3);
         }
@@ -1774,6 +1884,15 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.tick_playback(&ctx);
+        // Give the follow policy to every source when it changes (or a
+        // source is added).
+        if (self.policy_gen.0, self.panes.len()) != (self.policy_gen.1, self.policy_gen.2) {
+            for p in &self.panes {
+                p.source.set_follow_policy(self.follow_policy.clone());
+            }
+            self.policy_gen = (self.policy_gen.0, self.policy_gen.0, self.panes.len());
+        }
         egui::Panel::top("top").exact_size(40.0).frame(theme::bar_frame()).show(ui, |ui| self.top_bar(ui));
         egui::Panel::bottom("status").exact_size(24.0).frame(theme::bar_frame()).show(ui, |ui| {
             ui.horizontal_centered(|ui| {
@@ -1987,6 +2106,41 @@ fn open_path(p: &std::path::Path) {
     let r = std::process::Command::new("xdg-open").arg(p).spawn();
     if let Err(e) = r {
         log::warn!("open {}: {e}", p.display());
+    }
+}
+
+fn follow_policy_path() -> std::path::PathBuf {
+    catalog_path().with_file_name("follow.txt")
+}
+
+/// `priority <talkgroup>` / `lockout <talkgroup>` lines.
+fn load_follow_policy() -> engine::FollowPolicy {
+    let mut p = engine::FollowPolicy::default();
+    for line in std::fs::read_to_string(follow_policy_path()).unwrap_or_default().lines() {
+        let mut w = line.split_whitespace();
+        match (w.next(), w.next().and_then(|t| t.parse::<u32>().ok())) {
+            (Some("priority"), Some(tg)) => {
+                p.priority.insert(tg);
+            }
+            (Some("lockout"), Some(tg)) => {
+                p.lockout.insert(tg);
+            }
+            _ => {}
+        }
+    }
+    p
+}
+
+fn save_follow_policy(p: &engine::FollowPolicy) {
+    let mut text = String::from("# Talkgroups for call following: priority <tg> / lockout <tg>\n");
+    p.priority.iter().for_each(|t| text.push_str(&format!("priority {t}\n")));
+    p.lockout.iter().for_each(|t| text.push_str(&format!("lockout {t}\n")));
+    let path = follow_policy_path();
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    if let Err(e) = std::fs::write(&path, text) {
+        log::warn!("{}: {e}", path.display());
     }
 }
 

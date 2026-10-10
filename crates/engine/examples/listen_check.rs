@@ -1,6 +1,6 @@
 //! Listens to one channel and writes the audio to a WAV file.
 //!
-//!     cargo run --release -p engine --example listen_check -- <serial> <tune MHz> <channel MHz> <nfm|am|wfm|p25|p25p2|follow> <seconds> <out.wav>
+//!     cargo run --release -p engine --example listen_check -- <serial> <tune MHz> <channel MHz> <nfm|am|wfm|p25|p25p2|follow> <seconds> <out.wav> [priority=tg,tg] [lockout=tg,tg]
 
 use std::io::Write;
 use std::time::Duration;
@@ -27,6 +27,18 @@ fn main() {
     std::thread::sleep(Duration::from_millis(500));
     src.listen(Some(ListenSpec { center_hz: chan, mode, follow, tdma: a[4] == "p25p2", slot: None }));
     let mut last_status = String::new();
+    let mut policy = engine::FollowPolicy::default();
+    for arg in a.iter().skip(7) {
+        if let Some((k, v)) = arg.split_once('=') {
+            let tgs = v.split(',').filter_map(|t| t.parse::<u32>().ok());
+            match k {
+                "priority" => policy.priority.extend(tgs),
+                "lockout" => policy.lockout.extend(tgs),
+                _ => {}
+            }
+        }
+    }
+    src.set_follow_policy(policy);
     let q = src.audio();
     let mut pcm: Vec<f32> = Vec::new();
     let mut open_blocks = (0, 0);

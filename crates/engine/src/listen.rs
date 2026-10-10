@@ -35,6 +35,15 @@ pub struct ListenSpec {
     pub slot: Option<u8>,
 }
 
+/// Which talkgroups following prefers or ignores.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FollowPolicy {
+    /// Never followed.
+    pub lockout: std::collections::BTreeSet<u32>,
+    /// Followed first, interrupting a call on any other talkgroup.
+    pub priority: std::collections::BTreeSet<u32>,
+}
+
 /// The digital voice channel being played, for the UI.
 #[derive(Debug, Clone, Default)]
 pub struct VoiceStatus {
@@ -276,29 +285,42 @@ fn follow_target(
 ) -> Option<(f64, Option<u8>)> {
     let now = SystemTime::now();
     let age = |t: SystemTime| now.duration_since(t).map(|d| d.as_secs_f64()).unwrap_or(0.0);
-    if let Some((hz, slot, c)) = current {
-        let busy = match c.voice.idle_s() {
-            Some(idle) => idle < HOLD_S && c.voice.cipher().is_none(),
-            None => age(c.since) < HOLD_S,
-        };
-        if busy {
-            return Some((hz, slot));
-        }
-    }
+    let policy = shared.follow_policy.lock().clone();
+    let group_in = |set: &std::collections::BTreeSet<u32>, c: Option<Call>| c.is_some_and(|c| c.group && set.contains(&c.target));
     let calls = shared.calls.lock();
-    calls
+    // (channel, slot, granted at, priority) of each call worth following.
+    let candidates: Vec<((f64, Option<u8>), SystemTime, bool)> = calls
         .calls
         .iter()
         .rev()
         .take(256)
         .filter(|e| e.granted_at.is_some_and(|t| age(t) < GRANT_FRESH_S))
-        .filter(|e| !e.call.encrypted)
+        .filter(|e| !e.call.encrypted && !group_in(&policy.lockout, Some(e.call)))
         .filter(|e| locked.get(&(e.call.group, e.call.target)).is_none_or(|&t| age(t) > ENCRYPTED_LOCKOUT_S))
-        .filter_map(|e| e.center_hz.filter(|f| (lo..hi).contains(f)).map(|f| ((f, e.slot), e.granted_at)))
-        .filter(|(t, _)| current.is_none_or(|(hz, slot, _)| (hz - t.0).abs() > 1.0 || slot != t.1))
-        .max_by_key(|(_, t)| *t)
-        .map(|(t, _)| t)
-        .or(current.map(|(hz, slot, _)| (hz, slot)))
+        .filter_map(|e| {
+            let f = e.center_hz.filter(|f| (lo..hi).contains(f))?;
+            Some(((f, e.slot), e.granted_at?, group_in(&policy.priority, Some(e.call))))
+        })
+        .filter(|(t, _, _)| current.is_none_or(|(hz, slot, _)| (hz - t.0).abs() > 1.0 || slot != t.1))
+        .collect();
+    drop(calls);
+    let best = candidates.iter().max_by_key(|(_, t, p)| (*p, *t)).copied();
+    if let Some((hz, slot, c)) = current {
+        let busy = match c.voice.idle_s() {
+            Some(idle) => idle < HOLD_S && c.voice.cipher().is_none(),
+            None => age(c.since) < HOLD_S,
+        };
+        let talking = c.voice.call();
+        let current_priority = group_in(&policy.priority, talking);
+        // A priority talkgroup preempts anything else; a locked-out one
+        // (locked while it was playing) is left.
+        let preempt = best.is_some_and(|(_, _, p)| p) && !current_priority;
+        if busy && !preempt && !group_in(&policy.lockout, talking) {
+            return Some((hz, slot));
+        }
+    }
+    let keep = current.filter(|(_, _, c)| !group_in(&policy.lockout, c.voice.call())).map(|(hz, slot, _)| (hz, slot));
+    best.map(|(t, _, _)| t).or(keep)
 }
 
 pub(crate) fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>, rate: f64) {
@@ -469,5 +491,114 @@ fn attach(shared: &Shared, center_hz: f64, call: Option<Call>, path: PathBuf) {
     log::info!("recorded {}", path.display());
     if let Some(call) = call {
         shared.calls.lock().recorded(center_hz, call, path);
+    }
+}
+
+/// A recording being played: a WAV (16-bit PCM, any rate, mono or the
+/// first channel) fed at real time into its own audio queue.
+pub struct Playback {
+    pub path: PathBuf,
+    pub queue: Arc<AudioQueue>,
+    pub seconds: f64,
+    stop: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+}
+
+impl Playback {
+    pub fn start(path: &std::path::Path) -> std::io::Result<Self> {
+        let bytes = std::fs::read(path)?;
+        let (rate, pcm) = read_wav(&bytes).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "not a 16-bit PCM WAV"))?;
+        let queue = Arc::new(AudioQueue::default());
+        queue.set_limits(1.0, 0.0);
+        let (stop, done) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let seconds = pcm.len() as f64 / rate;
+        let (q, st, dn) = (queue.clone(), stop.clone(), done.clone());
+        std::thread::Builder::new().name("playback".into()).spawn(move || {
+            // Linear interpolation to the output rate, 20 ms at a time.
+            let step = rate / AUDIO_RATE;
+            let out_len = (pcm.len() as f64 / step) as usize;
+            let chunk = (0.02 * AUDIO_RATE) as usize;
+            let t0 = std::time::Instant::now();
+            let mut i = 0;
+            while i < out_len && !st.load(Ordering::Relaxed) {
+                let block: Vec<f32> = (i..(i + chunk).min(out_len))
+                    .map(|k| {
+                        let x = k as f64 * step;
+                        let (j, f) = (x as usize, (x.fract()) as f32);
+                        let a = pcm[j] as f32;
+                        let b = *pcm.get(j + 1).unwrap_or(&pcm[j]) as f32;
+                        (a + (b - a) * f) / 32768.0
+                    })
+                    .collect();
+                q.push(&block);
+                i += block.len();
+                // Stay about 0.1 s ahead of the player.
+                let ahead = i as f64 / AUDIO_RATE - t0.elapsed().as_secs_f64();
+                if ahead > 0.1 {
+                    std::thread::sleep(Duration::from_secs_f64(ahead - 0.1));
+                }
+            }
+            if !st.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            dn.store(true, Ordering::Relaxed);
+        })?;
+        Ok(Playback { path: path.to_path_buf(), queue, seconds, stop, done })
+    }
+
+    /// Played to the end (or stopped).
+    pub fn finished(&self) -> bool {
+        self.done.load(Ordering::Relaxed)
+    }
+
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.queue.clear();
+    }
+}
+
+impl Drop for Playback {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// (sample rate, samples of the first channel) of a 16-bit PCM WAV.
+fn read_wav(b: &[u8]) -> Option<(f64, Vec<i16>)> {
+    if b.get(0..4)? != b"RIFF" || b.get(8..12)? != b"WAVE" {
+        return None;
+    }
+    let (mut at, mut fmt) = (12, None);
+    while at + 8 <= b.len() {
+        let id = &b[at..at + 4];
+        let len = u32::from_le_bytes(b[at + 4..at + 8].try_into().ok()?) as usize;
+        let body = b.get(at + 8..(at + 8 + len).min(b.len()))?;
+        if id == b"fmt " && body.len() >= 16 {
+            let channels = u16::from_le_bytes([body[2], body[3]]) as usize;
+            let rate = u32::from_le_bytes(body[4..8].try_into().ok()?) as f64;
+            let bits = u16::from_le_bytes([body[14], body[15]]);
+            if u16::from_le_bytes([body[0], body[1]]) != 1 || bits != 16 || channels == 0 {
+                return None;
+            }
+            fmt = Some((rate, channels));
+        } else if id == b"data" {
+            let (rate, channels) = fmt?;
+            let pcm = body.chunks_exact(2 * channels).map(|s| i16::from_le_bytes([s[0], s[1]])).collect();
+            return Some((rate, pcm));
+        }
+        at += 8 + len + (len & 1);
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wav_round_trip() {
+        let pcm: Vec<i16> = (0..400).map(|i| (i * 37 % 2000) as i16 - 1000).collect();
+        let (rate, back) = read_wav(&wav(&pcm)).unwrap();
+        assert_eq!((rate, back), (8000.0, pcm));
     }
 }

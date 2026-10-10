@@ -29,7 +29,7 @@ pub use classify::ClassifierLoad;
 pub use detect::demod::Mode as DemodMode;
 pub use detect::p25::SystemInfo as P25System;
 pub use emitters::Emitter;
-pub use listen::{AudioQueue, ListenSpec, VoiceStatus, recordings_dir};
+pub use listen::{AudioQueue, FollowPolicy, ListenSpec, Playback, VoiceStatus, recordings_dir};
 pub use calls::CallEvent;
 pub use monitor::{GrantEvent, MonitorInfo, PageEvent};
 pub use occupancy::KnownOccupant;
@@ -145,6 +145,7 @@ struct Shared {
     listen: Mutex<Option<ListenSpec>>,
     audio: Arc<AudioQueue>,
     voice: Mutex<VoiceStatus>,
+    follow_policy: Mutex<FollowPolicy>,
 }
 
 impl Shared {
@@ -263,6 +264,7 @@ impl Source {
             listen: Mutex::new(None),
             audio: Arc::new(AudioQueue::default()),
             voice: Mutex::new(Default::default()),
+            follow_policy: Mutex::new(Default::default()),
         });
         device.start(Box::new(RingSink { shared: shared.clone() }))?;
         let info = device.info().clone();
@@ -388,6 +390,11 @@ impl Source {
 
     pub fn listening(&self) -> Option<ListenSpec> {
         *self.shared.listen.lock()
+    }
+
+    /// Talkgroups following prefers or ignores.
+    pub fn set_follow_policy(&self, p: FollowPolicy) {
+        *self.shared.follow_policy.lock() = p;
     }
 
     /// The digital voice channel being played, if any.
