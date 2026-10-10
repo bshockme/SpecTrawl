@@ -13,8 +13,8 @@ use std::f64::consts::PI;
 use crate::frames::Frame;
 use crate::imbe_tables::{BLOCKS, DCT_BITS, GAIN_ALLOC, GAIN_LEVELS};
 use crate::mbe::{self, Model, MAX_L};
-use crate::p25::data_dibits;
-use crate::p25_lc::golay23_decode;
+use crate::p25::{data_dibits, data_soft};
+use crate::p25_lc::{chase, dibit_reliability, golay23_decode, golay23_nearest};
 
 /// Code vector lengths: c0..c7.
 const LEN: [usize; 8] = [23, 23, 23, 23, 15, 15, 15, 7];
@@ -186,6 +186,41 @@ pub fn decode(dibits: &[u8]) -> Coded {
     Coded { u, errors }
 }
 
+/// Bits flipped in every combination by the soft decoder: the 5 least
+/// reliable of each word (32 trials).
+const CHASE_FLIPS: usize = 5;
+
+/// Error-corrects a frame's 72 dibits using their soft values (BABA 7:
+/// "soft-decision decoding can substantially improve performance"):
+/// Chase decoding of each Golay and Hamming word.
+pub fn decode_soft(dibits: &[u8], soft: &[f32]) -> Coded {
+    let mut c = deinterleave(dibits);
+    let mut rel = [[0f32; 23]; 8];
+    for (x, pair) in soft.iter().zip(INTERLEAVE.iter()) {
+        for (r, &(v, b)) in dibit_reliability(*x).into_iter().zip(pair) {
+            rel[v as usize][b as usize] = r;
+        }
+    }
+    let hamming = |w: u32| {
+        let (d, _) = hamming15_decode(w as u16);
+        (d as u32) << 4 | hamming15_parity(d) as u32
+    };
+    let mut u = [0u16; 8];
+    let mut errors = [0u8; 7];
+    let cw0 = chase(c[0], &rel[0], CHASE_FLIPS, golay23_nearest);
+    u[0] = (cw0 >> 11) as u16;
+    errors[0] = (cw0 ^ c[0]).count_ones() as u8;
+    let m = modulation(u[0]);
+    for i in 1..7 {
+        c[i] ^= m[i];
+        let cw = if i < 4 { chase(c[i], &rel[i][..23], CHASE_FLIPS, golay23_nearest) } else { chase(c[i], &rel[i][..15], CHASE_FLIPS, hamming) };
+        u[i] = (cw >> if i < 4 { 11 } else { 4 }) as u16;
+        errors[i] = (cw ^ c[i]).count_ones() as u8;
+    }
+    u[7] = c[7] as u16;
+    Coded { u, errors }
+}
+
 /// Where the nine voice frames of an LDU sit in its data dibits (after the
 /// NID, status symbols removed): two frames, then six pieces of link
 /// control or encryption sync (20 dibits) each followed by a frame, then
@@ -193,8 +228,17 @@ pub fn decode(dibits: &[u8]) -> Coded {
 pub const LDU_VOICE: [usize; 9] = [0, 72, 164, 256, 348, 440, 532, 624, 712];
 
 /// The nine voice frames of an LDU1 or LDU2 (sliced with at least ~880
-/// dibits after the sync), error corrected.
+/// dibits after the sync), error corrected (soft decision).
 pub fn ldu_frames(f: &Frame) -> Option<[Coded; 9]> {
+    let d = data_dibits(f, 784)?;
+    match data_soft(f, 784) {
+        Some(x) => Some(LDU_VOICE.map(|at| decode_soft(&d[at..at + 72], &x[at..at + 72]))),
+        None => Some(LDU_VOICE.map(|at| decode(&d[at..at + 72]))),
+    }
+}
+
+/// The same, hard decision only.
+pub fn ldu_frames_hard(f: &Frame) -> Option<[Coded; 9]> {
     let d = data_dibits(f, 784)?;
     Some(LDU_VOICE.map(|at| decode(&d[at..at + 72])))
 }
@@ -493,6 +537,42 @@ mod tests {
         assert_eq!(got.u, u);
         assert_eq!(got.errors[0], 3);
         assert!(got.errors[4..7].iter().all(|&e| e == 1), "{:?}", got.errors);
+    }
+
+    /// On noisy symbols, soft decision recovers frames hard decision loses.
+    #[test]
+    fn soft_decision_beats_hard_in_noise() {
+        // xorshift: deterministic noise without a dependency.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut gauss = move || {
+            let (a, b) = (rnd().max(1e-12), rnd());
+            ((-2.0 * a.ln()).sqrt() * (2.0 * PI * b).cos()) as f32
+        };
+        let level = |d: u8| [1.0 / 3.0, 1.0, -1.0 / 3.0, -1.0][d as usize];
+        let (mut hard_bad, mut soft_bad) = (0, 0);
+        for n in 0..400u32 {
+            let u = [n as u16 * 7 & 0xFFF, n as u16 * 13 & 0xFFF, 0x5A5, 0x3C3, 0x2AA, 0x155, 0x7F0, 0x2B];
+            let d = encode(u);
+            let x: Vec<f32> = d.iter().map(|&v| level(v) + 0.22 * gauss()).collect();
+            let rx: Vec<u8> = x
+                .iter()
+                .map(|&v| match v {
+                    v if v > 2.0 / 3.0 => 1,
+                    v if v > 0.0 => 0,
+                    v if v > -2.0 / 3.0 => 2,
+                    _ => 3,
+                })
+                .collect();
+            hard_bad += (decode(&rx).u != u) as u32;
+            soft_bad += (decode_soft(&rx, &x).u != u) as u32;
+        }
+        assert!(soft_bad * 3 < hard_bad * 2, "hard {hard_bad} soft {soft_bad}");
     }
 
     #[test]

@@ -66,6 +66,39 @@ pub fn golay23_decode(cw: u32) -> (u32, u32) {
     ((cw ^ e) >> 11, e.count_ones())
 }
 
+/// Bit reliabilities of a dibit from its soft value (outer levels ±1, inner
+/// ±1/3): the first bit is the sign, the second outer (1) or inner (0).
+pub fn dibit_reliability(x: f32) -> [f32; 2] {
+    [x.abs(), (x.abs() - 2.0 / 3.0).abs()]
+}
+
+/// Chase decoding: `rx` is a received word whose bit `i` has reliability
+/// `rel[i]`; `decode` maps a hard word to the nearest codeword. Tries every
+/// pattern of flips among the `flips` least reliable bits and returns the
+/// codeword nearest `rx` in reliability-weighted distance.
+pub fn chase(rx: u32, rel: &[f32], flips: usize, decode: impl Fn(u32) -> u32) -> u32 {
+    let mut order: Vec<usize> = (0..rel.len()).collect();
+    order.sort_by(|&a, &b| rel[a].total_cmp(&rel[b]));
+    let weak = &order[..flips.min(order.len())];
+    let cost = |cw: u32| -> f32 { (0..rel.len()).filter(|&i| (cw ^ rx) >> i & 1 == 1).map(|i| rel[i]).sum() };
+    let mut best = (f32::MAX, rx);
+    for pattern in 0u32..1 << weak.len() {
+        let flip = weak.iter().enumerate().filter(|(k, _)| pattern >> k & 1 == 1).fold(0u32, |a, (_, &i)| a | 1 << i);
+        let cw = decode(rx ^ flip);
+        let c = cost(cw);
+        if c < best.0 {
+            best = (c, cw);
+        }
+    }
+    best.1
+}
+
+/// The Golay (23,12) codeword nearest a received word.
+pub fn golay23_nearest(w: u32) -> u32 {
+    let (d, _) = golay23_decode(w);
+    golay_encode(d) >> 1
+}
+
 /// Corrects a received Golay (24,12) word: (12 data bits, bits fixed), or
 /// None when it's beyond repair (4 errors, caught by the parity bit).
 pub fn golay_decode(w: u32) -> Option<(u32, u32)> {

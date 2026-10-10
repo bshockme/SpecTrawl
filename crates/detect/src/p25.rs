@@ -40,6 +40,15 @@ pub const CODING: Coding = Coding { scatter: true, transpose: false, crc_init: 0
 /// every 35 dibits, counted from the first sync dibit). None if `f.dibits`
 /// doesn't reach that far.
 pub fn data_dibits(f: &Frame, n: usize) -> Option<Vec<u8>> {
+    data_symbols(&f.dibits, f.sync_start, n)
+}
+
+/// The soft values of the same symbols as `data_dibits`.
+pub fn data_soft(f: &Frame, n: usize) -> Option<Vec<f32>> {
+    data_symbols(&f.soft, f.sync_start, n)
+}
+
+fn data_symbols<T: Copy>(v: &[T], sync_start: usize, n: usize) -> Option<Vec<T>> {
     let mut out = Vec::with_capacity(n);
     let mut idx = 24; // frame dibit index (0 = first sync dibit)
     let mut nid = 0;
@@ -48,7 +57,7 @@ pub fn data_dibits(f: &Frame, n: usize) -> Option<Vec<u8>> {
             if nid < 32 {
                 nid += 1;
             } else {
-                out.push(*f.dibits.get(f.sync_start + idx)?);
+                out.push(*v.get(sync_start + idx)?);
             }
         }
         idx += 1;
