@@ -17,8 +17,8 @@ pub mod flex_join;
 pub mod frames;
 pub mod gsm;
 pub mod imbe;
-pub mod lte;
 mod imbe_tables;
+pub mod lte;
 pub mod mbe;
 pub mod p25;
 pub mod p25_lc;
@@ -125,10 +125,8 @@ pub fn p25_voice_frames(x: &[Complex32], fs: f64) -> Vec<frames::Frame> {
     let slice = |hs: &[sync::SyncHit]| frames::slice_with(&disc, fs, hs, 8, 880, frames::SliceOpts::default());
     let mut found: Vec<frames::Frame> = slice(&hits).into_iter().filter(is_ldu).collect();
     let max_symbol = (x.len() as f64 / fs * 4800.0) as usize;
-    let mut frontier: Vec<sync::SyncHit> = found
-        .iter()
-        .filter_map(|f| hits.iter().find(|h| h.symbol.abs_diff(f.at_symbol + 23) <= 3).cloned())
-        .collect();
+    let mut frontier: Vec<sync::SyncHit> =
+        found.iter().filter_map(|f| hits.iter().find(|h| h.symbol.abs_diff(f.at_symbol + 23) <= 3).cloned()).collect();
     // Walk out from every LDU in both directions while LDUs keep turning up.
     while !frontier.is_empty() {
         let mut next = Vec::new();
@@ -149,6 +147,112 @@ pub fn p25_voice_frames(x: &[Complex32], fs: f64) -> Vec<frames::Frame> {
     }
     found.sort_by_key(|f| f.at_symbol);
     found
+}
+
+/// One sync search and slice of a discriminator: the protocol named, its
+/// frames and what decoded from them.
+struct SyncPass {
+    best: SyncResult,
+    frames: Vec<frames::Frame>,
+    fields: decode::Fields,
+}
+
+impl SyncPass {
+    /// More decoded frames wins; then more sync occurrences.
+    fn better_than(&self, other: &SyncPass) -> bool {
+        (self.fields.decoded, self.best.count) > (other.fields.decoded, other.best.count)
+    }
+}
+
+/// Symbols sliced around each sync: DMR bursts carry their payload either
+/// side of the sync (54 symbols before, 78 after); others need only the
+/// header after. P25 link control: TDULC ends ~210 dibits after the sync,
+/// LDU1 ~860. Phase 2: a fragment is 720 dibits, its syncs at 360 and 540,
+/// so take enough either side for whichever this is. A POCSAG batch: 16
+/// codewords of 32 bits after the sync.
+fn slice_extent(protocol: &str, detail: &str) -> (usize, usize) {
+    match protocol {
+        "DMR" => (54, 80),
+        "POCSAG" => (0, 520),
+        "P25" if detail == "Phase 2" => (560, 380),
+        "P25" => (8, 880),
+        _ => (8, 64),
+    }
+}
+
+/// Pre-filter cutoff each protocol slices best through, measured on the
+/// real captures (`examples/slice_tune`, `examples/burst_windows`):
+/// narrowband 4FSK at 4 kHz (the weak DMR control channel: 58 frames
+/// against 22 at 6.5 kHz; P25 Phase 1 NID errors 0.43 against 0.46-0.58);
+/// NXDN48 is indifferent on a strong signal (81-82 LICH at every cutoff)
+/// and decodes a few more frames through 6.5 kHz on a weak one (4 against
+/// 1), so it gets the second look through the wide filter; the ±4.5 kHz
+/// binary pagers want the wide filter outright. Phase 2 showed no
+/// difference between 4, 5 and 6.5 kHz on the captures here.
+pub fn protocol_cutoff_hz(protocol: &str, detail: &str) -> f64 {
+    match (protocol, detail) {
+        ("NXDN", "NXDN48") => 6_500.0,
+        ("dPMR", _) => 3_000.0,
+        ("POCSAG", _) | ("ProVoice", _) => 6_500.0,
+        _ => NARROW_CUTOFF_HZ,
+    }
+}
+
+/// Searches `d` for syncs (all protocols, or only `want`'s), slices the
+/// winner's frames and decodes them.
+fn sync_pass(d: &[f32], fs: f64, want: Option<&SyncResult>) -> Option<SyncPass> {
+    let mut hits = sync::search(d, fs, &sync::table());
+    if let Some(w) = want {
+        hits.retain(|h| h.entry.protocol == w.protocol && h.entry.detail == w.detail && h.entry.baud == w.baud);
+    }
+    let best = sync::best(&hits)?;
+    let mine: Vec<sync::SyncHit> = hits.into_iter().filter(|h| h.entry.protocol == best.protocol && h.entry.baud == best.baud).collect();
+    let (before, after) = slice_extent(best.protocol, best.detail);
+    let fr = frames::slice(d, fs, &mine, before, after);
+    let mut fields = decode::summarise(&fr);
+    if best.protocol == "POCSAG" {
+        let pages = pocsag::pages(&fr);
+        fields.tried = fr.len();
+        fields.decoded = pages.len();
+        fields.activity = Some(decode::Activity::Data);
+        fields.kinds = vec![("page".into(), pages.len())];
+        fields.messages = pages.iter().map(|p| format!("{} ({}): {}", p.address, (b'A' + p.function) as char, p.text)).collect();
+    }
+    Some(SyncPass { best, frames: fr, fields })
+}
+
+/// Features read off the sliced frames once a sync has named the signal:
+/// the symbol rate is the protocol's, the deviation is the outer level the
+/// sync measured (in Hz), and the level count comes from how many payload
+/// symbols sit at the inner levels. The raw histogram and transition-line
+/// measures these come from are blank or high on weak real signals
+/// (noise overshoot widens the 98th percentile; the line is buried).
+fn sync_features(f: &mut Features, frames: &[frames::Frame], best: &SyncResult) {
+    f.symbol_rate = Some(best.baud);
+    if f.symbol_rate_raw.is_none() {
+        f.symbol_rate_raw = Some(best.baud);
+    }
+    if frames.is_empty() {
+        return;
+    }
+    let mut outers: Vec<f32> = frames.iter().map(|fr| fr.outer.abs()).collect();
+    outers.sort_by(f32::total_cmp);
+    f.deviation_hz = outers[outers.len() / 2];
+    let binary = matches!(best.protocol, "POCSAG" | "ProVoice");
+    let (mut inner, mut total) = (0usize, 0usize);
+    for fr in frames {
+        for v in &fr.soft {
+            total += 1;
+            inner += (v.abs() < 2.0 / 3.0) as usize;
+        }
+    }
+    f.fsk_levels = if binary {
+        2
+    } else if total > 0 && inner as f32 / total as f32 > 0.12 {
+        4
+    } else {
+        2
+    };
 }
 
 fn frames_from(x: &[Complex32], fs: f64, before: usize, after: usize, opts: frames::SliceOpts) -> Vec<frames::Frame> {
@@ -210,6 +314,13 @@ pub fn classify(x: &[Complex32], fs: f64, bandwidth_hz: f64) -> Classification {
             c.protocol = Some("FLEX".into());
             c.label = format!("FLEX {}", h.mode());
             c.confidence = 0.95;
+            // The header names the speed; FLEX deviates ±4.8 kHz at the outer levels.
+            c.features.symbol_rate = Some(h.baud as f64);
+            if c.features.symbol_rate_raw.is_none() {
+                c.features.symbol_rate_raw = Some(h.baud as f64);
+            }
+            c.features.fsk_levels = h.levels;
+            c.features.deviation_hz = 4_800.0;
             c.fields = Some(decode::Fields {
                 kinds: vec![("frame".into(), headers.len()), ("page".into(), pages.len())],
                 decoded: headers.len(),
@@ -223,44 +334,40 @@ pub fn classify(x: &[Complex32], fs: f64, bandwidth_hz: f64) -> Classification {
     }
 
     // Sync search for narrowband signals that aren't bare carriers: first
-    // through the narrow 4FSK pre-filter, then the bandwidth's own.
+    // through the narrow 4FSK pre-filter, then the bandwidth's own. Once a
+    // protocol is named, the channel is sliced again through the cutoff
+    // that protocol does best with, and the better of the two passes kept.
     if (4.5e3..60e3).contains(&bandwidth_hz) {
         let narrow = bandwidth_hz <= 25e3;
-        for d in [narrow.then(|| sync_disc(&prepare_cutoff(raw, fs, NARROW_CUTOFF_HZ), fs)), Some(sync_disc(x, fs))].into_iter().flatten() {
-            let hits = sync::search(&d, fs, &sync::table());
-            let Some(best) = sync::best(&hits) else { continue };
-            // Slice and decode the frames of the identified protocol.
-            let mine: Vec<sync::SyncHit> =
-                hits.into_iter().filter(|h| h.entry.protocol == best.protocol && h.entry.baud == best.baud).collect();
-            // DMR bursts carry their payload either side of the sync (54
-            // symbols before, 78 after); others need only the header after.
-            let (before, after) = match best.protocol {
-                "DMR" => (54, 80),
-                // A POCSAG batch: 16 codewords of 32 bits after the sync.
-                "POCSAG" => (0, 520),
-                // P25 link control: TDULC ends ~210 dibits after the sync,
-                // LDU1 ~860.
-                // Phase 2: a fragment is 720 dibits, its syncs at 360 and
-                // 540, so take enough either side for whichever this is.
-                "P25" if best.detail == "Phase 2" => (560, 380),
-                "P25" => (8, 880),
-                _ => (8, 64),
-            };
-            let fr = frames::slice(&d, fs, &mine, before, after);
-            let mut fields = decode::summarise(&fr);
-            if best.protocol == "POCSAG" {
-                let pages = pocsag::pages(&fr);
-                fields.tried = fr.len();
-                fields.decoded = pages.len();
-                fields.activity = Some(decode::Activity::Data);
-                fields.kinds = vec![("page".into(), pages.len())];
-                fields.messages = pages.iter().map(|p| format!("{} ({}): {}", p.address, (b'A' + p.function) as char, p.text)).collect();
+        let own_cutoff = (bandwidth_hz * 0.5 + 500.0).clamp(4_000.0, 6_500.0);
+        let mut found: Option<(f64, SyncPass)> = None;
+        for (cutoff, d) in [
+            narrow.then(|| (NARROW_CUTOFF_HZ, sync_disc(&prepare_cutoff(raw, fs, NARROW_CUTOFF_HZ), fs))),
+            Some((own_cutoff, sync_disc(x, fs))),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(p) = sync_pass(&d, fs, None) {
+                found = Some((cutoff, p));
+                break;
             }
-            if fields.tried > 0 {
-                c.fields = Some(fields);
+        }
+        if let Some((used, mut pass)) = found {
+            let pref = protocol_cutoff_hz(pass.best.protocol, pass.best.detail);
+            if (pref - used).abs() > 1.0 {
+                let d = sync_disc(&prepare_cutoff(raw, fs, pref), fs);
+                if let Some(again) = sync_pass(&d, fs, Some(&pass.best)) {
+                    if again.better_than(&pass) {
+                        pass = again;
+                    }
+                }
             }
-            c.sync = Some(best);
-            break;
+            sync_features(&mut c.features, &pass.frames, &pass.best);
+            if pass.fields.tried > 0 {
+                c.fields = Some(pass.fields);
+            }
+            c.sync = Some(pass.best);
         }
     }
     let f = &c.features;
@@ -376,7 +483,9 @@ mod tests {
         cws.push(pocsag::encode((1_234_567u32 >> 3) << 2 | 3));
         let text = "SPECTRAWL TEST";
         let bits: Vec<u32> = text.bytes().flat_map(|c| (0..7).map(move |i| (c >> i & 1) as u32)).collect();
-        cws.extend(bits.chunks(20).map(|c| pocsag::encode(1 << 20 | c.iter().chain(std::iter::repeat(&0)).take(20).fold(0, |a, b| a << 1 | b))));
+        cws.extend(
+            bits.chunks(20).map(|c| pocsag::encode(1 << 20 | c.iter().chain(std::iter::repeat(&0)).take(20).fold(0, |a, b| a << 1 | b))),
+        );
         cws.resize(32, 0x7A89_C197);
         let mut stream: Vec<bool> = (0..576).map(|i| i % 2 == 0).collect();
         for batch in cws.chunks(16) {

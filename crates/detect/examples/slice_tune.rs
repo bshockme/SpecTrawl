@@ -29,6 +29,10 @@ fn main() {
         let variants: Vec<(&str, f64, SliceOpts)> = vec![
             ("plain 6.5k/0.5", 6.5e3, SliceOpts::plain()),
             ("default 4k", 4.0e3, SliceOpts::default()),
+            ("default 2.5k", 2.5e3, SliceOpts::default()),
+            ("default 3k", 3.0e3, SliceOpts::default()),
+            ("default 5k", 5.0e3, SliceOpts::default()),
+            ("default 6.5k", 6.5e3, SliceOpts::default()),
             ("4k 0.75 refine", 4.0e3, base),
             ("3.5k 0.75 refine", 3.5e3, base),
             ("4k +lpf.625", 4.0e3, SliceOpts { post_lpf: Some(0.625), ..base }),
@@ -47,6 +51,7 @@ fn main() {
                     let (mut dmr_n, mut slot_errs, mut ok) = (0, 0u32, 0);
                     let (mut nids, mut nid_errs) = (0, 0u32);
                     let mut nxdn = 0;
+                    let mut p2 = 0;
                     for f in &fr {
                         match f.protocol {
                             "DMR" if f.detail.contains("data") => {
@@ -62,19 +67,21 @@ fn main() {
                                     nid_errs += n.errors;
                                 }
                             }
-                            "NXDN" => nxdn += 1,
+                            "NXDN" => nxdn += decode::nxdn_lich(f).is_some() as usize,
+                            "P25" if f.detail == "Phase 2" => p2 += 1,
                             _ => {}
                         }
                     }
                     println!(
-                        "  {:<20} | {:>6} {:>14.2} {:>10} | {:>8} {:>9.2} | {:>4}",
+                        "  {:<20} | {:>6} {:>14.2} {:>10} | {:>8} {:>9.2} | {:>4} | P2 {:>4}",
                         label,
                         dmr_n,
                         slot_errs as f32 / dmr_n.max(1) as f32,
                         ok,
                         nids,
                         nid_errs as f32 / nids.max(1) as f32,
-                        nxdn
+                        nxdn,
+                        p2
                     );
                 }
             }

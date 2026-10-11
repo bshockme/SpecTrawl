@@ -613,6 +613,7 @@ mod tests {
             class_at: None,
             group_misses: 0,
             last_end_sample: 0,
+            recent: Default::default(),
             tuner_center_hz: 0.0,
             bin_hz: 54e3,
             solid_records: 5,

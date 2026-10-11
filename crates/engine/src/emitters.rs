@@ -43,6 +43,8 @@ const PRUNE_EVERY: u32 = 64;
 
 /// See `Emitter::label`.
 const STICKY_LABELS: [&str; 2] = ["Internal spur", "DC offset"];
+/// Closed records whose ring extents an emitter remembers.
+const RECENT_RECORDS: usize = 8;
 
 /// Times a protocol must be identified on an emitter before it's believed...
 const MIN_PROTOCOL_HITS: u32 = 2;
@@ -89,6 +91,10 @@ pub struct Emitter {
     pub(crate) group_misses: u32,
     /// Newest record's ring position and tuner centre (for group windows).
     pub(crate) last_end_sample: u64,
+    /// Ring extents (first row end, last row end) of the newest closed
+    /// records, oldest first, so a group window can take in several short
+    /// bursts rather than a fixed stretch behind the last one.
+    pub(crate) recent: std::collections::VecDeque<(u64, u64)>,
     pub(crate) tuner_center_hz: f64,
     /// Bin width of the rows its records came from.
     pub(crate) bin_hz: f64,
@@ -243,6 +249,10 @@ impl EmitterBook {
                 if r.rows >= 2 || r.max_snr_db >= BLIP_SNR_DB {
                     e.solid_records += 1;
                 }
+                if e.recent.len() >= RECENT_RECORDS {
+                    e.recent.pop_front();
+                }
+                e.recent.push_back((r.first_row_end_sample, r.last_row_end_sample));
             }
             e.confirmed |= e.solid_records >= CONFIRM_RECORDS
                 || (r.duration_s() >= CONFIRM_DURATION_S && r.rows >= CONFIRM_ROWS)
@@ -276,6 +286,11 @@ impl EmitterBook {
         e.confirmed |= from.confirmed;
         e.peak_snr_db = e.peak_snr_db.max(from.peak_snr_db);
         e.last_end_sample = e.last_end_sample.max(from.last_end_sample);
+        e.recent.extend(from.recent);
+        let mut recent: Vec<(u64, u64)> = e.recent.drain(..).collect();
+        recent.sort();
+        recent.dedup();
+        e.recent.extend(recent.into_iter().rev().take(RECENT_RECORDS).rev());
         for (k, n) in from.tally {
             *e.tally.entry(k).or_default() += n;
         }
@@ -328,6 +343,7 @@ impl EmitterBook {
             class_at: None,
             group_misses: 0,
             last_end_sample: r.last_row_end_sample,
+            recent: Default::default(),
             tuner_center_hz: r.tuner_center_hz,
             bin_hz: r.bin_hz,
         }
