@@ -52,6 +52,9 @@ pub struct SpectrumView {
     zoom: Option<(f64, f64)>,
     /// The zoom the texture was built for.
     tex_zoom: Option<(f64, f64)>,
+    /// Rows at the back of `history` copied from the survey after a retune
+    /// (drawn dimmed: coarse and seconds apart, not this receiver's own).
+    backfilled: usize,
     /// Rows scrolled back from the newest (0 = live edge).
     scroll: usize,
     /// Wall time of each history row, newest first (parallel to `history`).
@@ -87,6 +90,7 @@ impl SpectrumView {
             last_timed: None,
             zoom: None,
             tex_zoom: None,
+            backfilled: 0,
             scroll: 0,
             row_times: VecDeque::with_capacity(ROWS),
             trace: Vec::new(),
@@ -228,11 +232,58 @@ impl SpectrumView {
             if self.history.len() == ROWS {
                 self.history.pop_back();
                 self.row_times.pop_back();
+                self.backfilled = self.backfilled.saturating_sub(1);
             }
             self.history.push_front(dec);
             self.row_times.push_front(row.time);
             self.push_tex_row();
         }
+    }
+
+    /// Fills this (focus) view's history from the survey's rows over
+    /// `lo..hi` Hz, so a freshly tuned pane doesn't start blank: each survey
+    /// row is stretched over the focus rows its pass covered and resampled
+    /// to the span. Drawn dimmed until live rows push it off.
+    pub fn backfill_from(&mut self, survey: &SpectrumView, lo: f64, hi: f64, rows_per_sec: f64) {
+        let Some((f0, f1)) = survey.full_span() else { return };
+        if hi <= lo || lo < f0 || hi > f1 || survey.history.is_empty() {
+            return;
+        }
+        self.history.clear();
+        self.row_times.clear();
+        self.scroll = 0;
+        let width = self.hist_w.min(2048);
+        let mut dec = vec![0.0; width];
+        let mut times = survey.row_times.iter().copied();
+        let mut newer = times.next();
+        // Survey rows newest first; each covers the time back to the next one.
+        for (k, row) in survey.history.iter().enumerate() {
+            let len = row.len();
+            let c0 = (((lo - f0) / (f1 - f0)) * len as f64).floor().clamp(0.0, (len - 1) as f64) as usize;
+            let c1 = (((hi - f0) / (f1 - f0)) * len as f64).ceil().clamp((c0 + 1) as f64, len as f64) as usize;
+            dsp::decimate_max(&row[c0..c1], &mut dec);
+            let t = survey.row_times.get(k).copied().unwrap_or_else(std::time::SystemTime::now);
+            let older = survey.row_times.get(k + 1).copied();
+            let gap = match older {
+                Some(o) => t.duration_since(o).map(|d| d.as_secs_f64()).unwrap_or(1.0),
+                None => 1.0,
+            };
+            let n = ((gap * rows_per_sec).round() as usize).clamp(1, 200);
+            for i in 0..n {
+                if self.history.len() >= ROWS {
+                    break;
+                }
+                self.history.push_back(dec.clone());
+                self.row_times.push_back(t - std::time::Duration::from_secs_f64(i as f64 / rows_per_sec));
+            }
+            newer = Some(t);
+            if self.history.len() >= ROWS {
+                break;
+            }
+        }
+        let _ = newer;
+        self.backfilled = self.history.len();
+        self.tex = None;
     }
 
     /// Clock-driven rows: the newest row is the sweep's row in progress and
@@ -330,10 +381,16 @@ impl SpectrumView {
         let mut px = vec![theme::PLOT_BG; width * ROWS];
         let mut cols = vec![0.0; width];
         let mut line = Vec::with_capacity(width);
+        let first_backfilled = self.history.len().saturating_sub(self.backfilled);
         for (r, row) in self.history.iter().enumerate() {
             let (c0, c1) = self.zoom_cols(row.len());
             dsp::decimate_max(&row[c0..c1], &mut cols);
             self.colorize(&cols, &mut line);
+            if r >= first_backfilled {
+                for c in line.iter_mut() {
+                    *c = c.gamma_multiply(0.55);
+                }
+            }
             px[r * width..(r + 1) * width].copy_from_slice(&line);
         }
         let img = egui::ColorImage::new([width, ROWS], px);

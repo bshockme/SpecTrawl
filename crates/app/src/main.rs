@@ -1476,11 +1476,37 @@ impl App {
         if !self.explore_tuning && self.receiver(id).is_some_and(|p| p.mode == RxMode::Explore) {
             self.set_mode(id, RxMode::Manual);
         }
+        let mut err = None;
         if let Some(p) = self.receiver_mut(id) {
             if let Err(e) = p.source.set_center(mhz * 1e6) {
-                self.error = Some(e.to_string());
+                err = Some(e.to_string());
             }
         }
+        if let Some(e) = err {
+            self.error = Some(e);
+        } else if !id.is_sweep() {
+            self.backfill(id, mhz * 1e6);
+        }
+    }
+
+    /// Copies the survey's history over a focus receiver's new span into
+    /// its waterfall so it doesn't start blank after a retune.
+    fn backfill(&mut self, id: ReceiverId, center_hz: f64) {
+        let (Some(si), Some(fi)) = (self.panes.iter().position(|p| p.id.is_sweep()), self.panes.iter().position(|p| p.id == id)) else { return };
+        if si == fi {
+            return;
+        }
+        let (rate, usable, rows_per_sec) = {
+            let p = &self.panes[fi];
+            let snap = p.source.snapshot();
+            (snap.sample_rate, snap.caps.usable_bandwidth_fraction, p.source.config().rows_per_sec)
+        };
+        let half = rate * usable / 2.0;
+        let (lo, hi) = (center_hz - half, center_hz + half);
+        let (a, b) = if si < fi { (si, fi) } else { (fi, si) };
+        let (left, right) = self.panes.split_at_mut(b);
+        let (survey, focus) = if si < fi { (&left[a], &mut right[0]) } else { (&right[0], &mut left[a]) };
+        focus.view.backfill_from(&survey.view, lo, hi, rows_per_sec);
     }
 
     /// Switches a focus receiver between Manual and Explore.
