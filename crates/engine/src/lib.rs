@@ -153,6 +153,10 @@ struct Shared {
     /// The sweep's row in progress: the stitched row as it stands part way
     /// through a pass, refreshed every `PARTIAL_EVERY` while hops arrive.
     partial: Mutex<Option<Arc<SpectrumRow>>>,
+    /// Frequency ranges (Hz) the sweep blanks before detection: the other
+    /// receivers' local-oscillator leakage (an Airspy radiates at its centre
+    /// + 5 MHz), which moves whenever they retune.
+    masks: Mutex<Vec<(f64, f64)>>,
     ffts_per_sec: Mutex<f64>,
     classifier_load: Mutex<classify::ClassifierLoad>,
     p25: Mutex<monitor::P25Book>,
@@ -280,6 +284,7 @@ impl Source {
             rows: Mutex::new(VecDeque::with_capacity(cfg.row_history)),
             sweep: Mutex::new(None),
             partial: Mutex::new(None),
+            masks: Mutex::new(Vec::new()),
             ffts_per_sec: Mutex::new(0.0),
             classifier_load: Mutex::new(Default::default()),
             p25: Mutex::new(Default::default()),
@@ -552,6 +557,13 @@ impl Source {
     /// than per pass. Its `seq` is the pass row it will become.
     pub fn sweep_partial(&self) -> Option<Arc<SpectrumRow>> {
         self.shared.partial.lock().clone()
+    }
+
+    /// Ranges (Hz) a sweeping source blanks in every hop before detection,
+    /// e.g. where another receiver's local oscillator leaks in. Replaces the
+    /// previous list; takes effect from the next hop.
+    pub fn set_masks(&self, masks: Vec<(f64, f64)>) {
+        *self.shared.masks.lock() = masks;
     }
 
     pub fn stats(&self) -> SourceStats {

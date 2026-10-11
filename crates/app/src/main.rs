@@ -316,6 +316,8 @@ struct App {
     /// Receivers whose device stopped delivering samples: (letter, when
     /// noticed, last reopen attempt).
     lost: Vec<(ReceiverId, std::time::Instant, std::time::Instant)>,
+    /// LO-leak masks last given to the survey (other Airspys' centre + 5 MHz).
+    lo_masks: Vec<(f64, f64)>,
     frame_count: u64,
 }
 
@@ -374,6 +376,12 @@ impl EmitterSort {
 
 /// Target frame interval (~60 fps).
 const FRAME_TIME: std::time::Duration = std::time::Duration::from_micros(16_667);
+/// Where an Airspy R2's local oscillator leaks out of its antenna port,
+/// relative to its centre, and how wide a notch the survey blanks there.
+const LO_LEAK_OFFSET_HZ: f64 = 5e6;
+const LO_LEAK_HALFWIDTH_HZ: f64 = 15e3;
+/// Survey emitters closer than this form one busy band in the table.
+const BAND_GAP_HZ: f64 = 1e6;
 
 /// A dockable pane. Plain identifiers: the dock tree serialises as these
 /// and the bodies are `App` methods.
@@ -617,6 +625,7 @@ impl App {
             explore_csv_ready: false,
             lost: Vec::new(),
             frame_count: 0,
+            lo_masks: Vec::new(),
         };
         app.rescan();
 
@@ -2385,6 +2394,23 @@ impl App {
         let live = self.live_ids();
         let target = self.tune_target;
         let live_spans: Vec<(ReceiverId, (f64, f64))> = live.iter().filter_map(|id| Some((*id, self.receiver(*id)?.view.span()?))).collect();
+        // Each Airspy radiates a little of its local oscillator at its
+        // centre + 5 MHz; the survey blanks those spots so they don't read
+        // as carriers that follow the focus receivers around.
+        let mut masks: Vec<(f64, f64)> = self
+            .panes
+            .iter()
+            .filter(|p| !p.id.is_sweep() && p.source.info().backend.to_lowercase().contains("airspy"))
+            .map(|p| p.source.snapshot().center_hz + LO_LEAK_OFFSET_HZ)
+            .map(|f| (f - LO_LEAK_HALFWIDTH_HZ, f + LO_LEAK_HALFWIDTH_HZ))
+            .collect();
+        masks.sort_by(|a, b| a.0.total_cmp(&b.0));
+        if masks != self.lo_masks {
+            if let Some(s) = self.receiver(ReceiverId::SWEEP) {
+                s.source.set_masks(masks.clone());
+            }
+            self.lo_masks = masks;
+        }
         self.frame = FrameInfo {
             spans: live_spans.iter().map(|(_, s)| *s).collect(),
             live_spans,
@@ -3247,6 +3273,47 @@ impl App {
         }
         let rows = std::mem::take(&mut self.emitter_cache.1);
         let new_window = std::time::Duration::from_secs_f64(self.settings.new_signal_s.max(0.0));
+        // The survey as busy bands: one chip per stretch of emitters less
+        // than a megahertz apart, so hundreds of coarse detections read as
+        // "451–455 MHz, 37 channels". Click a chip to tune the target there.
+        let mut band_tune: Option<f64> = None;
+        if self.emitter_view.source == Some(ReceiverId::SWEEP) && !rows.is_empty() {
+            let mut bands: Vec<(f64, f64, usize, usize, std::collections::BTreeMap<String, usize>)> = Vec::new();
+            let mut sorted: Vec<&engine::Emitter> = rows.iter().filter(|r| r.0.is_sweep()).map(|r| &r.1).collect();
+            sorted.sort_by(|a, b| a.center_hz.total_cmp(&b.center_hz));
+            for e in sorted {
+                match bands.last_mut() {
+                    Some(b) if e.center_hz - b.1 <= BAND_GAP_HZ => {
+                        b.1 = e.center_hz;
+                        b.2 += 1;
+                        b.3 += e.active as usize;
+                        if let Some(l) = e.label() {
+                            *b.4.entry(l).or_default() += 1;
+                        }
+                    }
+                    _ => {
+                        let mut labels = std::collections::BTreeMap::new();
+                        if let Some(l) = e.label() {
+                            labels.insert(l, 1);
+                        }
+                        bands.push((e.center_hz, e.center_hz, 1, e.active as usize, labels));
+                    }
+                }
+            }
+            let mut tune_band: Option<f64> = None;
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new(format!("{} busy bands:", bands.len())).small().color(theme::MUTED));
+                for (lo, hi, n, act, labels) in &bands {
+                    let top = labels.iter().max_by_key(|(_, c)| **c).map(|(l, c)| format!(" · {l}×{c}")).unwrap_or_default();
+                    let text = if (hi - lo) < 0.5e6 { format!("{:.2} MHz · {n}", lo / 1e6) } else { format!("{:.1}–{:.1} MHz · {n}", lo / 1e6, hi / 1e6) };
+                    let text = if *act > 0 { format!("{text} ({act} active)") } else { text };
+                    if ui.add(egui::Button::new(egui::RichText::new(text).small()).small()).on_hover_text(format!("{n} emitters{top}")).clicked() {
+                        tune_band = Some((lo + hi) / 2.0);
+                    }
+                }
+            });
+            band_tune = tune_band;
+        }
         let active = rows.iter().filter(|r| r.1.active).count();
         let identified = rows.iter().filter(|r| r.1.has_protocol()).count();
         let hidden = self.emitter_cache.2;
@@ -3390,7 +3457,7 @@ impl App {
         if let Some((rx, id)) = clicked {
             self.selection = Selection::Emitter(rx, id);
         }
-        if let Some(f) = tune {
+        if let Some(f) = tune.or(band_tune) {
             self.retune_target((f / 1e3).round() / 1e3);
         }
     }

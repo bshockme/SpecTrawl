@@ -409,6 +409,10 @@ pub(crate) fn run(
                     if let Some(grid) = plan.spur_grid_hz {
                         blank_grid_spurs(&mut db, center, rate, grid, plan.spur_halfwidth_hz);
                     }
+                    let masks = shared.masks.lock().clone();
+                    for (mlo, mhi) in masks {
+                        blank_range(&mut db, center, rate, mlo, mhi);
+                    }
                     full[h * bins_per_hop..(h + 1) * bins_per_hop].copy_from_slice(&db[first_bin..first_bin + bins_per_hop]);
                 }
                 break;
@@ -615,6 +619,28 @@ fn blank_grid_spurs(db: &mut [f32], center_hz: f64, rate: f64, grid_hz: f64, hal
     }
 }
 
+/// Replaces the bins within `lo_hz..=hi_hz` with the quieter of the levels
+/// just outside (as `blank_grid_spurs` does for one spur). No-op when the
+/// range misses this hop or runs off its edge.
+fn blank_range(db: &mut [f32], center_hz: f64, rate: f64, lo_hz: f64, hi_hz: f64) {
+    let n = db.len() as isize;
+    let bin_hz = rate / n as f64;
+    let start = center_hz - rate / 2.0;
+    let a = ((lo_hz - start) / bin_hz).floor() as isize;
+    let b = ((hi_hz - start) / bin_hz).ceil() as isize;
+    let side = 3isize;
+    if b < 0 || a >= n || a > b {
+        return;
+    }
+    let (a, b) = (a.max(side), b.min(n - 1 - side));
+    if a > b {
+        return;
+    }
+    let mean = |r: std::ops::Range<isize>| r.clone().map(|j| db[j as usize]).sum::<f32>() / r.len() as f32;
+    let fill = mean(a - side..a).min(mean(b + 1..b + 1 + side));
+    db[a as usize..=b as usize].iter_mut().for_each(|v| *v = fill);
+}
+
 enum Wait {
     Ready,
     Stopped,
@@ -810,6 +836,22 @@ mod tests {
             hop_mask(&SweepPlan { start_hz: 100e6, stop_hz: 200e6, segments: vec![(300e6, 310e6)], ..Default::default() }, 10e6, 10),
             vec![false; 10]
         );
+    }
+
+    #[test]
+    fn blank_range_fills_from_the_quieter_side_and_ignores_misses() {
+        let (centre, rate, n) = (872.5e6, 10e6, 1000);
+        let bin = |f: f64| ((f - (centre - rate / 2.0)) / (rate / n as f64)).round() as usize;
+        let mut db = vec![-90.0f32; n];
+        db[bin(876.5e6) - 1..=bin(876.5e6) + 1].iter_mut().for_each(|v| *v = -40.0);
+        db[bin(870e6)] = -50.0;
+        blank_range(&mut db, centre, rate, 876.5e6 - 15e3, 876.5e6 + 15e3);
+        assert_eq!(db[bin(876.5e6)], -90.0, "the leak is gone");
+        assert_eq!(db[bin(870e6)], -50.0, "a signal elsewhere is untouched");
+        // A range outside this hop changes nothing.
+        let before = db.clone();
+        blank_range(&mut db, centre, rate, 900e6, 900.1e6);
+        assert_eq!(db, before);
     }
 
     #[test]
