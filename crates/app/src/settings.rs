@@ -24,6 +24,8 @@ pub struct Settings {
     pub survey_segments: Vec<(f64, f64)>,
     /// Auto-explore filters and timings (`docs/auto-explore.md`).
     pub explore: ExploreSettings,
+    /// Survey waterfall row clock in seconds; 0 = one row per sweep pass.
+    pub survey_row_s: f64,
 }
 
 /// Serialisable form of `engine::explore::Config`.
@@ -78,6 +80,7 @@ impl Default for Settings {
             new_signal_s: 120.0,
             survey_segments: Vec::new(),
             explore: ExploreSettings::default(),
+            survey_row_s: 0.0,
         }
     }
 }

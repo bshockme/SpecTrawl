@@ -44,6 +44,10 @@ pub struct SpectrumView {
     pub new_within: std::time::Duration,
     /// Keep history at near-native resolution (survey views).
     hist_w: usize,
+    /// Clock-driven rows: a new history row every period, filled from the
+    /// sweep's row in progress (hop by hop), instead of one row per pass.
+    pub row_period: Option<std::time::Duration>,
+    last_timed: Option<std::time::Instant>,
     /// The frequency window shown, when zoomed in (Hz); None = the whole span.
     zoom: Option<(f64, f64)>,
     /// The zoom the texture was built for.
@@ -79,6 +83,8 @@ impl SpectrumView {
             squelch: false,
             new_within: std::time::Duration::from_secs(120),
             hist_w: HIST_W,
+            row_period: None,
+            last_timed: None,
             zoom: None,
             tex_zoom: None,
             scroll: 0,
@@ -170,8 +176,28 @@ impl SpectrumView {
         self.db_max = self.db_min + 65.0;
     }
 
+    /// Starts (or restarts) the traces on a row with a new tuning or size.
+    fn retune_to(&mut self, row: &engine::SpectrumRow) {
+        let first = self.tuning.is_none();
+        self.tuning = Some(row.tuning);
+        if let (Some((a, b)), Some((f0, f1))) = (self.zoom, self.full_span()) {
+            if a < f0 || b > f1 {
+                self.zoom = None;
+            }
+        }
+        self.trace = row.db.clone();
+        self.hold = row.db.clone();
+        if first {
+            self.auto_range();
+        }
+    }
+
     /// Pulls new spectrum rows from the source.
     pub fn ingest(&mut self, src: &Source) {
+        if let Some(period) = self.row_period {
+            self.ingest_timed(src, period);
+            return;
+        }
         let rows = src.rows_after(self.last_seq);
         let skip = rows.len().saturating_sub(ROWS);
         for row in rows.iter().skip(skip) {
@@ -207,6 +233,67 @@ impl SpectrumView {
             self.row_times.push_front(row.time);
             self.push_tex_row();
         }
+    }
+
+    /// Clock-driven rows: the newest row is the sweep's row in progress and
+    /// is redrawn as hops arrive; every `period` it is frozen and a new one
+    /// starts. A slow pass repeats cells rather than stretching a row.
+    fn ingest_timed(&mut self, src: &Source, period: std::time::Duration) {
+        let rows = src.rows_after(self.last_seq);
+        if let Some(r) = rows.last() {
+            self.last_seq = Some(r.seq);
+        }
+        let Some(cur) = src.sweep_partial().or_else(|| rows.last().cloned()) else { return };
+        if self.tuning != Some(cur.tuning) || self.trace.len() != cur.db.len() {
+            self.retune_to(&cur);
+            self.history.clear();
+            self.row_times.clear();
+            self.last_timed = None;
+        }
+        let a = self.smoothing;
+        for ((t, h), &v) in self.trace.iter_mut().zip(self.hold.iter_mut()).zip(&cur.db) {
+            *t = a * *t + (1.0 - a) * v;
+            *h = (*h - 0.05).max(v);
+        }
+        let mut dec = vec![0.0; cur.db.len().min(self.hist_w)];
+        dsp::decimate_max(&cur.db, &mut dec);
+        let now = std::time::Instant::now();
+        let due = self.last_timed.is_none_or(|t| now.duration_since(t) >= period) || self.history.is_empty();
+        if due {
+            if self.history.len() == ROWS {
+                self.history.pop_back();
+                self.row_times.pop_back();
+            }
+            self.history.push_front(dec);
+            self.row_times.push_front(cur.time);
+            self.last_timed = Some(now);
+            self.push_tex_row();
+        } else {
+            if let Some(front) = self.history.front_mut() {
+                *front = dec;
+            }
+            if let Some(t) = self.row_times.front_mut() {
+                *t = cur.time;
+            }
+            self.refresh_tex_row();
+        }
+    }
+
+    /// Re-uploads the newest history row into its texture row (the row in
+    /// progress changed) without advancing the ring.
+    fn refresh_tex_row(&mut self) {
+        let Some(len) = self.history.front().map(|r| r.len()) else { return };
+        let (c0, c1) = self.zoom_cols(len);
+        let (Some(tex), Some(row)) = (self.tex.as_mut(), self.history.front()) else { return };
+        if self.tex_w == 0 {
+            return;
+        }
+        let mut cols = vec![0.0; self.tex_w];
+        dsp::decimate_max(&row[c0..c1], &mut cols);
+        let (lo, k, lut) = (self.db_min, 255.0 / (self.db_max - self.db_min).max(1.0), &self.lut);
+        let px: Vec<Color32> = cols.iter().map(|&v| if engine::is_empty_db(v) { GAP } else { lut[((v - lo) * k).clamp(0.0, 255.0) as usize] }).collect();
+        let img = egui::ColorImage::new([self.tex_w, 1], px);
+        tex.set_partial([0, self.write_row], img, TextureOptions::LINEAR);
     }
 
     fn colorize(&self, db: &[f32], out: &mut Vec<Color32>) {
@@ -570,12 +657,30 @@ impl SpectrumView {
         let x_hz = |f: f64| full.left() + ((f - f0) / span) as f32 * full.width();
         let mut boxes: Vec<(Rect, &SignalRecord)> = Vec::new();
         let squelched = |r: &SignalRecord| self.squelch && self.known.iter().any(|(lo, hi, _)| (*lo..=*hi).contains(&r.center_hz()));
+        // Rows back from the top row for a record's end and start: by row
+        // sequence normally, by time when rows run on a clock.
+        let timed = self.row_period.is_some();
+        let top_time = self.row_times.get(self.scroll).copied();
+        let rows_back = |r: &SignalRecord| -> Option<(f32, f32)> {
+            if timed {
+                let top = top_time?;
+                if r.t_start > top {
+                    return None;
+                }
+                let idx = |t: std::time::SystemTime| self.row_times.partition_point(|rt| *rt > t).saturating_sub(self.scroll) as f32;
+                Some((idx(r.t_end), idx(r.t_start) + 1.0))
+            } else {
+                if r.first_seq > newest {
+                    return None;
+                }
+                Some((newest.saturating_sub(r.last_seq) as f32, newest.saturating_sub(r.first_seq) as f32 + 1.0))
+            }
+        };
         for r in records {
-            if r.f_hi_hz < f0 || r.f_lo_hz > f1 || r.first_seq > newest || squelched(r) {
+            if r.f_hi_hz < f0 || r.f_lo_hz > f1 || squelched(r) {
                 continue;
             }
-            let back_end = newest.saturating_sub(r.last_seq) as f32;
-            let back_start = newest.saturating_sub(r.first_seq) as f32 + 1.0;
+            let Some((back_end, back_start)) = rows_back(r) else { continue };
             if back_end >= visible as f32 {
                 continue;
             }
@@ -763,8 +868,8 @@ impl SpectrumView {
         } else if let Some(p) = resp.hover_pos() {
             let fx = f0 + ((p.x - full.left()) / full.width()) as f64 * span;
             painter.vline(p.x, full.y_range(), Stroke::new(1.0, Color32::from_rgba_unmultiplied(230, 237, 243, 90)));
-            let (F0, F1) = self.full_span().unwrap_or((f0, f1));
-            let i = (((fx - F0) / (F1 - F0)).clamp(0.0, 1.0) * self.trace.len() as f64) as usize;
+            let (full0, full1) = self.full_span().unwrap_or((f0, f1));
+            let i = (((fx - full0) / (full1 - full0)).clamp(0.0, 1.0) * self.trace.len() as f64) as usize;
             let db = self.trace.get(i.min(self.trace.len().saturating_sub(1))).copied().unwrap_or(f32::NAN);
             let mut label = format!("{:.4} MHz  {:.1} dBFS", fx / 1e6, db);
             if self.zoom.is_some() {

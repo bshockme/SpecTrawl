@@ -147,6 +147,9 @@ struct Shared {
     state: Mutex<StreamState>,
     rows: Mutex<VecDeque<Arc<SpectrumRow>>>,
     sweep: Mutex<Option<SweepStatus>>,
+    /// The sweep's row in progress: the stitched row as it stands part way
+    /// through a pass, refreshed every `PARTIAL_EVERY` while hops arrive.
+    partial: Mutex<Option<Arc<SpectrumRow>>>,
     ffts_per_sec: Mutex<f64>,
     classifier_load: Mutex<classify::ClassifierLoad>,
     p25: Mutex<monitor::P25Book>,
@@ -267,6 +270,7 @@ impl Source {
             state: Mutex::new(StreamState { center_hz: device.center_hz(), sample_rate: rate, ..Default::default() }),
             rows: Mutex::new(VecDeque::with_capacity(cfg.row_history)),
             sweep: Mutex::new(None),
+            partial: Mutex::new(None),
             ffts_per_sec: Mutex::new(0.0),
             classifier_load: Mutex::new(Default::default()),
             p25: Mutex::new(Default::default()),
@@ -296,6 +300,7 @@ impl Source {
         self.shared.rows.lock().clear();
         *self.shared.records.lock() = RecordStore::default();
         *self.shared.sweep.lock() = None;
+        *self.shared.partial.lock() = None;
         // Identify on ~2 s of live rows, or two sweep passes.
         let every = match &mode {
             Mode::Live => (2.0 * self.cfg.rows_per_sec) as u32,
@@ -505,6 +510,13 @@ impl Source {
 
     pub fn sweep_status(&self) -> Option<SweepStatus> {
         self.shared.sweep.lock().clone()
+    }
+
+    /// The sweep's row in progress (hops measured so far this pass pasted
+    /// over the previous pass), for views that advance on a clock rather
+    /// than per pass. Its `seq` is the pass row it will become.
+    pub fn sweep_partial(&self) -> Option<Arc<SpectrumRow>> {
+        self.shared.partial.lock().clone()
     }
 
     pub fn stats(&self) -> SourceStats {

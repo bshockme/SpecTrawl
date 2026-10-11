@@ -1275,9 +1275,10 @@ impl App {
             self.sweep_hi_mhz = self.sweep_lo_mhz + 10.0;
         }
         let plan = self.sweep_plan();
+        let row_s = self.settings.survey_row_s;
         if let Some(p) = self.receiver_mut(ReceiverId::SWEEP) {
             p.source.set_mode(Mode::Sweep(plan));
-            p.view = survey_view();
+            p.view = survey_view(row_s);
         }
     }
 
@@ -1383,7 +1384,7 @@ impl App {
                         self.tune_target = id;
                     }
                 }
-                let view = if id.is_sweep() { survey_view() } else { SpectrumView::new() };
+                let view = if id.is_sweep() { survey_view(self.settings.survey_row_s) } else { SpectrumView::new() };
                 // Matches the backend's opening default (Airspy linearity 13/21).
                 self.panes.push(Receiver {
                     id,
@@ -2591,6 +2592,27 @@ impl App {
         }
         if show_segments {
             ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Waterfall rows").small().color(theme::MUTED));
+                let cur = self.settings.survey_row_s;
+                let name = SURVEY_ROW_CHOICES.iter().find(|(s, _)| (*s - cur).abs() < 1e-9).map(|(_, n)| *n).unwrap_or("custom");
+                let mut pick: Option<f64> = None;
+                egui::ComboBox::from_id_salt("survey_rows").selected_text(name).width(90.0).show_ui(ui, |ui| {
+                    for (s, n) in SURVEY_ROW_CHOICES {
+                        if ui.selectable_label((s - cur).abs() < 1e-9, n).clicked() {
+                            pick = Some(s);
+                        }
+                    }
+                });
+                ui.label(egui::RichText::new("per pass, or a fixed time slice filled hop by hop").small().color(theme::MUTED));
+                if let Some(s) = pick {
+                    self.settings.survey_row_s = s;
+                    self.settings.save();
+                    if let Some(p) = self.receiver_mut(ReceiverId::SWEEP) {
+                        p.view.row_period = (s > 0.0).then(|| std::time::Duration::from_secs_f64(s));
+                    }
+                }
+            });
             apply |= self.segments_ui(ui);
         }
         if apply {
@@ -4284,14 +4306,18 @@ fn pane_records(p: &mut Receiver) -> std::sync::Arc<[engine::SignalRecord]> {
     p.records.2.clone()
 }
 
-fn survey_view() -> SpectrumView {
+fn survey_view(row_s: f64) -> SpectrumView {
     let mut v = SpectrumView::new().with_native_history();
     // One row per pass (seconds apart): already averaged, and drawn thick.
     v.smoothing = 0.0;
     v.row_px = Some(3.0);
     v.subtle_boxes = true;
+    v.row_period = (row_s > 0.0).then(|| std::time::Duration::from_secs_f64(row_s));
     v
 }
+
+/// Choices for the survey's row clock (0 = one row per pass).
+const SURVEY_ROW_CHOICES: [(f64, &str); 6] = [(0.0, "per pass"), (0.5, "0.5 s"), (1.0, "1 s"), (2.0, "2 s"), (5.0, "5 s"), (10.0, "10 s")];
 
 /// SigMF annotations for records on a receiver.
 fn annotations(focus: &Receiver, rs: &[engine::SignalRecord]) -> Vec<engine::sigmf::ExportAnnotation> {

@@ -250,6 +250,7 @@ pub(crate) fn run(
     // last pass, to notice and explain a sweep that has slowed down.
     let mut typical_pass: Option<f64> = None;
     let mut last_counters = (0u64, 0u64, 0u64);
+    let mut last_partial = Instant::now();
     if measured_hops > 0 && !measured[probe_hop] {
         probe_hop = next_measured(probe_hop);
     }
@@ -409,6 +410,23 @@ pub(crate) fn run(
                 continue;
             }
             let now = Instant::now();
+            // The row in progress, for clock-driven views.
+            if now.duration_since(last_partial) >= PARTIAL_EVERY {
+                last_partial = now;
+                let mut row = vec![0.0f32; out_bins];
+                if profile.len() == bins_per_hop {
+                    for seg in corrected.chunks_mut(bins_per_hop).zip(full.chunks(bins_per_hop)) {
+                        for ((c, &v), &p) in seg.0.iter_mut().zip(seg.1).zip(&profile) {
+                            *c = if is_empty_db(v) { EMPTY_DB } else { v - p };
+                        }
+                    }
+                    dsp::decimate_max(&corrected, &mut row);
+                } else {
+                    dsp::decimate_max(&full, &mut row);
+                }
+                let head = shared.ring.lock().head();
+                *shared.partial.lock() = Some(Arc::new(SpectrumRow { seq: seq + 1, tuning, end_sample: head, time: SystemTime::now(), db: row }));
+            }
             rate_window.1 += 1;
             let el = rate_window.0.elapsed().as_secs_f64();
             if let Some(s) = shared.sweep.lock().as_mut() {
@@ -473,6 +491,9 @@ pub(crate) fn run(
         }
     }
 }
+
+/// How often the row in progress is published while a pass runs.
+const PARTIAL_EVERY: Duration = Duration::from_millis(100);
 
 /// Replaces the bins within `halfwidth_hz` of every multiple of `grid_hz`
 /// with the level just outside them (the quieter side, so a neighbouring
