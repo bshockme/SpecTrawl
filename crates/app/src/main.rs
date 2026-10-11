@@ -2457,6 +2457,17 @@ impl App {
             }
         }
         self.known = (std::time::Instant::now(), merged);
+        // Hand each focus receiver the survey's occupants inside its span,
+        // so its station and cell monitors have something to work on even
+        // when a carrier fills the span.
+        if let Some(survey) = self.receiver(ReceiverId::SWEEP).map(|s| s.source.occupants()) {
+            for p in self.panes.iter().filter(|p| !p.id.is_sweep()) {
+                let Some((lo, hi)) = p.view.span() else { continue };
+                let hints: Vec<detect::spectral::Occupant> =
+                    survey.iter().filter(|k| k.occupant.lo_hz < hi && k.occupant.hi_hz > lo).map(|k| k.occupant.clone()).collect();
+                p.source.set_hints(hints);
+            }
+        }
     }
 
     /// The known occupant covering `hz`, if any.

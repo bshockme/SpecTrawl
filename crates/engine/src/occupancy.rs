@@ -29,6 +29,11 @@ pub struct KnownOccupant {
     sightings: u32,
     /// Extents of the latest sightings, newest last.
     extents: Vec<(f64, f64)>,
+    /// Told to us by another source (the survey) rather than seen here: a
+    /// focus span sitting inside a 10 MHz LTE carrier has no floor to judge
+    /// it by, so the survey's list stands in. Not counted as missing; goes
+    /// when the hints are replaced without it.
+    pub hinted: bool,
     /// What the cell monitor found on a cellular block (LTE sync, MIB), and
     /// when it last looked.
     pub cell: Option<detect::lte::LteCell>,
@@ -126,6 +131,7 @@ impl OccupancyTracker {
                     k.last_seen = now;
                     k.misses = 0;
                     k.sightings += 1;
+                    k.hinted = false;
                     seen[i] = true;
                 }
                 None => {
@@ -141,12 +147,13 @@ impl OccupancyTracker {
                         cell_checked: None,
                         misses: 0,
                         sightings: 1,
+                        hinted: false,
                     })
                 }
             }
         }
         for (i, k) in self.known.iter_mut().enumerate() {
-            if i < seen.len() && !seen[i] && k.occupant.lo_hz >= lo && k.occupant.hi_hz <= hi {
+            if i < seen.len() && !seen[i] && !k.hinted && k.occupant.lo_hz >= lo && k.occupant.hi_hz <= hi {
                 k.misses += 1;
             }
         }
@@ -190,6 +197,32 @@ impl OccupancyTracker {
 impl OccupancyTracker {
     /// Records a cell monitor's look at the cellular block covering `hz`:
     /// the result (None: nothing recognisable) and when it was made.
+    /// Replaces the hinted occupants (from another source's list) with
+    /// `found`: ones already known here are left alone, new ones are added
+    /// as hinted, and hinted ones no longer in the list go.
+    pub(crate) fn hint(&mut self, found: Vec<Occupant>, now: SystemTime) {
+        self.known.retain(|k| !k.hinted || found.iter().any(|o| same(&k.occupant, o)));
+        for o in found {
+            if self.known.iter().any(|k| same(&k.occupant, &o)) {
+                continue;
+            }
+            self.known.push(KnownOccupant {
+                extents: vec![(o.lo_hz, o.hi_hz)],
+                occupant: o,
+                first_seen: now,
+                last_seen: now,
+                station: None,
+                station_at: None,
+                cell: None,
+                cell_checked: None,
+                misses: 0,
+                sightings: 0,
+                hinted: true,
+            });
+        }
+        self.known.sort_by(|a, b| a.occupant.lo_hz.total_cmp(&b.occupant.lo_hz));
+    }
+
     pub(crate) fn note_cell(&mut self, hz: f64, cell: Option<detect::lte::LteCell>) {
         if let Some(k) = self
             .known

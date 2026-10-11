@@ -479,9 +479,18 @@ impl Source {
         self.shared.audio.clone()
     }
 
-    /// Known wideband occupants (FM broadcast, TV, LTE/NR) identified so far.
+    /// Known wideband occupants (FM broadcast, TV, LTE/NR) identified so far
+    /// (including hinted ones, see `set_hints`).
     pub fn occupants(&self) -> Vec<KnownOccupant> {
         self.shared.occupancy.lock().known.clone()
+    }
+
+    /// Occupants another source (the survey) knows inside this source's
+    /// span, so the station and cell monitors can work on carriers this
+    /// source can't judge itself (an LTE carrier filling the whole span).
+    /// Replaces the previous hints.
+    pub fn set_hints(&self, found: Vec<detect::spectral::Occupant>) {
+        self.shared.occupancy.lock().hint(found, SystemTime::now());
     }
 
     /// Writes part of the look-back ring to SigMF on a background thread.

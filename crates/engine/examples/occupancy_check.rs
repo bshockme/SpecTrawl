@@ -1,6 +1,9 @@
 //! Prints the known wideband occupants a source identifies.
 //!
-//!     cargo run --release -p engine --example occupancy_check -- <serial> <MHz | loMHz-hiMHz> <seconds>
+//!     cargo run --release -p engine --example occupancy_check -- <serial> <MHz | loMHz-hiMHz> <seconds> [--hint loMHz-hiMHz]
+//!
+//! `--hint` tells a live source about a cellular block it can't see the
+//! edges of (as the app's survey would), so the cell monitor runs on it.
 
 use std::time::Duration;
 
@@ -25,6 +28,18 @@ fn main() {
         }
     };
     let src = Source::start(d, SourceConfig::default(), mode).unwrap();
+    if let Some(h) = a.iter().position(|s| s == "--hint").and_then(|i| a.get(i + 1)) {
+        if let Some((lo, hi)) = h.split_once('-') {
+            let (lo, hi) = (lo.parse::<f64>().unwrap() * 1e6, hi.parse::<f64>().unwrap() * 1e6);
+            src.set_hints(vec![detect::spectral::Occupant {
+                kind: detect::spectral::Kind::Cellular { bw_mhz: ((hi - lo) / 1e6) as f32 },
+                center_hz: (lo + hi) / 2.0,
+                lo_hz: lo,
+                hi_hz: hi,
+                snr_db: 20.0,
+            }]);
+        }
+    }
     std::thread::sleep(Duration::from_secs(secs));
     let occ = src.occupants();
     println!("{} occupants", occ.len());
@@ -36,7 +51,7 @@ fn main() {
             o.lo_hz / 1e6,
             o.hi_hz / 1e6,
             o.snr_db,
-            o.kind.label()
+            k.label()
         );
     }
 }
