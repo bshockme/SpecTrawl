@@ -56,6 +56,9 @@ struct Api {
     set_sensitivity_gain: unsafe extern "C" fn(*mut AirspyDev, u8) -> c_int,
     set_lna_agc: unsafe extern "C" fn(*mut AirspyDev, u8) -> c_int,
     set_mixer_agc: unsafe extern "C" fn(*mut AirspyDev, u8) -> c_int,
+    set_lna_gain: unsafe extern "C" fn(*mut AirspyDev, u8) -> c_int,
+    set_mixer_gain: unsafe extern "C" fn(*mut AirspyDev, u8) -> c_int,
+    set_vga_gain: unsafe extern "C" fn(*mut AirspyDev, u8) -> c_int,
     r820t_read: unsafe extern "C" fn(*mut AirspyDev, u8, *mut u8) -> c_int,
     error_name: unsafe extern "C" fn(c_int) -> *const c_char,
 }
@@ -94,6 +97,9 @@ impl Api {
                 set_sensitivity_gain: sym!("airspy_set_sensitivity_gain"),
                 set_lna_agc: sym!("airspy_set_lna_agc"),
                 set_mixer_agc: sym!("airspy_set_mixer_agc"),
+                set_lna_gain: sym!("airspy_set_lna_gain"),
+                set_mixer_gain: sym!("airspy_set_mixer_gain"),
+                set_vga_gain: sym!("airspy_set_vga_gain"),
                 r820t_read: sym!("airspy_r820t_read"),
                 error_name: sym!("airspy_error_name"),
                 _lib: lib,
@@ -372,6 +378,13 @@ impl Device for AirspyDevice {
             GainSetting::Auto => {
                 a.check("set_lna_agc", unsafe { (a.set_lna_agc)(self.dev, 1) })?;
                 a.check("set_mixer_agc", unsafe { (a.set_mixer_agc)(self.dev, 1) })
+            }
+            GainSetting::Manual { lna, mixer, vga } => {
+                a.check("set_lna_agc", unsafe { (a.set_lna_agc)(self.dev, 0) })?;
+                a.check("set_mixer_agc", unsafe { (a.set_mixer_agc)(self.dev, 0) })?;
+                a.check("set_lna_gain", unsafe { (a.set_lna_gain)(self.dev, lna.min(15)) })?;
+                a.check("set_mixer_gain", unsafe { (a.set_mixer_gain)(self.dev, mixer.min(15)) })?;
+                a.check("set_vga_gain", unsafe { (a.set_vga_gain)(self.dev, vga.min(15)) })
             }
         }
     }

@@ -25,6 +25,7 @@ pub fn gain_key(g: Option<GainSetting>) -> String {
         Some(GainSetting::Auto) => "agc".into(),
         Some(GainSetting::Linearity(v)) => format!("lin{:02}", (v.clamp(0.0, 1.0) * 100.0).round() as u32),
         Some(GainSetting::Sensitivity(v)) => format!("sens{:02}", (v.clamp(0.0, 1.0) * 100.0).round() as u32),
+        Some(GainSetting::Manual { lna, mixer, vga }) => format!("man{lna}-{mixer}-{vga}"),
     }
 }
 

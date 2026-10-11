@@ -105,6 +105,8 @@ enum GainMode {
     Linearity,
     Sensitivity,
     Agc,
+    /// LNA, mixer and VGA set one by one.
+    Manual,
 }
 
 /// What a focus receiver does with itself (`docs/auto-explore.md`).
@@ -156,6 +158,8 @@ struct Receiver {
     gain_mode: GainMode,
     /// Preset step 0..=21 (Airspy's linearity/sensitivity tables).
     gain_step: u8,
+    /// Manual stage settings (LNA, mixer, VGA), in device steps.
+    gain_stages: [u8; 3],
 }
 
 impl Receiver {
@@ -165,6 +169,7 @@ impl Receiver {
             GainMode::Linearity => GainSetting::Linearity(v),
             GainMode::Sensitivity => GainSetting::Sensitivity(v),
             GainMode::Agc => GainSetting::Auto,
+            GainMode::Manual => GainSetting::Manual { lna: self.gain_stages[0], mixer: self.gain_stages[1], vga: self.gain_stages[2] },
         }
     }
 }
@@ -174,11 +179,24 @@ fn gain_ui(ui: &mut egui::Ui, p: &mut Receiver) -> Option<String> {
     let mut changed = false;
     ui.horizontal(|ui| {
         ui.label("Gain");
-        for (m, name) in [(GainMode::Linearity, "Linearity"), (GainMode::Sensitivity, "Sensitivity"), (GainMode::Agc, "AGC")] {
+        for (m, name) in [(GainMode::Linearity, "Linearity"), (GainMode::Sensitivity, "Sensitivity"), (GainMode::Agc, "AGC"), (GainMode::Manual, "Manual")] {
             changed |= ui.selectable_value(&mut p.gain_mode, m, name).changed();
         }
     });
-    if p.gain_mode != GainMode::Agc {
+    if p.gain_mode == GainMode::Manual {
+        // One slider per stage the device reports (an Airspy: LNA, mixer,
+        // VGA at 0-15); defaults when it reports none.
+        let stages = p.source.snapshot().caps.gain_stages;
+        let names: Vec<(String, u8)> = if stages.len() == 3 {
+            stages.iter().map(|s| (s.name.clone(), s.max as u8)).collect()
+        } else {
+            [("LNA", 15u8), ("Mixer", 15), ("VGA", 15)].iter().map(|(n, m)| (n.to_string(), *m)).collect()
+        };
+        for (k, (name, max)) in names.iter().enumerate() {
+            changed |= ui.add(egui::Slider::new(&mut p.gain_stages[k], 0..=*max).text(name)).changed();
+        }
+        ui.label(egui::RichText::new("AGC off. Watch the overload count in Diagnostics when raising the LNA.").small().color(theme::MUTED));
+    } else if p.gain_mode != GainMode::Agc {
         changed |= ui.add(egui::Slider::new(&mut p.gain_step, 0..=21).text("step")).changed();
     } else if p.id.is_sweep() {
         ui.label(egui::RichText::new("AGC makes hops inconsistent; fixed gain is better for surveys").small().color(theme::MUTED));
@@ -1435,6 +1453,7 @@ impl App {
                     records: (None, std::time::Instant::now(), Vec::new().into()),
                     gain_mode: GainMode::Linearity,
                     gain_step: 13,
+                    gain_stages: [10, 8, 10],
                 });
                 self.panes.sort_by_key(|p| (!p.id.is_sweep(), p.id));
                 self.dock_requests.push(DockReq::AddReceiver(id));

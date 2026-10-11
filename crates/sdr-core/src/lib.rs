@@ -84,6 +84,10 @@ pub enum GainSetting {
     Linearity(f32),
     Sensitivity(f32),
     Auto,
+    /// Each stage set by hand, in the device's own steps (`Capabilities::
+    /// gain_stages` gives names and ranges; an Airspy has LNA, mixer and
+    /// VGA at 0–15). AGC is off.
+    Manual { lna: u8, mixer: u8, vga: u8 },
 }
 
 #[derive(Debug, Clone)]
