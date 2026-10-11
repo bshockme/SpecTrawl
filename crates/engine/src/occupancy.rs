@@ -29,6 +29,10 @@ pub struct KnownOccupant {
     sightings: u32,
     /// Extents of the latest sightings, newest last.
     extents: Vec<(f64, f64)>,
+    /// What the cell monitor found on a cellular block (LTE sync, MIB), and
+    /// when it last looked.
+    pub cell: Option<detect::lte::LteCell>,
+    pub(crate) cell_checked: Option<std::time::Instant>,
 }
 
 impl KnownOccupant {
@@ -40,12 +44,16 @@ impl KnownOccupant {
         MIN_MISSES + self.sightings.min(MAX_EXTRA_MISSES)
     }
 
-    /// What to call it: the kind, plus the station when RDS named it
-    /// (`FM broadcast · KXYZ "TEST  FM"`).
+    /// What to call it: the kind, plus what a decoder found out: the
+    /// station when RDS named it (`FM broadcast · KXYZ "TEST  FM"`), or
+    /// the cell identity ("LTE 10 MHz PCI 217 (2 ports)" instead of
+    /// "LTE/NR 10 MHz").
     pub fn label(&self) -> String {
-        match &self.station {
-            Some(s) => format!("{} · {}", self.occupant.kind.label(), s.short()),
-            None => self.occupant.kind.label(),
+        match (&self.station, &self.cell) {
+            (Some(s), _) => format!("{} · {}", self.occupant.kind.label(), s.short()),
+            (None, Some(c)) if c.sync.is_some() => c.label(),
+            (None, Some(c)) => format!("{} · {}", self.occupant.kind.label(), c.label()),
+            (None, None) => self.occupant.kind.label(),
         }
     }
 }
@@ -129,6 +137,8 @@ impl OccupancyTracker {
                         last_seen: now,
                         station: None,
                         station_at: None,
+                        cell: None,
+                        cell_checked: None,
                         misses: 0,
                         sightings: 1,
                     })
@@ -162,9 +172,37 @@ impl OccupancyTracker {
                     self.known[i].station = gone.station;
                     self.known[i].station_at = gone.station_at;
                 }
+                // The cell identity belongs to the block, whichever cut stays.
+                let synced = |c: &Option<detect::lte::LteCell>| c.as_ref().is_some_and(|c| c.sync.is_some());
+                if self.known[i].cell.is_none() || (synced(&gone.cell) && !synced(&self.known[i].cell)) {
+                    if gone.cell.is_some() {
+                        self.known[i].cell = gone.cell;
+                        self.known[i].cell_checked = gone.cell_checked;
+                    }
+                }
             } else {
                 i += 1;
             }
+        }
+    }
+}
+
+impl OccupancyTracker {
+    /// Records a cell monitor's look at the cellular block covering `hz`:
+    /// the result (None: nothing recognisable) and when it was made.
+    pub(crate) fn note_cell(&mut self, hz: f64, cell: Option<detect::lte::LteCell>) {
+        if let Some(k) = self
+            .known
+            .iter_mut()
+            .find(|k| matches!(k.occupant.kind, Kind::Cellular { .. }) && (k.occupant.lo_hz..=k.occupant.hi_hz).contains(&hz))
+        {
+            // Keep a synchronised identity over a later look that lost it
+            // (a weak moment); replace anything else.
+            let keep_old = cell.as_ref().is_none_or(|c| c.sync.is_none()) && k.cell.as_ref().is_some_and(|c| c.sync.is_some());
+            if !keep_old {
+                k.cell = cell;
+            }
+            k.cell_checked = Some(std::time::Instant::now());
         }
     }
 }

@@ -15,6 +15,7 @@ pub mod features;
 pub mod flex;
 pub mod frames;
 pub mod imbe;
+pub mod lte;
 mod imbe_tables;
 pub mod mbe;
 pub mod p25;
