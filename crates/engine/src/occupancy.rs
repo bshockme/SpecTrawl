@@ -2,10 +2,11 @@
 //! identifier on averaged rows, kept as a persistent list so the UI can
 //! label them and squelch them out of the way.
 
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use detect::spectral::{Kind, Occupant, Spectrum, floor_estimate, identify};
 
+use crate::rds_monitor::StationInfo;
 use crate::{SpectrumRow, Tuning};
 
 /// An occupant and when it was seen.
@@ -14,9 +15,24 @@ pub struct KnownOccupant {
     pub occupant: Occupant,
     pub first_seen: SystemTime,
     pub last_seen: SystemTime,
+    /// What RDS said, for an FM station the monitor has looked at.
+    pub station: Option<StationInfo>,
+    /// When the RDS monitor last looked.
+    pub(crate) station_at: Option<Instant>,
     /// Looks in a row (since the last sighting) where it should have been
     /// visible and wasn't.
     misses: u32,
+}
+
+impl KnownOccupant {
+    /// What to call it: the kind, plus the station when RDS named it
+    /// (`FM broadcast · KXYZ "TEST  FM"`).
+    pub fn label(&self) -> String {
+        match &self.station {
+            Some(s) => format!("{} · {}", self.occupant.kind.label(), s.short()),
+            None => self.occupant.kind.label(),
+        }
+    }
 }
 
 /// Looks in view without finding an occupant before it's forgotten.
@@ -78,7 +94,14 @@ impl OccupancyTracker {
                     k.misses = 0;
                     seen[i] = true;
                 }
-                None => self.known.push(KnownOccupant { occupant: o, first_seen: now, last_seen: now, misses: 0 }),
+                None => self.known.push(KnownOccupant {
+                    occupant: o,
+                    first_seen: now,
+                    last_seen: now,
+                    station: None,
+                    station_at: None,
+                    misses: 0,
+                }),
             }
         }
         for (i, k) in self.known.iter_mut().enumerate() {
@@ -96,8 +119,12 @@ impl OccupancyTracker {
             if same(&a.occupant, &b.occupant) {
                 let keep = if a.last_seen >= b.last_seen { i } else { i + 1 };
                 let first = a.first_seen.min(b.first_seen);
-                self.known.remove(if keep == i { i + 1 } else { i });
+                let gone = self.known.remove(if keep == i { i + 1 } else { i });
                 self.known[i].first_seen = first;
+                if self.known[i].station.is_none() {
+                    self.known[i].station = gone.station;
+                    self.known[i].station_at = gone.station_at;
+                }
             } else {
                 i += 1;
             }

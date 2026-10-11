@@ -22,6 +22,7 @@ pub mod p25_lc;
 pub mod p25_voice;
 pub mod p25p2;
 pub mod pocsag;
+pub mod rds;
 pub mod spectral;
 pub mod sync;
 pub mod trunk;

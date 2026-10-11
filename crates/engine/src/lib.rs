@@ -10,6 +10,7 @@ mod emitters;
 mod listen;
 mod monitor;
 mod occupancy;
+mod rds_monitor;
 mod ring;
 pub mod sigmf;
 mod sweep;
@@ -34,6 +35,7 @@ pub use calls::CallEvent;
 pub use detect::trunk::{SystemKey, SystemKind};
 pub use monitor::{GrantEvent, MonitorInfo, PageEvent, TrunkSystem};
 pub use occupancy::KnownOccupant;
+pub use rds_monitor::StationInfo;
 pub use ring::IqRing;
 pub use sweep::{SweepPlan, SweepStatus};
 
@@ -302,6 +304,8 @@ impl Source {
                 handles.push(std::thread::Builder::new().name("monitor".into()).spawn(move || monitor::run(sh, s, rate)));
                 let (sh, s) = (shared.clone(), st.clone());
                 handles.push(std::thread::Builder::new().name("listen".into()).spawn(move || listen::run(sh, s, rate)));
+                let (sh, s) = (shared.clone(), st.clone());
+                handles.push(std::thread::Builder::new().name("rds".into()).spawn(move || rds_monitor::run(sh, s, rate)));
                 let caps = self.device.lock().capabilities().clone();
                 handles.push(std::thread::Builder::new().name("classify".into()).spawn(move || classify::run(shared, cfg, st, rate, caps)));
             }
