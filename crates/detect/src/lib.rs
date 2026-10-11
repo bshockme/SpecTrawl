@@ -14,6 +14,7 @@ pub mod dmr;
 pub mod features;
 pub mod flex;
 pub mod frames;
+pub mod gsm;
 pub mod imbe;
 pub mod lte;
 mod imbe_tables;
@@ -277,6 +278,23 @@ pub fn classify(x: &[Complex32], fs: f64, bandwidth_hz: f64) -> Classification {
                 c.confidence = 0.8;
                 return c;
             }
+        }
+    }
+    // A GSM beacon: FCCH tone bursts on the frame grid, BSIC from the SCH.
+    if (150e3..300e3).contains(&bandwidth_hz) {
+        if let Some(g) = gsm::detect(raw, fs) {
+            c.protocol = Some("GSM".into());
+            c.label = g.label();
+            c.confidence = if g.sch_ok > 0 { 0.95 } else { 0.7 };
+            c.fields = Some(decode::Fields {
+                id: g.id(),
+                kinds: vec![("FCCH".into(), g.fcch_hits), ("SCH".into(), g.sch_ok)],
+                decoded: g.sch_ok,
+                tried: g.fcch_hits,
+                activity: Some(decode::Activity::Control),
+                ..Default::default()
+            });
+            return c;
         }
     }
     let gated = gate.iter().filter(|g| !**g).count() as f32 / gate.len() as f32;
