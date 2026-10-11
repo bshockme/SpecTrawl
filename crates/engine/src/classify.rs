@@ -57,14 +57,28 @@ pub(crate) fn run(shared: Arc<Shared>, cfg: SourceConfig, stop: Arc<AtomicBool>,
             log_call(&shared, w.center_hz, &class);
         } else if let Some(rec) = pick(&shared) {
             let class = Arc::new(classify_record(&shared, &cfg, rate, &radio, &rec, &mut chunk, &stop));
-            log::debug!("classify: record {} at {:.4} MHz, {:.1} kHz: {} ({:.0} ms, {:.2} s analysed)", rec.id, rec.center_hz() / 1e6, rec.bandwidth_hz() / 1e3, class.label, t0.elapsed().as_secs_f64() * 1e3, class.analysed_s);
+            log::debug!(
+                "classify: record {} at {:.4} MHz, {:.1} kHz: {} ({:.0} ms, {:.2} s analysed)",
+                rec.id,
+                rec.center_hz() / 1e6,
+                rec.bandwidth_hz() / 1e3,
+                class.label,
+                t0.elapsed().as_secs_f64() * 1e3,
+                class.analysed_s
+            );
             log_call(&shared, rec.center_hz(), &class);
             let mut st = shared.records.lock();
             st.emitters.tally(rec.id, &class);
             st.classes.insert(rec.id, (class, Instant::now(), rec.active));
         } else if let Some(job) = pick_emitter(&shared, rate) {
             let class = Arc::new(classify_window(&shared, rate, &radio, &job, &mut chunk, &stop));
-            log::debug!("classify: emitter {} group window at {:.4} MHz: {} ({:.0} ms)", job.emitter, job.center_hz / 1e6, class.label, t0.elapsed().as_secs_f64() * 1e3);
+            log::debug!(
+                "classify: emitter {} group window at {:.4} MHz: {} ({:.0} ms)",
+                job.emitter,
+                job.center_hz / 1e6,
+                class.label,
+                t0.elapsed().as_secs_f64() * 1e3
+            );
             log_call(&shared, job.center_hz, &class);
             shared.records.lock().emitters.set_group_class(job.emitter, class);
         } else {
@@ -153,8 +167,18 @@ struct Window {
 const GROUP_REFRESH: Duration = Duration::from_secs(10);
 const GROUP_REFRESH_MAX: Duration = Duration::from_secs(160);
 /// Group windows: long enough for two syncs of every supported protocol
-/// (P25 frames are 180 ms apart, NXDN48 80 ms, DMR 30-360 ms).
+/// (P25 frames are 180 ms apart, NXDN48 80 ms, DMR 30-360 ms)...
 const GROUP_WINDOW_S: f64 = 0.75;
+/// ...unless the emitter's records are short bursts (one TDMA slot, a
+/// beacon every few hundred ms: mean record under this), when the window
+/// reaches back over the newest `GROUP_BURSTS` of them, up to this long, so
+/// it holds the two syncs one burst can't (measured with
+/// `detect/examples/burst_windows`: on the Phase 2 TDMA site capture a 0.25
+/// s window names the protocol in 30% of windows and a 1.5 s one in all
+/// that have signal; a single DMR burst has one sync).
+const GROUP_WINDOW_MAX_S: f64 = 3.0;
+const GROUP_BURSTS: usize = 4;
+const BURSTY_RECORD_S: f64 = 0.15;
 /// Records shorter than this can't hold two syncs; their emitter's group
 /// window covers them instead of a DDC pass each.
 const MIN_RECORD_S: f64 = 0.06;
@@ -174,12 +198,29 @@ fn pick_emitter(shared: &Shared, rate: f64) -> Option<Window> {
         .min_by_key(|e| e.class_at)
         .map(|e| Window {
             emitter: e.id,
-            start: e.last_end_sample.saturating_sub((GROUP_WINDOW_S * rate) as u64),
+            start: group_window_start(e, rate),
             end: e.last_end_sample,
             center_hz: e.center_hz,
             bandwidth_hz: e.bandwidth_hz,
             tuner_center_hz: e.tuner_center_hz,
         })
+}
+
+/// Where an emitter's group window starts (its end is the newest record's
+/// end): `GROUP_WINDOW_S` back, or for bursty emitters the start of the
+/// `GROUP_BURSTS`-th newest record, within `GROUP_WINDOW_MAX_S`.
+fn group_window_start(e: &crate::Emitter, rate: f64) -> u64 {
+    let end = e.last_end_sample;
+    let plain = end.saturating_sub((GROUP_WINDOW_S * rate) as u64);
+    let mean_s = if e.records > 0 { e.on_time_s / e.records as f64 } else { 0.0 };
+    if mean_s >= BURSTY_RECORD_S || e.recent.len() < 2 {
+        return plain;
+    }
+    let mut starts: Vec<u64> = e.recent.iter().map(|(s, _)| *s).collect();
+    starts.sort_unstable_by(|a, b| b.cmp(a));
+    let nth = starts[GROUP_BURSTS.min(starts.len()) - 1];
+    let floor = end.saturating_sub((GROUP_WINDOW_MAX_S * rate) as u64);
+    nth.max(floor).min(plain)
 }
 
 fn label_only(label: &str) -> Classification {
@@ -268,4 +309,63 @@ fn classify_window(shared: &Shared, rate: f64, radio: &Radio, w: &Window, chunk:
     };
     detect::context::refine(&mut c, &ctx, &chan, ddc.fs_out);
     c
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    fn emitter(records: u32, on_time_s: f64, last_end: u64, recent: &[(u64, u64)]) -> crate::Emitter {
+        crate::Emitter {
+            id: 1,
+            center_hz: 856.3375e6,
+            bandwidth_hz: 12_500.0,
+            first_seen: SystemTime::now(),
+            last_seen: SystemTime::now(),
+            records,
+            on_time_s,
+            active: false,
+            confirmed: true,
+            peak_snr_db: 20.0,
+            tally: Default::default(),
+            protocols: Default::default(),
+            ids: Default::default(),
+            activity: Default::default(),
+            talk: Default::default(),
+            last_talk: None,
+            capplus_repeater: None,
+            strong: Default::default(),
+            class: None,
+            best: None,
+            class_at: None,
+            group_misses: 0,
+            last_end_sample: last_end,
+            recent: recent.iter().copied().collect(),
+            tuner_center_hz: 856e6,
+            bin_hz: 610.0,
+            solid_records: records,
+        }
+    }
+
+    #[test]
+    fn group_window_reaches_back_over_short_bursts_only() {
+        let rate = 10e6;
+        // Sample index of a time in milliseconds (10 000 samples per ms).
+        let s = |ms: u64| ms * 10_000;
+        // Long records (a 2 s transmission): the plain 0.75 s window.
+        let long = emitter(3, 6.0, s(20_000), &[(s(10_000), s(12_000)), (s(14_000), s(16_000)), (s(18_000), s(20_000))]);
+        assert_eq!(group_window_start(&long, rate), s(19_250));
+        // Short bursts 0.8 s apart: back to the start of the fourth-newest.
+        let bursts: Vec<(u64, u64)> = (0..6).map(|k| (s(14_000 + 800 * k), s(14_100 + 800 * k))).collect();
+        let bursty = emitter(6, 0.6, s(18_100), &bursts);
+        assert_eq!(group_window_start(&bursty, rate), s(15_600));
+        // Bursts further apart than the cap allows: no further back than 3 s.
+        let sparse: Vec<(u64, u64)> = (0..6).map(|k| (s(2_000 * k), s(2_000 * k + 100))).collect();
+        let sparse_e = emitter(6, 0.6, s(10_100), &sparse);
+        assert_eq!(group_window_start(&sparse_e, rate), s(7_100));
+        // One record so far: nothing to reach back to.
+        let one = emitter(1, 0.05, s(5_050), &[(s(5_000), s(5_050))]);
+        assert_eq!(group_window_start(&one, rate), s(4_300));
+    }
 }
