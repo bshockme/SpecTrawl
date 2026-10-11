@@ -13,6 +13,7 @@ mod listen;
 mod monitor;
 mod occupancy;
 mod rds_monitor;
+mod record_all;
 mod ring;
 pub mod sigmf;
 mod sweep;
@@ -40,6 +41,7 @@ pub use monitor::{GrantEvent, MonitorInfo, PageEvent, TrunkSystem};
 pub use detect::lte::LteCell;
 pub use occupancy::KnownOccupant;
 pub use rds_monitor::StationInfo;
+pub use record_all::{RecordAllConfig, RecordAllStatus};
 pub use ring::IqRing;
 pub use sweep::{SweepPlan, SweepStatus};
 
@@ -161,6 +163,9 @@ struct Shared {
     audio: Arc<AudioQueue>,
     voice: Mutex<VoiceStatus>,
     follow_policy: Mutex<FollowPolicy>,
+    /// "Record every signal": the mode's settings while it is on, and its counters.
+    record_all: Mutex<Option<RecordAllConfig>>,
+    record_all_status: Mutex<RecordAllStatus>,
 }
 
 impl Shared {
@@ -281,6 +286,8 @@ impl Source {
             audio: Arc::new(AudioQueue::default()),
             voice: Mutex::new(Default::default()),
             follow_policy: Mutex::new(Default::default()),
+            record_all: Mutex::new(None),
+            record_all_status: Mutex::new(Default::default()),
         });
         device.start(Box::new(RingSink { shared: shared.clone() }))?;
         let info = device.info().clone();
@@ -324,6 +331,9 @@ impl Source {
                 handles.push(std::thread::Builder::new().name("listen".into()).spawn(move || listen::run(sh, s, rate)));
                 let (sh, s) = (shared.clone(), st.clone());
                 handles.push(std::thread::Builder::new().name("rds".into()).spawn(move || rds_monitor::run(sh, s, rate)));
+                let (sh, s, c) = (shared.clone(), st.clone(), cfg.clone());
+                let hw = format!("{} {}", self.info.label, self.info.serial);
+                handles.push(std::thread::Builder::new().name("record".into()).spawn(move || record_all::run(sh, s, rate, c, hw)));
                 let (sh, s) = (shared.clone(), st.clone());
                 handles.push(std::thread::Builder::new().name("cell".into()).spawn(move || cell_monitor::run(sh, s, rate)));
                 let caps = self.device.lock().capabilities().clone();
@@ -422,6 +432,21 @@ impl Source {
 
     pub fn listening(&self) -> Option<ListenSpec> {
         *self.shared.listen.lock()
+    }
+
+    /// Turns "record every signal" on (with its settings) or off. Only a
+    /// live source records; a sweep ignores it. Switching off finishes the
+    /// captures in progress.
+    pub fn set_record_all(&self, cfg: Option<RecordAllConfig>) {
+        *self.shared.record_all.lock() = cfg;
+    }
+
+    pub fn record_all(&self) -> Option<RecordAllConfig> {
+        self.shared.record_all.lock().clone()
+    }
+
+    pub fn record_all_status(&self) -> RecordAllStatus {
+        self.shared.record_all_status.lock().clone()
     }
 
     /// Talkgroups following prefers or ignores.
