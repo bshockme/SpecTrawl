@@ -203,16 +203,18 @@ pub struct LogEntry {
     pub dwell_s: f64,
     /// Determined inside a focus span without a visit (§7).
     pub in_place: bool,
+    /// File stem of the channel capture saved for this visit, if any.
+    pub capture: Option<String>,
 }
 
 impl LogEntry {
-    pub const CSV_HEADER: &'static str = "time_unix,receiver,emitter,center_mhz,bw_khz,verdict,label,id,dwell_s,in_place";
+    pub const CSV_HEADER: &'static str = "time_unix,receiver,emitter,center_mhz,bw_khz,verdict,label,id,dwell_s,in_place,capture";
 
     pub fn csv_line(&self) -> String {
         let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
         let t = self.time.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
         format!(
-            "{t:.3},{},{},{:.6},{:.2},{},{},{},{:.1},{}",
+            "{t:.3},{},{},{:.6},{:.2},{},{},{},{:.1},{},{}",
             self.receiver,
             self.emitter,
             self.center_hz / 1e6,
@@ -221,7 +223,8 @@ impl LogEntry {
             q(&self.label),
             q(&self.id),
             self.dwell_s,
-            self.in_place as u8
+            self.in_place as u8,
+            q(self.capture.as_deref().unwrap_or(""))
         )
     }
 }
@@ -461,8 +464,9 @@ impl Explorer {
     }
 
     /// Ends a visit: records the history and, for anything but *gone*, a
-    /// log row (returned, so the app can append it to the CSV).
-    pub fn finish(&mut self, v: &Visit, verdict: &Verdict, now: Instant) -> Option<LogEntry> {
+    /// log row (returned, so the app can append it to the CSV). `capture`
+    /// is the stem of the channel capture the app saved for it, if any.
+    pub fn finish(&mut self, v: &Visit, verdict: &Verdict, now: Instant, capture: Option<String>) -> Option<LogEntry> {
         self.busy.remove(&v.receiver);
         let h = self.history.entry(v.emitter).or_insert(History { last: now, kind: verdict.kind, gone_streak: 0 });
         h.last = now;
@@ -482,6 +486,7 @@ impl Explorer {
             id: verdict.id.clone().unwrap_or_default(),
             dwell_s: v.dwell(now).as_secs_f64(),
             in_place: false,
+            capture,
         };
         self.log.push(entry.clone());
         Some(entry)
@@ -518,6 +523,7 @@ impl Explorer {
             id: obs.id.clone().unwrap_or_default(),
             dwell_s: 0.0,
             in_place: true,
+            capture: None,
         };
         self.log.push(entry.clone());
         Some(entry)
@@ -665,14 +671,15 @@ mod tests {
         assert_eq!(v.update(&Observation::default(), &cfg, t0 + Duration::from_secs(2)), None);
         let verdict = v.update(&Observation::default(), &cfg, t0 + Duration::from_millis(3100)).unwrap();
         assert_eq!(verdict.kind, Kind::Gone);
-        assert!(ex.finish(&v, &verdict, t0 + Duration::from_secs(4)).is_none(), "gone isn't logged");
+        assert!(ex.finish(&v, &verdict, t0 + Duration::from_secs(4), None).is_none(), "gone isn't logged");
         // Identified: protocol with an identity.
         let mut v = ex.begin('A', &c, t0);
         let obs = Observation { active: true, label: Some("P25 Phase 1".into()), protocol: true, id: Some("NAC 0x2A5".into()) };
         let verdict = v.update(&obs, &cfg, t0 + Duration::from_secs(1)).unwrap();
         assert_eq!(verdict.kind, Kind::Identified);
-        let e = ex.finish(&v, &verdict, t0 + Duration::from_secs(1)).unwrap();
+        let e = ex.finish(&v, &verdict, t0 + Duration::from_secs(1), Some("cap".into())).unwrap();
         assert_eq!(e.id, "NAC 0x2A5");
+        assert!(e.csv_line().ends_with("\"cap\""));
         // Classified: a feature label that holds.
         let mut v = ex.begin('B', &c, t0);
         let obs = Observation { active: true, label: Some("Analog FM".into()), ..Default::default() };
@@ -706,18 +713,18 @@ mod tests {
         let c = ex.next('A', &[a.clone(), b.clone()], &cfg, &[], base, t0).unwrap();
         let v = ex.begin('A', &c, t0);
         let gone = Verdict { kind: Kind::Gone, label: None, id: None };
-        ex.finish(&v, &gone, t0);
+        ex.finish(&v, &gone, t0, None);
         let c2 = ex.next('A', &[a.clone(), b.clone()], &cfg, &[], base, t0).unwrap();
         assert_ne!(c2.emitter, c.emitter, "the one just visited waits");
         // Both visited: nothing is due until the gone interval passes.
         let v = ex.begin('A', &c2, t0);
-        ex.finish(&v, &gone, t0);
+        ex.finish(&v, &gone, t0, None);
         assert!(ex.next('A', &[a.clone(), b.clone()], &cfg, &[], base, t0 + Duration::from_secs(30)).is_none());
         assert!(ex.next('A', &[a.clone(), b.clone()], &cfg, &[], base, t0 + REVISIT_GONE + Duration::from_secs(1)).is_some());
         // Three gones in a row: the long interval.
         for _ in 0..2 {
             let v = ex.begin('A', &c, t0);
-            ex.finish(&v, &gone, t0);
+            ex.finish(&v, &gone, t0, None);
         }
         assert_eq!(ex.history[&c.emitter].gone_streak, 3);
         assert!(ex.next('A', &[a.clone()], &cfg, &[], base, t0 + REVISIT_GONE + Duration::from_secs(1)).is_none());

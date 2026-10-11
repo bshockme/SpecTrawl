@@ -1,7 +1,14 @@
 # Auto-explore: unattended visits to survey emitters
 
-Status: design, 2026-10-10; nothing implemented. Decisions here came out of
-a discussion on 2026-10-10; the open points are in §8.
+Status: first cut implemented 2026-10-11 (`engine::explore`, the app's
+Explore and Scan modes, the Exploration tab); not yet run on air. Decisions
+here came out of a discussion on 2026-10-10. What is in: §1–§7 as written,
+plus per-visit capture (§6, a setting: off / unknown only / all) and a
+Scanner mode (§8's audio point: follow the active signals in the filtered
+ranges under a rule, newest / busiest range / stay, with an aviation AM
+variant). Still open: patrol revisits of *classified* emitters (today:
+identified and classified wait 30 min, unknown 5 min, gone 1 min, three
+gones 10 min), thumbnails, and tuning the dwell rules on real signals.
 
 ## 1. What it is
 

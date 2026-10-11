@@ -86,6 +86,9 @@ pub struct ExploreSettings {
     pub settle_s: f64,
     pub silence_s: f64,
     pub cap_s: f64,
+    /// Save a channel capture per visit: "off", "unknown" (visits that end
+    /// unknown) or "all".
+    pub capture: String,
 }
 
 impl Default for ExploreSettings {
@@ -102,6 +105,7 @@ impl ExploreSettings {
             settle_s: c.settle_s,
             silence_s: c.silence_s,
             cap_s: c.cap_s,
+            capture: "off".into(),
         }
     }
 

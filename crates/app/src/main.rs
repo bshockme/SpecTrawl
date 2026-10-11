@@ -318,6 +318,8 @@ struct App {
     lost: Vec<(ReceiverId, std::time::Instant, std::time::Instant)>,
     /// LO-leak masks last given to the survey (other Airspys' centre + 5 MHz).
     lo_masks: Vec<(f64, f64)>,
+    /// Channel captures the explorer started (stem, handle), logged when done.
+    explore_exports: Vec<(String, std::thread::JoinHandle<Result<engine::sigmf::ExportResult, String>>)>,
     frame_count: u64,
 }
 
@@ -626,6 +628,7 @@ impl App {
             lost: Vec::new(),
             frame_count: 0,
             lo_masks: Vec::new(),
+            explore_exports: Vec::new(),
         };
         app.rescan();
 
@@ -1649,6 +1652,59 @@ impl App {
         }
     }
 
+    /// Starts a channel capture of a finished visit (the dwell, from the
+    /// look-back ring) under captures/explore; returns its file stem.
+    fn explore_capture(&mut self, id: ReceiverId, v: &engine::explore::Visit, verdict: &engine::explore::Verdict) -> Option<String> {
+        let p = self.receiver(id)?;
+        let rate = p.source.snapshot().sample_rate;
+        let (oldest, head) = p.source.ring_range();
+        let dwell = v.dwell(std::time::Instant::now()).as_secs_f64() + 0.5;
+        let start = head.saturating_sub((dwell * rate) as u64).max(oldest);
+        if head <= start + (0.1 * rate) as u64 {
+            return None;
+        }
+        let label = verdict.label.clone().unwrap_or_else(|| verdict.kind.name().to_string());
+        let stem = engine::sigmf::sanitize(&format!(
+            "{}_{:.4}MHz_{}_{}_E{}_explore",
+            engine::sigmf::stamp(SystemTime::now()),
+            v.center_hz / 1e6,
+            verdict.kind.name(),
+            label,
+            v.emitter
+        ));
+        let dir = engine::sigmf::default_dir().join("explore");
+        let req = engine::sigmf::ExportRequest {
+            start_sample: start,
+            end_sample: head,
+            kind: engine::sigmf::ExportKind::Channel { center_hz: v.center_hz, bandwidth_hz: v.bandwidth_hz.max(12_500.0) },
+            dir,
+            stem: stem.clone(),
+            description: format!("SpecTrawl explore visit on {id}: {} {label} ({})", verdict.kind.name(), v.reason),
+            annotations: Vec::new(),
+        };
+        let h = p.source.export(req);
+        self.explore_exports.push((stem.clone(), h));
+        Some(stem)
+    }
+
+    /// Logs finished explore captures and drops their handles.
+    fn poll_explore_exports(&mut self) {
+        let mut done = Vec::new();
+        for (k, (_, h)) in self.explore_exports.iter().enumerate() {
+            if h.is_finished() {
+                done.push(k);
+            }
+        }
+        for k in done.into_iter().rev() {
+            let (stem, h) = self.explore_exports.remove(k);
+            match h.join() {
+                Ok(Ok(r)) => log::info!("explore capture {stem}: {:.1} s, {:.1} MB", r.seconds, r.bytes as f64 / 1e6),
+                Ok(Err(e)) => log::warn!("explore capture {stem}: {e}"),
+                Err(_) => log::warn!("explore capture {stem}: export thread panicked"),
+            }
+        }
+    }
+
     /// Writes a verdict onto the survey's emitter so its table shows it.
     fn adopt_verdict(&self, e: &engine::explore::LogEntry) {
         use engine::explore::Kind;
@@ -1697,6 +1753,7 @@ impl App {
             return;
         }
         self.explore_tick = std::time::Instant::now();
+        self.poll_explore_exports();
         let exploring: Vec<ReceiverId> = self.panes.iter().filter(|p| p.mode == RxMode::Explore).map(|p| p.id).collect();
         let any_focus = self.panes.iter().any(|p| !p.id.is_sweep());
         if exploring.is_empty() && !any_focus {
@@ -1764,7 +1821,14 @@ impl App {
                             verdict.kind.name(),
                             verdict.label.as_ref().map(|l| format!(" · {l}")).unwrap_or_default()
                         );
-                        if let Some(row) = self.explorer.finish(&v, &verdict, now) {
+                        // A channel capture of the visit, when the setting asks for one.
+                        let want = match self.settings.explore.capture.as_str() {
+                            "all" => verdict.kind != engine::explore::Kind::Gone,
+                            "unknown" => verdict.kind == engine::explore::Kind::Unknown,
+                            _ => false,
+                        };
+                        let capture = if want { self.explore_capture(id, &v, &verdict) } else { None };
+                        if let Some(row) = self.explorer.finish(&v, &verdict, now, capture) {
                             rows.push(row);
                         }
                         if let Some(p) = self.receiver_mut(id) {
@@ -1847,6 +1911,17 @@ impl App {
                     }
                 });
                 ui.add_space(4.0);
+                ui.label(egui::RichText::new("Capture per visit").small().color(theme::MUTED));
+                ui.horizontal(|ui| {
+                    for (v, n) in [("off", "off"), ("unknown", "unknown only"), ("all", "every visit")] {
+                        if ui.selectable_label(self.settings.explore.capture == v, n).clicked() {
+                            self.settings.explore.capture = v.to_string();
+                            changed = true;
+                        }
+                    }
+                    ui.label(egui::RichText::new("channel SigMF of the dwell, under captures/explore").small().color(theme::MUTED));
+                });
+                ui.add_space(4.0);
                 ui.label(egui::RichText::new("Dwell").small().color(theme::MUTED));
                 ui.horizontal(|ui| {
                     changed |= ui.add(egui::DragValue::new(&mut self.settings.explore.settle_s).speed(0.1).range(0.0..=10.0).suffix(" s settle")).changed();
@@ -1913,7 +1988,17 @@ impl App {
                     row.col(|ui| text(ui, e.label.clone(), col));
                     row.col(|ui| text(ui, e.id.clone(), col));
                     row.col(|ui| text(ui, if e.in_place { String::new() } else { format!("{:.1} s", e.dwell_s) }, theme::MUTED));
-                    row.col(|ui| text(ui, if e.in_place { "in place".to_string() } else { "visit".to_string() }, theme::MUTED));
+                    row.col(|ui| {
+                        let how = match (e.in_place, &e.capture) {
+                            (true, _) => "in place".to_string(),
+                            (false, Some(_)) => "visit · captured".to_string(),
+                            (false, None) => "visit".to_string(),
+                        };
+                        let r = ui.label(egui::RichText::new(how).small().monospace().color(theme::MUTED));
+                        if let Some(c) = &e.capture {
+                            r.on_hover_text(format!("captures/explore/{c}.sigmf-data"));
+                        }
+                    });
                     if row.response().clicked() {
                         tune = Some(e.center_hz);
                     }
@@ -3971,6 +4056,14 @@ impl App {
                     section(ui, "PROCESSING");
                     kv(ui, "FFT", &format!("{} pt · {:.0}/s · {:.0} Hz/bin", cfg.fft_size, st.ffts_per_sec, rate / cfg.fft_size as f64));
                     kv(ui, "Classifier", &format!("{:.1} jobs/s · {:.0} ms · {:.0}% busy", load.jobs_per_sec, load.avg_job_ms, load.busy * 100.0));
+                    if !id.is_sweep() {
+                        let detail = match (&p.visit, &p.scan) {
+                            (Some(v), _) => format!(" · visiting {:.4} MHz, {:.1} s", v.center_hz / 1e6, v.dwell(std::time::Instant::now()).as_secs_f64()),
+                            (None, Some(t)) => format!(" · on {:.4} MHz, {:.0} s", t.center_hz / 1e6, t.started.elapsed().as_secs_f64()),
+                            _ => String::new(),
+                        };
+                        kv(ui, "Mode", &format!("{}{detail}", p.mode.name()));
+                    }
                     let monitors = p.source.monitors();
                     if monitors.is_empty() {
                         kv(ui, "Monitors", "none");
