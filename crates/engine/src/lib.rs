@@ -28,6 +28,7 @@ pub use bursts::{BurstDetector, DetectorConfig, SignalRecord};
 pub use classify::ClassifierLoad;
 pub use detect::demod::Mode as DemodMode;
 pub use detect::p25::SystemInfo as P25System;
+pub use detect::spectral::{EMPTY_DB, is_empty_db};
 pub use emitters::Emitter;
 pub use listen::{AudioQueue, FollowPolicy, ListenSpec, Playback, VoiceStatus, recordings_dir};
 pub use calls::CallEvent;
@@ -66,7 +67,10 @@ pub struct Tuning {
     pub span_hz: f64,
 }
 
-/// One waterfall row: power spectrum in dBFS, lowest frequency first.
+/// One waterfall row: power spectrum in dBFS, lowest frequency first. Bins
+/// a segmented sweep never measured hold `EMPTY_DB` (test with
+/// `is_empty_db`); detectors and the floor estimates skip them, and the view
+/// should draw them as gaps.
 #[derive(Debug)]
 pub struct SpectrumRow {
     pub seq: u64,

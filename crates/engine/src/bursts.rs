@@ -14,6 +14,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
+use detect::spectral::is_empty_db;
+
 use crate::{SpectrumRow, Tuning};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -275,15 +277,28 @@ impl BurstDetector {
         if fresh {
             self.block_floor = vec![0.0; nb];
         }
+        // Unmeasured bins (a segmented sweep's skipped hops) don't count; a
+        // block with none measured borrows its nearest measured neighbour's.
+        let mut unmeasured: Vec<usize> = Vec::new();
         for k in 0..nb {
             let s = &db[k * b..((k + 1) * b).min(n)];
             self.scratch.clear();
-            self.scratch.extend_from_slice(s);
+            self.scratch.extend(s.iter().copied().filter(|v| !is_empty_db(*v)));
+            if self.scratch.is_empty() {
+                unmeasured.push(k);
+                continue;
+            }
             let idx = ((self.scratch.len() as f32 * self.cfg.floor_pct) as usize).min(self.scratch.len() - 1);
             let (_, q, _) = self.scratch.select_nth_unstable_by(idx, f32::total_cmp);
             let q = *q;
             let f = &mut self.block_floor[k];
             *f = if fresh { q } else { *f + self.cfg.floor_alpha * (q - *f) };
+        }
+        if unmeasured.len() < nb {
+            for &k in &unmeasured {
+                let near = (0..nb).filter(|j| !unmeasured.contains(j)).min_by_key(|j| j.abs_diff(k)).unwrap();
+                self.block_floor[k] = self.block_floor[near];
+            }
         }
         // Interpolate between block centres.
         self.floor.resize(n, 0.0);
@@ -314,13 +329,13 @@ impl BurstDetector {
         let mut i = margin;
         let n = n - margin;
         while i < n {
-            if db[i] - self.floor[i] <= thr {
+            if is_empty_db(db[i]) || db[i] - self.floor[i] <= thr {
                 i += 1;
                 continue;
             }
             let lo = i;
             let (mut peak, mut snr) = (f32::MIN, f32::MIN);
-            while i < n && db[i] - self.floor[i] > thr {
+            while i < n && !is_empty_db(db[i]) && db[i] - self.floor[i] > thr {
                 peak = peak.max(db[i]);
                 snr = snr.max(db[i] - self.floor[i]);
                 i += 1;
@@ -453,6 +468,38 @@ mod tests {
         assert!((r.f_lo_hz - (99.5e6 + 1000.0 * bin)).abs() < bin * 1.5);
         assert!((r.f_hi_hz - (99.5e6 + 1020.0 * bin)).abs() < bin * 1.5);
         assert!(r.mean_snr_db > 25.0);
+    }
+
+    #[test]
+    fn unmeasured_stretch_makes_no_records_and_keeps_the_floor_honest() {
+        // A segmented sweep row: bins 1000..3000 were never measured.
+        let mut d = BurstDetector::new(DetectorConfig::sweep(), "T".into());
+        let n = 4096;
+        let mut closed = Vec::new();
+        for seq in 1..=40u64 {
+            let mut db = noise(n, seq);
+            for v in &mut db[1000..3000] {
+                *v = detect::spectral::EMPTY_DB;
+            }
+            if (10..30).contains(&seq) {
+                // A real signal right at the gap's edge, and one far from it.
+                for v in &mut db[990..1000] {
+                    *v = -75.0;
+                }
+                for v in &mut db[3500..3510] {
+                    *v = -75.0;
+                }
+            }
+            closed.extend(d.process(&row(seq, db)));
+            // The floor over measured bins stays near the noise, even next
+            // to the gap, so nothing in the quiet rows is "above floor".
+            assert!(d.floor().iter().all(|f| (-103.0..-97.0).contains(f)), "floor off: {:?}", &d.floor()[980..1010]);
+        }
+        assert_eq!(closed.len(), 2, "{closed:?}");
+        for r in &closed {
+            assert_eq!((r.first_seq, r.last_seq), (10, 29));
+            assert!(r.mean_snr_db > 20.0 && r.mean_snr_db < 30.0, "snr {}", r.mean_snr_db);
+        }
     }
 
     #[test]
