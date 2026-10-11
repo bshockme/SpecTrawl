@@ -59,6 +59,12 @@ pub struct Page {
     pub damaged: bool,
     /// Not the whole message: more fragments follow in later frames.
     pub continued: bool,
+    /// Alphanumeric fragment number: 3 for the first (or only) fragment,
+    /// then 0, 1, 2 cycling for continuations (`flex_join` puts them back
+    /// together). 3 for other kinds.
+    pub fragment: u8,
+    /// Alphanumeric message number from the header (6 bits), 0 otherwise.
+    pub message_no: u8,
 }
 
 impl Page {
@@ -464,19 +470,19 @@ fn phase_pages(dw: &[Option<u32>], phase: char) -> Vec<Page> {
         let kind_bits = vec >> 4 & 7;
         let mw1 = (vec >> 7 & 0x7F) as usize;
         let len = (vec >> 14 & 0x7F) as usize;
-        let (kind, text, damaged, continued) = match kind_bits {
+        let (kind, text, damaged, continued, fragment, message_no) = match kind_bits {
             5 => alpha(dw, mw1, len, header, long),
             3 | 4 | 7 => {
                 let (t, dmg) = numeric(dw, mw1, len, header, long, kind_bits == 7);
-                ("numeric", t, dmg, false)
+                ("numeric", t, dmg, false, 3, 0)
             }
-            2 => ("tone", String::new(), false, false),
-            6 => ("binary", String::new(), false, false),
-            1 => ("instruction", String::new(), false, false),
-            _ => ("secure", String::new(), false, false),
+            2 => ("tone", String::new(), false, false, 3, 0),
+            6 => ("binary", String::new(), false, false, 3, 0),
+            1 => ("instruction", String::new(), false, false, 3, 0),
+            _ => ("secure", String::new(), false, false, 3, 0),
         };
         if capcode <= MAX_CAPCODE {
-            out.push(Page { capcode, phase, kind, text, damaged, continued });
+            out.push(Page { capcode, phase, kind, text, damaged, continued, fragment, message_no });
         }
         i += if long { 2 } else { 1 };
     }
@@ -488,10 +494,13 @@ fn phase_pages(dw: &[Option<u32>], phase: char) -> Vec<Page> {
 /// message word for short addresses; for long ones it's the second vector
 /// word and the message starts at `mw1`. A message that isn't the first
 /// fragment (fragment ≠ 3) starts with a signature character, not text.
-fn alpha(dw: &[Option<u32>], mw1: usize, len: usize, header: Option<u32>, long: bool) -> (&'static str, String, bool, bool) {
+fn alpha(dw: &[Option<u32>], mw1: usize, len: usize, header: Option<u32>, long: bool) -> (&'static str, String, bool, bool, u8, u8) {
     let (header, first) = if long { (header, mw1) } else { (dw.get(mw1).copied().flatten(), mw1 + 1) };
-    let frag = header.map_or(0, |h| h >> 11 & 3);
+    // Without a header the fragment number is unknown; 3 (a whole message)
+    // keeps it out of the joiner, and `damaged` says it was guessed.
+    let frag = header.map_or(3, |h| h >> 11 & 3);
     let continued = header.is_some_and(|h| h >> 10 & 1 == 1);
+    let message_no = header.map_or(0, |h| (h >> 4 & 0x3F) as u8);
     let last = (mw1 + len).min(dw.len());
     let mut text = String::new();
     let mut damaged = header.is_none();
@@ -513,7 +522,7 @@ fn alpha(dw: &[Option<u32>], mw1: usize, len: usize, header: Option<u32>, long: 
             }
         }
     }
-    ("alpha", text.trim_end().to_string(), damaged, continued)
+    ("alpha", text.trim_end().to_string(), damaged, continued, frag as u8, message_no)
 }
 
 /// Numeric digits: 4 bits each, LSB first, packed across words. The first
