@@ -5,6 +5,9 @@
 //! FFTs, keep only the alias-free middle of the band, and paste it into a
 //! stitched row. One row is published per completed pass. On an Airspy that
 //! is one hop per 6.55 ms USB transfer.
+//!
+//! A plan may name segments to measure; hops outside them are skipped and
+//! their bins stay `EMPTY_DB`, so the row's frequency axis is unchanged.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime};
 use dsp::SpectrumAnalyzer;
 use sdr_core::Complex32;
 
-use crate::{BurstDetector, Shared, SharedDevice, SourceConfig, SpectrumRow, Tuning};
+use crate::{BurstDetector, EMPTY_DB, Shared, SharedDevice, SourceConfig, SpectrumRow, Tuning, is_empty_db};
 
 #[derive(Debug, Clone)]
 pub struct SweepPlan {
@@ -33,6 +36,12 @@ pub struct SweepPlan {
     pub spur_grid_hz: Option<f64>,
     /// Half-width of each blanked spur.
     pub spur_halfwidth_hz: f64,
+    /// Frequency ranges (Hz, lo < hi) to measure; empty means the whole
+    /// `start_hz..stop_hz`. The hop grid still runs from `start_hz` over the
+    /// whole span, so rows keep one frequency axis; hops that touch no
+    /// segment are skipped and their bins stay `EMPTY_DB`. Normalised
+    /// (sorted, clamped, merged) by `normalised`, which `run` applies.
+    pub segments: Vec<(f64, f64)>,
 }
 
 impl Default for SweepPlan {
@@ -46,8 +55,59 @@ impl Default for SweepPlan {
             max_bins: 32768,
             spur_grid_hz: Some(5e6),
             spur_halfwidth_hz: 5e3,
+            segments: Vec::new(),
         }
     }
+}
+
+impl SweepPlan {
+    /// A plan over `start_hz..stop_hz` measuring only `segments` (any
+    /// order, may overlap or stick out; empty = everything).
+    pub fn with_segments(start_hz: f64, stop_hz: f64, segments: Vec<(f64, f64)>) -> Self {
+        Self { start_hz, stop_hz, segments, ..Default::default() }.normalised()
+    }
+
+    /// The same plan with its segments sorted, clamped to the span, merged
+    /// where they overlap or touch, and empty ones dropped. A list that
+    /// covers the whole span collapses to "no segments".
+    pub fn normalised(mut self) -> Self {
+        let (lo, hi) = (self.start_hz.min(self.stop_hz), self.start_hz.max(self.stop_hz));
+        let mut v: Vec<(f64, f64)> =
+            self.segments.iter().map(|&(a, b)| (a.min(b).max(lo), a.max(b).min(hi))).filter(|(a, b)| b > a).collect();
+        v.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut merged: Vec<(f64, f64)> = Vec::with_capacity(v.len());
+        for s in v {
+            match merged.last_mut() {
+                Some(m) if s.0 <= m.1 => m.1 = m.1.max(s.1),
+                _ => merged.push(s),
+            }
+        }
+        if merged.len() == 1 && merged[0] == (lo, hi) {
+            merged.clear();
+        }
+        self.segments = merged;
+        self
+    }
+
+    /// The ranges actually measured: the segments, or the whole span.
+    pub fn measured_ranges(&self) -> Vec<(f64, f64)> {
+        if self.segments.is_empty() { vec![(self.start_hz, self.stop_hz)] } else { self.segments.clone() }
+    }
+}
+
+/// Which hops of a grid of `hops` hops of `hop_hz` from `plan.start_hz` the
+/// plan measures: those overlapping a segment (all of them without segments).
+pub fn hop_mask(plan: &SweepPlan, hop_hz: f64, hops: usize) -> Vec<bool> {
+    if plan.segments.is_empty() {
+        return vec![true; hops];
+    }
+    (0..hops)
+        .map(|h| {
+            let lo = plan.start_hz + h as f64 * hop_hz;
+            let hi = lo + hop_hz;
+            plan.segments.iter().any(|&(a, b)| a < hi && b > lo)
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -71,15 +131,28 @@ pub struct SweepStatus {
     pub tuner_lock: bool,
     /// Retunes where the tuner was still searching for lock.
     pub lock_waits: u64,
+    /// The plan's normalised segments (empty: the whole span is measured).
+    pub segments: Vec<(f64, f64)>,
+    /// Per grid hop, whether it is measured (`hops` counts the grid).
+    pub measured: Vec<bool>,
+    /// How many of `hops` are measured.
+    pub measured_hops: usize,
 }
 
 impl SweepStatus {
+    /// End of the hop grid (the row's frequency axis), measured or not.
     pub fn stop_hz(&self) -> f64 {
         self.start_hz + self.hop_hz * self.hops as f64
     }
 
+    /// Spectrum measured per second (skipped hops cost nothing).
     pub fn mhz_per_sec(&self) -> f64 {
         self.hops_per_sec * self.hop_hz / 1e6
+    }
+
+    /// Spectrum actually measured per pass, Hz.
+    pub fn measured_hz(&self) -> f64 {
+        self.measured_hops as f64 * self.hop_hz
     }
 }
 
@@ -91,6 +164,7 @@ pub(crate) fn run(
     stop: Arc<AtomicBool>,
     mut det: BurstDetector,
 ) {
+    let plan = plan.normalised();
     let (rate, usable, latency, fmax) = {
         let d = dev.lock();
         let c = d.capabilities();
@@ -108,10 +182,27 @@ pub(crate) fn run(
     let dwell = (n * plan.ffts_per_hop) as u64;
     let long_guard = (LONG_GUARD_S * rate).ceil() as u64;
 
+    // Hops touching no segment are never tuned to; their bins stay EMPTY_DB.
+    let measured = hop_mask(&plan, hop_hz, hops);
+    let measured_hops = measured.iter().filter(|m| **m).count();
+    if measured_hops == 0 {
+        log::warn!("sweep: no hop of {hops} falls in the segments {:?}; nothing to measure", plan.segments);
+    }
+    let next_measured = |h: usize| -> usize {
+        if measured_hops == 0 {
+            return 0;
+        }
+        let mut k = (h + 1) % hops;
+        while !measured[k] {
+            k = (k + 1) % hops;
+        }
+        k
+    };
+
     let mut sa = SpectrumAnalyzer::new(n);
     let mut block = vec![Complex32::default(); n];
     let mut db = Vec::with_capacity(n);
-    let mut full = vec![-200.0f32; hops * bins_per_hop];
+    let mut full = vec![EMPTY_DB; hops * bins_per_hop];
     let out_bins = full.len().min(plan.max_bins);
     // Common response of a hop (passband ripple + fixed spurs), relative to its median.
     let mut profile: Vec<f32> = Vec::new();
@@ -133,6 +224,9 @@ pub(crate) fn run(
         slow_hops: 0,
         tuner_lock: false,
         lock_waits: 0,
+        segments: plan.segments.clone(),
+        measured: measured.clone(),
+        measured_hops,
     });
 
     let mut rate_window = (Instant::now(), 0u32);
@@ -151,17 +245,24 @@ pub(crate) fn run(
     // Known after the first retune: whether the device reports tuner lock. If
     // it does, slow steps are waited out exactly and the probing isn't needed.
     let mut has_lock: Option<bool> = None;
-    log::info!("sweep: {:.1}–{:.1} MHz, {hops} hops of {:.2} MHz, {} FFTs of {n} per hop", plan.start_hz / 1e6, (plan.start_hz + span) / 1e6, hop_hz / 1e6, plan.ffts_per_hop);
+    log::info!("sweep: {:.1}–{:.1} MHz, {hops} hops of {:.2} MHz ({measured_hops} measured), {} FFTs of {n} per hop", plan.start_hz / 1e6, (plan.start_hz + span) / 1e6, hop_hz / 1e6, plan.ffts_per_hop);
     // Typical pass time (a slow average) and the counters at the end of the
     // last pass, to notice and explain a sweep that has slowed down.
     let mut typical_pass: Option<f64> = None;
     let mut last_counters = (0u64, 0u64, 0u64);
+    if measured_hops > 0 && !measured[probe_hop] {
+        probe_hop = next_measured(probe_hop);
+    }
     'passes: loop {
         let pass_start = Instant::now();
         let mut h = 0;
         while h < hops {
             if stop.load(Ordering::Relaxed) {
                 break 'passes;
+            }
+            if !measured[h] {
+                h += 1;
+                continue;
             }
             let center = plan.start_hz + hop_hz * (h as f64 + 0.5);
             // Separate statements: never hold two engine locks at once (a guard
@@ -209,11 +310,11 @@ pub(crate) fn run(
             // one hop at a time in turn, rate-limited so short sweeps don't
             // spend their time waiting.
             let probe = has_lock == Some(false)
-                && hops > 1
+                && measured_hops > 1
                 && short < long_guard
                 && (pass_no == 0 || (h == probe_hop && last_probe.elapsed() >= PROBE_INTERVAL));
             if pass_no > 0 && h == probe_hop && (probe || short >= long_guard) {
-                probe_hop = (probe_hop + 1) % hops;
+                probe_hop = next_measured(probe_hop);
             }
             if probe {
                 last_probe = Instant::now();
@@ -329,7 +430,7 @@ pub(crate) fn run(
             let (sr, rd, lw) = shared.sweep.lock().as_ref().map(|s| (s.settle_retries, s.redone_hops, s.lock_waits)).unwrap_or_default();
             let d = (sr - last_counters.0, rd - last_counters.1, lw - last_counters.2);
             last_counters = (sr, rd, lw);
-            log::debug!("sweep: pass {pass_no} in {took:.2} s ({:.0} hops/s), settle retries {}, gap redos {}, lock waits {}", hops as f64 / took, d.0, d.1, d.2);
+            log::debug!("sweep: pass {pass_no} in {took:.2} s ({:.0} hops/s), settle retries {}, gap redos {}, lock waits {}", measured_hops as f64 / took, d.0, d.1, d.2);
             match typical_pass {
                 Some(t) if took > 3.0 * t && took > 1.0 => {
                     log::warn!("sweep: pass {pass_no} took {took:.2} s, typical {t:.2} s (settle retries {}, gap redos {}, lock waits {}, slow hops {})", d.0, d.1, d.2, slow.iter().filter(|s| **s).count());
@@ -341,12 +442,18 @@ pub(crate) fn run(
                 None => took,
             });
         }
+        if measured_hops == 0 {
+            // Nothing to measure: idle rather than spin, but keep the row
+            // flowing so the view shows the (empty) span.
+            std::thread::sleep(Duration::from_millis(250));
+        }
         let mut row = vec![0.0f32; out_bins];
-        if hops >= MIN_HOPS_FOR_PROFILE {
+        if measured_hops >= MIN_HOPS_FOR_PROFILE {
             update_hop_profile(&full, bins_per_hop, &mut profile);
             for seg in corrected.chunks_mut(bins_per_hop).zip(full.chunks(bins_per_hop)) {
                 for ((c, &v), &p) in seg.0.iter_mut().zip(seg.1).zip(&profile) {
-                    *c = v - p;
+                    // Unmeasured bins stay the sentinel, not sentinel-minus-profile.
+                    *c = if is_empty_db(v) { EMPTY_DB } else { v - p };
                 }
             }
             dsp::decimate_max(&corrected, &mut row);
@@ -518,7 +625,7 @@ fn update_hop_profile(full: &[f32], bins_per_hop: usize, profile: &mut Vec<f32>)
     let mut now = vec![0.0f32; bins_per_hop];
     for (k, out) in now.iter_mut().enumerate() {
         col.clear();
-        col.extend((0..hops).map(|h| full[h * bins_per_hop + k]).filter(|v| *v > -199.0));
+        col.extend((0..hops).map(|h| full[h * bins_per_hop + k]).filter(|v| !is_empty_db(*v)));
         if col.is_empty() {
             continue;
         }
@@ -549,6 +656,41 @@ mod tests {
         // A busy band's carrier level moving around isn't settling.
         assert!(!settling(&[-73.5, -73.1, -78.8, -74.4]));
         assert!(!settling(&[-71.5, -72.5, -73.6, -81.7]));
+    }
+
+    fn plan(segs: &[(f64, f64)]) -> SweepPlan {
+        SweepPlan::with_segments(100e6, 200e6, segs.to_vec())
+    }
+
+    #[test]
+    fn segments_are_sorted_clamped_merged_and_emptied() {
+        assert!(plan(&[]).segments.is_empty());
+        // Covering the whole span is the same as no segments.
+        assert!(plan(&[(0.0, 300e6)]).segments.is_empty());
+        assert!(plan(&[(100e6, 150e6), (150e6, 200e6)]).segments.is_empty());
+        let p = plan(&[(180e6, 250e6), (120e6, 110e6), (115e6, 130e6), (140e6, 140e6)]);
+        assert_eq!(p.segments, vec![(110e6, 130e6), (180e6, 200e6)]);
+        assert_eq!(p.measured_ranges(), p.segments);
+        assert_eq!(plan(&[]).measured_ranges(), vec![(100e6, 200e6)]);
+    }
+
+    #[test]
+    fn hop_mask_covers_touched_hops_only() {
+        // 10 hops of 10 MHz over 100-200 MHz.
+        let all = hop_mask(&plan(&[]), 10e6, 10);
+        assert_eq!(all, vec![true; 10]);
+        // A segment narrower than a hop still gets its hop; boundaries on
+        // the grid don't leak into the neighbour.
+        let m = hop_mask(&plan(&[(123e6, 124e6), (150e6, 170e6)]), 10e6, 10);
+        assert_eq!(m, vec![false, false, true, false, false, true, true, false, false, false]);
+        // A segment crossing a hop boundary takes both hops.
+        let m = hop_mask(&plan(&[(139e6, 141e6)]), 10e6, 10);
+        assert_eq!(m, vec![false, false, false, true, true, false, false, false, false, false]);
+        // Segments outside the span measure nothing.
+        assert_eq!(
+            hop_mask(&SweepPlan { start_hz: 100e6, stop_hz: 200e6, segments: vec![(300e6, 310e6)], ..Default::default() }, 10e6, 10),
+            vec![false; 10]
+        );
     }
 
     #[test]

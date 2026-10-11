@@ -347,26 +347,56 @@ fn cellular(s: &Spectrum, found: &[Occupant]) -> Vec<Occupant> {
     out
 }
 
+/// Level of a bin that was never measured (a hop a segmented sweep skips).
+/// Anything at or below `EMPTY_DB + 1` is "no data", not a quiet bin.
+pub const EMPTY_DB: f32 = -200.0;
+
+/// True for a bin that holds no measurement (see `EMPTY_DB`).
+#[inline]
+pub fn is_empty_db(v: f32) -> bool {
+    v <= EMPTY_DB + 1.0
+}
+
 /// A noise floor for a spectrum with no better estimate: the 20th
 /// percentile of each `window`-wide block, interpolated linearly.
 pub fn floor_estimate(db: &[f32], window_bins: usize) -> Vec<f32> {
     let n = db.len();
     let w = window_bins.clamp(16, n.max(16));
     let blocks = n.div_ceil(w);
-    let mut fl = Vec::with_capacity(blocks);
+    // Unmeasured bins (`EMPTY_DB`) don't count; a block with none measured
+    // takes its nearest measured neighbour's floor.
+    let mut fl: Vec<Option<f32>> = Vec::with_capacity(blocks);
     for b in 0..blocks {
-        let mut v: Vec<f32> = db[b * w..((b + 1) * w).min(n)].to_vec();
+        let mut v: Vec<f32> = db[b * w..((b + 1) * w).min(n)].iter().copied().filter(|v| !is_empty_db(*v)).collect();
+        if v.is_empty() {
+            fl.push(None);
+            continue;
+        }
         let i = v.len() / 5;
-        fl.push(*v.select_nth_unstable_by(i, f32::total_cmp).1);
+        fl.push(Some(*v.select_nth_unstable_by(i, f32::total_cmp).1));
     }
     // A block filled by a wide signal reads high: cap each block at 3 dB
-    // over the lower of its neighbours.
+    // over the lower of its neighbours (the nearest measured one each side,
+    // so a gap next to a signal doesn't lose the cap).
     let raw = fl.clone();
     for b in 0..blocks {
-        let l = if b > 0 { raw[b - 1] } else { raw[b] };
-        let r = if b + 1 < blocks { raw[b + 1] } else { raw[b] };
-        fl[b] = raw[b].min(l.min(r) + 3.0);
+        let Some(own) = raw[b] else { continue };
+        let l = (0..b).rev().find_map(|j| raw[j]).unwrap_or(own);
+        let r = (b + 1..blocks).find_map(|j| raw[j]).unwrap_or(own);
+        fl[b] = Some(own.min(l.min(r) + 3.0));
     }
+    // Blocks before the first measured one take the first measured floor;
+    // later unmeasured blocks carry the previous one forward.
+    let mut last = fl.iter().flatten().next().copied().unwrap_or(EMPTY_DB);
+    let fl: Vec<f32> = fl
+        .iter()
+        .map(|v| {
+            if let Some(v) = v {
+                last = *v;
+            }
+            last
+        })
+        .collect();
     (0..n)
         .map(|i| {
             let x = (i as f64 + 0.5) / w as f64 - 0.5;
@@ -395,6 +425,26 @@ mod tests {
             })
             .collect();
         (db, vec![0.0; n], f0)
+    }
+
+    #[test]
+    fn floor_ignores_unmeasured_bins() {
+        // 2000 bins at -100 dB; 600..1400 never measured; a wide signal
+        // sits right next to the gap.
+        let mut db = vec![-100.0f32; 2000];
+        for v in &mut db[600..1400] {
+            *v = EMPTY_DB;
+        }
+        for v in &mut db[1400..1600] {
+            *v = -70.0;
+        }
+        let fl = floor_estimate(&db, 100);
+        for (i, f) in fl.iter().enumerate() {
+            assert!((-101.0..-96.0).contains(f), "bin {i}: floor {f}");
+        }
+        // Nothing is identified from a gap edge.
+        let s = Spectrum { db: &db, floor: &fl, f0_hz: 600e6, bin_hz: 54e3 };
+        assert!(identify(&s).is_empty());
     }
 
     fn fm(c: f64, hd: bool) -> impl Fn(f64) -> f32 {
