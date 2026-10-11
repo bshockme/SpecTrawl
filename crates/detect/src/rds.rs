@@ -433,6 +433,10 @@ pub struct RdsDecoder {
     sync: BlockSync,
     pi_votes: HashMap<u16, u32>,
     ps: [Option<[u8; 2]>; 4],
+    /// The last complete PS assembly; a name is published once it is seen
+    /// twice in a row, so a wrongly corrected segment can't put a bad
+    /// character into a name (on air: "Star1 02" for "Star 102").
+    ps_last: Option<String>,
     rt: [Option<u8>; 64],
     rt_ab: Option<bool>,
     rt_len: usize,
@@ -461,6 +465,7 @@ impl RdsDecoder {
             sync: BlockSync::new(),
             pi_votes: HashMap::new(),
             ps: [None; 4],
+            ps_last: None,
             rt: [None; 64],
             rt_ab: None,
             rt_len: 64,
@@ -611,7 +616,11 @@ impl RdsDecoder {
                     self.ps[seg] = Some([(d >> 8) as u8, d as u8]);
                     if self.ps.iter().all(|s| s.is_some()) {
                         let s: String = self.ps.iter().flatten().flatten().map(|&c| rds_char(c)).collect();
-                        self.info.ps = Some(s);
+                        if self.ps_last.as_deref() == Some(s.as_str()) {
+                            self.info.ps = Some(s);
+                        } else {
+                            self.ps_last = Some(s);
+                        }
                     }
                 }
                 if !version_b {
