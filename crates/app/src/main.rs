@@ -277,13 +277,15 @@ struct EmitterView {
     source: Option<ReceiverId>,
     /// Also list emitters that might still be noise (seen once, weak, briefly).
     unconfirmed: bool,
+    /// Emitters first seen recently (the new-signal window) sort to the top.
+    new_first: bool,
 }
 
 impl Default for EmitterView {
     fn default() -> Self {
         // The survey's coarse bins can't separate channels and its emitters
         // run to hundreds; it marks activity on its waterfall instead.
-        Self { sort: EmitterSort::Freq, descending: false, source: Some(ReceiverId::live(0)), unconfirmed: false }
+        Self { sort: EmitterSort::Freq, descending: false, source: Some(ReceiverId::live(0)), unconfirmed: false, new_first: true }
     }
 }
 
@@ -814,6 +816,12 @@ impl App {
         ui.horizontal(|ui| {
             changed |= ui.add(egui::DragValue::new(&mut self.settings.survey_nudge_mhz).speed(0.5).range(0.1..=100.0).suffix(" MHz")).changed();
             ui.label(egui::RichText::new("Ctrl ← → shift the survey span, Ctrl ↑ ↓ widen / narrow it").small().color(theme::MUTED));
+        });
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("New signals").small().color(theme::MUTED));
+        ui.horizontal(|ui| {
+            changed |= ui.add(egui::DragValue::new(&mut self.settings.new_signal_s).speed(5.0).range(0.0..=3600.0).suffix(" s")).changed();
+            ui.label(egui::RichText::new("emitters first seen within this long are outlined on the waterfalls and marked ✦ in the table").small().color(theme::MUTED));
         });
         ui.add_space(4.0);
         ui.label(egui::RichText::new("Logging").small().color(theme::MUTED));
@@ -2136,8 +2144,10 @@ impl App {
     /// live spans (for the survey's brackets) and the next tune target.
     fn frame_prep(&mut self) {
         self.refresh_known();
+        let new_within = std::time::Duration::from_secs_f64(self.settings.new_signal_s.max(0.0));
         for p in self.panes.iter_mut() {
             p.view.known = self.known.1.clone();
+            p.view.new_within = new_within;
             p.view.squelch = self.squelch;
             p.view.paused = self.paused;
             p.view.markers = p.source.monitors().iter().map(|m| (m.center_hz, m.label.clone())).collect();
@@ -2860,6 +2870,7 @@ impl App {
             }
             ui.separator();
             refresh |= ui.checkbox(&mut v.unconfirmed, egui::RichText::new("show unconfirmed").small()).changed();
+            refresh |= ui.checkbox(&mut v.new_first, egui::RichText::new("new first").small()).on_hover_text("Emitters first seen within the new-signal window (⚙) sort to the top and are marked ✦").changed();
             ui.separator();
             if ui
                 .button(egui::RichText::new("Export CSV").small())
@@ -2900,14 +2911,20 @@ impl App {
                 }
             }
             let (sort, desc) = (v.sort, v.descending);
+            let new_first = v.new_first;
+            let window = std::time::Duration::from_secs_f64(self.settings.new_signal_s.max(0.0));
+            let now = SystemTime::now();
+            let is_new = |e: &engine::Emitter| now.duration_since(e.first_seen).map(|d| d <= window).unwrap_or(false);
             rows.sort_by(|a, b| {
                 let o = sort.cmp(&a.1, &b.1).then(a.1.center_hz.total_cmp(&b.1.center_hz));
-                if desc { o.reverse() } else { o }
+                let o = if desc { o.reverse() } else { o };
+                if new_first { is_new(&b.1).cmp(&is_new(&a.1)).then(o) } else { o }
             });
             self.emitter_cache = (std::time::Instant::now(), rows, hidden);
             self.emitter_squelched = squelched;
         }
         let rows = std::mem::take(&mut self.emitter_cache.1);
+        let new_window = std::time::Duration::from_secs_f64(self.settings.new_signal_s.max(0.0));
         let active = rows.iter().filter(|r| r.1.active).count();
         let identified = rows.iter().filter(|r| r.1.has_protocol()).count();
         let hidden = self.emitter_cache.2;
@@ -3000,7 +3017,14 @@ impl App {
                     let mut others: Vec<(&String, &u32)> = e.tally.iter().filter(|(l, _)| **l != label).collect();
                     others.sort_by(|a, b| b.1.cmp(a.1));
                     let also: Vec<String> = others.iter().take(2).map(|(l, n)| format!("{l}×{n}")).collect();
-                    row.col(|ui| text(ui, if e.active { "●".into() } else { String::new() }, theme::ACCENT));
+                    let is_new = SystemTime::now().duration_since(e.first_seen).map(|d| d <= new_window).unwrap_or(false);
+                    row.col(|ui| {
+                        if is_new {
+                            text(ui, "✦".into(), theme::NEW);
+                        } else {
+                            text(ui, if e.active { "●".into() } else { String::new() }, theme::ACCENT);
+                        }
+                    });
                     row.col(|ui| text(ui, role.to_string(), c));
                     row.col(|ui| text(ui, format!("{:.4}", e.center_hz / 1e6), c));
                     row.col(|ui| text(ui, label, class_col));
@@ -3021,7 +3045,7 @@ impl App {
                     row.col(|ui| text(ui, format!("{:.1}", e.bandwidth_hz / 1e3), c));
                     row.col(|ui| text(ui, e.records.to_string(), c));
                     row.col(|ui| text(ui, format!("{:.0}", e.duty() * 100.0), c));
-                    row.col(|ui| text(ui, hms(e.first_seen), c));
+                    row.col(|ui| text(ui, hms(e.first_seen), if is_new { theme::NEW } else { c }));
                     row.col(|ui| text(ui, hms(e.last_seen), c));
                     row.col(|ui| text(ui, format!("{:.0}", e.peak_snr_db), c));
                     let resp = row.response();

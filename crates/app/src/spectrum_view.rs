@@ -35,6 +35,8 @@ pub struct SpectrumView {
     pub known: Vec<(f64, f64, String)>,
     /// Spectrum squelch: dim known occupants and hide their records.
     pub squelch: bool,
+    /// Records of emitters first seen within this long are outlined as new.
+    pub new_within: std::time::Duration,
     /// Rows scrolled back from the newest (0 = live edge).
     scroll: usize,
     /// Wall time of each history row, newest first (parallel to `history`).
@@ -64,6 +66,7 @@ impl SpectrumView {
             markers: Vec::new(),
             known: Vec::new(),
             squelch: false,
+            new_within: std::time::Duration::from_secs(120),
             scroll: 0,
             row_times: VecDeque::with_capacity(ROWS),
             trace: Vec::new(),
@@ -476,6 +479,7 @@ impl SpectrumView {
             let y1 = (wf.top() + back_start * row_h).min(wf.bottom());
             boxes.push((Rect::from_min_max(pos2(x0 - 1.0, y0), pos2(x1 + 1.0, y1.max(y0 + 2.0))), r));
         }
+        let now_sys = std::time::SystemTime::now();
         let hover = resp.hover_pos();
         let hovered = hover.and_then(|p| {
             boxes.iter().filter(|(b, _)| b.expand(2.0).contains(p)).min_by(|a, b| a.0.area().total_cmp(&b.0.area())).map(|(_, r)| r.id)
@@ -499,6 +503,10 @@ impl SpectrumView {
             painter.rect_filled(*b, 1.5, base.gamma_multiply(alpha));
             if focused(r) {
                 painter.rect_stroke(*b, 1.5, Stroke::new(1.0, theme::SELECT), egui::StrokeKind::Outside);
+            } else if let Some(age) = r.emitter_first_seen.and_then(|t| now_sys.duration_since(t).ok()).filter(|a| *a <= self.new_within) {
+                // New emitter: an outline that fades over the window.
+                let k = 1.0 - age.as_secs_f32() / self.new_within.as_secs_f32().max(1.0);
+                painter.rect_stroke(*b, 1.5, Stroke::new(1.0, theme::NEW.gamma_multiply(0.35 + 0.65 * k)), egui::StrokeKind::Outside);
             }
         }
         // Labels on top: one per emitter (its newest visible burst), only for

@@ -23,6 +23,8 @@ pub const KNOWN: Color32 = Color32::from_rgb(0x8f, 0x86, 0xc9);
 /// Digital channels carrying voice (talk activity).
 pub const VOICE: Color32 = Color32::from_rgb(0x7e, 0xe0, 0x81);
 /// Emergency calls.
+/// Emitters first seen recently.
+pub const NEW: Color32 = Color32::from_rgb(0x8c, 0xf0, 0x8a);
 pub const ALERT: Color32 = Color32::from_rgb(0xf0, 0x5a, 0x4f);
 pub const CHIP_FOCUS_BG: Color32 = Color32::from_rgb(0xe6, 0xed, 0xf3);
 pub const CHIP_FOCUS_FG: Color32 = BG;

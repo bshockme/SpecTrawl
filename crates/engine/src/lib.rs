@@ -125,7 +125,9 @@ impl RecordStore {
         let mut r = r.clone();
         r.class = self.classes.get(&r.id).map(|c| c.0.clone());
         r.emitter = self.emitters.by_record.get(&r.id).copied();
-        r.emitter_class = r.emitter.and_then(|id| self.emitters.get(id)).and_then(|e| e.best.clone());
+        let em = r.emitter.and_then(|id| self.emitters.get(id));
+        r.emitter_class = em.and_then(|e| e.best.clone());
+        r.emitter_first_seen = em.map(|e| e.first_seen);
         r
     }
 }

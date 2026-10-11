@@ -38,7 +38,8 @@ pub struct LogLevels {
 
 impl Default for LogLevels {
     fn default() -> Self {
-        Self { default: LevelFilter::Info, areas: Default::default() }
+        // Third-party crates (wgpu, winit) chatter at info; warn is enough.
+        Self { default: LevelFilter::Info, areas: [("other".to_string(), "warn".to_string())].into_iter().collect() }
     }
 }
 
@@ -116,7 +117,7 @@ pub fn area_of(target: &str) -> &'static str {
         "decoders"
     } else if t.starts_with("engine") || t.starts_with("detect") || t.starts_with("dsp") {
         "detection"
-    } else if t.starts_with("app") {
+    } else if t.starts_with("app") || t.starts_with("spectrawl") {
         "ui"
     } else {
         "other"
@@ -312,6 +313,7 @@ mod tests {
         assert_eq!(area_of("detect::spectral"), "detection");
         assert_eq!(area_of("engine::occupancy"), "detection");
         assert_eq!(area_of("app"), "ui");
+        assert_eq!(area_of("spectrawl::logging"), "ui");
         assert_eq!(area_of("wgpu_core::device"), "other");
     }
 

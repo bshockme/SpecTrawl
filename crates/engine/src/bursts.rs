@@ -114,6 +114,8 @@ pub struct SignalRecord {
     /// The emitter this record belongs to, and that emitter's best class.
     pub emitter: Option<u64>,
     pub emitter_class: Option<std::sync::Arc<detect::Classification>>,
+    /// When that emitter was first seen (the view outlines recent ones).
+    pub emitter_first_seen: Option<std::time::SystemTime>,
 }
 
 impl SignalRecord {
@@ -266,6 +268,7 @@ impl BurstDetector {
             class: None,
             emitter: None,
             emitter_class: None,
+            emitter_first_seen: None,
         }
     }
 
