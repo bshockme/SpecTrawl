@@ -20,11 +20,13 @@ pub struct Settings {
     pub survey_nudge_mhz: f64,
     /// Emitters first seen within this many seconds are drawn as new.
     pub new_signal_s: f64,
+    /// Survey segments (MHz); empty = the whole span.
+    pub survey_segments: Vec<(f64, f64)>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { log: LogLevels::default(), ring_seconds: 10.0, nudge_khz: 100.0, survey_nudge_mhz: 1.0, new_signal_s: 120.0 }
+        Self { log: LogLevels::default(), ring_seconds: 10.0, nudge_khz: 100.0, survey_nudge_mhz: 1.0, new_signal_s: 120.0, survey_segments: Vec::new() }
     }
 }
 

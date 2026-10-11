@@ -14,6 +14,8 @@ use crate::theme;
 
 /// Waterfall depth in rows (at 50 rows/s ≈ 20 s on screen).
 const ROWS: usize = 1024;
+/// Colour of stretches the survey doesn't measure (outside its segments).
+const GAP: Color32 = Color32::from_rgb(0x16, 0x18, 0x1c);
 /// Resolution rows are kept at for recolouring; display width never exceeds it.
 const HIST_W: usize = 4096;
 
@@ -83,7 +85,11 @@ impl SpectrumView {
         if self.trace.is_empty() {
             return;
         }
-        let mut v = self.trace.clone();
+        // Unmeasured stretches (survey segments) aren't spectrum.
+        let mut v: Vec<f32> = self.trace.iter().copied().filter(|v| !engine::is_empty_db(*v)).collect();
+        if v.is_empty() {
+            return;
+        }
         v.sort_by(f32::total_cmp);
         let floor = v[v.len() / 5];
         self.db_min = (floor - 6.0).round();
@@ -127,7 +133,7 @@ impl SpectrumView {
         let lo = self.db_min;
         let k = 255.0 / (self.db_max - self.db_min).max(1.0);
         out.clear();
-        out.extend(db.iter().map(|&v| self.lut[((v - lo) * k).clamp(0.0, 255.0) as usize]));
+        out.extend(db.iter().map(|&v| if engine::is_empty_db(v) { GAP } else { self.lut[((v - lo) * k).clamp(0.0, 255.0) as usize] }));
     }
 
     fn push_tex_row(&mut self) {
@@ -140,7 +146,7 @@ impl SpectrumView {
         let mut px = Vec::with_capacity(self.tex_w);
         // Borrow juggling: colourise with a copy of the parameters.
         let (lo, k, lut) = (self.db_min, 255.0 / (self.db_max - self.db_min).max(1.0), &self.lut);
-        px.extend(cols.iter().map(|&v| lut[((v - lo) * k).clamp(0.0, 255.0) as usize]));
+        px.extend(cols.iter().map(|&v| if engine::is_empty_db(v) { GAP } else { lut[((v - lo) * k).clamp(0.0, 255.0) as usize] }));
         self.write_row = (self.write_row + ROWS - 1) % ROWS;
         let img = egui::ColorImage::new([self.tex_w, 1], px);
         tex.set_partial([0, self.write_row], img, TextureOptions::LINEAR);
@@ -230,6 +236,9 @@ impl SpectrumView {
             let pass = s.last_pass_s.max(0.5);
             for (h, t) in s.hop_times.iter().enumerate() {
                 let Some(t) = t else { continue };
+                if !s.measured.get(h).copied().unwrap_or(true) {
+                    continue;
+                }
                 let age = now.duration_since(*t).as_secs_f64() / pass;
                 let a = if h == s.current_hop { 255 } else { (200.0 * (1.0 - age.min(1.0) * 0.8)) as u8 };
                 let x0 = strip.left() + strip.width() * h as f32 / s.hops as f32;
@@ -356,8 +365,53 @@ impl SpectrumView {
             }
         }
         painter.add(Shape::mesh(fill));
-        painter.add(Shape::line(hold_pts, Stroke::new(1.0, Color32::from_rgba_unmultiplied(242, 163, 58, 110))));
-        painter.add(Shape::line(pts, Stroke::new(1.3, theme::ACCENT)));
+        // Lines break over unmeasured stretches, which get a hatch-free
+        // grey band instead of a trace.
+        let runs = |pts: &[Pos2], vals: &[f32]| -> Vec<Vec<Pos2>> {
+            let mut out: Vec<Vec<Pos2>> = Vec::new();
+            let mut cur: Vec<Pos2> = Vec::new();
+            for (p, v) in pts.iter().zip(vals) {
+                if engine::is_empty_db(*v) {
+                    if cur.len() > 1 {
+                        out.push(std::mem::take(&mut cur));
+                    } else {
+                        cur.clear();
+                    }
+                } else {
+                    cur.push(*p);
+                }
+            }
+            if cur.len() > 1 {
+                out.push(cur);
+            }
+            out
+        };
+        let mut gap_from: Option<f32> = None;
+        for (i, v) in self.scratch.iter().enumerate() {
+            let empty = engine::is_empty_db(*v);
+            match (gap_from, empty) {
+                (None, true) => gap_from = Some(x_of(i)),
+                (Some(x0), false) => {
+                    painter.rect_filled(Rect::from_x_y_ranges(x0..=x_of(i), plot.y_range()), 0.0, GAP);
+                    gap_from = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(x0) = gap_from {
+            painter.rect_filled(Rect::from_x_y_ranges(x0..=plot.right(), plot.y_range()), 0.0, GAP);
+        }
+        let hold_vals: Vec<f32> = {
+            let mut h = vec![0.0; cols];
+            dsp::decimate_max(&self.hold, &mut h);
+            h
+        };
+        for run in runs(&hold_pts, &hold_vals) {
+            painter.add(Shape::line(run, Stroke::new(1.0, Color32::from_rgba_unmultiplied(242, 163, 58, 110))));
+        }
+        for run in runs(&pts, &self.scratch) {
+            painter.add(Shape::line(run, Stroke::new(1.3, theme::ACCENT)));
+        }
         // Known occupants: a bar along the bottom of the plot, labelled
         // where there's room.
         let mut known_chips: Vec<Rect> = Vec::new();

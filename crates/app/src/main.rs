@@ -1171,7 +1171,52 @@ impl App {
     }
 
     fn sweep_plan(&self) -> SweepPlan {
-        SweepPlan { start_hz: self.sweep_lo_mhz * 1e6, stop_hz: self.sweep_hi_mhz * 1e6, ..Default::default() }
+        let segs = self.settings.survey_segments.iter().map(|(lo, hi)| (lo * 1e6, hi * 1e6)).collect();
+        SweepPlan::with_segments(self.sweep_lo_mhz * 1e6, self.sweep_hi_mhz * 1e6, segs)
+    }
+
+    /// The survey's segment list: editable ranges within the span; empty
+    /// means the whole span. Returns true when Apply was clicked.
+    fn segments_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        ui.set_min_width(300.0);
+        ui.label(egui::RichText::new("Survey segments (MHz). Empty = the whole span.").small().color(theme::MUTED));
+        let (lo_lim, hi_lim) = (self.sweep_lo_mhz, self.sweep_hi_mhz);
+        let mut remove: Option<usize> = None;
+        let mut changed = false;
+        for (k, (lo, hi)) in self.settings.survey_segments.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                changed |= ui.add(egui::DragValue::new(lo).speed(0.5).range(lo_lim..=hi_lim).max_decimals(3)).changed();
+                ui.label("–");
+                changed |= ui.add(egui::DragValue::new(hi).speed(0.5).range(lo_lim..=hi_lim).max_decimals(3)).changed();
+                if ui.small_button("✕").clicked() {
+                    remove = Some(k);
+                }
+            });
+        }
+        if let Some(k) = remove {
+            self.settings.survey_segments.remove(k);
+            changed = true;
+        }
+        let mut apply = false;
+        ui.horizontal(|ui| {
+            if ui.small_button("+ Add").clicked() {
+                let last = self.settings.survey_segments.last().map(|s| s.1).unwrap_or(lo_lim);
+                let lo = last.max(lo_lim).min(hi_lim - 1.0);
+                self.settings.survey_segments.push((lo, (lo + 10.0).min(hi_lim)));
+                changed = true;
+            }
+            if !self.settings.survey_segments.is_empty() && ui.small_button("Clear").clicked() {
+                self.settings.survey_segments.clear();
+                changed = true;
+            }
+            if ui.small_button("Apply").clicked() {
+                apply = true;
+            }
+        });
+        if changed {
+            self.settings.save();
+        }
+        apply
     }
 
     /// Restarts the sweeper on the current range.
@@ -1800,6 +1845,8 @@ impl App {
             Err(String),
         }
         let mut acts: Vec<Act> = Vec::new();
+        let segments = self.settings.survey_segments.len();
+        let mut open_inspector = false;
         {
             let App { panes, sweep_lo_mhz, sweep_hi_mhz, frame, .. } = &mut *self;
             let Some(p) = panes.iter_mut().find(|p| p.id == id) else { return };
@@ -1817,6 +1864,17 @@ impl App {
             if id.is_sweep() {
                 let st = p.source.sweep_status();
                 let title = match &st {
+                    Some(s) if !s.segments.is_empty() => format!(
+                        "S · {} · {:.0}–{:.0} MHz · {} segments, {} of {} hops · {:.0} MHz/s · revisit {:.1} s",
+                        info.label,
+                        s.start_hz / 1e6,
+                        s.stop_hz() / 1e6,
+                        s.segments.len(),
+                        s.measured_hops,
+                        s.hops,
+                        s.mhz_per_sec(),
+                        s.last_pass_s
+                    ),
                     Some(s) => format!(
                         "S · {} · {:.0}–{:.0} MHz · {} hops · {:.0} MHz/s · revisit {:.1} s",
                         info.label,
@@ -1896,6 +1954,14 @@ impl App {
                     if ui.small_button("Apply").clicked() {
                         acts.push(Act::ApplySweep);
                     }
+                    if ui
+                        .small_button(if segments == 0 { "Segments".to_string() } else { format!("{segments} segments") })
+                        .on_hover_text("Sweep only chosen ranges of the span (edited in the Inspector)")
+                        .clicked()
+                    {
+                        acts.push(Act::Select(Selection::Receiver(id)));
+                        open_inspector = true;
+                    }
                     ui.add(egui::DragValue::new(sweep_hi_mhz).speed(1.0).range(34.0..=1800.0).suffix(" MHz"));
                     ui.label(egui::RichText::new("–").small());
                     ui.add(egui::DragValue::new(sweep_lo_mhz).speed(1.0).range(24.0..=1790.0).suffix(" MHz"));
@@ -1914,6 +1980,9 @@ impl App {
                     }
                 }
             });
+        }
+        if open_inspector {
+            self.dock_requests.push(DockReq::Show(Tab::Inspector));
         }
         for a in acts {
             match a {
@@ -1984,6 +2053,7 @@ impl App {
         let mut apply = false;
         let mut set_target = false;
         let mut err = None;
+        let mut show_segments = false;
         {
             let App { panes, sweep_lo_mhz, sweep_hi_mhz, .. } = &mut *self;
             let Some(p) = panes.iter_mut().find(|p| p.id == id) else {
@@ -2013,6 +2083,7 @@ impl App {
                     ui.add(egui::DragValue::new(sweep_hi_mhz).speed(1.0).range(34.0..=1800.0).suffix(" MHz"));
                     apply = ui.button("Apply range").clicked();
                 });
+                show_segments = true;
             } else {
                 ui.horizontal(|ui| {
                     ui.label("Centre");
@@ -2057,6 +2128,10 @@ impl App {
         }
         if let Some(m) = tune {
             self.retune(id, m);
+        }
+        if show_segments {
+            ui.separator();
+            apply |= self.segments_ui(ui);
         }
         if apply {
             self.apply_sweep();
