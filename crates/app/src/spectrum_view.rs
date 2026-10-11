@@ -18,6 +18,11 @@ const ROWS: usize = 1024;
 const GAP: Color32 = Color32::from_rgb(0x16, 0x18, 0x1c);
 /// Resolution rows are kept at for recolouring; display width never exceeds it.
 const HIST_W: usize = 4096;
+/// Survey rows are kept near their native bin count (a full-band sweep is
+/// 32768 bins) so zooming in is a view operation: 1024 rows × 16384 × 4 B.
+const HIST_W_NATIVE: usize = 16384;
+/// Narrowest zoom, in history columns.
+const MIN_ZOOM_COLS: f64 = 24.0;
 
 pub struct SpectrumView {
     pub db_min: f32,
@@ -37,6 +42,12 @@ pub struct SpectrumView {
     pub squelch: bool,
     /// Records of emitters first seen within this long are outlined as new.
     pub new_within: std::time::Duration,
+    /// Keep history at near-native resolution (survey views).
+    hist_w: usize,
+    /// The frequency window shown, when zoomed in (Hz); None = the whole span.
+    zoom: Option<(f64, f64)>,
+    /// The zoom the texture was built for.
+    tex_zoom: Option<(f64, f64)>,
     /// Rows scrolled back from the newest (0 = live edge).
     scroll: usize,
     /// Wall time of each history row, newest first (parallel to `history`).
@@ -67,6 +78,9 @@ impl SpectrumView {
             known: Vec::new(),
             squelch: false,
             new_within: std::time::Duration::from_secs(120),
+            hist_w: HIST_W,
+            zoom: None,
+            tex_zoom: None,
             scroll: 0,
             row_times: VecDeque::with_capacity(ROWS),
             trace: Vec::new(),
@@ -80,6 +94,63 @@ impl SpectrumView {
             tex_range: (0.0, 0.0),
             lut: theme::waterfall_lut(),
             scratch: Vec::new(),
+        }
+    }
+
+    /// Keeps history at near-native resolution, for views whose rows are
+    /// wider than any screen (the survey).
+    pub fn with_native_history(mut self) -> Self {
+        self.hist_w = HIST_W_NATIVE;
+        self
+    }
+
+    /// The tuned extent, ignoring any zoom.
+    fn full_span(&self) -> Option<(f64, f64)> {
+        self.tuning.map(|t| (t.center_hz - t.span_hz / 2.0, t.center_hz + t.span_hz / 2.0))
+    }
+
+    /// Zoom factor relative to the full span (1 = not zoomed).
+    pub fn zoom_factor(&self) -> f64 {
+        match (self.zoom, self.full_span()) {
+            (Some((a, b)), Some((f0, f1))) if b > a => (f1 - f0) / (b - a),
+            _ => 1.0,
+        }
+    }
+
+    pub fn reset_zoom(&mut self) {
+        self.zoom = None;
+    }
+
+    /// Zooms by `factor` (> 1 in) keeping `at_hz` under the cursor.
+    fn zoom_by(&mut self, factor: f64, at_hz: f64) {
+        let Some((f0, f1)) = self.full_span() else { return };
+        let (a, b) = self.zoom.unwrap_or((f0, f1));
+        let cols = self.history.front().map(|r| r.len()).unwrap_or(self.trace.len()).max(1) as f64;
+        let min_w = (f1 - f0) * (MIN_ZOOM_COLS / cols).min(1.0);
+        let w = ((b - a) / factor).clamp(min_w, f1 - f0);
+        let t = ((at_hz - a) / (b - a)).clamp(0.0, 1.0);
+        let mut na = at_hz - t * w;
+        na = na.clamp(f0, f1 - w);
+        self.zoom = if w >= (f1 - f0) * 0.999 { None } else { Some((na, na + w)) };
+    }
+
+    /// Pans the zoom window by `dhz`.
+    fn pan_by(&mut self, dhz: f64) {
+        let (Some((f0, f1)), Some((a, b))) = (self.full_span(), self.zoom) else { return };
+        let w = b - a;
+        let na = (a + dhz).clamp(f0, f1 - w);
+        self.zoom = Some((na, na + w));
+    }
+
+    /// History/trace index range covering the zoom window of a row `len` wide.
+    fn zoom_cols(&self, len: usize) -> (usize, usize) {
+        match (self.zoom, self.full_span()) {
+            (Some((a, b)), Some((f0, f1))) if f1 > f0 && len > 0 => {
+                let c0 = (((a - f0) / (f1 - f0)) * len as f64).floor().clamp(0.0, (len - 1) as f64) as usize;
+                let c1 = (((b - f0) / (f1 - f0)) * len as f64).ceil().clamp((c0 + 1) as f64, len as f64) as usize;
+                (c0, c1)
+            }
+            _ => (0, len),
         }
     }
 
@@ -109,6 +180,12 @@ impl SpectrumView {
                 // Retune or FFT size change: restart the traces.
                 let first = self.tuning.is_none();
                 self.tuning = Some(row.tuning);
+                // A zoom window that fell off the new span goes.
+                if let (Some((a, b)), Some((f0, f1))) = (self.zoom, self.full_span()) {
+                    if a < f0 || b > f1 {
+                        self.zoom = None;
+                    }
+                }
                 self.trace = row.db.clone();
                 self.hold = row.db.clone();
                 if first {
@@ -120,7 +197,7 @@ impl SpectrumView {
                 *t = a * *t + (1.0 - a) * v;
                 *h = (*h - 0.05).max(v);
             }
-            let mut dec = vec![0.0; row.db.len().min(HIST_W)];
+            let mut dec = vec![0.0; row.db.len().min(self.hist_w)];
             dsp::decimate_max(&row.db, &mut dec);
             if self.history.len() == ROWS {
                 self.history.pop_back();
@@ -140,12 +217,14 @@ impl SpectrumView {
     }
 
     fn push_tex_row(&mut self) {
+        let Some(len) = self.history.front().map(|r| r.len()) else { return };
+        let (c0, c1) = self.zoom_cols(len);
         let (Some(tex), Some(row)) = (self.tex.as_mut(), self.history.front()) else { return };
         if self.tex_w == 0 {
             return;
         }
         let mut cols = vec![0.0; self.tex_w];
-        dsp::decimate_max(row, &mut cols);
+        dsp::decimate_max(&row[c0..c1], &mut cols);
         let mut px = Vec::with_capacity(self.tex_w);
         // Borrow juggling: colourise with a copy of the parameters.
         let (lo, k, lut) = (self.db_min, 255.0 / (self.db_max - self.db_min).max(1.0), &self.lut);
@@ -159,12 +238,14 @@ impl SpectrumView {
     fn rebuild_tex(&mut self, ctx: &egui::Context, width: usize) {
         self.tex_w = width;
         self.tex_range = (self.db_min, self.db_max);
+        self.tex_zoom = self.zoom;
         self.write_row = 0;
         let mut px = vec![theme::PLOT_BG; width * ROWS];
         let mut cols = vec![0.0; width];
         let mut line = Vec::with_capacity(width);
         for (r, row) in self.history.iter().enumerate() {
-            dsp::decimate_max(row, &mut cols);
+            let (c0, c1) = self.zoom_cols(row.len());
+            dsp::decimate_max(&row[c0..c1], &mut cols);
             self.colorize(&cols, &mut line);
             px[r * width..(r + 1) * width].copy_from_slice(&line);
         }
@@ -175,9 +256,10 @@ impl SpectrumView {
         }
     }
 
-    /// Frequency extent currently displayed, in Hz.
+    /// Frequency extent currently displayed, in Hz (the zoom window when
+    /// zoomed in).
     pub fn span(&self) -> Option<(f64, f64)> {
-        self.tuning.map(|t| (t.center_hz - t.span_hz / 2.0, t.center_hz + t.span_hz / 2.0))
+        self.zoom.or_else(|| self.full_span())
     }
 
     /// Draws a labelled bracket over `[lo, hi]` Hz (e.g. a focus pane's coverage).
@@ -244,8 +326,13 @@ impl SpectrumView {
                 }
                 let age = now.duration_since(*t).as_secs_f64() / pass;
                 let a = if h == s.current_hop { 255 } else { (200.0 * (1.0 - age.min(1.0) * 0.8)) as u8 };
-                let x0 = strip.left() + strip.width() * h as f32 / s.hops as f32;
-                let x1 = strip.left() + strip.width() * (h + 1) as f32 / s.hops as f32;
+                let (z0, z1) = self.span().unwrap_or((s.start_hz, s.stop_hz()));
+                let (h0, h1) = (s.start_hz + s.hop_hz * h as f64, s.start_hz + s.hop_hz * (h + 1) as f64);
+                if h1 < z0 || h0 > z1 {
+                    continue;
+                }
+                let x0 = strip.left() + strip.width() * ((h0 - z0) / (z1 - z0)).clamp(0.0, 1.0) as f32;
+                let x1 = strip.left() + strip.width() * ((h1 - z0) / (z1 - z0)).clamp(0.0, 1.0) as f32;
                 p.rect_filled(
                     Rect::from_x_y_ranges(x0..=(x1 - 1.0).max(x0 + 0.5), strip.y_range()),
                     0.0,
@@ -254,10 +341,31 @@ impl SpectrumView {
             }
             full.min.y += 6.0;
         }
-        let resp = ui.allocate_rect(full, egui::Sense::click());
+        let resp = ui.allocate_rect(full, egui::Sense::click_and_drag());
+        // Zoom and pan: Ctrl + wheel zooms about the cursor, a right or
+        // middle drag pans, a right double-click resets.
+        if resp.hovered() {
+            let (ctrl, dy, pos) = ui.input(|i| (i.modifiers.command, i.smooth_scroll_delta.y, i.pointer.hover_pos()));
+            if ctrl && dy != 0.0 {
+                if let (Some(p), Some((f0, f1))) = (pos, self.span()) {
+                    let at = f0 + ((p.x - full.left()) / full.width()).clamp(0.0, 1.0) as f64 * (f1 - f0);
+                    self.zoom_by((1.0 + dy.abs() as f64 / 120.0).powf(if dy > 0.0 { 1.0 } else { -1.0 }), at);
+                }
+            }
+        }
+        if resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) {
+            if let Some((f0, f1)) = self.span() {
+                let d = resp.drag_delta().x as f64 / full.width() as f64 * (f1 - f0);
+                self.pan_by(-d);
+            }
+        }
+        if resp.double_clicked_by(egui::PointerButton::Secondary) {
+            self.reset_zoom();
+        }
+        let ctrl_held = ui.input(|i| i.modifiers.command);
         if !self.paused {
             self.scroll = 0;
-        } else if resp.hovered() {
+        } else if resp.hovered() && !ctrl_held {
             // Wheel up = further back in time, ~10 rows per notch.
             let dy = ui.input(|i| i.smooth_scroll_delta.y);
             if dy != 0.0 {
@@ -285,7 +393,7 @@ impl SpectrumView {
         // --- waterfall ---
         let ppp = ui.ctx().pixels_per_point();
         let want_w = ((wf.width() * ppp).round() as usize).clamp(64, HIST_W);
-        if self.tex.is_none() || want_w != self.tex_w || self.tex_range != (self.db_min, self.db_max) {
+        if self.tex.is_none() || want_w != self.tex_w || self.tex_range != (self.db_min, self.db_max) || self.tex_zoom != self.zoom {
             self.rebuild_tex(ui.ctx(), want_w);
         }
         if let Some(tex) = &self.tex {
@@ -350,11 +458,12 @@ impl SpectrumView {
         let cols = (spec.width() as usize).max(2);
         self.scratch.resize(cols, 0.0);
         let x_of = |i: usize| spec.left() + i as f32 * spec.width() / (cols - 1) as f32;
-        // Peak hold.
-        dsp::decimate_max(&self.hold, &mut self.scratch);
+        // Peak hold and trace, over the zoom window's bins.
+        let (t0, t1) = self.zoom_cols(self.trace.len());
+        dsp::decimate_max(&self.hold[t0..t1], &mut self.scratch);
         let hold_pts: Vec<Pos2> = self.scratch.iter().enumerate().map(|(i, &v)| pos2(x_of(i), y_of(v))).collect();
         // Trace with fill.
-        dsp::decimate_max(&self.trace, &mut self.scratch);
+        dsp::decimate_max(&self.trace[t0..t1], &mut self.scratch);
         let pts: Vec<Pos2> = self.scratch.iter().enumerate().map(|(i, &v)| pos2(x_of(i), y_of(v))).collect();
         let mut fill = Mesh::default();
         let fill_c = Color32::from_rgba_unmultiplied(0x38, 0xd3, 0xcf, 16);
@@ -406,7 +515,7 @@ impl SpectrumView {
         }
         let hold_vals: Vec<f32> = {
             let mut h = vec![0.0; cols];
-            dsp::decimate_max(&self.hold, &mut h);
+            dsp::decimate_max(&self.hold[t0..t1], &mut h);
             h
         };
         for run in runs(&hold_pts, &hold_vals) {
@@ -654,9 +763,13 @@ impl SpectrumView {
         } else if let Some(p) = resp.hover_pos() {
             let fx = f0 + ((p.x - full.left()) / full.width()) as f64 * span;
             painter.vline(p.x, full.y_range(), Stroke::new(1.0, Color32::from_rgba_unmultiplied(230, 237, 243, 90)));
-            let i = (((p.x - spec.left()) / spec.width()) * self.trace.len() as f32) as usize;
+            let (F0, F1) = self.full_span().unwrap_or((f0, f1));
+            let i = (((fx - F0) / (F1 - F0)).clamp(0.0, 1.0) * self.trace.len() as f64) as usize;
             let db = self.trace.get(i.min(self.trace.len().saturating_sub(1))).copied().unwrap_or(f32::NAN);
             let mut label = format!("{:.4} MHz  {:.1} dBFS", fx / 1e6, db);
+            if self.zoom.is_some() {
+                label += &format!("  ·  zoom ×{:.1} (right double-click resets)", self.zoom_factor());
+            }
             if let Some((_, _, k)) = self.known.iter().find(|(lo, hi, _)| (*lo..=*hi).contains(&fx)) {
                 label += &format!("  ·  {k}");
             }

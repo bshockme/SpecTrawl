@@ -4285,7 +4285,7 @@ fn pane_records(p: &mut Receiver) -> std::sync::Arc<[engine::SignalRecord]> {
 }
 
 fn survey_view() -> SpectrumView {
-    let mut v = SpectrumView::new();
+    let mut v = SpectrumView::new().with_native_history();
     // One row per pass (seconds apart): already averaged, and drawn thick.
     v.smoothing = 0.0;
     v.row_px = Some(3.0);
