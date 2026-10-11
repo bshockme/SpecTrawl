@@ -1711,7 +1711,7 @@ impl App {
             .panes
             .iter()
             .flat_map(|p| p.source.occupants())
-            .map(|k| (k.occupant.lo_hz, k.occupant.hi_hz, k.occupant.kind.label()))
+            .map(|k| (k.occupant.lo_hz, k.occupant.hi_hz, k.label()))
             .collect();
         all.sort_by(|a, b| a.0.total_cmp(&b.0));
         let mut merged: Vec<(f64, f64, String)> = Vec::new();
