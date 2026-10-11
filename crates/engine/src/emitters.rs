@@ -370,6 +370,23 @@ impl EmitterBook {
         }
     }
 
+    /// Takes a verdict made elsewhere (an explore visit on another receiver)
+    /// as this emitter's label outright: counted as enough hits to be
+    /// believed, and made `best`.
+    pub(crate) fn adopt(&mut self, id: u64, c: Arc<Classification>) {
+        let Some(e) = self.map.get_mut(&id) else { return };
+        *e.tally.entry(c.label.clone()).or_default() += MIN_PROTOCOL_HITS;
+        if c.protocol.is_some() {
+            *e.protocols.entry(c.label.clone()).or_default() += MIN_PROTOCOL_HITS;
+            e.strong.insert(c.label.clone());
+        }
+        if let Some(i) = c.fields.as_ref().and_then(|f| f.id.clone()) {
+            *e.ids.entry(i).or_default() += 1;
+        }
+        e.class = Some(c.clone());
+        e.best = Some(c);
+    }
+
     /// Stores a group-level classification for an emitter.
     pub(crate) fn set_group_class(&mut self, id: u64, c: Arc<Classification>) {
         if let Some(e) = self.map.get_mut(&id) {

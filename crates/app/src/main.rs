@@ -107,10 +107,22 @@ enum GainMode {
     Agc,
 }
 
+/// What a focus receiver does with itself (`docs/auto-explore.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RxMode {
+    Manual,
+    Explore,
+}
+
 struct Receiver {
     id: ReceiverId,
     source: Source,
     view: SpectrumView,
+    mode: RxMode,
+    /// The explore visit in progress.
+    visit: Option<engine::explore::Visit>,
+    /// The last verdict, shown in the pane for a moment.
+    last_verdict: Option<(std::time::Instant, String)>,
     /// Records for the boxes, refetched only when new rows arrive.
     records: (Option<u64>, std::time::Instant, std::sync::Arc<[engine::SignalRecord]>),
     gain_mode: GainMode,
@@ -245,6 +257,16 @@ struct App {
     sweep_dirty: Option<std::time::Instant>,
     /// Diagnostics log view: text filter.
     log_filter: String,
+    /// Auto-explore: the shared queue, history and log.
+    explorer: engine::explore::Explorer,
+    /// When exploring was first switched on (emitters seen after it are new).
+    explore_since: Option<SystemTime>,
+    /// Set around the explorer's own retunes, which must not drop the
+    /// receiver back to Manual.
+    explore_tuning: bool,
+    explore_tick: std::time::Instant,
+    /// Set once the exploration CSV has its header.
+    explore_csv_ready: bool,
 }
 
 /// What the emitter table shows and in what order.
@@ -314,12 +336,13 @@ enum Tab {
     Trunking,
     Calls,
     Pages,
+    Exploration,
     Diagnostics,
 }
 
 impl Tab {
     /// Every pane that isn't a receiver.
-    const PANELS: [Tab; 8] = [Tab::Sources, Tab::Inspector, Tab::Emitters, Tab::Records, Tab::Trunking, Tab::Calls, Tab::Pages, Tab::Diagnostics];
+    const PANELS: [Tab; 9] = [Tab::Sources, Tab::Inspector, Tab::Emitters, Tab::Records, Tab::Trunking, Tab::Calls, Tab::Pages, Tab::Exploration, Tab::Diagnostics];
 
     fn name(&self) -> String {
         match self {
@@ -331,13 +354,14 @@ impl Tab {
             Tab::Trunking => "Trunking".into(),
             Tab::Calls => "Calls".into(),
             Tab::Pages => "Pages".into(),
+            Tab::Exploration => "Exploration".into(),
             Tab::Diagnostics => "Diagnostics".into(),
         }
     }
 
     /// Lives in the tables group of the default layout.
     fn is_table(&self) -> bool {
-        matches!(self, Tab::Emitters | Tab::Records | Tab::Trunking | Tab::Calls | Tab::Pages | Tab::Diagnostics)
+        matches!(self, Tab::Emitters | Tab::Records | Tab::Trunking | Tab::Calls | Tab::Pages | Tab::Exploration | Tab::Diagnostics)
     }
 }
 
@@ -413,6 +437,7 @@ enum Cmd {
     Priority(u32),
     Lockout(u32),
     Reset,
+    Explore(ReceiverId, bool),
 }
 
 /// Per-frame facts the receiver panes share (live spans for the survey's
@@ -450,6 +475,7 @@ fn parse_args() -> Args {
                     Some("records") => Some(Tab::Records),
                     Some("p25") | Some("trunking") => Some(Tab::Trunking),
                     Some("pages") => Some(Tab::Pages),
+                    Some("exploration") | Some("explore") => Some(Tab::Exploration),
                     Some("calls") => Some(Tab::Calls),
                     Some("diagnostics") | Some("diag") => Some(Tab::Diagnostics),
                     _ => Some(Tab::Emitters),
@@ -531,6 +557,11 @@ impl App {
             settings: settings::Settings::load(),
             sweep_dirty: None,
             log_filter: String::new(),
+            explorer: engine::explore::Explorer::default(),
+            explore_since: None,
+            explore_tuning: false,
+            explore_tick: std::time::Instant::now(),
+            explore_csv_ready: false,
         };
         app.rescan();
 
@@ -895,6 +926,10 @@ impl App {
         v.push((if self.volume > 0.0 { "Mute" } else { "Unmute" }.into(), "mute unmute volume", Cmd::Mute));
         v.push((if self.paused { "Resume" } else { "Pause" }.into(), "pause resume freeze", Cmd::Pause));
         v.push((format!("Squelch known: {}", if self.squelch { "off" } else { "on" }), "squelch known fm tv lte", Cmd::Squelch));
+        for id in &live {
+            let on = self.receiver(*id).is_some_and(|p| p.mode == RxMode::Explore);
+            v.push((format!("{} explore on {id}", if on { "Stop" } else { "Start" }), "explore auto visit survey", Cmd::Explore(*id, !on)));
+        }
         v.push(("Export emitters and records (CSV)".into(), "export csv emitters records", Cmd::ExportEmitters));
         v.push(("Reset layout".into(), "reset layout", Cmd::Reset));
         for t in Tab::PANELS {
@@ -971,6 +1006,7 @@ impl App {
                 self.dock_requests.push(DockReq::Reset);
                 self.workspace_name = None;
             }
+            Cmd::Explore(id, on) => self.set_mode(id, if on { RxMode::Explore } else { RxMode::Manual }),
         }
     }
 
@@ -1301,6 +1337,9 @@ impl App {
                     id,
                     source,
                     view,
+                    mode: RxMode::Manual,
+                    visit: None,
+                    last_verdict: None,
                     records: (None, std::time::Instant::now(), Vec::new().into()),
                     gain_mode: GainMode::Linearity,
                     gain_step: 13,
@@ -1322,10 +1361,324 @@ impl App {
         if id == self.tune_target {
             self.tune_mhz = mhz;
         }
+        // A manual retune takes the receiver back from the explorer.
+        if !self.explore_tuning && self.receiver(id).is_some_and(|p| p.mode == RxMode::Explore) {
+            self.set_mode(id, RxMode::Manual);
+        }
         if let Some(p) = self.receiver_mut(id) {
             if let Err(e) = p.source.set_center(mhz * 1e6) {
                 self.error = Some(e.to_string());
             }
+        }
+    }
+
+    /// Switches a focus receiver between Manual and Explore.
+    fn set_mode(&mut self, id: ReceiverId, mode: RxMode) {
+        let Some(p) = self.receiver_mut(id) else { return };
+        if p.mode == mode {
+            return;
+        }
+        p.mode = mode;
+        p.visit = None;
+        log::info!("receiver {id}: {mode:?}");
+        if mode == RxMode::Manual {
+            self.explorer.abandon(id.0);
+        } else if self.explore_since.is_none() {
+            self.explore_since = Some(SystemTime::now());
+        }
+    }
+
+    /// Appends a verdict to the exploration CSV next to the emitter exports.
+    fn explore_csv(&mut self, e: &engine::explore::LogEntry) {
+        use std::io::Write;
+        let path = engine::sigmf::default_dir().join("exploration_log.csv");
+        let _ = std::fs::create_dir_all(engine::sigmf::default_dir());
+        let fresh = !path.exists();
+        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(mut f) => {
+                if fresh || !self.explore_csv_ready {
+                    if fresh {
+                        let _ = writeln!(f, "{}", engine::explore::LogEntry::CSV_HEADER);
+                    }
+                    self.explore_csv_ready = true;
+                }
+                let _ = writeln!(f, "{}", e.csv_line());
+            }
+            Err(err) => log::warn!("exploration log {}: {err}", path.display()),
+        }
+    }
+
+    /// Writes a verdict onto the survey's emitter so its table shows it.
+    fn adopt_verdict(&self, e: &engine::explore::LogEntry) {
+        use engine::explore::Kind;
+        if e.kind < Kind::Classified || e.label.is_empty() {
+            return;
+        }
+        let Some(s) = self.receiver(ReceiverId::SWEEP) else { return };
+        let class = detect::Classification {
+            label: e.label.clone(),
+            protocol: if e.kind == Kind::Identified { Some(e.label.clone()) } else { None },
+            confidence: 1.0,
+            features: Default::default(),
+            sync: None,
+            fields: if e.id.is_empty() { None } else { Some(detect::decode::Fields { id: Some(e.id.clone()), ..Default::default() }) },
+            analysed_s: e.dwell_s,
+        };
+        s.source.label_emitter(e.emitter, std::sync::Arc::new(class));
+    }
+
+    /// What a focus receiver sees of a survey emitter: its own emitters and
+    /// known occupants overlapping the emitter's extent.
+    fn observe(p: &Receiver, e_center: f64, e_bw: f64) -> engine::explore::Observation {
+        let half = e_bw.max(54e3) / 2.0 + 27e3;
+        let (lo, hi) = (e_center - half, e_center + half);
+        let mut obs = engine::explore::observe(&p.source.emitters(), lo, hi, std::time::Duration::from_secs(1), SystemTime::now());
+        // A known wideband occupant covering it is a classification in
+        // itself, an identity when a decoder named it.
+        if obs.id.is_none() {
+            if let Some(k) = p.source.occupants().iter().find(|k| k.occupant.lo_hz <= hi && k.occupant.hi_hz >= lo) {
+                obs.active = true;
+                let named = k.station.is_some() || k.cell.as_ref().is_some_and(|c| c.sync.is_some());
+                obs.label = Some(k.label());
+                if named {
+                    obs.protocol = true;
+                    obs.id = Some(k.label());
+                }
+            }
+        }
+        obs
+    }
+
+    /// The explorer's turn: a few times a second, advance every exploring
+    /// receiver's visit and determine in-view emitters in place.
+    fn explore_step(&mut self) {
+        if self.explore_tick.elapsed() < std::time::Duration::from_millis(250) {
+            return;
+        }
+        self.explore_tick = std::time::Instant::now();
+        let exploring: Vec<ReceiverId> = self.panes.iter().filter(|p| p.mode == RxMode::Explore).map(|p| p.id).collect();
+        let any_focus = self.panes.iter().any(|p| !p.id.is_sweep());
+        if exploring.is_empty() && !any_focus {
+            return;
+        }
+        let Some(survey) = self.receiver(ReceiverId::SWEEP).map(|s| s.source.emitters()) else { return };
+        let cfg = self.settings.explore.to_config();
+        let now = std::time::Instant::now();
+        let baseline = self.explore_since.unwrap_or_else(SystemTime::now);
+        let spans = self.frame.live_spans.clone();
+        let mut rows: Vec<engine::explore::LogEntry> = Vec::new();
+        // In place (§7): survey emitters inside any focus span.
+        for (rx, (lo, hi)) in &spans {
+            let Some(p) = self.receiver(*rx) else { continue };
+            let inside: Vec<&engine::Emitter> = survey.iter().filter(|e| e.confirmed && e.center_hz >= *lo && e.center_hz <= *hi).collect();
+            if inside.is_empty() {
+                continue;
+            }
+            let focus = p.source.emitters();
+            let occupants = p.source.occupants();
+            for e in inside {
+                let half = e.bandwidth_hz.max(54e3) / 2.0 + 27e3;
+                let (elo, ehi) = (e.center_hz - half, e.center_hz + half);
+                let mut obs = engine::explore::observe(&focus, elo, ehi, std::time::Duration::from_secs(1), SystemTime::now());
+                if obs.id.is_none() {
+                    if let Some(k) = occupants.iter().find(|k| k.occupant.lo_hz <= ehi && k.occupant.hi_hz >= elo) {
+                        let named = k.station.is_some() || k.cell.as_ref().is_some_and(|c| c.sync.is_some());
+                        obs.label = Some(k.label());
+                        if named {
+                            obs.protocol = true;
+                            obs.id = Some(k.label());
+                        }
+                    }
+                }
+                if let Some(row) = self.explorer.determined_in_place(rx.0, e, &obs, now) {
+                    rows.push(row);
+                }
+            }
+        }
+        // Visits.
+        for id in exploring {
+            let Some(p) = self.receiver(id) else { continue };
+            match p.visit.clone() {
+                None => {
+                    let others: Vec<(f64, f64)> = spans.iter().filter(|(r, _)| *r != id).map(|(_, s)| *s).collect();
+                    if let Some(c) = self.explorer.next(id.0, &survey, &cfg, &others, baseline, now) {
+                        log::debug!("explore {id}: visiting emitter {} at {:.4} MHz ({})", c.emitter, c.center_hz / 1e6, c.reason);
+                        self.explore_tuning = true;
+                        self.retune(id, (c.center_hz / 1e3).round() / 1e3);
+                        self.explore_tuning = false;
+                        let v = self.explorer.begin(id.0, &c, now);
+                        if let Some(p) = self.receiver_mut(id) {
+                            p.visit = Some(v);
+                        }
+                    }
+                }
+                Some(mut v) => {
+                    let obs = Self::observe(p, v.center_hz, v.bandwidth_hz);
+                    if let Some(verdict) = v.update(&obs, &cfg, now) {
+                        log::debug!("explore {id}: emitter {} {} {:?} {:?} after {:.1} s", v.emitter, verdict.kind.name(), verdict.label, verdict.id, v.dwell(now).as_secs_f64());
+                        let text = format!(
+                            "{:.4} MHz: {}{}",
+                            v.center_hz / 1e6,
+                            verdict.kind.name(),
+                            verdict.label.as_ref().map(|l| format!(" · {l}")).unwrap_or_default()
+                        );
+                        if let Some(row) = self.explorer.finish(&v, &verdict, now) {
+                            rows.push(row);
+                        }
+                        if let Some(p) = self.receiver_mut(id) {
+                            p.visit = None;
+                            p.last_verdict = Some((now, text));
+                        }
+                    } else if let Some(p) = self.receiver_mut(id) {
+                        p.visit = Some(v);
+                    }
+                }
+            }
+        }
+        for row in rows {
+            self.adopt_verdict(&row);
+            self.explore_csv(&row);
+        }
+    }
+
+    /// The Exploration tab: filters, and one row per verdict.
+    fn exploration_panel(&mut self, ui: &mut egui::Ui) {
+        use engine::explore::{Kind, PRESETS, Rule};
+        let exploring: Vec<ReceiverId> = self.panes.iter().filter(|p| p.mode == RxMode::Explore).map(|p| p.id).collect();
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            let n = self.explorer.log.len();
+            let in_place = self.explorer.log.iter().filter(|e| e.in_place).count();
+            ui.label(egui::RichText::new(format!("{n} verdicts · {} visits · {in_place} in place · exploring: {}", n - in_place, if exploring.is_empty() { "nobody".to_string() } else { exploring.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(" ") })).small().monospace().color(theme::MUTED));
+            ui.menu_button(egui::RichText::new("Filters ⏷").small(), |ui| {
+                ui.set_min_width(360.0);
+                ui.label(egui::RichText::new("Band presets").small().color(theme::MUTED));
+                egui::Grid::new("explore_presets").num_columns(4).spacing([12.0, 2.0]).show(ui, |ui| {
+                    for (k, p) in PRESETS.iter().enumerate() {
+                        let cur = self.settings.explore.presets.get(p.name).and_then(|s| Rule::parse(s)).unwrap_or_default();
+                        let mut sel = cur;
+                        ui.label(egui::RichText::new(p.name).small());
+                        egui::ComboBox::from_id_salt(format!("preset_{}", p.name)).selected_text(sel.name()).width(110.0).show_ui(ui, |ui| {
+                            for r in Rule::ALL {
+                                ui.selectable_value(&mut sel, r, r.name());
+                            }
+                        });
+                        if sel != cur {
+                            if sel == Rule::Ignore {
+                                self.settings.explore.presets.remove(p.name);
+                            } else {
+                                self.settings.explore.presets.insert(p.name.to_string(), sel.name().to_string());
+                            }
+                            changed = true;
+                        }
+                        if k % 2 == 1 {
+                            ui.end_row();
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Ranges (MHz) to explore; empty = anywhere").small().color(theme::MUTED));
+                let mut remove = None;
+                for (k, (lo, hi)) in self.settings.explore.ranges_mhz.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        changed |= ui.add(egui::DragValue::new(lo).speed(0.5).range(24.0..=1800.0).max_decimals(3)).changed();
+                        ui.label("–");
+                        changed |= ui.add(egui::DragValue::new(hi).speed(0.5).range(24.0..=1800.0).max_decimals(3)).changed();
+                        if ui.small_button("✕").clicked() {
+                            remove = Some(k);
+                        }
+                    });
+                }
+                if let Some(k) = remove {
+                    self.settings.explore.ranges_mhz.remove(k);
+                    changed = true;
+                }
+                ui.horizontal(|ui| {
+                    if ui.small_button("+ Add range").clicked() {
+                        let lo = self.sweep_lo_mhz;
+                        self.settings.explore.ranges_mhz.push((lo, (lo + 20.0).min(self.sweep_hi_mhz)));
+                        changed = true;
+                    }
+                    if ui.small_button("Use survey segments").on_hover_text("Copy the survey's segment list").clicked() {
+                        self.settings.explore.ranges_mhz = self.settings.survey_segments.clone();
+                        changed = true;
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Dwell").small().color(theme::MUTED));
+                ui.horizontal(|ui| {
+                    changed |= ui.add(egui::DragValue::new(&mut self.settings.explore.settle_s).speed(0.1).range(0.0..=10.0).suffix(" s settle")).changed();
+                    changed |= ui.add(egui::DragValue::new(&mut self.settings.explore.silence_s).speed(0.1).range(0.5..=60.0).suffix(" s silence")).changed();
+                    changed |= ui.add(egui::DragValue::new(&mut self.settings.explore.cap_s).speed(0.5).range(2.0..=300.0).suffix(" s cap")).changed();
+                });
+            });
+            if ui.small_button("Open CSV folder").clicked() {
+                let d = engine::sigmf::default_dir();
+                let _ = std::fs::create_dir_all(&d);
+                open_path(&d);
+            }
+            if ui.small_button("Clear").clicked() {
+                self.explorer.log.clear();
+            }
+        });
+        if changed {
+            self.settings.save();
+        }
+        let rows: Vec<engine::explore::LogEntry> = self.explorer.log.iter().rev().cloned().collect();
+        let manual: Option<ReceiverId> = Some(self.tune_target)
+            .filter(|t| self.receiver(*t).is_some_and(|p| p.mode == RxMode::Manual))
+            .or_else(|| self.panes.iter().find(|p| !p.id.is_sweep() && p.mode == RxMode::Manual).map(|p| p.id));
+        let mut tune: Option<f64> = None;
+        let row_h = 18.0;
+        let text = |ui: &mut egui::Ui, s: String, c: egui::Color32| {
+            ui.label(egui::RichText::new(s).small().monospace().color(c));
+        };
+        egui_extras::TableBuilder::new(ui)
+            .id_salt("exploration")
+            .striped(true)
+            .sense(egui::Sense::click())
+            .auto_shrink([false, false])
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(egui_extras::Column::exact(66.0))
+            .column(egui_extras::Column::exact(28.0))
+            .column(egui_extras::Column::exact(84.0))
+            .column(egui_extras::Column::exact(60.0))
+            .column(egui_extras::Column::exact(74.0))
+            .column(egui_extras::Column::exact(190.0))
+            .column(egui_extras::Column::exact(170.0))
+            .column(egui_extras::Column::exact(50.0))
+            .column(egui_extras::Column::remainder())
+            .header(row_h, |mut h| {
+                for t in ["Time", "Rx", "MHz", "BW kHz", "Verdict", "Label", "ID", "Dwell", "How"] {
+                    h.col(|ui| {
+                        ui.label(egui::RichText::new(t).small().strong().color(theme::MUTED));
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(row_h, rows.len(), |mut row| {
+                    let e = &rows[row.index()];
+                    let col = match e.kind {
+                        Kind::Identified => theme::TEXT,
+                        Kind::Classified => theme::TEXT2,
+                        _ => theme::MUTED,
+                    };
+                    row.col(|ui| text(ui, hms(e.time), theme::MUTED));
+                    row.col(|ui| text(ui, e.receiver.to_string(), theme::MUTED));
+                    row.col(|ui| text(ui, format!("{:.4}", e.center_hz / 1e6), col));
+                    row.col(|ui| text(ui, format!("{:.1}", e.bandwidth_hz / 1e3), theme::MUTED));
+                    row.col(|ui| text(ui, e.kind.name().to_string(), col));
+                    row.col(|ui| text(ui, e.label.clone(), col));
+                    row.col(|ui| text(ui, e.id.clone(), col));
+                    row.col(|ui| text(ui, if e.in_place { String::new() } else { format!("{:.1} s", e.dwell_s) }, theme::MUTED));
+                    row.col(|ui| text(ui, if e.in_place { "in place".to_string() } else { "visit".to_string() }, theme::MUTED));
+                    if row.response().clicked() {
+                        tune = Some(e.center_hz);
+                    }
+                });
+            });
+        if let (Some(hz), Some(rx)) = (tune, manual) {
+            self.retune(rx, (hz / 1e3).round() / 1e3);
         }
     }
 
@@ -1843,10 +2196,18 @@ impl App {
             Target(ReceiverId),
             Close(DeviceInfo),
             Err(String),
+            Mode(ReceiverId, RxMode),
         }
         let mut acts: Vec<Act> = Vec::new();
         let segments = self.settings.survey_segments.len();
+        let queue_len = if self.panes.iter().any(|p| p.id == id && p.mode == RxMode::Explore) {
+            let cfg = self.settings.explore.to_config();
+            self.receiver(ReceiverId::SWEEP).map(|s| self.explorer.queue_len(id.0, &s.source.emitters(), &cfg, std::time::Instant::now()))
+        } else {
+            None
+        };
         let mut open_inspector = false;
+        let self_cap_s = self.settings.explore.cap_s;
         {
             let App { panes, sweep_lo_mhz, sweep_hi_mhz, frame, .. } = &mut *self;
             let Some(p) = panes.iter_mut().find(|p| p.id == id) else { return };
@@ -1904,6 +2265,41 @@ impl App {
                 let snap = p.source.snapshot();
                 let title = format!("{id} · {} · {:.3} MHz · {:.1} MS/s", info.label, snap.center_hz / 1e6, snap.sample_rate / 1e6);
                 let res = p.view.show(ui, r, &title, None, &records, sel_record, sel_emitter);
+                if p.mode == RxMode::Explore {
+                    // The explorer's state, over the top of the spectrum.
+                    let now = std::time::Instant::now();
+                    let cap = self_cap_s;
+                    let line = match &p.visit {
+                        Some(v) => {
+                            let label = v.label.as_ref().map(|(l, _)| format!(" · {l}")).unwrap_or_default();
+                            let idtxt = v.id.as_ref().map(|i| format!(" · {i}")).unwrap_or_default();
+                            format!(
+                                "EXPLORE · {:.4} MHz · {:.1} kHz · {} · dwell {:.1} / {:.0} s{label}{idtxt}{}",
+                                v.center_hz / 1e6,
+                                v.bandwidth_hz / 1e3,
+                                v.reason,
+                                v.dwell(now).as_secs_f64(),
+                                cap,
+                                queue_len.map(|n| format!(" · queue {n}")).unwrap_or_default()
+                            )
+                        }
+                        None => format!("EXPLORE · waiting for the survey{}", queue_len.map(|n| format!(" · queue {n}")).unwrap_or_default()),
+                    };
+                    let painter = ui.painter_at(r);
+                    let font = egui::FontId::monospace(11.0);
+                    let g = painter.layout_no_wrap(line, font.clone(), theme::TEXT);
+                    let at = egui::pos2(r.left() + 8.0, r.top() + spectrum_view::HEADER_H + 6.0);
+                    painter.rect_filled(egui::Rect::from_min_size(at - egui::vec2(5.0, 2.0), g.size() + egui::vec2(10.0, 4.0)), 3.0, theme::PANEL.gamma_multiply(0.9));
+                    painter.galley(at, g, theme::TEXT);
+                    if let Some((t, text)) = &p.last_verdict {
+                        if t.elapsed() < std::time::Duration::from_secs(8) {
+                            let g = painter.layout_no_wrap(format!("last: {text}"), font, theme::TEXT2);
+                            let at2 = at + egui::vec2(0.0, 18.0);
+                            painter.rect_filled(egui::Rect::from_min_size(at2 - egui::vec2(5.0, 2.0), g.size() + egui::vec2(10.0, 4.0)), 3.0, theme::PANEL.gamma_multiply(0.9));
+                            painter.galley(at2, g, theme::TEXT2);
+                        }
+                    }
+                }
                 // Live click: select a record if one was hit, otherwise
                 // recentre this receiver.
                 match (res.record, res.freq_hz) {
@@ -1971,6 +2367,14 @@ impl App {
                         acts.push(Act::Tune(id, mhz * 1e6));
                     }
                     ui.label(egui::RichText::new("Centre").small().color(theme::MUTED));
+                    let exploring = p.mode == RxMode::Explore;
+                    if ui
+                        .selectable_label(exploring, egui::RichText::new(if exploring { "Explore ●" } else { "Explore" }).small())
+                        .on_hover_text("Visit the survey's emitters in turn and log a verdict for each (docs/auto-explore.md); any manual retune returns to Manual")
+                        .clicked()
+                    {
+                        acts.push(Act::Mode(id, if exploring { RxMode::Manual } else { RxMode::Explore }));
+                    }
                     if ui
                         .selectable_label(target == id, egui::RichText::new("⌖").small())
                         .on_hover_text("Tune target: survey clicks and double-clicks land here (keys 1, 2, 3)")
@@ -1992,6 +2396,7 @@ impl App {
                 Act::Target(id) => self.tune_target = id,
                 Act::Close(d) => self.close(&d),
                 Act::Err(e) => self.error = Some(e),
+                Act::Mode(id, m) => self.set_mode(id, m),
             }
         }
     }
@@ -3488,6 +3893,7 @@ impl eframe::App for App {
         egui::Panel::left("rail").exact_size(36.0).frame(theme::rail_frame()).show(ui, |ui| self.rail(ui, width));
         self.palette(&ctx, width);
         self.frame_prep();
+        self.explore_step();
         if std::mem::take(&mut self.maximize) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
         } else {
@@ -3611,6 +4017,7 @@ impl egui_dock::TabViewer for App {
             Tab::Trunking => self.trunking_panel(ui),
             Tab::Calls => self.calls_panel(ui),
             Tab::Pages => self.pages_panel(ui),
+            Tab::Exploration => self.exploration_panel(ui),
             Tab::Diagnostics => self.diagnostics_panel(ui),
         }
     }

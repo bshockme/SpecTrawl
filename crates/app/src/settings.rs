@@ -22,11 +22,63 @@ pub struct Settings {
     pub new_signal_s: f64,
     /// Survey segments (MHz); empty = the whole span.
     pub survey_segments: Vec<(f64, f64)>,
+    /// Auto-explore filters and timings (`docs/auto-explore.md`).
+    pub explore: ExploreSettings,
+}
+
+/// Serialisable form of `engine::explore::Config`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExploreSettings {
+    /// Ranges (MHz) to explore; empty = anywhere in the survey.
+    pub ranges_mhz: Vec<(f64, f64)>,
+    /// Preset name → rule name ("exclude", "prioritise", ...), for presets
+    /// that aren't ignored.
+    pub presets: std::collections::BTreeMap<String, String>,
+    pub settle_s: f64,
+    pub silence_s: f64,
+    pub cap_s: f64,
+}
+
+impl Default for ExploreSettings {
+    fn default() -> Self {
+        Self::from_config(&engine::explore::Config::default())
+    }
+}
+
+impl ExploreSettings {
+    pub fn from_config(c: &engine::explore::Config) -> Self {
+        Self {
+            ranges_mhz: c.ranges_mhz.clone(),
+            presets: c.presets.iter().map(|(k, r)| (k.clone(), r.name().to_string())).collect(),
+            settle_s: c.settle_s,
+            silence_s: c.silence_s,
+            cap_s: c.cap_s,
+        }
+    }
+
+    pub fn to_config(&self) -> engine::explore::Config {
+        engine::explore::Config {
+            ranges_mhz: self.ranges_mhz.clone(),
+            presets: self.presets.iter().filter_map(|(k, v)| engine::explore::Rule::parse(v).map(|r| (k.clone(), r))).collect(),
+            settle_s: self.settle_s.clamp(0.0, 10.0),
+            silence_s: self.silence_s.clamp(0.5, 60.0),
+            cap_s: self.cap_s.clamp(2.0, 300.0),
+        }
+    }
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { log: LogLevels::default(), ring_seconds: 10.0, nudge_khz: 100.0, survey_nudge_mhz: 1.0, new_signal_s: 120.0, survey_segments: Vec::new() }
+        Self {
+            log: LogLevels::default(),
+            ring_seconds: 10.0,
+            nudge_khz: 100.0,
+            survey_nudge_mhz: 1.0,
+            new_signal_s: 120.0,
+            survey_segments: Vec::new(),
+            explore: ExploreSettings::default(),
+        }
     }
 }
 

@@ -8,6 +8,7 @@ mod cell_monitor;
 mod bursts;
 mod classify;
 mod emitters;
+pub mod explore;
 mod listen;
 mod monitor;
 mod occupancy;
@@ -391,6 +392,12 @@ impl Source {
     pub fn recent_records(&self, n: usize) -> Vec<SignalRecord> {
         let st = self.shared.records.lock();
         st.open.iter().chain(st.closed.iter().rev()).take(n).map(|r| st.with_class(r)).collect()
+    }
+
+    /// Puts a label on an emitter from outside the classifier (an explore
+    /// verdict made on another receiver).
+    pub fn label_emitter(&self, id: u64, class: Arc<detect::Classification>) {
+        self.shared.records.lock().emitters.adopt(id, class);
     }
 
     /// All emitters, active first, then most recently seen.
