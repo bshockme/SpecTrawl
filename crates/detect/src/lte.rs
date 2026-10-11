@@ -262,14 +262,17 @@ fn crs_values(pci: u32, ns: usize, l: usize) -> [Complex32; 12] {
     r
 }
 
-/// RE indices (0..71) of port `port`'s reference symbols in symbol `l` of a
-/// slot (`l` is 0 or 4), for cell `pci`.
-fn crs_positions(pci: u32, port: usize, l: usize) -> [usize; 12] {
+/// RE indices (0..71) of port `port`'s reference symbols in symbol `l` of
+/// slot `ns` (ports 0 and 1: `l` 0 or 4; ports 2 and 3: `l` 1), for cell
+/// `pci` (36.211 6.10.1.2).
+fn crs_positions(pci: u32, port: usize, ns: usize, l: usize) -> [usize; 12] {
     let v = match (port, l) {
         (0, 0) | (1, 4) => 0,
-        _ => 3,
+        (0, _) | (1, _) => 3,
+        (2, _) => 3 * (ns % 2),
+        _ => 3 + 3 * (ns % 2),
     };
-    let shift = (v + pci % 6) % 6;
+    let shift = (v + pci as usize % 6) % 6;
     std::array::from_fn(|m| 6 * m + shift as usize)
 }
 
@@ -492,7 +495,7 @@ pub struct Mib {
     pub phich_resource: u8,
     /// System frame number, 0..1023.
     pub sfn: u16,
-    /// Cell-specific antenna ports: 1 or 2 (4 isn't decoded).
+    /// Cell-specific antenna ports: 1, 2 or 4.
     pub antenna_ports: u8,
 }
 
@@ -572,7 +575,7 @@ fn conv_encode(c: &[u8]) -> [Vec<u8>; 3] {
 
 /// Tail-biting Viterbi over soft bits `llr[k][s]` (positive = 0), trying
 /// every start state and demanding it be the end state.
-fn conv_decode(llr: &[[f32; 3]]) -> Vec<u8> {
+fn conv_decode(llr: &[[f32; 3]]) -> (Vec<u8>, f32) {
     let k = llr.len();
     let mut best = (f32::MIN, Vec::new());
     for start in 0..64u8 {
@@ -613,7 +616,7 @@ fn conv_decode(llr: &[[f32; 3]]) -> Vec<u8> {
             best = (metric[end], bits);
         }
     }
-    best.1
+    (best.1, best.0)
 }
 
 /// Encodes a MIB into the 1920 scrambled PBCH bits of one 40 ms period.
@@ -658,10 +661,51 @@ fn pbch_res(pci: u32, l: usize) -> Vec<usize> {
     (0..72).filter(|k| l >= 2 || k % 3 != shift).collect()
 }
 
+/// Channel estimate for `port` over the 72 central REs of slot 1 of
+/// subframe 0, from its reference symbols (ports 0 and 1: symbols 0 and 4;
+/// ports 2 and 3: symbol 1), linearly interpolated between pilots and held
+/// flat beyond the ends. Also a crude SNR from the difference between
+/// neighbouring pilots (frequency selectivity counts as noise, so it is a
+/// lower bound). `syms` are the FFTs of slot-1 symbols 0..=4.
+fn channel(syms: &[Vec<Complex32>], pci: u32, port: usize) -> ([Complex32; 72], f32) {
+    let symbols: &[usize] = if port < 2 { &[0, 4] } else { &[1] };
+    let mut known: Vec<(usize, Complex32)> = Vec::new();
+    let (mut power, mut noise, mut pairs) = (0f32, 0f32, 0usize);
+    for &l in symbols {
+        let vals = crs_values(pci, 1, l);
+        let hs: Vec<(usize, Complex32)> =
+            crs_positions(pci, port, 1, l).iter().enumerate().map(|(m, &k)| (k, syms[l][pbch_bin(k)] * vals[m].conj())).collect();
+        for w in hs.windows(2) {
+            noise += (w[0].1 - w[1].1).norm_sqr() / 2.0;
+            pairs += 1;
+        }
+        power += hs.iter().map(|h| h.1.norm_sqr()).sum::<f32>();
+        known.extend(hs);
+    }
+    known.sort_by_key(|(k, _)| *k);
+    let mut h = [Complex32::default(); 72];
+    for (k, hk) in h.iter_mut().enumerate() {
+        let after = known.iter().position(|(kk, _)| *kk >= k);
+        *hk = match after {
+            Some(0) => known[0].1,
+            None => known[known.len() - 1].1,
+            Some(j) => {
+                let (k0, h0) = known[j - 1];
+                let (k1, h1) = known[j];
+                let t = (k - k0) as f32 / (k1 - k0) as f32;
+                h0 * (1.0 - t) + h1 * t
+            }
+        };
+    }
+    let snr_db = 10.0 * (power / known.len() as f32 / (noise / pairs.max(1) as f32).max(1e-12)).max(1e-6).log10();
+    (h, snr_db)
+}
+
 /// Soft PBCH bits of one radio frame (480 values, positive = 0, weighted by
-/// channel power), decoded assuming `ports` transmit antennas. `frame` is the
-/// index of the first sample of the frame in `x` (at `FS`, CFO-corrected).
-fn pbch_llrs(x: &[Complex32], frame: usize, pci: u32, ports: usize) -> Option<Vec<f32>> {
+/// channel power), decoded assuming `ports` transmit antennas (1, 2 or 4).
+/// `frame` is the index of the first sample of the frame in `x` (at `FS`,
+/// CFO-corrected). Also returns the per-port CRS SNRs.
+fn pbch_llrs(x: &[Complex32], frame: usize, pci: u32, ports: usize) -> Option<(Vec<f32>, Vec<f32>)> {
     let fft = FftPlanner::new().plan_fft_forward(N);
     let slot1 = frame + SLOT;
     if slot1 + symbol_start(4) + N > x.len() {
@@ -674,93 +718,120 @@ fn pbch_llrs(x: &[Complex32], frame: usize, pci: u32, ports: usize) -> Option<Ve
         b
     };
     let syms: Vec<Vec<Complex32>> = (0..5).map(&mut sym).collect();
-    // Channel per port over the 72 REs from the CRS of symbols 0 and 4.
-    let mut h = vec![[Complex32::default(); 72]; ports];
-    for (p, hp) in h.iter_mut().enumerate() {
-        let mut known: Vec<(usize, Complex32)> = Vec::new();
-        for l in [0usize, 4] {
-            let vals = crs_values(pci, 1, l);
-            for (m, &k) in crs_positions(pci, p, l).iter().enumerate() {
-                known.push((k, syms[l][pbch_bin(k)] * vals[m].conj()));
-            }
-        }
-        known.sort_by_key(|(k, _)| *k);
-        // Linear interpolation between pilots, held flat beyond the ends.
-        for k in 0..72 {
-            let after = known.iter().position(|(kk, _)| *kk >= k);
-            hp[k] = match after {
-                Some(0) => known[0].1,
-                None => known[known.len() - 1].1,
-                Some(j) => {
-                    let (k0, h0) = known[j - 1];
-                    let (k1, h1) = known[j];
-                    let t = (k - k0) as f32 / (k1 - k0) as f32;
-                    h0 * (1.0 - t) + h1 * t
-                }
-            };
-        }
-    }
+    let est: Vec<([Complex32; 72], f32)> = (0..ports).map(|p| channel(&syms, pci, p)).collect();
+    let h = |p: usize, k: usize| est[p].0[k];
+    let snrs: Vec<f32> = est.iter().map(|e| e.1).collect();
     let mut llr = Vec::with_capacity(480);
+    // Alamouti pair on REs (ka, kb) sent by ports (pa, pb): pa sends
+    // (x0, x1), pb sends (-x1*, x0*).
+    let alamouti = |l: usize, ka: usize, kb: usize, pa: usize, pb: usize, out: &mut Vec<f32>| {
+        let (r0, r1) = (syms[l][pbch_bin(ka)], syms[l][pbch_bin(kb)]);
+        let (h0, h1) = ((h(pa, ka) + h(pa, kb)) * 0.5, (h(pb, ka) + h(pb, kb)) * 0.5);
+        let x0 = h0.conj() * r0 + h1 * r1.conj();
+        let x1 = h0.conj() * r1 - h1 * r0.conj();
+        out.extend([x0.re, x0.im, x1.re, x1.im]);
+    };
     for l in 0..4 {
         let res = pbch_res(pci, l);
         match ports {
             1 => {
                 for &k in &res {
-                    let r = syms[l][pbch_bin(k)];
-                    let xh = r * h[0][k].conj();
+                    let xh = syms[l][pbch_bin(k)] * h(0, k).conj();
                     llr.push(xh.re);
                     llr.push(xh.im);
                 }
             }
-            _ => {
+            2 => {
                 for pair in res.chunks(2) {
-                    let (k0, k1) = (pair[0], pair[1]);
-                    let (r0, r1) = (syms[l][pbch_bin(k0)], syms[l][pbch_bin(k1)]);
-                    let (h0, h1) = ((h[0][k0] + h[0][k1]) * 0.5, (h[1][k0] + h[1][k1]) * 0.5);
-                    // Alamouti: port 0 sends (x0, x1), port 1 (-x1*, x0*).
-                    let x0 = h0.conj() * r0 + h1 * r1.conj();
-                    let x1 = h0.conj() * r1 - h1 * r0.conj();
-                    llr.extend([x0.re, x0.im, x1.re, x1.im]);
+                    alamouti(l, pair[0], pair[1], 0, 1, &mut llr);
+                }
+            }
+            _ => {
+                // SFBC + FSTD: ports 0 and 2 on the first two REs of each
+                // four, ports 1 and 3 on the other two.
+                for quad in res.chunks(4) {
+                    alamouti(l, quad[0], quad[1], 0, 2, &mut llr);
+                    alamouti(l, quad[2], quad[3], 1, 3, &mut llr);
                 }
             }
         }
     }
-    Some(llr)
+    Some((llr, snrs))
 }
 
-/// Decodes the MIB from the frames starting at `frame_starts` (any number
-/// from 1 to 4 consecutive frames; more improve the soft combining).
+/// Decodes the MIB from the frames starting at `sync.frame_start` (any
+/// number from 1 to 4 consecutive frames; more improve the soft combining).
 pub fn decode_mib(x: &[Complex32], sync: &CellSync) -> Option<Mib> {
+    decode_mib_impl(x, sync, None)
+}
+
+/// `decode_mib` with a line of diagnostics per step pushed to `log`: CRS
+/// SNR per port and frame, and the Viterbi metric and CRC outcome of every
+/// port-count and TTI-phase hypothesis.
+pub fn decode_mib_debug(x: &[Complex32], sync: &CellSync, log: &mut Vec<String>) -> Option<Mib> {
+    decode_mib_impl(x, sync, Some(log))
+}
+
+fn decode_mib_impl(x: &[Complex32], sync: &CellSync, mut log: Option<&mut Vec<String>>) -> Option<Mib> {
     let pci = sync.pci;
     let frames: Vec<usize> = (0..4).map(|j| sync.frame_start + j * FRAME).filter(|&f| f + SLOT + symbol_start(4) + N <= x.len()).collect();
     if frames.is_empty() {
+        if let Some(l) = log.as_deref_mut() {
+            l.push("no whole frame in the data".into());
+        }
         return None;
     }
     let scr = gold(pci, 1920);
     let order = interleave_order();
-    for ports in [2usize, 1] {
-        let per_frame: Vec<Vec<f32>> = frames.iter().filter_map(|&f| pbch_llrs(x, f, pci, ports)).collect();
+    let mut found: Option<Mib> = None;
+    for ports in [2usize, 4, 1] {
+        let per_frame: Vec<(Vec<f32>, Vec<f32>)> = frames.iter().filter_map(|&f| pbch_llrs(x, f, pci, ports)).collect();
         if per_frame.is_empty() {
             continue;
         }
+        if let Some(l) = log.as_deref_mut() {
+            for (j, (_, snrs)) in per_frame.iter().enumerate() {
+                let s: Vec<String> = snrs.iter().enumerate().map(|(p, v)| format!("p{p} {v:.1} dB")).collect();
+                l.push(format!("{ports} ports, frame {j}: CRS SNR {}", s.join(", ")));
+            }
+        }
         for phase in 0..4usize {
-            // Coded-bit soft values: 3 streams × 40.
+            // Coded-bit soft values: 3 streams x 40, combined over the
+            // frames that share frame 0's 40 ms TTI (the next TTI carries a
+            // different payload: SFN + 4, another CRC), so under this
+            // phase hypothesis only frames j < 4 - phase are added.
             let mut soft = vec![[0f32; 3]; 40];
-            for (j, llr) in per_frame.iter().enumerate() {
-                let seg = (phase + j) % 4;
+            let mut energy = 0f32;
+            for (j, (llr, _)) in per_frame.iter().enumerate().take(4 - phase) {
+                let seg = phase + j;
                 for i in 0..480 {
                     let g = seg * 480 + i;
                     let v = if scr[g] == 1 { -llr[i] } else { llr[i] };
                     let w = g % 120;
                     let (stream, pos) = (w / 40, order[w % 40]);
                     soft[pos][stream] += v;
+                    energy += v.abs();
                 }
             }
-            let bits = conv_decode(&soft);
-            let mask: u16 = if ports == 2 { 0xFFFF } else { 0 };
+            let (bits, metric) = conv_decode(&soft);
+            let mask: u16 = match ports {
+                2 => 0xFFFF,
+                4 => 0x5555,
+                _ => 0,
+            };
             let crc = crc16(&bits[..24]);
             let got = bits[24..40].iter().fold(0u16, |a, &b| (a << 1) | b as u16);
-            if crc ^ mask != got {
+            let ok = crc ^ mask == got;
+            if let Some(l) = log.as_deref_mut() {
+                l.push(format!(
+                    "{ports} ports, phase {phase}: metric {:.3} of {:.3} ({:.0}%), crc {}",
+                    metric,
+                    energy,
+                    100.0 * metric / energy.max(1e-9),
+                    if ok { "ok" } else { "bad" }
+                ));
+            }
+            if !ok {
                 continue;
             }
             let bw = ((bits[0] << 2) | (bits[1] << 1) | bits[2]) as usize;
@@ -768,16 +839,20 @@ pub fn decode_mib(x: &[Complex32], sync: &CellSync) -> Option<Mib> {
                 continue;
             }
             let sfn_msb = bits[6..14].iter().fold(0u16, |a, &b| (a << 1) | b as u16);
-            return Some(Mib {
+            let mib = Mib {
                 bandwidth_rb: BW_TABLE[bw],
                 phich_extended: bits[3] == 1,
                 phich_resource: (bits[4] << 1) | bits[5],
                 sfn: (sfn_msb << 2) | phase as u16,
                 antenna_ports: ports as u8,
-            });
+            };
+            if log.is_none() {
+                return Some(mib);
+            }
+            found.get_or_insert(mib);
         }
     }
-    None
+    found
 }
 
 // --------------------------------------------------------------- Identify
@@ -856,6 +931,23 @@ pub fn identify(x: &[Complex32], fs: f64) -> Option<LteCell> {
     Some(LteCell { numerology, sync: Some(sync), mib })
 }
 
+/// `identify` with the MIB stage's diagnostics pushed to `log`.
+pub fn identify_debug(x: &[Complex32], fs: f64, log: &mut Vec<String>) -> Option<LteCell> {
+    let x = resample(x, fs);
+    let numerology = cp_autocorrelation(&x, FS)?;
+    if numerology.scs_khz != 15 {
+        return Some(LteCell { numerology, sync: None, mib: None });
+    }
+    let Some(sync) = cell_sync(&x, Some(numerology.cfo_hz)) else {
+        log.push("no PSS/SSS sync".into());
+        return Some(LteCell { numerology, sync: None, mib: None });
+    };
+    let mut rot = Vec::new();
+    shift(&x, sync.cfo_hz as f64, &mut rot);
+    let mib = decode_mib_debug(&rot, &sync, log);
+    Some(LteCell { numerology, sync: Some(sync), mib })
+}
+
 // ------------------------------------------------------------------ Synth
 
 /// A synthetic LTE downlink at `FS`, for tests and examples: PSS/SSS, CRS
@@ -894,17 +986,24 @@ pub mod synth {
                     // Per-port frequency grids.
                     let mut grid = vec![vec![Complex32::default(); N]; ports];
                     let mut used = vec![false; 72];
-                    if l == 0 || l == 4 {
-                        for p in 0..ports {
-                            let vals = crs_values(cell.pci, ns, l);
-                            for (m, &k) in crs_positions(cell.pci, p, l).iter().enumerate() {
-                                grid[p][pbch_bin(k)] = vals[m];
-                                used[k] = true;
-                            }
-                            // The other port's pilots are left empty on this port.
-                            for &k in crs_positions(cell.pci, 1 - p.min(1), l).iter() {
-                                used[k] = true;
-                            }
+                    // Reference symbols: ports 0/1 in symbols 0 and 4, ports
+                    // 2/3 in symbol 1; every port leaves the others' pilot
+                    // REs empty.
+                    let crs_ports: Vec<usize> = match l {
+                        0 | 4 => (0..ports.min(2)).collect(),
+                        1 if ports == 4 => vec![2, 3],
+                        _ => Vec::new(),
+                    };
+                    for &p in &crs_ports {
+                        let vals = crs_values(cell.pci, ns, l);
+                        for (m, &k) in crs_positions(cell.pci, p, ns, l).iter().enumerate() {
+                            grid[p][pbch_bin(k)] = vals[m];
+                            used[k] = true;
+                        }
+                    }
+                    for &p in &crs_ports {
+                        for &k in crs_positions(cell.pci, p ^ 1, ns, l).iter() {
+                            used[k] = true;
                         }
                     }
                     let sync_slot = (ns == 0 || ns == 10) && (l == 5 || l == 6);
@@ -937,21 +1036,34 @@ pub mod synth {
                             .chunks(2)
                             .map(|b| Complex32::new(1.0 - 2.0 * b[0] as f32, 1.0 - 2.0 * b[1] as f32) * std::f32::consts::FRAC_1_SQRT_2)
                             .collect();
-                        if ports == 1 {
-                            for (i, &k) in res.iter().enumerate() {
-                                grid[0][pbch_bin(k)] = qpsk[i];
-                                used[k] = true;
+                        let s2 = std::f32::consts::FRAC_1_SQRT_2;
+                        // Alamouti pair (x0, x1) on REs (ka, kb) from ports (pa, pb).
+                        let mut pair =
+                            |grid: &mut Vec<Vec<Complex32>>, ka: usize, kb: usize, pa: usize, pb: usize, x0: Complex32, x1: Complex32| {
+                                grid[pa][pbch_bin(ka)] = x0 * s2;
+                                grid[pa][pbch_bin(kb)] = x1 * s2;
+                                grid[pb][pbch_bin(ka)] = -x1.conj() * s2;
+                                grid[pb][pbch_bin(kb)] = x0.conj() * s2;
+                                used[ka] = true;
+                                used[kb] = true;
+                            };
+                        match ports {
+                            1 => {
+                                for (i, &k) in res.iter().enumerate() {
+                                    grid[0][pbch_bin(k)] = qpsk[i];
+                                    used[k] = true;
+                                }
                             }
-                        } else {
-                            let s2 = std::f32::consts::FRAC_1_SQRT_2;
-                            for (i, pair) in res.chunks(2).enumerate() {
-                                let (x0, x1) = (qpsk[2 * i], qpsk[2 * i + 1]);
-                                grid[0][pbch_bin(pair[0])] = x0 * s2;
-                                grid[0][pbch_bin(pair[1])] = x1 * s2;
-                                grid[1][pbch_bin(pair[0])] = -x1.conj() * s2;
-                                grid[1][pbch_bin(pair[1])] = x0.conj() * s2;
-                                used[pair[0]] = true;
-                                used[pair[1]] = true;
+                            2 => {
+                                for (i, p) in res.chunks(2).enumerate() {
+                                    pair(&mut grid, p[0], p[1], 0, 1, qpsk[2 * i], qpsk[2 * i + 1]);
+                                }
+                            }
+                            _ => {
+                                for (i, q) in res.chunks(4).enumerate() {
+                                    pair(&mut grid, q[0], q[1], 0, 2, qpsk[4 * i], qpsk[4 * i + 1]);
+                                    pair(&mut grid, q[2], q[3], 1, 3, qpsk[4 * i + 2], qpsk[4 * i + 3]);
+                                }
                             }
                         }
                     }
@@ -1053,13 +1165,13 @@ mod tests {
         }
         let streams = conv_encode(&all);
         let soft: Vec<[f32; 3]> = (0..40).map(|i| std::array::from_fn(|s| 1.0 - 2.0 * streams[s][i] as f32)).collect();
-        assert_eq!(conv_decode(&soft), all);
+        assert_eq!(conv_decode(&soft).0, all);
         // A few flipped bits still decode.
         let mut noisy = soft.clone();
         noisy[3][0] = -noisy[3][0];
         noisy[17][2] = -noisy[17][2];
         noisy[30][1] = -noisy[30][1];
-        assert_eq!(conv_decode(&noisy), all);
+        assert_eq!(conv_decode(&noisy).0, all);
     }
 
     #[test]
@@ -1102,8 +1214,8 @@ mod tests {
     }
 
     #[test]
-    fn decodes_the_mib_on_one_and_two_ports() {
-        for ports in [2u8, 1] {
+    fn decodes_the_mib_on_one_two_and_four_ports() {
+        for ports in [4u8, 2, 1] {
             let c = cell(42, ports);
             let x = frames(&c, 4, 23);
             let y = impair(&x, 500, -900.0, 8.0, 29);
