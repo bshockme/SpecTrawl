@@ -13,6 +13,7 @@ pub mod demod;
 pub mod dmr;
 pub mod features;
 pub mod flex;
+pub mod flex_join;
 pub mod frames;
 pub mod imbe;
 pub mod lte;

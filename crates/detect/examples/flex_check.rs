@@ -2,7 +2,10 @@
 //! counts. Message text is only printed with `--show` (pager traffic is
 //! often personal or medical).
 //!
-//!     cargo run --release -p detect --example flex_check -- [--show] <path without extension>...
+//!     cargo run --release -p detect --example flex_check -- [--show] [--join] <path without extension>...
+//!
+//! `--join` also runs the fragment joiner over the frames and reports how
+//! many pages were fragments and how many whole messages came out.
 
 use detect::flex;
 use num_complex::Complex32;
@@ -20,7 +23,8 @@ fn load(stem: &str) -> (Vec<Complex32>, f64) {
 
 fn main() {
     let show = std::env::args().any(|a| a == "--show");
-    for stem in std::env::args().skip(1).filter(|a| a != "--show") {
+    let join = std::env::args().any(|a| a == "--join");
+    for stem in std::env::args().skip(1).filter(|a| a != "--show" && a != "--join") {
         let (x, fs) = load(&stem);
         let t = std::time::Instant::now();
         let frames = flex::decode(&x, fs);
@@ -42,6 +46,27 @@ fn main() {
             *labels.entry(detect::classify(w, fs, 16e3).label).or_default() += 1;
         }
         println!("  1.5 s windows: {labels:?}");
+        if join {
+            let fragments = pages.iter().filter(|p| p.kind == "alpha" && (p.continued || p.fragment != 3)).count();
+            let joined = detect::flex_join::join_frames(&frames);
+            let gaps = joined.iter().filter(|p| p.text.contains(detect::flex_join::GAP.trim())).count();
+            println!(
+                "  join: {} alpha fragments ({} continued, {} continuations) → {} pages after joining ({} with gaps)",
+                fragments,
+                pages.iter().filter(|p| p.continued).count(),
+                pages.iter().filter(|p| p.kind == "alpha" && p.fragment != 3).count(),
+                joined.len(),
+                gaps
+            );
+            if show {
+                for p in joined
+                    .iter()
+                    .filter(|p| p.kind == "alpha" && (p.text.contains(detect::flex_join::GAP.trim()) || p.text.chars().count() > 80))
+                {
+                    println!("      joined {}", p.summary());
+                }
+            }
+        }
         for f in &frames {
             println!("  t {:7.2} {} cycle {:2} frame {:3} blocks {:?}", f.at as f64 / fs, f.mode(), f.cycle, f.frame, f.block_ok);
             for p in &f.pages {

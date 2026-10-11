@@ -237,6 +237,8 @@ struct Mon {
     buf: Vec<Complex32>,
     messages: u64,
     label: String,
+    /// FLEX: puts messages split across frames back together.
+    joiner: detect::flex_join::FragmentJoiner,
 }
 
 pub(crate) fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>, rate: f64) {
@@ -293,6 +295,7 @@ pub(crate) fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>, rate: f64) {
                     buf: Vec::new(),
                     messages: 0,
                     label,
+                    joiner: Default::default(),
                 });
             }
         }
@@ -392,11 +395,17 @@ fn decode_pages(shared: &Shared, m: &mut Mon, fs: f64) {
         count: 1,
     };
     let pages: Vec<PageEvent> = if m.kind == Kind::Flex {
-        flex::decode(&m.buf, fs)
-            .into_iter()
-            .flat_map(|f| f.pages)
-            .map(|p| page("FLEX", p.capcode, format!("{} {}", p.kind, p.phase), p.text, p.damaged))
-            .collect()
+        // Fragments of a long message wait in the joiner until the last one
+        // (or a timeout) releases the whole message; everything else passes
+        // straight through.
+        let mut whole: Vec<flex::Page> = Vec::new();
+        for f in flex::decode(&m.buf, fs) {
+            for p in f.pages {
+                whole.extend(m.joiner.push(p, f.cycle, f.frame));
+            }
+            whole.extend(m.joiner.expire(f.cycle, f.frame));
+        }
+        whole.into_iter().map(|p| page("FLEX", p.capcode, format!("{} {}", p.kind, p.phase), p.text, p.damaged)).collect()
     } else {
         let frames = detect::frames_with(&m.buf, fs, 6_500.0, 0, 520, Default::default());
         pocsag::pages(&frames)
