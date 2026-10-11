@@ -246,7 +246,11 @@ pub(crate) fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>, rate: f64) {
     while !stop.load(Ordering::Relaxed) {
         let tuner = shared.state.lock().center_hz;
         // Drop monitors from an old tuning; look for new candidates now and then.
+        let before = mons.len();
         mons.retain(|m| m.tuner_hz == tuner);
+        if mons.len() != before {
+            log::debug!("monitor: {} monitor(s) dropped after a retune to {:.4} MHz", before - mons.len(), tuner / 1e6);
+        }
         if last_pick.elapsed() > Duration::from_secs(2) {
             last_pick = Instant::now();
             let candidates: Vec<(u64, f64, Kind, String)> = {
@@ -278,6 +282,7 @@ pub(crate) fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>, rate: f64) {
                 let head = shared.ring.lock().head();
                 // Pagers deviate up to 4.8 kHz at 3200 baud: a wider channel.
                 let cutoff = if kind == Kind::P25 { 8e3 } else { 10e3 };
+                log::debug!("monitor: {label} at {:.4} MHz (emitter {id})", c / 1e6);
                 mons.push(Mon {
                     kind,
                     emitter: id,

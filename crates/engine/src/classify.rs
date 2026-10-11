@@ -57,12 +57,14 @@ pub(crate) fn run(shared: Arc<Shared>, cfg: SourceConfig, stop: Arc<AtomicBool>,
             log_call(&shared, w.center_hz, &class);
         } else if let Some(rec) = pick(&shared) {
             let class = Arc::new(classify_record(&shared, &cfg, rate, &radio, &rec, &mut chunk, &stop));
+            log::debug!("classify: record {} at {:.4} MHz, {:.1} kHz: {} ({:.0} ms, {:.2} s analysed)", rec.id, rec.center_hz() / 1e6, rec.bandwidth_hz() / 1e3, class.label, t0.elapsed().as_secs_f64() * 1e3, class.analysed_s);
             log_call(&shared, rec.center_hz(), &class);
             let mut st = shared.records.lock();
             st.emitters.tally(rec.id, &class);
             st.classes.insert(rec.id, (class, Instant::now(), rec.active));
         } else if let Some(job) = pick_emitter(&shared, rate) {
             let class = Arc::new(classify_window(&shared, rate, &radio, &job, &mut chunk, &stop));
+            log::debug!("classify: emitter {} group window at {:.4} MHz: {} ({:.0} ms)", job.emitter, job.center_hz / 1e6, class.label, t0.elapsed().as_secs_f64() * 1e3);
             log_call(&shared, job.center_hz, &class);
             shared.records.lock().emitters.set_group_class(job.emitter, class);
         } else {

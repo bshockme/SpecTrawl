@@ -277,6 +277,10 @@ impl Source {
     /// Stops the current worker and starts one for `mode`. Row history is
     /// cleared because rows from different modes don't share a frequency axis.
     pub fn set_mode(&mut self, mode: Mode) {
+        match &mode {
+            Mode::Live => log::info!("{}: live at {:.4} MHz, ring {:.0} s", self.info.serial, self.device.lock().center_hz() / 1e6, self.cfg.ring_seconds),
+            Mode::Sweep(p) => log::info!("{}: sweep {:.1}–{:.1} MHz, ring {:.0} s", self.info.serial, p.start_hz / 1e6, p.stop_hz / 1e6, self.cfg.ring_seconds),
+        }
         self.stop_worker();
         self.shared.rows.lock().clear();
         *self.shared.records.lock() = RecordStore::default();
@@ -347,6 +351,7 @@ impl Source {
         if matches!(self.mode, Mode::Sweep(_)) {
             return Ok(());
         }
+        log::debug!("{}: tune {:.4} MHz", self.info.serial, hz / 1e6);
         self.device.lock().set_center(hz)
     }
 

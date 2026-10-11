@@ -11,16 +11,37 @@ use crate::{SpectrumRow, Tuning};
 /// An occupant and when it was seen.
 #[derive(Debug, Clone)]
 pub struct KnownOccupant {
+    /// The latest sighting, with its extent widened to the union of the
+    /// last few (`EXTENT_SIGHTINGS`), so a block whose edges are cut
+    /// differently from one look to the next keeps a steady footprint.
     pub occupant: Occupant,
     pub first_seen: SystemTime,
     pub last_seen: SystemTime,
     /// Looks in a row (since the last sighting) where it should have been
     /// visible and wasn't.
     misses: u32,
+    /// Looks that found it.
+    sightings: u32,
+    /// Extents of the latest sightings, newest last.
+    extents: Vec<(f64, f64)>,
 }
 
-/// Looks in view without finding an occupant before it's forgotten.
-const MAX_MISSES: u32 = 3;
+impl KnownOccupant {
+    /// Looks in view without a sighting before it's forgotten: a few for a
+    /// newcomer, more the longer it has been there (hysteresis, so a
+    /// wideband signal that fades below the identifier's threshold for a
+    /// moment doesn't flash in and out of the squelch).
+    fn allowed_misses(&self) -> u32 {
+        MIN_MISSES + self.sightings.min(MAX_EXTRA_MISSES)
+    }
+}
+
+/// Looks in view without finding a new occupant before it's forgotten...
+const MIN_MISSES: u32 = 3;
+/// ...plus one per sighting so far, up to this many.
+const MAX_EXTRA_MISSES: u32 = 12;
+/// Sightings whose extents are unioned into the displayed one.
+const EXTENT_SIGHTINGS: usize = 4;
 
 pub(crate) struct OccupancyTracker {
     /// Rows averaged per identification.
@@ -73,12 +94,29 @@ impl OccupancyTracker {
             match self.known.iter().position(|k| same(&k.occupant, &o)) {
                 Some(i) => {
                     let k = &mut self.known[i];
+                    k.extents.push((o.lo_hz, o.hi_hz));
+                    if k.extents.len() > EXTENT_SIGHTINGS {
+                        k.extents.remove(0);
+                    }
                     k.occupant = o;
+                    k.occupant.lo_hz = k.extents.iter().map(|e| e.0).fold(f64::MAX, f64::min);
+                    k.occupant.hi_hz = k.extents.iter().map(|e| e.1).fold(f64::MIN, f64::max);
                     k.last_seen = now;
                     k.misses = 0;
+                    k.sightings += 1;
                     seen[i] = true;
                 }
-                None => self.known.push(KnownOccupant { occupant: o, first_seen: now, last_seen: now, misses: 0 }),
+                None => {
+                    log::debug!("occupancy: new {} at {:.3}–{:.3} MHz ({:.0} dB)", o.kind.label(), o.lo_hz / 1e6, o.hi_hz / 1e6, o.snr_db);
+                    self.known.push(KnownOccupant {
+                        extents: vec![(o.lo_hz, o.hi_hz)],
+                        occupant: o,
+                        first_seen: now,
+                        last_seen: now,
+                        misses: 0,
+                        sightings: 1,
+                    })
+                }
             }
         }
         for (i, k) in self.known.iter_mut().enumerate() {
@@ -86,7 +124,11 @@ impl OccupancyTracker {
                 k.misses += 1;
             }
         }
-        self.known.retain(|k| k.misses < MAX_MISSES);
+        let before = self.known.len();
+        self.known.retain(|k| k.misses < k.allowed_misses());
+        if self.known.len() != before {
+            log::debug!("occupancy: {} occupant(s) forgotten after missing looks", before - self.known.len());
+        }
         self.known.sort_by(|a, b| a.occupant.lo_hz.total_cmp(&b.occupant.lo_hz));
         // Cellular blocks are cut differently from pass to pass: entries that
         // now overlap are one block; keep the newer cut.
@@ -96,8 +138,10 @@ impl OccupancyTracker {
             if same(&a.occupant, &b.occupant) {
                 let keep = if a.last_seen >= b.last_seen { i } else { i + 1 };
                 let first = a.first_seen.min(b.first_seen);
+                let sightings = a.sightings.max(b.sightings);
                 self.known.remove(if keep == i { i + 1 } else { i });
                 self.known[i].first_seen = first;
+                self.known[i].sightings = sightings;
             } else {
                 i += 1;
             }
@@ -138,9 +182,34 @@ mod tests {
             t.merge(vec![], 200e6, 210e6, now);
         }
         assert_eq!(t.known.len(), 1);
-        // In view but missing: forgotten after MAX_MISSES looks.
-        for _ in 0..MAX_MISSES {
+        // In view but missing: forgotten after its allowed looks (two
+        // sightings so far).
+        for _ in 0..MIN_MISSES + 2 {
             t.merge(vec![], 100e6, 105e6, now);
+        }
+        assert!(t.known.is_empty());
+    }
+
+    #[test]
+    fn long_seen_occupant_survives_a_fade_and_keeps_a_steady_extent() {
+        let mut t = OccupancyTracker::new(1);
+        let now = SystemTime::now();
+        let lte = |half: f64| occ(Kind::Cellular { bw_mhz: 10.0 }, 751e6, half);
+        // Seen for a long while, with its edges cut differently each look.
+        for k in 0..20 {
+            t.merge(vec![lte(4.4e6 + 0.1e6 * (k % 3) as f64)], 740e6, 760e6, now);
+        }
+        assert_eq!(t.known.len(), 1);
+        let (lo, hi) = (t.known[0].occupant.lo_hz, t.known[0].occupant.hi_hz);
+        assert!((hi - lo - 9.2e6).abs() < 1e3, "extent is the union of recent cuts: {}", hi - lo);
+        // Fades out of the identifier's reach for a few looks: still known.
+        for _ in 0..MIN_MISSES + 5 {
+            t.merge(vec![], 740e6, 760e6, now);
+        }
+        assert_eq!(t.known.len(), 1);
+        // Gone for good: forgotten eventually.
+        for _ in 0..MAX_EXTRA_MISSES {
+            t.merge(vec![], 740e6, 760e6, now);
         }
         assert!(t.known.is_empty());
     }

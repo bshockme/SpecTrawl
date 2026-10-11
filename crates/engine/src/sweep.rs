@@ -151,6 +151,11 @@ pub(crate) fn run(
     // Known after the first retune: whether the device reports tuner lock. If
     // it does, slow steps are waited out exactly and the probing isn't needed.
     let mut has_lock: Option<bool> = None;
+    log::info!("sweep: {:.1}–{:.1} MHz, {hops} hops of {:.2} MHz, {} FFTs of {n} per hop", plan.start_hz / 1e6, (plan.start_hz + span) / 1e6, hop_hz / 1e6, plan.ffts_per_hop);
+    // Typical pass time (a slow average) and the counters at the end of the
+    // last pass, to notice and explain a sweep that has slowed down.
+    let mut typical_pass: Option<f64> = None;
+    let mut last_counters = (0u64, 0u64, 0u64);
     'passes: loop {
         let pass_start = Instant::now();
         let mut h = 0;
@@ -241,6 +246,7 @@ pub(crate) fn run(
                 }
             }
             let mut from = n0 + if slow[h] { long_guard.max(short) } else { short };
+            log::trace!("sweep: hop {h} {:.3} MHz late {late} guard {short} lock-wait {after_lock} slow {}", center / 1e6, slow[h]);
             let mut redo_hop = false;
             let mut attempts = 0;
             loop {
@@ -318,6 +324,23 @@ pub(crate) fn run(
             h += 1;
         }
         pass_no += 1;
+        {
+            let took = pass_start.elapsed().as_secs_f64();
+            let (sr, rd, lw) = shared.sweep.lock().as_ref().map(|s| (s.settle_retries, s.redone_hops, s.lock_waits)).unwrap_or_default();
+            let d = (sr - last_counters.0, rd - last_counters.1, lw - last_counters.2);
+            last_counters = (sr, rd, lw);
+            log::debug!("sweep: pass {pass_no} in {took:.2} s ({:.0} hops/s), settle retries {}, gap redos {}, lock waits {}", hops as f64 / took, d.0, d.1, d.2);
+            match typical_pass {
+                Some(t) if took > 3.0 * t && took > 1.0 => {
+                    log::warn!("sweep: pass {pass_no} took {took:.2} s, typical {t:.2} s (settle retries {}, gap redos {}, lock waits {}, slow hops {})", d.0, d.1, d.2, slow.iter().filter(|s| **s).count());
+                }
+                _ => {}
+            }
+            typical_pass = Some(match typical_pass {
+                Some(t) => 0.9 * t + 0.1 * took.min(3.0 * t),
+                None => took,
+            });
+        }
         let mut row = vec![0.0f32; out_bins];
         if hops >= MIN_HOPS_FOR_PROFILE {
             update_hop_profile(&full, bins_per_hop, &mut profile);

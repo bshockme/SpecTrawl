@@ -1,4 +1,6 @@
 mod audio;
+mod logging;
+mod settings;
 mod spectrum_view;
 mod theme;
 
@@ -11,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use spectrum_view::SpectrumView;
 
 fn main() -> eframe::Result {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let settings = settings::Settings::load();
+    logging::init(settings.log.clone());
     spawn_deadlock_watchdog();
     // The window opens where it was left (the workspace remembers it);
     // the first run fills the screen, and the layout built on that first
@@ -236,6 +239,12 @@ struct App {
     volume: f32,
     /// Known occupants from every pane, merged: (lo Hz, hi Hz, label).
     known: (std::time::Instant, Vec<(f64, f64, String)>),
+    /// General settings (⚙), saved when changed.
+    settings: settings::Settings,
+    /// A survey span change from the keyboard, applied once the keys rest.
+    sweep_dirty: Option<std::time::Instant>,
+    /// Diagnostics log view: text filter.
+    log_filter: String,
 }
 
 /// What the emitter table shows and in what order.
@@ -519,6 +528,9 @@ impl App {
             catalog_msg: None,
             export: None,
             export_msg: None,
+            settings: settings::Settings::load(),
+            sweep_dirty: None,
+            log_filter: String::new(),
         };
         app.rescan();
 
@@ -743,7 +755,75 @@ impl App {
 
     /// Where SpecTrawl keeps its files.
     fn settings_menu(&mut self, ui: &mut egui::Ui) {
-        ui.set_min_width(300.0);
+        ui.set_min_width(340.0);
+        let mut changed = false;
+        ui.label(egui::RichText::new("Look-back").small().color(theme::MUTED));
+        let rate = self.panes.iter().map(|p| p.source.snapshot().sample_rate).fold(0.0, f64::max).max(2.5e6);
+        ui.horizontal(|ui| {
+            changed |= ui.add(egui::DragValue::new(&mut self.settings.ring_seconds).speed(1.0).range(2.0..=600.0).suffix(" s")).changed();
+            let per = self.settings.ring_bytes(rate) / 1e9;
+            let n = self.panes.len().max(1);
+            ui.label(egui::RichText::new(format!("≈ {per:.2} GB per device at {:.0} MS/s · {:.1} GB for {n}", rate / 1e6, per * n as f64)).small().color(theme::MUTED));
+        });
+        ui.horizontal(|ui| {
+            let cur: Vec<f64> = self.panes.iter().map(|p| p.source.config().ring_seconds).collect();
+            let stale = cur.iter().any(|s| (*s - self.settings.ring_seconds).abs() > 0.5);
+            ui.label(egui::RichText::new("Applies to devices opened from now on.").small().color(theme::MUTED));
+            if stale && ui.small_button("Reopen devices now").on_hover_text("Restarts every open device with the new ring length (emitters and records start over)").clicked() {
+                self.reopen_all();
+                ui.close();
+            }
+        });
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("Keyboard nudges").small().color(theme::MUTED));
+        ui.horizontal(|ui| {
+            changed |= ui.add(egui::DragValue::new(&mut self.settings.nudge_khz).speed(5.0).range(1.0..=5000.0).suffix(" kHz")).changed();
+            ui.label(egui::RichText::new("← → step the target receiver (Shift ×10, Alt ÷10)").small().color(theme::MUTED));
+        });
+        ui.horizontal(|ui| {
+            changed |= ui.add(egui::DragValue::new(&mut self.settings.survey_nudge_mhz).speed(0.5).range(0.1..=100.0).suffix(" MHz")).changed();
+            ui.label(egui::RichText::new("Ctrl ← → shift the survey span, Ctrl ↑ ↓ widen / narrow it").small().color(theme::MUTED));
+        });
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("Logging").small().color(theme::MUTED));
+        let mut levels = self.settings.log.clone();
+        let mut lv_changed = false;
+        egui::Grid::new("log_levels").num_columns(4).spacing([10.0, 2.0]).show(ui, |ui| {
+            let names = ["off", "error", "warn", "info", "debug", "trace"];
+            let combo = |ui: &mut egui::Ui, id: &str, cur: &mut log::LevelFilter| -> bool {
+                let mut ch = false;
+                egui::ComboBox::from_id_salt(id).selected_text(logging::level_str(*cur)).width(70.0).show_ui(ui, |ui| {
+                    for n in names {
+                        let l = logging::parse_level(n).unwrap();
+                        ch |= ui.selectable_value(cur, l, n).changed();
+                    }
+                });
+                ch
+            };
+            ui.label(egui::RichText::new("default").small());
+            lv_changed |= combo(ui, "lvl_default", &mut levels.default);
+            ui.end_row();
+            for (k, area) in logging::AREAS.iter().enumerate() {
+                let mut l = levels.level(area);
+                ui.label(egui::RichText::new(*area).small());
+                if combo(ui, &format!("lvl_{area}"), &mut l) {
+                    levels.set(area, l);
+                    lv_changed = true;
+                }
+                if k % 2 == 1 {
+                    ui.end_row();
+                }
+            }
+        });
+        if lv_changed {
+            self.settings.log = levels;
+            logging::set_levels(self.settings.log.clone());
+            changed = true;
+        }
+        if changed {
+            self.settings.save();
+        }
+        ui.add_space(4.0);
         ui.label(egui::RichText::new("Folders").small().color(theme::MUTED));
         for (what, path) in [
             ("Recordings", engine::recordings_dir()),
@@ -751,6 +831,8 @@ impl App {
             ("Workspaces", workspace_dir()),
             ("Names catalog", catalog_path()),
             ("Follow lists", follow_policy_path()),
+            ("Logs", logging::log_dir()),
+            ("Settings", settings::path()),
         ] {
             ui.horizontal(|ui| {
                 if ui.small_button("Open").clicked() {
@@ -1105,7 +1187,42 @@ impl App {
     }
 
     fn close(&mut self, info: &DeviceInfo) {
+        if self.panes.iter().any(|p| same_device(p.source.info(), info)) {
+            log::info!("close {} ({})", info.label, info.serial);
+        }
         self.panes.retain(|p| !same_device(p.source.info(), info));
+    }
+
+    /// Reopens every open device (after a change to the ring length).
+    fn reopen_all(&mut self) {
+        let open: Vec<(DeviceInfo, ReceiverId, f64)> = self.panes.iter().map(|p| (p.source.info().clone(), p.id, p.source.snapshot().center_hz)).collect();
+        for (d, id, hz) in open {
+            self.open_as(&d, id);
+            if !id.is_sweep() {
+                self.retune(id, hz / 1e6);
+            }
+        }
+    }
+
+    /// Steps a focus receiver's centre by `steps` nudges.
+    fn nudge(&mut self, id: ReceiverId, steps: f64) {
+        let Some(p) = self.receiver(id) else { return };
+        let mhz = p.source.snapshot().center_hz / 1e6 + steps * self.settings.nudge_khz / 1e3;
+        self.retune(id, (mhz.clamp(24.0, 1800.0) * 1e6).round() / 1e6);
+    }
+
+    /// Shifts (`shift`) or widens (`grow`) the survey span by nudges; the
+    /// sweep restarts once the keys have rested for a moment.
+    fn nudge_sweep(&mut self, shift: f64, grow: f64) {
+        let d = self.settings.survey_nudge_mhz;
+        let (mut lo, mut hi) = (self.sweep_lo_mhz + shift * d - grow * d, self.sweep_hi_mhz + shift * d + grow * d);
+        lo = lo.clamp(24.0, 1790.0);
+        hi = hi.clamp(lo + 1.0, 1800.0);
+        if (lo, hi) != (self.sweep_lo_mhz, self.sweep_hi_mhz) {
+            self.sweep_lo_mhz = lo;
+            self.sweep_hi_mhz = hi;
+            self.sweep_dirty = Some(std::time::Instant::now());
+        }
     }
 
     fn open_as(&mut self, info: &DeviceInfo, id: ReceiverId) {
@@ -1121,8 +1238,9 @@ impl App {
                     log::warn!("initial tune: {e}");
                 }
             }
-            Source::start(dev, SourceConfig::default(), mode)
+            Source::start(dev, SourceConfig { ring_seconds: self.settings.ring_seconds, ..SourceConfig::default() }, mode)
         });
+        log::info!("open {} ({}) as {id}: {}", info.label, info.serial, if result.is_ok() { "ok" } else { "failed" });
         match result {
             Ok(source) => {
                 if !id.is_sweep() {
@@ -3067,6 +3185,48 @@ impl App {
                 let names = if self.catalog.sources.is_empty() { "none".to_string() } else { self.catalog.sources.join(" · ") };
                 kv(ui, "Names", &names);
             });
+            ui.separator();
+            self.log_view(ui);
+        });
+    }
+
+    /// The newest log entries (levels are set in ⚙ → Logging).
+    fn log_view(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("LOG").small().strong().color(theme::MUTED));
+            ui.add(egui::TextEdit::singleline(&mut self.log_filter).desired_width(200.0).hint_text("filter: area, module or text"));
+            if ui.small_button("Clear").clicked() {
+                logging::clear();
+            }
+            if ui.small_button("Open log folder").clicked() {
+                let d = logging::log_dir();
+                let _ = std::fs::create_dir_all(&d);
+                open_path(&d);
+            }
+            ui.label(egui::RichText::new(format!("levels: {}", logging::AREAS.iter().map(|a| format!("{a} {}", logging::level_str(self.settings.log.level(a)))).collect::<Vec<_>>().join(" · "))).small().color(theme::MUTED));
+        });
+        let (entries, _) = logging::recent(400);
+        let q = self.log_filter.to_lowercase();
+        let shown: Vec<&logging::Entry> = entries
+            .iter()
+            .filter(|e| q.is_empty() || e.area.contains(&q) || e.target.to_lowercase().contains(&q) || e.message.to_lowercase().contains(&q) || e.level.as_str().to_lowercase() == q)
+            .collect();
+        let row_h = ui.text_style_height(&egui::TextStyle::Small);
+        egui::ScrollArea::vertical().id_salt("log_rows").max_height(260.0).stick_to_bottom(true).show_rows(ui, row_h, shown.len(), |ui, range| {
+            for e in &shown[range] {
+                let col = match e.level {
+                    log::Level::Error => theme::ALERT,
+                    log::Level::Warn => theme::ACCENT,
+                    log::Level::Info => theme::TEXT,
+                    _ => theme::TEXT2,
+                };
+                ui.label(
+                    egui::RichText::new(format!("{} {:<5} [{}] {}: {}", &logging::stamp(e.time)[11..], e.level, e.area, e.target, e.message))
+                        .small()
+                        .monospace()
+                        .color(col),
+                );
+            }
         });
     }
 
@@ -3176,6 +3336,8 @@ impl eframe::App for App {
         if !ctx.egui_wants_keyboard_input() && !self.palette_open {
             let live = self.live_ids();
             let mut mute = false;
+            let mut nudge: Option<f64> = None;
+            let mut nudge_sweep: Option<(f64, f64)> = None;
             ctx.input(|i| {
                 for (n, k) in [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3].into_iter().enumerate() {
                     if i.key_pressed(k) {
@@ -3193,6 +3355,28 @@ impl eframe::App for App {
                 if i.key_pressed(egui::Key::Escape) {
                     self.selection = Selection::None;
                 }
+                // Arrows nudge: ← → step the target receiver's centre (Shift
+                // ×10, Alt ÷10); with Ctrl they shift the survey span, and
+                // Ctrl ↑ ↓ widen or narrow it.
+                let (left, right, up, down) = (
+                    i.key_pressed(egui::Key::ArrowLeft),
+                    i.key_pressed(egui::Key::ArrowRight),
+                    i.key_pressed(egui::Key::ArrowUp),
+                    i.key_pressed(egui::Key::ArrowDown),
+                );
+                if left || right || up || down {
+                    let dir = if right || up { 1.0 } else { -1.0 };
+                    if i.modifiers.command {
+                        if left || right {
+                            nudge_sweep = Some((dir, 0.0));
+                        } else {
+                            nudge_sweep = Some((0.0, dir));
+                        }
+                    } else if left || right {
+                        let scale = if i.modifiers.shift { 10.0 } else if i.modifiers.alt { 0.1 } else { 1.0 };
+                        nudge = Some(dir * scale);
+                    }
+                }
                 if i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::P) {
                     if let Some(d) = self.dock.as_mut() {
                         if let Some((_, t)) = d.find_active_focused() {
@@ -3204,6 +3388,16 @@ impl eframe::App for App {
             if mute {
                 self.toggle_mute();
             }
+            if let Some(steps) = nudge {
+                self.nudge(self.tune_target, steps);
+            }
+            if let Some((shift, grow)) = nudge_sweep {
+                self.nudge_sweep(shift, grow);
+            }
+        }
+        if self.sweep_dirty.is_some_and(|t| t.elapsed() > std::time::Duration::from_millis(600)) {
+            self.sweep_dirty = None;
+            self.apply_sweep();
         }
         // Give the follow policy to every source when it changes (or a
         // source is added).
