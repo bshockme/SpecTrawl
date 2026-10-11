@@ -267,6 +267,10 @@ struct App {
     explore_tick: std::time::Instant,
     /// Set once the exploration CSV has its header.
     explore_csv_ready: bool,
+    /// Receivers whose device stopped delivering samples: (letter, when
+    /// noticed, last reopen attempt).
+    lost: Vec<(ReceiverId, std::time::Instant, std::time::Instant)>,
+    frame_count: u64,
 }
 
 /// What the emitter table shows and in what order.
@@ -564,6 +568,8 @@ impl App {
             explore_tuning: false,
             explore_tick: std::time::Instant::now(),
             explore_csv_ready: false,
+            lost: Vec::new(),
+            frame_count: 0,
         };
         app.rescan();
 
@@ -1280,6 +1286,44 @@ impl App {
             log::info!("close {} ({})", info.label, info.serial);
         }
         self.panes.retain(|p| !same_device(p.source.info(), info));
+    }
+
+    /// Notices devices that stopped delivering (unplugged, USB reset) and
+    /// reopens them when they come back: a rescan every few seconds, and the
+    /// same slot, tuning and mode once the serial is enumerated again.
+    fn recover_lost(&mut self) {
+        let now = std::time::Instant::now();
+        let lost_now: Vec<ReceiverId> = self.panes.iter().filter(|p| p.source.stats().device_lost).map(|p| p.id).collect();
+        for id in &lost_now {
+            if !self.lost.iter().any(|(r, _, _)| r == id) {
+                let info = self.receiver(*id).map(|p| p.source.info().clone());
+                log::warn!("receiver {id}: device lost ({}); will reopen when it is back", info.map(|i| format!("{} {}", i.label, i.serial)).unwrap_or_default());
+                self.lost.push((*id, now, now - std::time::Duration::from_secs(10)));
+            }
+        }
+        let open: Vec<ReceiverId> = self.panes.iter().map(|p| p.id).collect();
+        self.lost.retain(|(r, _, _)| lost_now.contains(r) || !open.contains(r));
+        let due: Vec<ReceiverId> = self.lost.iter().filter(|(_, _, last)| now.duration_since(*last) >= std::time::Duration::from_secs(5)).map(|(r, _, _)| *r).collect();
+        if due.is_empty() {
+            return;
+        }
+        for (_, _, last) in self.lost.iter_mut() {
+            *last = now;
+        }
+        self.rescan();
+        for id in due {
+            let Some(p) = self.receiver(id) else { continue };
+            let info = p.source.info().clone();
+            let hz = p.source.snapshot().center_hz;
+            if let Some(found) = self.devices.iter().find(|d| same_device(d, &info)).cloned() {
+                log::info!("receiver {id}: {} {} is back, reopening", found.label, found.serial);
+                self.open_as(&found, id);
+                if !id.is_sweep() && self.receiver(id).is_some_and(|p| !p.source.stats().device_lost) {
+                    self.retune(id, hz / 1e6);
+                }
+                self.lost.retain(|(r, _, _)| *r != id);
+            }
+        }
     }
 
     /// Reopens every open device (after a change to the ring length).
@@ -2273,7 +2317,8 @@ impl App {
                 }
             } else {
                 let snap = p.source.snapshot();
-                let title = format!("{id} · {} · {:.3} MHz · {:.1} MS/s", info.label, snap.center_hz / 1e6, snap.sample_rate / 1e6);
+                let lost = p.source.stats().device_lost;
+                let title = format!("{id} · {} · {:.3} MHz · {:.1} MS/s{}", info.label, snap.center_hz / 1e6, snap.sample_rate / 1e6, if lost { " · DEVICE LOST, waiting for it to return" } else { "" });
                 let res = p.view.show(ui, r, &title, None, &records, sel_record, sel_emitter);
                 if p.mode == RxMode::Explore {
                     // The explorer's state, over the top of the spectrum.
@@ -3918,6 +3963,10 @@ impl eframe::App for App {
         self.palette(&ctx, width);
         self.frame_prep();
         self.explore_step();
+        if self.frame_count % 60 == 0 {
+            self.recover_lost();
+        }
+        self.frame_count = self.frame_count.wrapping_add(1);
         if std::mem::take(&mut self.maximize) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
         } else {

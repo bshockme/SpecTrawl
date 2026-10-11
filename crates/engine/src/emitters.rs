@@ -476,6 +476,7 @@ mod tests {
             class: None,
             emitter: None,
             emitter_class: None,
+            emitter_first_seen: None,
         }
     }
 
