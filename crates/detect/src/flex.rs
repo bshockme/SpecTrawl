@@ -17,6 +17,14 @@
 //!
 //! Protocol facts from the FLEX spec as implemented by PDW and multimon-ng;
 //! the code is SpecTrawl's own.
+//!
+//! Reception notes, from off-air captures of a 3200/4 system heard under a
+//! second co-channel FLEX transmitter: symbol timing comes from sync 2
+//! (whole-symbol slips pass BCH, the code being cyclic, so data alone can't
+//! set it); the data is read through a quarter-symbol filter (a full-symbol
+//! one closes the four-level eye noticeably); and two-bit corrections are
+//! only trusted in blocks where every word decodes, a random word passing
+//! with two flips about one time in four.
 
 use num_complex::Complex32;
 
@@ -30,6 +38,8 @@ const HEADER_BAUD: f64 = 1600.0;
 const SYNC2_S: f64 = 0.025;
 const BLOCKS: usize = 11;
 const WORDS: usize = 88;
+/// Length of the data symbol filter, in 3200-baud symbols.
+const DATA_FILTER: f64 = 0.25;
 
 /// One phase's 8 words of a block: corrected word and bits fixed, or None
 /// past repair.
@@ -70,6 +80,8 @@ pub struct FlexFrame {
     pub frame: u8,
     /// Words that passed BCH (after correction), per block, over all phases.
     pub block_ok: [u8; BLOCKS],
+    /// Symbol timing used per block, in symbols from nominal.
+    pub block_off: [f32; BLOCKS],
     pub pages: Vec<Page>,
 }
 
@@ -97,8 +109,8 @@ fn data21(cw: u32) -> u32 {
     (cw >> 11).reverse_bits() >> 11
 }
 
-/// Discriminator, centred and smoothed over one 3200-baud symbol.
-fn discriminator(x: &[Complex32], fs: f64) -> Vec<f32> {
+/// Discriminator, centred and smoothed over `frac` of a 3200-baud symbol.
+fn discriminator(x: &[Complex32], fs: f64, frac: f64) -> Vec<f32> {
     let d = features::discriminator(x, fs);
     if d.is_empty() {
         return d;
@@ -106,7 +118,7 @@ fn discriminator(x: &[Complex32], fs: f64) -> Vec<f32> {
     let mut s = d.clone();
     s.sort_by(f32::total_cmp);
     let mid = s[s.len() / 2];
-    let n = ((fs / 3200.0).round() as usize).max(1);
+    let n = ((fs / 3200.0 * frac).round() as usize).max(1);
     let mut out = vec![0.0; d.len()];
     let mut acc = 0.0f32;
     for i in 0..d.len() + n / 2 {
@@ -175,6 +187,46 @@ fn fiw(d: &[f32], fs: f64, end: f64, inv: bool) -> Option<(u8, u8)> {
     // The checksum makes the nibbles (and the top bit) sum to 0xF.
     let sum = (0..6).map(|k| x >> (4 * k) & 0xF).sum::<u32>();
     (sum & 0xF == 0xF).then_some(((x >> 4 & 0xF) as u8, (x >> 8 & 0x7F) as u8))
+}
+
+/// Sync 2 at 3200 baud, 4 levels, in symbols: a comma (the outer levels
+/// alternating, 32 symbols), an 8-symbol word, the comma inverted and a
+/// second 8-symbol word. `+`/`-` are the outer levels, `p`/`n` the inner.
+/// Taken from off-air frames (it is the same in every clean one; the data
+/// grid lines up with it to a tenth of a symbol).
+const SYNC2_3200_4: &[u8; 80] = b"+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-p+pn+-n--+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-n-+np+p";
+
+/// Symbol timing from sync 2, in symbols from nominal: the offset within
+/// ±`span` symbols where the discriminator best matches the pattern
+/// (`start` is the nominal first sync 2 symbol, `s` samples per symbol).
+/// The comma pins the timing within a symbol; the two words break the
+/// comma's two-symbol period, so whole-symbol slips are told apart too —
+/// something the data can't do, the BCH code being cyclic.
+/// None when the match is too poor to trust (a collision, or a fade).
+fn sync2_timing(d: &[f32], start: f64, s: f64, inv: bool, level: f32, span: f64) -> Option<f64> {
+    let tmpl: Vec<f32> = SYNC2_3200_4
+        .iter()
+        .map(|&c| match c {
+            b'+' => 3.0,
+            b'p' => 1.0,
+            b'n' => -1.0,
+            _ => -3.0,
+        })
+        .map(|v| if inv { -v } else { v })
+        .collect();
+    let steps = (span / 0.05).round() as i32;
+    let mut best = (f32::MIN, 0.0);
+    for k in -steps..=steps {
+        let off = k as f64 * 0.05;
+        // The pattern has zero mean, so a carrier offset adds nothing.
+        let c: f32 = tmpl.iter().enumerate().map(|(i, &v)| v * at(d, start + (i as f64 + 0.5 + off) * s)).sum();
+        if c > best.0 {
+            best = (c, off);
+        }
+    }
+    // Ideal: Σ v² · level / 3.
+    let ideal = tmpl.iter().map(|v| v * v).sum::<f32>() * level / 3.0;
+    (best.0 > 0.5 * ideal).then_some(best.1)
 }
 
 /// Slices one block into each phase's 256 bits.
@@ -267,7 +319,7 @@ pub fn headers(x: &[Complex32], fs: f64) -> Vec<Header> {
     if (x.len() as f64) < fs * 0.1 {
         return Vec::new();
     }
-    let d = discriminator(x, fs);
+    let d = discriminator(x, fs, 1.0);
     find_sync1(&d, fs)
         .into_iter()
         .filter_map(|(end, speed, inv)| {
@@ -285,11 +337,14 @@ pub fn decode(x: &[Complex32], fs: f64) -> Vec<FlexFrame> {
     if (x.len() as f64) < fs * 0.1 {
         return Vec::new();
     }
-    let d = discriminator(x, fs);
+    // The 1600-baud header is read through a one-symbol filter; the data
+    // through a shorter one, which keeps the four levels further apart.
+    let dh = discriminator(x, fs, 1.0);
+    let d = discriminator(x, fs, DATA_FILTER);
     let sps = fs / HEADER_BAUD;
     let mut out = Vec::new();
-    for (end, speed, inv) in find_sync1(&d, fs) {
-        let Some((cycle, frame)) = fiw(&d, fs, end, inv) else { continue };
+    for (end, speed, inv) in find_sync1(&dh, fs) {
+        let Some((cycle, frame)) = fiw(&dh, fs, end, inv) else { continue };
         let (_, baud, levels) = SPEEDS[speed];
         let s = fs / baud as f64;
         let n = (baud as f64 * 0.16).round() as usize;
@@ -300,18 +355,30 @@ pub fn decode(x: &[Complex32], fs: f64) -> Vec<FlexFrame> {
         }
         let nph = phase_names(baud, levels).len();
         // Full deviation, from the 1600-baud header after sync 1's start.
-        let level = (0..112).map(|k| at(&d, end - (63 - k) as f64 * sps).abs()).sum::<f32>() / 112.0;
+        let level = (0..112).map(|k| at(&dh, end - (63 - k) as f64 * sps).abs()).sum::<f32>() / 112.0;
         let mut phases: Vec<Vec<Option<u32>>> = vec![Vec::with_capacity(WORDS); nph];
         let mut block_ok = [0u8; BLOCKS];
-        // Symbol timing (in symbols from nominal), anchored on the
-        // best-decoding block so far: clocks hold it to a small fraction
-        // of a symbol over a frame, while idle fill decodes equally well at
+        let mut block_off = [0f32; BLOCKS];
+        // Symbol timing (in symbols from nominal). The header places it
+        // within about half a symbol; sync 2 pins it to a tenth, and
+        // clocks hold it over the frame. Each block still looks half a
+        // symbol either side: under a co-channel signal the best sampling
+        // point moves about that much from block to block. Without a lock
+        // (other speeds, whose sync 2 isn't known here) the first block
+        // searches wide for the data start and later ones follow the
+        // best-decoding block so far: idle fill decodes equally well at
         // several offsets and would let a tracking loop wander.
-        let mut anchor = (0.0, 0usize);
+        let locked = if (baud, levels) == (3200, 4) { sync2_timing(&d, end + 48.5 * sps, s, inv, level, 4.0) } else { None };
+        let mut anchor = (locked.unwrap_or(0.0), 0usize);
         for (blk, ok_out) in block_ok.iter_mut().enumerate() {
             // Timing: the offset whose words need the fewest corrections.
-            // The first block searches wider to find the data start.
-            let span = if blk == 0 { 30 } else { 5 };
+            let span = if locked.is_some() {
+                5
+            } else if blk == 0 {
+                30
+            } else {
+                5
+            };
             let mut best: Option<(u32, f64, Vec<BlockWords>)> = None;
             // Nearest offsets first, so ties (idle fill decodes at several)
             // keep the timing where it is.
@@ -336,14 +403,16 @@ pub fn decode(x: &[Complex32], fs: f64) -> Vec<FlexFrame> {
             let (_, off, words) = best.expect("offset range is non-empty");
             let ok = words.iter().flatten().filter(|w| w.is_some()).count();
             *ok_out = ok as u8;
-            if ok > anchor.1 {
+            block_off[blk] = off as f32;
+            if locked.is_none() && ok > anchor.1 {
                 anchor = (off, ok);
             }
-            // A block that mostly failed is noise or a fade: 2-bit
-            // corrections there are as likely wrong as right (random words
-            // pass about a quarter of the time), so keep only words that
-            // needed at most one.
-            let weak = ok * 4 < nph * 8 * 3;
+            // A block with a word past repair has more wrong with it than
+            // the odd bit error (a collision, a fade): 2-bit corrections
+            // there are more often wrong than right (a random word passes
+            // with two about a quarter of the time), so keep only words
+            // that needed at most one.
+            let weak = ok < nph * 8;
             for (p, w) in phases.iter_mut().zip(&words) {
                 p.extend(w.iter().map(|w| w.filter(|c| !weak || c.1 <= 1).map(|c| data21(c.0))));
             }
@@ -352,7 +421,7 @@ pub fn decode(x: &[Complex32], fs: f64) -> Vec<FlexFrame> {
         for (ph, name) in phases.iter().zip(phase_names(baud, levels)) {
             pages.extend(phase_pages(ph, *name));
         }
-        out.push(FlexFrame { at: end as usize, baud, levels, cycle, frame, block_ok, pages });
+        out.push(FlexFrame { at: end as usize, baud, levels, cycle, frame, block_ok, block_off, pages });
     }
     out
 }
