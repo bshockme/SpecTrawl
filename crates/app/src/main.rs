@@ -1409,6 +1409,12 @@ impl App {
         log::info!("open {} ({}) as {id}: {}", info.label, info.serial, if result.is_ok() { "ok" } else { "failed" });
         match result {
             Ok(source) => {
+                // Set the opening gain explicitly (the pane's default below) so
+                // the engine knows it: the sweep's saved hop profile is keyed
+                // by gain, and a first run must land on the same key as later ones.
+                if let Err(e) = source.set_gain(GainSetting::Linearity(13.0 / 21.0)) {
+                    log::warn!("initial gain: {e}");
+                }
                 if !id.is_sweep() {
                     self.tune_mhz = source.snapshot().center_hz / 1e6;
                     // The first live receiver (or a reopened target) takes tuning.
