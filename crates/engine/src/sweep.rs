@@ -163,6 +163,7 @@ pub(crate) fn run(
     cfg: SourceConfig,
     stop: Arc<AtomicBool>,
     mut det: BurstDetector,
+    serial: String,
 ) {
     let plan = plan.normalised();
     let (rate, usable, latency, fmax) = {
@@ -204,8 +205,12 @@ pub(crate) fn run(
     let mut db = Vec::with_capacity(n);
     let mut full = vec![EMPTY_DB; hops * bins_per_hop];
     let out_bins = full.len().min(plan.max_bins);
-    // Common response of a hop (passband ripple + fixed spurs), relative to its median.
-    let mut profile: Vec<f32> = Vec::new();
+    // Common response of a hop (passband ripple + fixed spurs), relative to
+    // its median. A saved profile for this device, FFT, bin count and gain
+    // seeds it, so the first pass is already corrected; the live estimate
+    // keeps refining it and the result is saved back once it has settled.
+    let mut saved = SavedProfile::open(&serial, n, bins_per_hop, *shared.gain.lock());
+    let mut profile: Vec<f32> = saved.initial.take().unwrap_or_default();
     let mut corrected = vec![0.0f32; full.len()];
     let mut seq = 0u64;
     let span = hops as f64 * hop_hz;
@@ -245,7 +250,13 @@ pub(crate) fn run(
     // Known after the first retune: whether the device reports tuner lock. If
     // it does, slow steps are waited out exactly and the probing isn't needed.
     let mut has_lock: Option<bool> = None;
-    log::info!("sweep: {:.1}–{:.1} MHz, {hops} hops of {:.2} MHz ({measured_hops} measured), {} FFTs of {n} per hop", plan.start_hz / 1e6, (plan.start_hz + span) / 1e6, hop_hz / 1e6, plan.ffts_per_hop);
+    log::info!(
+        "sweep: {:.1}–{:.1} MHz, {hops} hops of {:.2} MHz ({measured_hops} measured), {} FFTs of {n} per hop",
+        plan.start_hz / 1e6,
+        (plan.start_hz + span) / 1e6,
+        hop_hz / 1e6,
+        plan.ffts_per_hop
+    );
     // Typical pass time (a slow average) and the counters at the end of the
     // last pass, to notice and explain a sweep that has slowed down.
     let mut typical_pass: Option<f64> = None;
@@ -425,7 +436,8 @@ pub(crate) fn run(
                     dsp::decimate_max(&full, &mut row);
                 }
                 let head = shared.ring.lock().head();
-                *shared.partial.lock() = Some(Arc::new(SpectrumRow { seq: seq + 1, tuning, end_sample: head, time: SystemTime::now(), db: row }));
+                *shared.partial.lock() =
+                    Some(Arc::new(SpectrumRow { seq: seq + 1, tuning, end_sample: head, time: SystemTime::now(), db: row }));
             }
             rate_window.1 += 1;
             let el = rate_window.0.elapsed().as_secs_f64();
@@ -448,10 +460,22 @@ pub(crate) fn run(
             let (sr, rd, lw) = shared.sweep.lock().as_ref().map(|s| (s.settle_retries, s.redone_hops, s.lock_waits)).unwrap_or_default();
             let d = (sr - last_counters.0, rd - last_counters.1, lw - last_counters.2);
             last_counters = (sr, rd, lw);
-            log::debug!("sweep: pass {pass_no} in {took:.2} s ({:.0} hops/s), settle retries {}, gap redos {}, lock waits {}", measured_hops as f64 / took, d.0, d.1, d.2);
+            log::debug!(
+                "sweep: pass {pass_no} in {took:.2} s ({:.0} hops/s), settle retries {}, gap redos {}, lock waits {}",
+                measured_hops as f64 / took,
+                d.0,
+                d.1,
+                d.2
+            );
             match typical_pass {
                 Some(t) if took > 3.0 * t && took > 1.0 => {
-                    log::warn!("sweep: pass {pass_no} took {took:.2} s, typical {t:.2} s (settle retries {}, gap redos {}, lock waits {}, slow hops {})", d.0, d.1, d.2, slow.iter().filter(|s| **s).count());
+                    log::warn!(
+                        "sweep: pass {pass_no} took {took:.2} s, typical {t:.2} s (settle retries {}, gap redos {}, lock waits {}, slow hops {})",
+                        d.0,
+                        d.1,
+                        d.2,
+                        slow.iter().filter(|s| **s).count()
+                    );
                 }
                 _ => {}
             }
@@ -467,7 +491,16 @@ pub(crate) fn run(
         }
         let mut row = vec![0.0f32; out_bins];
         if measured_hops >= MIN_HOPS_FOR_PROFILE {
+            // A gain change means a different passband: save what we have
+            // under the old key and start from the new key's file.
+            let gain = *shared.gain.lock();
+            if crate::hop_profile::gain_key(gain) != saved.gain_key {
+                saved.finish(&profile);
+                saved = SavedProfile::open(&serial, n, bins_per_hop, gain);
+                profile = saved.initial.take().unwrap_or_default();
+            }
             update_hop_profile(&full, bins_per_hop, &mut profile);
+            saved.refined(&profile);
             for seg in corrected.chunks_mut(bins_per_hop).zip(full.chunks(bins_per_hop)) {
                 for ((c, &v), &p) in seg.0.iter_mut().zip(seg.1).zip(&profile) {
                     // Unmeasured bins stay the sentinel, not sentinel-minus-profile.
@@ -488,6 +521,71 @@ pub(crate) fn run(
         );
         if let Some(s) = shared.sweep.lock().as_mut() {
             s.last_pass_s = pass_start.elapsed().as_secs_f64();
+        }
+    }
+    saved.finish(&profile);
+}
+
+/// The hop profile's file for the current key, and when to write it.
+struct SavedProfile {
+    path: std::path::PathBuf,
+    gain_key: String,
+    /// The loaded profile, taken by the worker at start.
+    initial: Option<Vec<f32>>,
+    /// Passes that refined the profile since it was loaded or started.
+    passes: u32,
+    /// Passes at the last write.
+    written_at: u32,
+}
+
+/// A profile is written after this many passes of refinement...
+const SAVE_AFTER_PASSES: u32 = 20;
+/// ...and again every this many after that.
+const SAVE_EVERY_PASSES: u32 = 100;
+/// On stop (or a gain change), a profile refined over fewer passes than
+/// this is not worth keeping over what is on disk.
+const SAVE_MIN_PASSES: u32 = 5;
+
+impl SavedProfile {
+    fn open(serial: &str, fft: usize, bins: usize, gain: Option<sdr_core::GainSetting>) -> Self {
+        let gain_key = crate::hop_profile::gain_key(gain);
+        let path = crate::hop_profile::path(serial, fft, bins, &gain_key);
+        let initial = crate::hop_profile::load(&path, bins);
+        match &initial {
+            Some(_) => log::info!("sweep: hop profile loaded from {}", path.display()),
+            None => log::debug!("sweep: no saved hop profile at {}", path.display()),
+        }
+        Self { path, gain_key, initial, passes: 0, written_at: 0 }
+    }
+
+    /// One more pass went into `profile`; writes it when due.
+    fn refined(&mut self, profile: &[f32]) {
+        self.passes += 1;
+        let due = self.passes == SAVE_AFTER_PASSES
+            || (self.passes > SAVE_AFTER_PASSES && (self.passes - SAVE_AFTER_PASSES) % SAVE_EVERY_PASSES == 0);
+        if due {
+            self.write(profile);
+        }
+    }
+
+    /// The sweep is stopping or changing key: keep the profile if it was
+    /// refined enough to be worth it and has changed since the last write.
+    fn finish(&mut self, profile: &[f32]) {
+        if self.passes >= SAVE_MIN_PASSES && self.passes != self.written_at {
+            self.write(profile);
+        }
+    }
+
+    fn write(&mut self, profile: &[f32]) {
+        if profile.is_empty() {
+            return;
+        }
+        match crate::hop_profile::save(&self.path, profile, self.passes) {
+            Ok(()) => {
+                self.written_at = self.passes;
+                log::debug!("sweep: hop profile saved to {} after {} passes", self.path.display(), self.passes);
+            }
+            Err(e) => log::warn!("sweep: hop profile {}: {e}", self.path.display()),
         }
     }
 }
@@ -727,6 +825,25 @@ mod tests {
         assert_eq!(db[bin(870e6)], -90.0);
         assert_eq!(db[bin(875e6)], -90.0);
         assert_eq!(db[bin(872.3e6)], -50.0);
+    }
+
+    #[test]
+    fn loaded_profile_is_refined_not_replaced() {
+        // A seeded profile (as loaded from disk) is blended on the first
+        // pass, the way a settled live one is, rather than overwritten.
+        let bph = 16;
+        let hops = 10;
+        let loaded: Vec<f32> = (0..bph).map(|k| if k == 3 { 6.0 } else { 0.0 }).collect();
+        let mut profile = loaded.clone();
+        // This pass shows no spur at all: a flat band.
+        let full = vec![-100.0f32; hops * bph];
+        update_hop_profile(&full, bph, &mut profile);
+        assert!((profile[3] - 6.0 * 0.7).abs() < 1e-3, "blended toward the new estimate: {}", profile[3]);
+        // Whereas an empty profile takes the first estimate outright.
+        let mut fresh = Vec::new();
+        update_hop_profile(&full, bph, &mut fresh);
+        assert_eq!(fresh.len(), bph);
+        assert!(fresh.iter().all(|v| v.abs() < 1e-6));
     }
 
     #[test]

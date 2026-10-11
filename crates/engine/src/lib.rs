@@ -9,6 +9,7 @@ mod bursts;
 mod classify;
 mod emitters;
 pub mod explore;
+pub mod hop_profile;
 mod listen;
 mod monitor;
 mod occupancy;
@@ -166,6 +167,9 @@ struct Shared {
     /// "Record every signal": the mode's settings while it is on, and its counters.
     record_all: Mutex<Option<RecordAllConfig>>,
     record_all_status: Mutex<RecordAllStatus>,
+    /// The gain last set through `Source::set_gain` (None: the backend's
+    /// opening default); part of the saved hop profile's key.
+    gain: Mutex<Option<sdr_core::GainSetting>>,
 }
 
 impl Shared {
@@ -288,6 +292,7 @@ impl Source {
             follow_policy: Mutex::new(Default::default()),
             record_all: Mutex::new(None),
             record_all_status: Mutex::new(Default::default()),
+            gain: Mutex::new(None),
         });
         device.start(Box::new(RingSink { shared: shared.clone() }))?;
         let info = device.info().clone();
@@ -341,8 +346,8 @@ impl Source {
             }
             Mode::Sweep(plan) => {
                 let (dev, plan) = (self.device.clone(), plan.clone());
-                let det = BurstDetector::new(DetectorConfig::sweep(), serial);
-                handles.push(std::thread::Builder::new().name("sweep".into()).spawn(move || sweep::run(shared, dev, plan, cfg, st, det)));
+                let det = BurstDetector::new(DetectorConfig::sweep(), serial.clone());
+                handles.push(std::thread::Builder::new().name("sweep".into()).spawn(move || sweep::run(shared, dev, plan, cfg, st, det, serial)));
             }
         }
         let handles = handles.into_iter().map(|h| h.expect("spawn worker")).collect();
@@ -386,7 +391,12 @@ impl Source {
     }
 
     pub fn set_gain(&self, gain: sdr_core::GainSetting) -> sdr_core::Result<()> {
-        self.device.lock().set_gain(gain)
+        // One lock at a time (see the lock-order note on `Shared`).
+        let r = self.device.lock().set_gain(gain);
+        if r.is_ok() {
+            *self.shared.gain.lock() = Some(gain);
+        }
+        r
     }
 
     /// Rows with `seq > after`, oldest first.
