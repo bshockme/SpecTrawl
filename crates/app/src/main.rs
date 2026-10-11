@@ -1489,14 +1489,19 @@ impl App {
             self.set_mode(id, RxMode::Manual);
         }
         let mut err = None;
+        let mut jumped = false;
         if let Some(p) = self.receiver_mut(id) {
+            let snap = p.source.snapshot();
+            // A small step (a nudge) keeps the waterfall; a jump to somewhere
+            // else gets the survey's history for the new span instead.
+            jumped = (mhz * 1e6 - snap.center_hz).abs() > snap.sample_rate * 0.25;
             if let Err(e) = p.source.set_center(mhz * 1e6) {
                 err = Some(e.to_string());
             }
         }
         if let Some(e) = err {
             self.error = Some(e);
-        } else if !id.is_sweep() {
+        } else if !id.is_sweep() && jumped {
             self.backfill(id, mhz * 1e6);
         }
     }
