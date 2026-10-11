@@ -26,6 +26,52 @@ pub struct Settings {
     pub explore: ExploreSettings,
     /// Survey waterfall row clock in seconds; 0 = one row per sweep pass.
     pub survey_row_s: f64,
+    /// Scanner mode rules.
+    pub scan: ScanSettings,
+}
+
+/// Which active signal a scanning receiver goes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ScanRule {
+    /// The transmission that started most recently; a newer one preempts.
+    #[default]
+    Newest,
+    /// The range (segment or preset) with the most activity, newest within it.
+    MostSignals,
+    /// Stay on the current one until it ends.
+    Stay,
+}
+
+impl ScanRule {
+    pub const ALL: [ScanRule; 3] = [ScanRule::Newest, ScanRule::MostSignals, ScanRule::Stay];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ScanRule::Newest => "always newest",
+            ScanRule::MostSignals => "busiest range",
+            ScanRule::Stay => "stay until it ends",
+        }
+    }
+}
+
+/// Scanner settings. The explore filters (ranges, presets) choose what is
+/// eligible; these say how the scanner moves between the active ones.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScanSettings {
+    pub rule: ScanRule,
+    /// Aviation scanner: only the Aviation preset, AM with carrier squelch.
+    pub aviation: bool,
+    /// Leave a channel after this long without activity.
+    pub silence_s: f64,
+    /// Longest stay on one channel.
+    pub max_s: f64,
+}
+
+impl Default for ScanSettings {
+    fn default() -> Self {
+        Self { rule: ScanRule::Newest, aviation: false, silence_s: 3.0, max_s: 180.0 }
+    }
 }
 
 /// Serialisable form of `engine::explore::Config`.
@@ -81,6 +127,7 @@ impl Default for Settings {
             survey_segments: Vec::new(),
             explore: ExploreSettings::default(),
             survey_row_s: 0.0,
+            scan: ScanSettings::default(),
         }
     }
 }

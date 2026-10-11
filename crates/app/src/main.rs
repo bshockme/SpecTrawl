@@ -112,6 +112,32 @@ enum GainMode {
 enum RxMode {
     Manual,
     Explore,
+    /// Super-scanner: follows the active signals in the explore filters'
+    /// ranges under a rule (newest, busiest range, stay), audio on.
+    Scan,
+}
+
+impl RxMode {
+    fn name(self) -> &'static str {
+        match self {
+            RxMode::Manual => "Manual",
+            RxMode::Explore => "Explore",
+            RxMode::Scan => "Scan",
+        }
+    }
+}
+
+/// The signal a scanning receiver is parked on.
+#[derive(Debug, Clone)]
+struct ScanTarget {
+    emitter: u64,
+    center_hz: f64,
+    bandwidth_hz: f64,
+    label: String,
+    /// When the survey first saw the emitter (the "newest" rule's clock).
+    first_seen: SystemTime,
+    started: std::time::Instant,
+    last_active: std::time::Instant,
 }
 
 struct Receiver {
@@ -121,6 +147,8 @@ struct Receiver {
     mode: RxMode,
     /// The explore visit in progress.
     visit: Option<engine::explore::Visit>,
+    /// The scanner's current signal.
+    scan: Option<ScanTarget>,
     /// The last verdict, shown in the pane for a moment.
     last_verdict: Option<(std::time::Instant, String)>,
     /// Records for the boxes, refetched only when new rows arrive.
@@ -444,6 +472,7 @@ enum Cmd {
     Lockout(u32),
     Reset,
     Explore(ReceiverId, bool),
+    Scan(ReceiverId, bool),
 }
 
 /// Per-frame facts the receiver panes share (live spans for the survey's
@@ -943,6 +972,8 @@ impl App {
         for id in &live {
             let on = self.receiver(*id).is_some_and(|p| p.mode == RxMode::Explore);
             v.push((format!("{} explore on {id}", if on { "Stop" } else { "Start" }), "explore auto visit survey", Cmd::Explore(*id, !on)));
+            let on = self.receiver(*id).is_some_and(|p| p.mode == RxMode::Scan);
+            v.push((format!("{} scanner on {id}", if on { "Stop" } else { "Start" }), "scan scanner follow active audio", Cmd::Scan(*id, !on)));
         }
         v.push(("Export emitters and records (CSV)".into(), "export csv emitters records", Cmd::ExportEmitters));
         v.push(("Reset layout".into(), "reset layout", Cmd::Reset));
@@ -1021,6 +1052,7 @@ impl App {
                 self.workspace_name = None;
             }
             Cmd::Explore(id, on) => self.set_mode(id, if on { RxMode::Explore } else { RxMode::Manual }),
+            Cmd::Scan(id, on) => self.set_mode(id, if on { RxMode::Scan } else { RxMode::Manual }),
         }
     }
 
@@ -1392,6 +1424,7 @@ impl App {
                     view,
                     mode: RxMode::Manual,
                     visit: None,
+                    scan: None,
                     last_verdict: None,
                     records: (None, std::time::Instant::now(), Vec::new().into()),
                     gain_mode: GainMode::Linearity,
@@ -1431,13 +1464,108 @@ impl App {
         if p.mode == mode {
             return;
         }
+        let was = p.mode;
         p.mode = mode;
         p.visit = None;
-        log::info!("receiver {id}: {mode:?}");
-        if mode == RxMode::Manual {
+        p.scan = None;
+        log::info!("receiver {id}: {}", mode.name());
+        if was == RxMode::Explore {
             self.explorer.abandon(id.0);
-        } else if self.explore_since.is_none() {
+        }
+        if was == RxMode::Scan && self.receiver(id).is_some_and(|p| p.source.listening().is_some()) {
+            self.stop_listen();
+        }
+        if mode != RxMode::Manual && self.explore_since.is_none() {
             self.explore_since = Some(SystemTime::now());
+        }
+    }
+
+    /// The scanner's turn (same cadence as the explorer): keep or leave the
+    /// current signal by the rule, and pick the next active one.
+    fn scan_step(&mut self, survey: &[engine::Emitter], now: std::time::Instant) {
+        let scanning: Vec<ReceiverId> = self.panes.iter().filter(|p| p.mode == RxMode::Scan).map(|p| p.id).collect();
+        if scanning.is_empty() {
+            return;
+        }
+        let cfg = self.settings.explore.to_config();
+        let scan = self.settings.scan.clone();
+        let aviation = engine::explore::preset("Aviation");
+        let eligible = |e: &engine::Emitter| {
+            e.confirmed && e.active && cfg.allowed(e.center_hz) && (!scan.aviation || aviation.is_some_and(|p| p.contains(e.center_hz)))
+        };
+        // Activity per range, for the busiest-range rule: a user range, else
+        // a preset, else a 1 MHz cell.
+        let range_of = |hz: f64| -> String {
+            let mhz = hz / 1e6;
+            if let Some((lo, hi)) = cfg.ranges_mhz.iter().find(|(lo, hi)| (*lo..=*hi).contains(&mhz)) {
+                return format!("{lo:.1}-{hi:.1}");
+            }
+            if let Some(p) = engine::explore::PRESETS.iter().find(|p| p.contains(hz)) {
+                return p.name.to_string();
+            }
+            format!("{:.0} MHz", mhz.floor())
+        };
+        let mut per_range: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for e in survey.iter().filter(|e| eligible(e)) {
+            *per_range.entry(range_of(e.center_hz)).or_default() += 1;
+        }
+        let busiest = per_range.iter().max_by_key(|(_, n)| **n).map(|(k, _)| k.clone());
+        let taken: Vec<u64> = self.panes.iter().filter_map(|p| p.scan.as_ref().map(|t| t.emitter)).collect();
+        for id in scanning {
+            let Some(p) = self.receiver(id) else { continue };
+            let mut current = p.scan.clone();
+            // Keep or leave the current signal.
+            if let Some(t) = current.as_mut() {
+                let obs = Self::observe(p, t.center_hz, t.bandwidth_hz);
+                let still_listed = survey.iter().any(|e| e.id == t.emitter && e.active);
+                if obs.active || still_listed {
+                    t.last_active = now;
+                }
+                if let Some(l) = obs.label.filter(|l| !l.is_empty()) {
+                    t.label = l;
+                }
+                let silent = now.duration_since(t.last_active).as_secs_f64() >= scan.silence_s;
+                let too_long = now.duration_since(t.started).as_secs_f64() >= scan.max_s;
+                if silent || too_long {
+                    log::debug!("scan {id}: leaving {:.4} MHz ({})", t.center_hz / 1e6, if silent { "silent" } else { "time" });
+                    current = None;
+                }
+            }
+            // Candidates, by rule.
+            let mut cands: Vec<&engine::Emitter> = survey.iter().filter(|e| eligible(e) && !taken.iter().any(|t| *t == e.id && current.as_ref().is_none_or(|c| c.emitter != e.id))).collect();
+            if scan.rule == settings::ScanRule::MostSignals {
+                if let Some(b) = &busiest {
+                    cands.retain(|e| &range_of(e.center_hz) == b);
+                }
+            }
+            cands.sort_by(|a, b| b.first_seen.cmp(&a.first_seen).then(b.last_seen.cmp(&a.last_seen)));
+            let pick = match (&current, scan.rule) {
+                (Some(_), settings::ScanRule::Stay) => None,
+                (Some(c), _) => cands.first().filter(|e| e.id != c.emitter && e.first_seen > c.first_seen + std::time::Duration::from_secs(1)).copied(),
+                (None, _) => cands.first().copied(),
+            };
+            if let Some(e) = pick {
+                let label = e.label().unwrap_or_default();
+                let mode = if scan.aviation { engine::DemodMode::Am } else { self.auto_mode(e.center_hz, &label, e.bandwidth_hz) };
+                log::debug!("scan {id}: {:.4} MHz {} ({label}), {} eligible", e.center_hz / 1e6, mode.name(), cands.len());
+                self.explore_tuning = true;
+                self.start_listen(id, engine::ListenSpec { center_hz: e.center_hz, mode, follow: false, tdma: false, slot: None });
+                self.explore_tuning = false;
+                current = Some(ScanTarget {
+                    emitter: e.id,
+                    center_hz: e.center_hz,
+                    bandwidth_hz: e.bandwidth_hz,
+                    label,
+                    first_seen: e.first_seen,
+                    started: now,
+                    last_active: now,
+                });
+            } else if current.is_none() && p.source.listening().is_some() {
+                self.stop_listen();
+            }
+            if let Some(p) = self.receiver_mut(id) {
+                p.scan = current;
+            }
         }
     }
 
@@ -1515,6 +1643,7 @@ impl App {
             return;
         }
         let Some(survey) = self.receiver(ReceiverId::SWEEP).map(|s| s.source.emitters()) else { return };
+        self.scan_step(&survey, std::time::Instant::now());
         let cfg = self.settings.explore.to_config();
         let now = std::time::Instant::now();
         let baseline = self.explore_since.unwrap_or_else(SystemTime::now);
@@ -2264,6 +2393,8 @@ impl App {
         };
         let mut open_inspector = false;
         let self_cap_s = self.settings.explore.cap_s;
+        let scan_rule_name = self.settings.scan.rule.name();
+        let scan_aviation = self.settings.scan.aviation;
         {
             let App { panes, sweep_lo_mhz, sweep_hi_mhz, frame, .. } = &mut *self;
             let Some(p) = panes.iter_mut().find(|p| p.id == id) else { return };
@@ -2307,6 +2438,13 @@ impl App {
                 for (rx, (lo, hi)) in &frame.live_spans {
                     p.view.bracket(ui, r, *lo, *hi, &rx.to_string());
                 }
+                // Where a click would put the target: its span, centred on
+                // the pointer (on a record, on the record).
+                if let (Some(hz), Some((_, (tlo, thi)))) = (res.hover_hz, frame.live_spans.iter().find(|(rx, _)| *rx == target)) {
+                    let half = (thi - tlo) / 2.0;
+                    let c = res.record.and_then(|rid| records.iter().find(|r| r.id == rid).map(|r| r.center_hz())).unwrap_or(hz);
+                    p.view.bracket(ui, r, c - half, c + half, &format!("→ {target}"));
+                }
                 // Survey click: tune the target there; on a record, also
                 // select it and centre on the record, not the click point.
                 if let Some(rid) = res.record {
@@ -2322,6 +2460,24 @@ impl App {
                 let lost = p.source.stats().device_lost;
                 let title = format!("{id} · {} · {:.3} MHz · {:.1} MS/s{}", info.label, snap.center_hz / 1e6, snap.sample_rate / 1e6, if lost { " · DEVICE LOST, waiting for it to return" } else { "" });
                 let res = p.view.show(ui, r, &title, None, &records, sel_record, sel_emitter);
+                if p.mode == RxMode::Scan {
+                    let line = match &p.scan {
+                        Some(t) => format!(
+                            "SCAN · {} · {:.4} MHz · {} · {:.0} s{}",
+                            scan_rule_name,
+                            t.center_hz / 1e6,
+                            if t.label.is_empty() { "unlabelled" } else { t.label.as_str() },
+                            t.started.elapsed().as_secs_f64(),
+                            if scan_aviation { " · aviation AM" } else { "" }
+                        ),
+                        None => format!("SCAN · {} · waiting for activity{}", scan_rule_name, if scan_aviation { " · aviation AM" } else { "" }),
+                    };
+                    let painter = ui.painter_at(r);
+                    let g = painter.layout_no_wrap(line, egui::FontId::monospace(11.0), theme::TEXT);
+                    let at = egui::pos2(r.left() + 8.0, r.top() + spectrum_view::HEADER_H + 6.0);
+                    painter.rect_filled(egui::Rect::from_min_size(at - egui::vec2(5.0, 2.0), g.size() + egui::vec2(10.0, 4.0)), 3.0, theme::PANEL.gamma_multiply(0.9));
+                    painter.galley(at, g, theme::TEXT);
+                }
                 if p.mode == RxMode::Explore {
                     // The explorer's state, over the top of the spectrum.
                     let now = std::time::Instant::now();
@@ -2439,13 +2595,16 @@ impl App {
                         acts.push(Act::Tune(id, mhz * 1e6));
                     }
                     ui.label(egui::RichText::new("Centre").small().color(theme::MUTED));
-                    let exploring = p.mode == RxMode::Explore;
-                    if ui
-                        .selectable_label(exploring, egui::RichText::new(if exploring { "Explore ●" } else { "Explore" }).small())
-                        .on_hover_text("Visit the survey's emitters in turn and log a verdict for each (docs/auto-explore.md); any manual retune returns to Manual")
-                        .clicked()
-                    {
-                        acts.push(Act::Mode(id, if exploring { RxMode::Manual } else { RxMode::Explore }));
+                    // Mode: Manual, Explore (visit and classify), Scan (follow the
+                    // active ones with audio). Any manual retune returns to Manual.
+                    for (m, tip) in [
+                        (RxMode::Scan, "Scanner: follow the active signals in the explore filters' ranges by the rule in the Inspector (newest, busiest range, stay), audio on"),
+                        (RxMode::Explore, "Visit the survey's emitters in turn and log a verdict for each (docs/auto-explore.md)"),
+                    ] {
+                        let on = p.mode == m;
+                        if ui.selectable_label(on, egui::RichText::new(if on { format!("{} ●", m.name()) } else { m.name().to_string() }).small()).on_hover_text(tip).clicked() {
+                            acts.push(Act::Mode(id, if on { RxMode::Manual } else { m }));
+                        }
                     }
                     if ui
                         .selectable_label(target == id, egui::RichText::new("⌖").small())
@@ -2611,6 +2770,29 @@ impl App {
         }
         if let Some(m) = tune {
             self.retune(id, m);
+        }
+        if !id.is_sweep() {
+            ui.separator();
+            ui.label(egui::RichText::new("Scanner").small().strong().color(theme::MUTED));
+            let mut ch = false;
+            ui.horizontal(|ui| {
+                let mut rule = self.settings.scan.rule;
+                egui::ComboBox::from_id_salt("scan_rule").selected_text(rule.name()).width(150.0).show_ui(ui, |ui| {
+                    for r in settings::ScanRule::ALL {
+                        ch |= ui.selectable_value(&mut rule, r, r.name()).changed();
+                    }
+                });
+                self.settings.scan.rule = rule;
+                ch |= ui.checkbox(&mut self.settings.scan.aviation, "Aviation AM").on_hover_text("Only the Aviation preset (108–137, 225–400 MHz), AM with carrier squelch").changed();
+            });
+            ui.horizontal(|ui| {
+                ch |= ui.add(egui::DragValue::new(&mut self.settings.scan.silence_s).speed(0.1).range(0.5..=60.0).suffix(" s silence")).changed();
+                ch |= ui.add(egui::DragValue::new(&mut self.settings.scan.max_s).speed(1.0).range(5.0..=3600.0).suffix(" s max")).changed();
+                ui.label(egui::RichText::new("ranges and presets: Exploration tab → Filters").small().color(theme::MUTED));
+            });
+            if ch {
+                self.settings.save();
+            }
         }
         if show_segments {
             ui.separator();

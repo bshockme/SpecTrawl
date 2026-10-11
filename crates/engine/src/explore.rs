@@ -48,6 +48,11 @@ pub const PRESETS: &[Preset] = &[
     Preset { name: "Satellite", ranges_mhz: &[(137.0, 138.0), (243.0, 270.0), (399.9, 403.0), (1525.0, 1559.0), (1616.0, 1627.0)] },
 ];
 
+/// The preset with this name, if any.
+pub fn preset(name: &str) -> Option<&'static Preset> {
+    PRESETS.iter().find(|p| p.name == name)
+}
+
 impl Preset {
     pub fn contains(&self, hz: f64) -> bool {
         let mhz = hz / 1e6;
@@ -112,6 +117,11 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Whether the filters let an emitter at `hz` through at all.
+    pub fn allowed(&self, hz: f64) -> bool {
+        self.standing(hz).is_some()
+    }
+
     fn rule(&self, name: &str) -> Rule {
         self.presets.get(name).copied().unwrap_or_default()
     }

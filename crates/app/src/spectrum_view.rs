@@ -885,7 +885,8 @@ impl SpectrumView {
         }
         let click = resp.interact_pointer_pos().filter(|_| resp.clicked());
         let record = click.and(hovered);
-        ShowResult { freq_hz: click.map(|p| f0 + ((p.x - full.left()) / full.width()) as f64 * span), record }
+        let at = |p: Pos2| f0 + ((p.x - full.left()) / full.width()) as f64 * span;
+        ShowResult { freq_hz: click.map(at), record, hover_hz: hover.map(at) }
     }
 }
 
@@ -894,6 +895,8 @@ impl SpectrumView {
 pub struct ShowResult {
     pub freq_hz: Option<f64>,
     pub record: Option<u64>,
+    /// Frequency under the pointer while it hovers the view.
+    pub hover_hz: Option<f64>,
 }
 
 pub const HEADER_H: f32 = 26.0;

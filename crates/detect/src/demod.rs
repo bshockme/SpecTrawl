@@ -169,7 +169,8 @@ impl Demod {
         }
     }
 
-    /// Whether the squelch is open (NFM; AM and WFM are always open).
+    /// Whether the squelch is open (NFM noise squelch, AM carrier squelch;
+    /// WFM is always open).
     pub fn is_open(&self) -> bool {
         self.open
     }
@@ -206,6 +207,23 @@ impl Demod {
                     let m = s.norm();
                     let dc = self.dc.push(m);
                     self.agc += 0.0005 * (dc - self.agc);
+                    // Carrier squelch: noise alone has a Rayleigh envelope
+                    // whose ripple is broadband, while a carrier's modulation
+                    // sits below the voice band. The envelope ripple above
+                    // 6 kHz, relative to the carrier, is ~0.2 for noise and
+                    // falls with SNR once a carrier is there. Hysteresis
+                    // between 0.06 and 0.12.
+                    if self.squelch > 0.0 {
+                        let r = self.noise_hp.push(m - dc);
+                        let n = self.noise.push(r * r);
+                        let l = self.level.push(dc * dc);
+                        let cv2 = if l > 0.0 { n / l } else { 1.0 };
+                        if self.open && cv2 > AM_CLOSE_CV2 {
+                            self.open = false;
+                        } else if !self.open && cv2 < AM_OPEN_CV2 {
+                            self.open = true;
+                        }
+                    }
                     if self.agc > 0.0 { (m - dc) / (self.agc * 1.5) } else { 0.0 }
                 }
             };
@@ -216,7 +234,8 @@ impl Demod {
             // Linear-interpolating resampler to 48 kHz.
             while self.pos <= 1.0 {
                 let v = self.last + (y - self.last) * self.pos as f32;
-                out.push(if self.mode == Mode::Nfm && !self.open && self.squelch > 0.0 { 0.0 } else { v.clamp(-1.0, 1.0) });
+                let muted = matches!(self.mode, Mode::Nfm | Mode::Am) && !self.open && self.squelch > 0.0;
+                out.push(if muted { 0.0 } else { v.clamp(-1.0, 1.0) });
                 self.pos += step;
             }
             self.pos -= 1.0;
@@ -225,9 +244,49 @@ impl Demod {
     }
 }
 
+/// AM carrier squelch thresholds on (envelope ripple above 6 kHz / carrier)²:
+/// open below 0.06, closed above 0.12; noise alone sits near 0.2.
+const AM_OPEN_CV2: f32 = 0.06;
+const AM_CLOSE_CV2: f32 = 0.12;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn am_squelch_opens_on_a_carrier_and_closes_on_noise() {
+        let fs = 48_000.0;
+        let n = 48_000;
+        let mut seed = 12345u64;
+        let mut uni = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed >> 11) as f64 / (1u64 << 53) as f64).max(1e-12)
+        };
+        // Gaussian noise (Box-Muller): the envelope must be Rayleigh for the
+        // squelch's statistics to apply.
+        let mut rnd = move || ((-2.0 * uni().ln()).sqrt() * (2.0 * std::f64::consts::PI * uni()).cos()) as f32;
+        // Noise alone: Rayleigh envelope, squelch closes.
+        let noise: Vec<Complex32> = (0..n).map(|_| Complex32::new(rnd(), rnd())).collect();
+        let mut d = Demod::new(Mode::Am, fs);
+        let mut out = Vec::new();
+        d.process(&noise, &mut out);
+        assert!(!d.is_open(), "noise should close the AM squelch");
+        assert!(out[out.len() / 2..].iter().all(|v| *v == 0.0), "closed squelch mutes");
+        // A carrier modulated 80% by a 1 kHz tone over the same noise, 20 dB up: opens.
+        let am: Vec<Complex32> = (0..n)
+            .map(|i| {
+                let t = i as f64 / fs;
+                let env = 10.0 * (1.0 + 0.8 * (2.0 * std::f64::consts::PI * 1000.0 * t).sin()) as f32;
+                Complex32::new(env, 0.0) + Complex32::new(rnd(), rnd())
+            })
+            .collect();
+        let mut out = Vec::new();
+        d.process(&am, &mut out);
+        assert!(d.is_open(), "a carrier should open the AM squelch");
+        assert!(out[out.len() / 2..].iter().any(|v| v.abs() > 0.05));
+    }
 
     fn fm(fs: f64, n: usize, tone: f64, dev: f64) -> Vec<Complex32> {
         let mut ph = 0.0f64;
