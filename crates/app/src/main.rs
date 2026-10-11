@@ -2252,6 +2252,7 @@ impl App {
             Close(DeviceInfo),
             Err(String),
             Mode(ReceiverId, RxMode),
+            RecordAll(ReceiverId, bool),
         }
         let mut acts: Vec<Act> = Vec::new();
         let segments = self.settings.survey_segments.len();
@@ -2378,6 +2379,21 @@ impl App {
             ui.scope_builder(egui::UiBuilder::new().max_rect(hdr).layout(egui::Layout::right_to_left(egui::Align::Center)), |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 ui.menu_button(egui::RichText::new("…").small(), |ui| {
+                    if !id.is_sweep() {
+                        let mut on = p.source.record_all().is_some();
+                        if ui
+                            .checkbox(&mut on, "Record every signal")
+                            .on_hover_text("One SigMF channel capture per detected signal in this span (DDC'd to its bandwidth, start to stop) under captures/signals. Busy spans fill disks: ~0.4 MB/s per concurrent narrowband signal.")
+                            .changed()
+                        {
+                            acts.push(Act::RecordAll(id, on));
+                        }
+                        let st = p.source.record_all_status();
+                        if st.files > 0 || st.open > 0 {
+                            ui.label(egui::RichText::new(format!("{} files · {:.0} MB · {} open", st.files, st.bytes as f64 / 1e6, st.open)).small().color(theme::MUTED));
+                        }
+                        ui.separator();
+                    }
                     if ui.button("Close device").clicked() {
                         acts.push(Act::Close(info.clone()));
                         ui.close();
@@ -2453,6 +2469,12 @@ impl App {
                 Act::Close(d) => self.close(&d),
                 Act::Err(e) => self.error = Some(e),
                 Act::Mode(id, m) => self.set_mode(id, m),
+                Act::RecordAll(id, on) => {
+                    if let Some(p) = self.receiver(id) {
+                        log::info!("receiver {id}: record every signal {}", if on { "on" } else { "off" });
+                        p.source.set_record_all(on.then(engine::RecordAllConfig::default));
+                    }
+                }
             }
         }
     }
@@ -3655,6 +3677,22 @@ impl App {
                     } else {
                         let names: Vec<String> = monitors.iter().map(|m| m.label.clone()).collect();
                         kv(ui, "Monitors", &names.join(" · "));
+                    }
+                    if p.source.record_all().is_some() {
+                        let s = p.source.record_all_status();
+                        kv(
+                            ui,
+                            "Record all",
+                            &format!(
+                                "{} files · {:.1} MB · {} open · skipped {} expired, {} filtered{}",
+                                s.files,
+                                s.bytes as f64 / 1e6,
+                                s.open,
+                                s.skipped_expired,
+                                s.skipped_filter,
+                                s.last_error.as_ref().map(|e| format!(" · {e}")).unwrap_or_default()
+                            ),
+                        );
                     }
                     if let Some(s) = p.source.sweep_status() {
                         section(ui, "SWEEP");
