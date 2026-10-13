@@ -152,13 +152,18 @@ Still questionable in the after run, each worth a capture:
 - A strong 9 kHz signal at 855.6375 MHz (33 dB) alternated between
   "Analog FM" (deviation 1.3–1.5 kHz) and "2FSK 2400 Bd" from one window
   to the next. It is an analog FM repeater (an industrial railroad channel
-  nearby), so the FSK half was the error: a steady 1200 Hz tone on FM
-  gives a two-peak (arcsine) frequency histogram and, because the
-  symbol-rate detector works on the squared derivative, a line at exactly
-  2400. Fixed after run 3: `Features::tone_hz` finds a single pure tone
-  holding ≥ 50 % of the discriminator's power with no third harmonic
-  (alternating data makes a square wave, which has one), and such a window
-  is "Analog FM" before any FSK rule runs. Not in the run 3 numbers.
+  nearby), so the FSK half was the error. A capture of it keyed up shows
+  the idle carrier carrying a sub-audible tone near 65 Hz swung ±1.2 kHz
+  (over 80 % of the discriminator's power below 300 Hz): a sinusoidal
+  deviation gives a two-peak (arcsine) frequency histogram, which the
+  level counter reads as two FSK levels, and a spurious line in the
+  squared derivative then named a rate. Fixed after run 3:
+  `Features::tone_hz` finds a single tone holding ≥ 50 % of the
+  discriminator's power with no third harmonic (alternating data makes a
+  square wave, which has one), or a sub-audible band holding ≥ 70 %, and
+  such a window is "Analog FM" before any FSK rule runs. On the capture
+  every window from 0.5 to 1.5 s now reads "Analog FM"
+  (`detect/tests/real_captures.rs`). Not in the run 3 numbers.
 
 ## 5. What is still wrong or unknown
 

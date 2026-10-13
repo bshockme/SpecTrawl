@@ -1,0 +1,18 @@
+{
+  "annotations": [],
+  "captures": [
+    {
+      "core:datetime": "2026-10-12T22:02:00Z",
+      "core:frequency": 855637500.0,
+      "core:sample_start": 0
+    }
+  ],
+  "global": {
+    "core:datatype": "cf32_le",
+    "core:description": "Analog FM repeater (idle carrier with DCS, then voice) via SpecTrawl capture_channel",
+    "core:hw": "Airspy R2",
+    "core:recorder": "SpecTrawl capture_channel",
+    "core:sample_rate": 62500.0,
+    "core:version": "1.2.0"
+  }
+}

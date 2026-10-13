@@ -121,6 +121,13 @@ pub fn extract(x: &[Complex32], disc: &[f32], fs: f64) -> Features {
 /// sine has none).
 const TONE_SHARE: f32 = 0.5;
 const TONE_THIRD_HARMONIC: f32 = 0.03;
+/// A sub-audible tone (CTCSS and the like) on an otherwise idle carrier:
+/// this much of the discriminator's power below `SUBAUDIBLE_HZ`. No data
+/// mode keeps all its energy there. (A 65 Hz tone swinging ±1.2 kHz on a
+/// nearby repeater's idle carrier read as two FSK levels; its energy sits
+/// in a band around the tone rather than one sharp line.)
+const SUBAUDIBLE_HZ: f64 = 300.0;
+const SUBAUDIBLE_SHARE: f32 = 0.7;
 
 /// A pure tone dominating the instantaneous frequency (see `Features::tone_hz`).
 fn dominant_tone(disc: &[f32], fs: f64) -> Option<f32> {
@@ -130,11 +137,19 @@ fn dominant_tone(disc: &[f32], fs: f64) -> Option<f32> {
     }
     let n = 1usize << avail.ilog2();
     let mean = disc[..n].iter().sum::<f32>() / n as f32;
-    let mut buf: Vec<num_complex::Complex32> = disc[..n].iter().map(|&v| num_complex::Complex32::new(v - mean, 0.0)).collect();
+    let mut buf: Vec<num_complex::Complex32> = disc[..n]
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            let w = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos();
+            num_complex::Complex32::new((v - mean) * w, 0.0)
+        })
+        .collect();
     FftPlanner::new().plan_fft_forward(n).process(&mut buf);
     let bin_hz = fs / n as f64;
     let pw: Vec<f32> = buf[..n / 2].iter().map(|c| c.norm_sqr()).collect();
     let lo = (50.0 / bin_hz).ceil() as usize;
+    let sub = ((SUBAUDIBLE_HZ / bin_hz) as usize).min(pw.len());
     if lo + 8 >= pw.len() {
         return None;
     }
@@ -143,19 +158,23 @@ fn dominant_tone(disc: &[f32], fs: f64) -> Option<f32> {
         return None;
     }
     let (k, _) = pw[lo..].iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, v)| (i + lo, v))?;
-    let around = |c: usize| -> f32 {
-        let a = c.saturating_sub(2);
-        let b = (c + 3).min(pw.len());
+    let f = (k as f64 * bin_hz) as f32;
+    let band = |c: usize, half: usize| -> f32 {
+        let a = c.saturating_sub(half);
+        let b = (c + half + 1).min(pw.len());
         if a >= b { 0.0 } else { pw[a..b].iter().sum() }
     };
-    let line = around(k);
-    if line < TONE_SHARE * total {
-        return None;
+    // One line: within ±3 bins or ±5 % of its frequency, whichever is wider.
+    let half = ((0.05 * k as f64).ceil() as usize).max(3);
+    let line = band(k, half);
+    if line >= TONE_SHARE * total && (3 * k + half >= pw.len() || band(3 * k, half) <= TONE_THIRD_HARMONIC * line) {
+        return Some(f);
     }
-    if 3 * k + 2 < pw.len() && around(3 * k) > TONE_THIRD_HARMONIC * line {
-        return None;
+    // A sub-audible tone, spread a little: most of the power below 300 Hz.
+    if k < sub && pw[lo..sub].iter().sum::<f32>() >= SUBAUDIBLE_SHARE * total {
+        return Some(f);
     }
-    Some((k as f64 * bin_hz) as f32)
+    None
 }
 
 /// Counts peaks in a smoothed histogram of the discriminator output. Clean

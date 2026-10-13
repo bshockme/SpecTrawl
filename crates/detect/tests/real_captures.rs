@@ -163,3 +163,18 @@ fn flex_pages_decode_from_the_committed_slice() {
     assert_eq!(pages.len(), 5, "{frames:?}");
     assert_eq!(pages[0].capcode, 6402344);
 }
+
+/// An analog FM repeater close by (855.6375 MHz, an industrial railroad
+/// channel): idle carrier with a sub-audible tone swinging ±1.2 kHz, then
+/// voice. Half its windows used to read "2FSK 2400 Bd".
+#[test]
+fn analog_fm_repeater_is_never_fsk() {
+    let Some((x, fs)) = common::capture("855.6375MHz_Analog_FM_repeater") else { return };
+    for win in [0.5, 0.75, 1.0, 1.5] {
+        let n = (win * fs) as usize;
+        for (k, w) in x.chunks(n).enumerate().filter(|(_, w)| w.len() == n) {
+            let c = detect::classify(w, fs, 9_000.0);
+            assert!(c.protocol.is_none() && !c.label.contains("FSK"), "window {k} of {win} s: {}", c.label);
+        }
+    }
+}
