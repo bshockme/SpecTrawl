@@ -41,8 +41,27 @@ const COARSE_BIN_HZ: f64 = 10e3;
 /// Calls to `mark_active` between sweeps for stale unconfirmed emitters.
 const PRUNE_EVERY: u32 = 64;
 
-/// See `Emitter::label`.
-const STICKY_LABELS: [&str; 2] = ["Internal spur", "DC offset"];
+/// See `Emitter::label`: labels fixed by where a signal sits rather than
+/// by its modulation. Matched by prefix ("Internal spur (image)", "Spur
+/// comb 750 kHz").
+const STICKY_LABELS: [&str; 3] = ["Internal spur", "Spur comb", "DC offset"];
+
+/// A label fixed by position (see `STICKY_LABELS`).
+pub fn is_sticky(label: &str) -> bool {
+    STICKY_LABELS.iter().any(|s| label.starts_with(s))
+}
+
+/// Narrower than this, a signal is a line: a carrier, a spur or a birdie.
+const LINE_HZ: f64 = 5e3;
+/// Lines this close in frequency are the same line (a bin or two).
+const LINE_TOL_HZ: f64 = 1.5e3;
+/// A comb needs this many lines at one spacing, this one included (with
+/// twenty-odd lines in a 10 MHz span, three at some common spacing is
+/// coincidence about once per line; four is not)...
+const COMB_LINES: usize = 4;
+/// ...with spacings in this range (closer is one wide signal's structure,
+/// further apart is coincidence in a 10 MHz span).
+const COMB_SPACING_HZ: (f64, f64) = (20e3, 2.5e6);
 /// Closed records whose ring extents an emitter remembers.
 const RECENT_RECORDS: usize = 8;
 
@@ -109,8 +128,8 @@ impl Emitter {
         // Labels fixed by where the signal sits (the tuner's DC, the radio's
         // own spur grid) beat any feature vote: early looks at a record can
         // see it wider than it is and vote otherwise.
-        if let Some(l) = STICKY_LABELS.iter().find(|l| self.tally.contains_key(**l)) {
-            return Some(l.to_string());
+        if let Some(l) = self.tally.keys().find(|l| is_sticky(l)) {
+            return Some(l.clone());
         }
         self.protocol_label().or_else(|| self.majority_feature_label())
     }
@@ -156,6 +175,11 @@ impl Emitter {
     /// Wait before the next group attempt: `base` doubled per miss, capped.
     pub(crate) fn group_backoff(&self, base: std::time::Duration, max: std::time::Duration) -> std::time::Duration {
         base.saturating_mul(1u32 << self.group_misses.min(8)).min(max)
+    }
+
+    /// Bin width of the rows its records came from.
+    pub fn bin_hz(&self) -> f64 {
+        self.bin_hz
     }
 
     /// Fraction of the time between first and last seen that it was on.
@@ -415,7 +439,7 @@ impl EmitterBook {
 
     fn note(&mut self, id: u64, c: &Arc<Classification>) {
         let Some(e) = self.map.get_mut(&id) else { return };
-        if matches!(c.label.as_str(), "too short" | "IQ expired" | "interrupted") {
+        if matches!(c.label.as_str(), "too short" | "IQ expired" | "interrupted") || c.label == detect::WEAK {
             return;
         }
         *e.tally.entry(c.label.clone()).or_default() += 1;
@@ -460,6 +484,71 @@ impl EmitterBook {
 
     pub(crate) fn get(&self, id: u64) -> Option<&Emitter> {
         self.map.get(&id)
+    }
+
+    /// What the other lines in view say about a line at `center_hz` (a
+    /// signal narrower than `LINE_HZ`) on a receiver tuned to `tuner_hz`:
+    /// its mirror image about the tuner centre is also a line (the radio's
+    /// own, from its IF or sampling: image pairs sit symmetrically about
+    /// the centre and move with it), or it is one of a comb of lines at a
+    /// common spacing (a clock harmonic family, the host's or the radio's).
+    /// None when it stands alone.
+    pub(crate) fn spur_context(&self, center_hz: f64, bandwidth_hz: f64, tuner_hz: f64) -> Option<SpurContext> {
+        if bandwidth_hz >= LINE_HZ {
+            return None;
+        }
+        let lines: Vec<f64> = self
+            .map
+            .values()
+            .filter(|e| e.bandwidth_hz < LINE_HZ && e.records >= 2 && (e.center_hz - center_hz).abs() > LINE_TOL_HZ)
+            .map(|e| e.center_hz)
+            .collect();
+        let near = |f: f64| lines.iter().any(|l| (l - f).abs() <= LINE_TOL_HZ);
+        let offset = center_hz - tuner_hz;
+        if offset.abs() > LINE_TOL_HZ && near(tuner_hz - offset) {
+            return Some(SpurContext::ImagePair);
+        }
+        // Each other line proposes a spacing; the spacing most lines fit wins.
+        let mut best: Option<(usize, f64)> = None;
+        for l in &lines {
+            let d = (l - center_hz).abs();
+            if !(COMB_SPACING_HZ.0..=COMB_SPACING_HZ.1).contains(&d) {
+                continue;
+            }
+            let n = 1 + lines
+                .iter()
+                .filter(|m| {
+                    let k = ((*m - center_hz) / d).round();
+                    k != 0.0 && (*m - (center_hz + k * d)).abs() <= LINE_TOL_HZ
+                })
+                .count();
+            if n >= COMB_LINES && best.is_none_or(|(bn, bd)| n > bn || (n == bn && d < bd)) {
+                best = Some((n, d));
+            }
+        }
+        best.map(|(lines, spacing_hz)| SpurContext::Comb { spacing_hz, lines })
+    }
+}
+
+/// See `EmitterBook::spur_context`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SpurContext {
+    ImagePair,
+    Comb { spacing_hz: f64, lines: usize },
+}
+
+impl SpurContext {
+    pub fn label(&self) -> String {
+        match self {
+            SpurContext::ImagePair => "Internal spur (image)".to_string(),
+            SpurContext::Comb { spacing_hz, lines } => {
+                if *spacing_hz >= 1e6 {
+                    format!("Spur comb {:.2} MHz ({lines} lines)", spacing_hz / 1e6)
+                } else {
+                    format!("Spur comb {:.0} kHz ({lines} lines)", spacing_hz / 1e3)
+                }
+            }
+        }
     }
 }
 
@@ -544,6 +633,41 @@ mod tests {
         assert_eq!(b.map.len(), 1);
         assert_eq!(b.by_record[&10], id);
         assert_eq!(b.get(id).unwrap().records, 4);
+    }
+
+    #[test]
+    fn image_pairs_and_combs_are_the_radios_own() {
+        let mut b = EmitterBook::default();
+        // Lines at the tuner (240 MHz) ± 96, ± 296 and ± 392 kHz, as seen on air...
+        let mut n = 0;
+        for off in [-392.0, -296.0, -96.0, 96.0, 296.0, 392.0] {
+            for _ in 0..3 {
+                b.observe(&rec(n, 240.0 + off / 1e3, 1.8, n), true);
+                n += 1;
+            }
+        }
+        // ...and a comb at 750 kHz: 94.4992, 95.2492, 95.9992, 97.4992 MHz.
+        for mhz in [94.4992, 95.2492, 95.9992, 97.4992] {
+            for _ in 0..3 {
+                b.observe(&rec(n, mhz, 1.8, n), true);
+                n += 1;
+            }
+        }
+        // A lone line, and a voice channel.
+        b.observe(&rec(n, 241.0, 1.8, n), true);
+        b.observe(&rec(n + 1, 241.0, 1.8, n + 1), true);
+        b.observe(&rec(n + 2, 240.2, 12.5, n + 2), true);
+        assert_eq!(b.spur_context(240.096e6, 1.8e3, 240e6), Some(SpurContext::ImagePair));
+        assert_eq!(b.spur_context(239.608e6, 1.8e3, 240e6), Some(SpurContext::ImagePair));
+        match b.spur_context(95.2492e6, 1.8e3, 98e6) {
+            Some(SpurContext::Comb { spacing_hz, lines }) => {
+                assert!((spacing_hz - 750e3).abs() < 2e3, "{spacing_hz}");
+                assert_eq!(lines, 4);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(b.spur_context(241.0e6, 1.8e3, 240e6), None);
+        assert_eq!(b.spur_context(240.2e6, 12.5e3, 240e6), None, "not a line");
     }
 
     #[test]

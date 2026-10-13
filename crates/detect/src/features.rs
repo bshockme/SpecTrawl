@@ -3,7 +3,7 @@
 use num_complex::Complex32;
 use rustfft::FftPlanner;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Features {
     /// Envelope coefficient of variation (std/mean of |x|). Low for
     /// constant-envelope FM/FSK, high for AM/OOK.
@@ -18,6 +18,26 @@ pub struct Features {
     /// rate when within 3%.
     pub symbol_rate: Option<f64>,
     pub symbol_rate_raw: Option<f64>,
+    /// Signal-to-noise ratio of the window, dB: the channel's power density
+    /// against the noise floor beside it, measured by the caller on the
+    /// wideband spectrum (`classify` itself only sees the channel). A window
+    /// of floor alone (an empty stretch, a raised hump, a neighbour's skirt)
+    /// reads near 0 dB. NaN when the caller did not measure it.
+    pub snr_db: f32,
+}
+
+impl Default for Features {
+    fn default() -> Self {
+        Self {
+            envelope_cv: 0.0,
+            deviation_hz: 0.0,
+            offset_hz: 0.0,
+            fsk_levels: 0,
+            symbol_rate: None,
+            symbol_rate_raw: None,
+            snr_db: f32::NAN,
+        }
+    }
 }
 
 /// True where the envelope is clearly above the noise: above a third of the

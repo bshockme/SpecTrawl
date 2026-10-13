@@ -903,11 +903,12 @@ impl SpectrumView {
                         );
                     }
                     text += &format!(
-                        "\nlevels {} · {} · ±{:.1} kHz\nenvelope CV {:.2} · {:.2} s analysed",
+                        "\nlevels {} · {} · ±{:.1} kHz\nenvelope CV {:.2} · {} · {:.2} s analysed",
                         if f.fsk_levels == 0 { "-".to_string() } else { f.fsk_levels.to_string() },
                         f.symbol_rate_raw.map(|v| format!("{v:.0} Bd")).unwrap_or("no symbol rate".into()),
                         f.deviation_hz / 1e3,
                         f.envelope_cv,
+                        if f.snr_db.is_nan() { "SNR -".to_string() } else { format!("SNR {:.0} dB", f.snr_db) },
                         c.analysed_s
                     );
                 }

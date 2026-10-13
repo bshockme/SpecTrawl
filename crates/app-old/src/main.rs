@@ -140,6 +140,8 @@ struct ScanTarget {
     emitter: u64,
     center_hz: f64,
     bandwidth_hz: f64,
+    /// Survey bin the emitter was measured with (its width is whole bins).
+    bin_hz: f64,
     label: String,
     /// When the survey first saw the emitter (the "newest" rule's clock).
     first_seen: SystemTime,
@@ -230,6 +232,8 @@ fn db_ui(ui: &mut egui::Ui, p: &mut Receiver) {
 struct App {
     backends: Vec<Box<dyn Backend>>,
     devices: Vec<DeviceInfo>,
+    /// The record store (`Documents/SpecTrawl/spectrawl.db`), when it opened.
+    store: Option<engine_old::Store>,
     panes: Vec<Receiver>,
     paused: bool,
     /// Where survey clicks and table double-clicks tune (keys 1/2/3 pick it).
@@ -586,9 +590,17 @@ impl App {
         theme::apply(&cc.egui_ctx);
         let args = parse_args();
         let (lo, hi) = args.sweep_range.unwrap_or((24.0, 1800.0));
+        let store = match engine_old::Store::open(&engine_old::store::default_path(), &format!("app {}", env!("CARGO_PKG_VERSION"))) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                log::warn!("record store: {e}; running without one");
+                None
+            }
+        };
         let mut app = Self {
             backends: vec![Box::new(backend_airspy::AirspyBackend::new()), Box::new(backend_sim::SimBackend)],
             devices: Vec::new(),
+            store,
             panes: Vec::new(),
             paused: false,
             tune_target: ReceiverId::live(0),
@@ -1518,6 +1530,7 @@ impl App {
         log::info!("open {} ({}) as {id}: {}", info.label, info.serial, if result.is_ok() { "ok" } else { "failed" });
         match result {
             Ok(source) => {
+                source.set_store(self.store.as_ref());
                 // Set the opening gain explicitly (the pane's default below) so
                 // the engine knows it: the sweep's saved hop profile is keyed
                 // by gain, and a first run must land on the same key as later ones.
@@ -1665,7 +1678,7 @@ impl App {
             let mut current = p.scan.clone();
             // Keep or leave the current signal.
             if let Some(t) = current.as_mut() {
-                let obs = Self::observe(p, t.center_hz, t.bandwidth_hz);
+                let obs = Self::observe(p, t.center_hz, t.bandwidth_hz, t.bin_hz);
                 let still_listed = survey.iter().any(|e| e.id == t.emitter && e.active);
                 if obs.active || still_listed {
                     t.last_active = now;
@@ -1709,6 +1722,7 @@ impl App {
                     emitter: e.id,
                     center_hz: e.center_hz,
                     bandwidth_hz: e.bandwidth_hz,
+                    bin_hz: e.bin_hz(),
                     label,
                     first_seen: e.first_seen,
                     started: now,
@@ -1726,6 +1740,21 @@ impl App {
     /// Appends a verdict to the exploration CSV next to the emitter exports.
     fn explore_csv(&mut self, e: &engine_old::explore::LogEntry) {
         use std::io::Write;
+        if let Some(db) = &self.store {
+            db.verdict(&engine_old::store::VerdictRow {
+                receiver: e.receiver,
+                emitter_id: e.emitter,
+                center_hz: e.center_hz,
+                bandwidth_hz: e.bandwidth_hz,
+                kind: e.kind.name(),
+                label: &e.label,
+                ident: &e.id,
+                dwell_s: e.dwell_s,
+                in_place: e.in_place,
+                capture: e.capture.as_deref(),
+                evidence: &e.evidence,
+            });
+        }
         let path = engine_old::sigmf::default_dir().join("exploration_log.csv");
         let _ = std::fs::create_dir_all(engine_old::sigmf::default_dir());
         let fresh = !path.exists();
@@ -1822,10 +1851,10 @@ impl App {
 
     /// What a focus receiver sees of a survey emitter: its own emitters and
     /// known occupants overlapping the emitter's extent.
-    fn observe(p: &Receiver, e_center: f64, e_bw: f64) -> engine_old::explore::Observation {
+    fn observe(p: &Receiver, e_center: f64, e_bw: f64, e_bin: f64) -> engine_old::explore::Observation {
         let half = e_bw.max(54e3) / 2.0 + 27e3;
         let (lo, hi) = (e_center - half, e_center + half);
-        let mut obs = engine_old::explore::observe(&p.source.emitters(), lo, hi, std::time::Duration::from_secs(1), SystemTime::now());
+        let mut obs = engine_old::explore::observe(&p.source.emitters(), lo, hi, e_bw, e_bin, std::time::Duration::from_secs(1), SystemTime::now());
         // A known wideband occupant covering it is a classification in
         // itself, an identity when a decoder named it.
         if obs.id.is_none() {
@@ -1833,6 +1862,8 @@ impl App {
                 obs.active = true;
                 let named = k.station.is_some() || k.cell.as_ref().is_some_and(|c| c.sync.is_some());
                 obs.label = Some(k.label());
+                obs.evidence = Some(format!("occupant {} at {:.3}-{:.3} MHz", k.label(), k.occupant.lo_hz / 1e6, k.occupant.hi_hz / 1e6));
+                obs.votes = u32::MAX;
                 if named {
                     obs.protocol = true;
                     obs.id = Some(k.label());
@@ -1875,11 +1906,13 @@ impl App {
             for e in inside {
                 let half = e.bandwidth_hz.max(54e3) / 2.0 + 27e3;
                 let (elo, ehi) = (e.center_hz - half, e.center_hz + half);
-                let mut obs = engine_old::explore::observe(&focus, elo, ehi, std::time::Duration::from_secs(1), SystemTime::now());
+                let mut obs = engine_old::explore::observe(&focus, elo, ehi, e.bandwidth_hz, e.bin_hz(), std::time::Duration::from_secs(1), SystemTime::now());
                 if obs.id.is_none() {
                     if let Some(k) = occupants.iter().find(|k| k.occupant.lo_hz <= ehi && k.occupant.hi_hz >= elo) {
                         let named = k.station.is_some() || k.cell.as_ref().is_some_and(|c| c.sync.is_some());
                         obs.label = Some(k.label());
+                        obs.evidence = Some(format!("occupant {} at {:.3}-{:.3} MHz", k.label(), k.occupant.lo_hz / 1e6, k.occupant.hi_hz / 1e6));
+                        obs.votes = u32::MAX;
                         if named {
                             obs.protocol = true;
                             obs.id = Some(k.label());
@@ -1909,7 +1942,7 @@ impl App {
                     }
                 }
                 Some(mut v) => {
-                    let obs = Self::observe(p, v.center_hz, v.bandwidth_hz);
+                    let obs = Self::observe(p, v.center_hz, v.bandwidth_hz, v.bin_hz);
                     if let Some(verdict) = v.update(&obs, &cfg, now) {
                         log::debug!(
                             "explore {id}: emitter {} {} {:?} {:?} after {:.1} s",

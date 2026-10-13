@@ -275,9 +275,22 @@ fn sync_disc(x: &[Complex32], fs: f64) -> Vec<f32> {
     disc
 }
 
+/// What the caller knows about a window that the channel alone can't show.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Hints {
+    /// The window's signal-to-noise ratio, dB, from the wideband spectrum
+    /// (see `Features::snr_db`).
+    pub snr_db: Option<f32>,
+}
+
 /// Classifies one channel: `x` is complex baseband centred on the signal,
 /// sampled at `fs`; `bandwidth_hz` is the detector's occupied bandwidth.
 pub fn classify(x: &[Complex32], fs: f64, bandwidth_hz: f64) -> Classification {
+    classify_with(x, fs, bandwidth_hz, Hints::default())
+}
+
+/// `classify` with what the caller measured about the window.
+pub fn classify_with(x: &[Complex32], fs: f64, bandwidth_hz: f64, hints: Hints) -> Classification {
     let analysed_s = x.len() as f64 / fs;
     let mut c = Classification {
         label: String::new(),
@@ -301,6 +314,7 @@ pub fn classify(x: &[Complex32], fs: f64, bandwidth_hz: f64) -> Classification {
     let on_iq: Vec<Complex32> = x.iter().zip(&gate).filter(|(_, g)| **g).map(|(v, _)| *v).collect();
     c.features = features::extract(&on_iq, &on, fs);
     c.features.envelope_cv = features::envelope_cv(x);
+    c.features.snr_db = hints.snr_db.unwrap_or(f32::NAN);
 
     // FLEX pagers: a 1600-baud header (sync 1 and a checked frame info
     // word) identifies them outright; the frame after it switches speed, so
@@ -388,11 +402,14 @@ pub fn classify(x: &[Complex32], fs: f64, bandwidth_hz: f64) -> Classification {
         }
     }
     // A GSM beacon: FCCH tone bursts on the frame grid, BSIC from the SCH.
+    // The tone bursts alone are not enough to name it (an FM broadcast
+    // station's pilot and programme passed that test on air); a decoded
+    // SCH is.
     if (150e3..300e3).contains(&bandwidth_hz) {
-        if let Some(g) = gsm::detect(raw, fs) {
+        if let Some(g) = gsm::detect(raw, fs).filter(|g| g.sch_ok > 0) {
             c.protocol = Some("GSM".into());
             c.label = g.label();
-            c.confidence = if g.sch_ok > 0 { 0.95 } else { 0.7 };
+            c.confidence = 0.95;
             c.fields = Some(decode::Fields {
                 id: g.id(),
                 kinds: vec![("FCCH".into(), g.fcch_hits), ("SCH".into(), g.sch_ok)],
@@ -404,7 +421,16 @@ pub fn classify(x: &[Complex32], fs: f64, bandwidth_hz: f64) -> Classification {
             return c;
         }
     }
-    let gated = gate.iter().filter(|g| !**g).count() as f32 / gate.len() as f32;
+    // Feature labels describe the modulation, so they need a signal to
+    // describe: a window whose channel is within `WEAK_DB` of the floor
+    // beside it has noise statistics (envelope CV ≈ 0.52, a one-hump
+    // frequency histogram, a few kHz of "deviation"), which read as AM,
+    // analog FM or a carrier. On air those were most of the wrong labels.
+    if hints.snr_db.is_some_and(|s| s < WEAK_DB) {
+        c.label = WEAK.into();
+        c.confidence = 0.1;
+        return c;
+    }
     let (label, conf) = if bandwidth_hz > 150e3 {
         (if f.envelope_cv < 0.25 { "Wideband FM".to_string() } else { "Wideband".to_string() }, 0.5)
     } else if bandwidth_hz < 4.5e3 && f.fsk_levels == 0 {
@@ -416,11 +442,22 @@ pub fn classify(x: &[Complex32], fs: f64, bandwidth_hz: f64) -> Classification {
         // Two histogram peaks without a symbol rate is more likely sine-tone
         // FM (arcsine distribution) than FSK; four peaks isn't.
         ("4FSK".to_string(), 0.5)
-    } else if let Some(r) = f.symbol_rate {
+    } else if let (Some(r), true) = (f.symbol_rate, f.envelope_cv < 0.3) {
+        // A timing line without clear levels is FSK only if the envelope is
+        // steady: AM and pulses put a line at their modulation rate too.
         (format!("FSK {:.0} Bd", r), 0.5)
-    } else if f.envelope_cv > 0.35 && gated < 0.2 {
-        // Envelope varies while the signal is present: amplitude modulation.
-        ("AM / OOK".to_string(), 0.5)
+    } else if f.envelope_cv > 0.35 {
+        // The envelope varies. Amplitude
+        // modulation shows one of two shapes: a carrier line standing clear
+        // of its sidebands with voice-band envelope content (AM), or the
+        // signal switching between two levels (OOK, pulses). A varying
+        // envelope with neither is noise, a neighbour's skirt or a hump of
+        // floor: not a modulation.
+        match am_evidence(raw, fs) {
+            Some(AmKind::Voice) => ("AM".to_string(), 0.6),
+            Some(AmKind::Keyed) => ("OOK".to_string(), 0.6),
+            None => ("Unknown".to_string(), 0.2),
+        }
     } else if (1000.0..7000.0).contains(&f.deviation_hz) {
         ("Analog FM".to_string(), 0.5)
     } else {
@@ -429,6 +466,65 @@ pub fn classify(x: &[Complex32], fs: f64, bandwidth_hz: f64) -> Classification {
     c.label = label;
     c.confidence = conf;
     c
+}
+
+/// Window SNR below which no feature label is given (see `classify_with`).
+pub const WEAK_DB: f32 = 7.0;
+/// The label of a window too weak to describe. Not a classification: the
+/// emitter book doesn't count it and the explorer doesn't log it.
+pub const WEAK: &str = "Weak";
+
+enum AmKind {
+    Voice,
+    Keyed,
+}
+
+/// Positive evidence of amplitude modulation on a channel (see `classify_with`).
+fn am_evidence(x: &[Complex32], fs: f64) -> Option<AmKind> {
+    if x.len() < 4096 {
+        return None;
+    }
+    // Keyed: the envelope sits at two levels 12 dB apart, nearly every
+    // sample at one or the other (noise alone is Rayleigh: its 10th and
+    // 90th percentiles are 13 dB apart too, but only 40% of it is near
+    // either), and the carrier is plain while on (a TDMA burst is keyed
+    // but carries FSK; a transmission starting mid-window is keyed but
+    // carries FM).
+    let mut mags: Vec<f32> = x.iter().map(|c| c.norm()).collect();
+    let n = mags.len();
+    let (i10, i90) = (n / 10, n * 9 / 10);
+    let hi = *mags.clone().select_nth_unstable_by(i90, f32::total_cmp).1;
+    let lo = *mags.select_nth_unstable_by(i10, f32::total_cmp).1;
+    if hi > 4.0 * lo.max(1e-9) {
+        let near_hi = x.iter().filter(|c| (c.norm() - hi).abs() <= 0.25 * hi).count() as f32 / n as f32;
+        let near_lo = x.iter().filter(|c| c.norm() < 0.25 * hi).count() as f32 / n as f32;
+        if near_hi + near_lo >= 0.7 {
+            // Instantaneous frequency while on, smoothed over 8 samples
+            // (one sample's phase step is mostly noise even at 25 dB; a
+            // symbol of FSK is 10 samples or more at these rates).
+            let k = (fs / (2.0 * std::f64::consts::PI)) as f32;
+            let inst: Vec<f32> = x
+                .windows(2)
+                .filter(|w| w[0].norm() > 0.5 * hi && w[1].norm() > 0.5 * hi)
+                .map(|w| (w[1] * w[0].conj()).arg() * k)
+                .collect();
+            let mut dev: Vec<f32> = inst.windows(8).map(|w| (w.iter().sum::<f32>() / 8.0).abs()).collect();
+            if dev.len() >= 256 {
+                let i98 = dev.len() * 98 / 100;
+                let p98 = *dev.select_nth_unstable_by(i98, f32::total_cmp).1;
+                if p98 < 600.0 {
+                    return Some(AmKind::Keyed);
+                }
+            }
+        }
+    }
+    // Voice: a carrier at least 10 dB over the noise beside it, modulated
+    // in the voice band (a bare carrier's ratio is about -40 dB).
+    let m = carrier::measure(x, fs);
+    if m.seconds > 0.0 && m.line_snr_db >= 10.0 && m.am_voice_db > -25.0 {
+        return Some(AmKind::Voice);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -500,6 +596,63 @@ mod tests {
         assert_eq!(c.protocol.as_deref(), Some("POCSAG"));
         let f = c.fields.expect("fields");
         assert_eq!(f.messages, vec!["1234567 (D): SPECTRAWL TEST".to_string()], "{f:?}");
+    }
+
+    /// Complex Gaussian noise, unit power.
+    fn noise(n: usize, seed: u64) -> Vec<Complex32> {
+        let mut seed = seed | 1;
+        let mut uni = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed >> 11) as f64 / (1u64 << 53) as f64).max(1e-12)
+        };
+        (0..n)
+            .map(|_| {
+                let r = (-2.0 * uni().ln()).sqrt() * std::f64::consts::FRAC_1_SQRT_2;
+                let th = 2.0 * std::f64::consts::PI * uni();
+                Complex32::new((r * th.cos()) as f32, (r * th.sin()) as f32)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn noise_is_not_a_modulation() {
+        let fs = 48_000.0;
+        let x = noise(72_000, 7);
+        // What a 25 kHz record of floor used to come out as.
+        let c = classify(&x, fs, 25_000.0);
+        assert_eq!(c.label, "Unknown", "{c:?}");
+        // Told the window is weak, it says so and stops.
+        let c = classify_with(&x, fs, 25_000.0, Hints { snr_db: Some(3.0) });
+        assert_eq!(c.label, WEAK);
+        assert_eq!(c.features.snr_db, 3.0);
+    }
+
+    #[test]
+    fn am_voice_and_ook_have_evidence() {
+        let fs = 48_000.0;
+        let n = 72_000;
+        let nz = noise(n, 11);
+        // AM: a carrier modulated 60% by a 1 kHz tone, 25 dB over the noise.
+        let am: Vec<Complex32> = (0..n)
+            .map(|i| {
+                let t = i as f64 / fs;
+                let a = 1.0 + 0.6 * (2.0 * std::f64::consts::PI * 1000.0 * t).sin();
+                Complex32::new(a as f32, 0.0) * 18.0 + nz[i]
+            })
+            .collect();
+        let c = classify_with(&am, fs, 8_000.0, Hints { snr_db: Some(25.0) });
+        assert_eq!(c.label, "AM", "{c:?}");
+        // OOK: the carrier keyed at 40 Hz, half on.
+        let ook: Vec<Complex32> = (0..n)
+            .map(|i| {
+                let on = ((i as f64 / fs * 40.0) as u64).is_multiple_of(2);
+                Complex32::new(if on { 18.0 } else { 0.0 }, 0.0) + nz[i]
+            })
+            .collect();
+        let c = classify_with(&ook, fs, 8_000.0, Hints { snr_db: Some(25.0) });
+        assert_eq!(c.label, "OOK", "{c:?}");
     }
 
     #[test]

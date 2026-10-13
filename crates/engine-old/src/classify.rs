@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use detect::{Classification, Ddc};
 use sdr_core::Complex32;
 
+use crate::store::ClassJob;
 use crate::{Shared, SignalRecord, SourceConfig};
 
 /// Re-classify an open record this often (less often once identified).
@@ -55,12 +56,27 @@ pub(crate) fn run(shared: Arc<Shared>, cfg: SourceConfig, stop: Arc<AtomicBool>,
             (win_start, jobs, work) = (Instant::now(), 0, Duration::ZERO);
         }
         let t0 = Instant::now();
+        let store = shared.store.lock().clone();
         if let Some(w) = follow_window(&shared, rate) {
             // Trunk following: a granted call's voice channel comes first.
             let class = classify_window(&shared, rate, &radio, &w, &mut chunk, &stop);
             log_call(&shared, w.center_hz, &class);
+            if let Some(db) = &store {
+                db.classification(&ClassJob {
+                    kind: "follow",
+                    record_id: None,
+                    emitter_id: None,
+                    center_hz: w.center_hz,
+                    bandwidth_hz: w.bandwidth_hz,
+                    tuner_hz: w.tuner_center_hz,
+                    window: (w.start, w.end),
+                    class: &class,
+                    ms: t0.elapsed().as_secs_f64() * 1e3,
+                });
+            }
         } else if let Some(rec) = pick(&shared) {
-            let class = Arc::new(classify_record(&shared, &cfg, rate, &radio, &rec, &mut chunk, &stop));
+            let (class, window) = classify_record(&shared, &cfg, rate, &radio, &rec, &mut chunk, &stop);
+            let class = Arc::new(class);
             log::debug!(
                 "classify: record {} at {:.4} MHz, {:.1} kHz: {} ({:.0} ms, {:.2} s analysed)",
                 rec.id,
@@ -73,7 +89,24 @@ pub(crate) fn run(shared: Arc<Shared>, cfg: SourceConfig, stop: Arc<AtomicBool>,
             log_call(&shared, rec.center_hz(), &class);
             let mut st = shared.records.lock();
             st.emitters.tally(rec.id, &class);
-            st.classes.insert(rec.id, (class, Instant::now(), rec.active));
+            let emitter = st.emitters.by_record.get(&rec.id).copied();
+            st.classes.insert(rec.id, (class.clone(), Instant::now(), rec.active));
+            if let Some(db) = &store {
+                db.classification(&ClassJob {
+                    kind: "record",
+                    record_id: Some(rec.id),
+                    emitter_id: emitter,
+                    center_hz: rec.center_hz(),
+                    bandwidth_hz: rec.bandwidth_hz(),
+                    tuner_hz: rec.tuner_center_hz,
+                    window,
+                    class: &class,
+                    ms: t0.elapsed().as_secs_f64() * 1e3,
+                });
+                if let Some(e) = emitter.and_then(|id| st.emitters.get(id)) {
+                    db.emitter(e);
+                }
+            }
         } else if let Some(job) = pick_emitter(&shared, rate) {
             let class = Arc::new(classify_window(&shared, rate, &radio, &job, &mut chunk, &stop));
             log::debug!(
@@ -84,7 +117,24 @@ pub(crate) fn run(shared: Arc<Shared>, cfg: SourceConfig, stop: Arc<AtomicBool>,
                 t0.elapsed().as_secs_f64() * 1e3
             );
             log_call(&shared, job.center_hz, &class);
-            shared.records.lock().emitters.set_group_class(job.emitter, class);
+            let mut st = shared.records.lock();
+            st.emitters.set_group_class(job.emitter, class.clone());
+            if let Some(db) = &store {
+                db.classification(&ClassJob {
+                    kind: "group",
+                    record_id: None,
+                    emitter_id: Some(job.emitter),
+                    center_hz: job.center_hz,
+                    bandwidth_hz: job.bandwidth_hz,
+                    tuner_hz: job.tuner_center_hz,
+                    window: (job.start, job.end),
+                    class: &class,
+                    ms: t0.elapsed().as_secs_f64() * 1e3,
+                });
+                if let Some(e) = st.emitters.get(job.emitter) {
+                    db.emitter(e);
+                }
+            }
         } else {
             std::thread::sleep(Duration::from_millis(100));
             continue;
@@ -127,16 +177,26 @@ fn log_call(shared: &Shared, center_hz: f64, c: &Classification) {
 
 fn pick(shared: &Shared) -> Option<SignalRecord> {
     let st = shared.records.lock();
+    // A record of an emitter already fixed by position (a spur, an image,
+    // a comb line) three times over doesn't need another look: those
+    // flicker in and out all day and would take most of the classifier's
+    // time.
+    let settled = |r: &SignalRecord| {
+        st.emitters.by_record.get(&r.id).and_then(|id| st.emitters.get(*id)).is_some_and(|e| {
+            e.tally.iter().any(|(l, n)| crate::emitters::is_sticky(l) && *n >= SETTLED_STICKY)
+        })
+    };
     // A closed record needs a (final) look if it was never classified, or
     // only while open, when it may have held too little signal.
     let fresh = |r: &SignalRecord| st.classes.get(&r.id).is_none_or(|c| c.2);
-    if let Some(r) = st.closed.iter().rev().take(200).find(|r| fresh(r)) {
+    if let Some(r) = st.closed.iter().rev().take(200).find(|r| fresh(r) && !settled(r)) {
         return Some(r.clone());
     }
     st.open
         .iter()
         // Let an open record build up ~0.25 s of signal before a first look.
         .filter(|r| r.rows >= 12)
+        .filter(|r| !settled(r))
         // Identified records need re-checking far less often.
         .filter(|r| {
             st.classes.get(&r.id).is_none_or(|c| {
@@ -186,6 +246,9 @@ const BURSTY_RECORD_S: f64 = 0.15;
 /// Records shorter than this can't hold two syncs; their emitter's group
 /// window covers them instead of a DDC pass each.
 const MIN_RECORD_S: f64 = 0.06;
+/// Position-fixed labels on an emitter before its records stop being
+/// classified (see `pick`).
+const SETTLED_STICKY: u32 = 3;
 
 /// Emitters still unidentified despite recent activity: their records were
 /// individually too short (TDMA slots, short bursts), so classify a window
@@ -255,9 +318,9 @@ fn classify_record(
     r: &SignalRecord,
     chunk: &mut [Complex32],
     stop: &AtomicBool,
-) -> Classification {
+) -> (Classification, (u64, u64)) {
     if r.duration_s() < MIN_RECORD_S && !r.active {
-        return label_only("too short");
+        return (label_only("too short"), (0, 0));
     }
     // The first row's FFTs started roughly one row before its end sample.
     let per_row = (rate / cfg.rows_per_sec) as u64;
@@ -270,7 +333,57 @@ fn classify_record(
         bandwidth_hz: r.bandwidth_hz(),
         tuner_center_hz: r.tuner_center_hz,
     };
-    classify_window(shared, rate, radio, &w, chunk, stop)
+    let window = (w.start, w.end);
+    (classify_window(shared, rate, radio, &w, chunk, stop), window)
+}
+
+/// Blocks of wideband IQ averaged for the window's SNR, spread over it.
+const SNR_FFT: usize = 16384;
+const SNR_BLOCKS: u64 = 24;
+
+/// The window's signal-to-noise ratio from the wideband spectrum: the mean
+/// power density over the record's bandwidth against the 20th percentile
+/// of the bins beside it (from 0.75 to 3 bandwidths out, plus a little,
+/// either side), in dB. Up to `SNR_BLOCKS` FFTs spread over `start..end`.
+/// None when the window is shorter than one block or the channel sits
+/// outside the row.
+fn window_snr(shared: &Shared, rate: f64, start: u64, end: u64, offset_hz: f64, bandwidth_hz: f64, buf: &mut Vec<Complex32>) -> Option<f32> {
+    let n = SNR_FFT as u64;
+    if end < start + n {
+        return None;
+    }
+    let bin_hz = rate / SNR_FFT as f64;
+    let centre = ((offset_hz + rate / 2.0) / bin_hz).round();
+    let half = (bandwidth_hz / 2.0 / bin_hz).ceil().max(1.0);
+    let near = half * 1.5 + 2.0;
+    let far = (half * 6.0 + 10e3 / bin_hz).max(near + 8.0);
+    if centre - far < 0.0 || centre + far >= SNR_FFT as f64 {
+        return None;
+    }
+    let mut sa = dsp::SpectrumAnalyzer::new(SNR_FFT);
+    buf.resize(SNR_FFT, Complex32::default());
+    let blocks = ((end - start) / n).min(SNR_BLOCKS).max(1);
+    let stride = (end - start - n) / blocks.max(1);
+    for b in 0..blocks {
+        let at = start + b * stride;
+        if shared.ring.lock().read(at, &mut buf[..]) {
+            sa.push(&buf[..]);
+        }
+    }
+    let mut power = Vec::with_capacity(SNR_FFT);
+    if !sa.take_power(&mut power) || power.len() != SNR_FFT {
+        return None;
+    }
+    let (c, h, nr, fr) = (centre as usize, half as usize, near as usize, far as usize);
+    let band = &power[c - h..=c + h];
+    let density = band.iter().map(|v| *v as f64).sum::<f64>() / band.len() as f64;
+    let mut beside: Vec<f32> = power[c - fr..c - nr].iter().chain(&power[c + nr + 1..=c + fr]).copied().collect();
+    if beside.len() < 8 {
+        return None;
+    }
+    let k = beside.len() / 5;
+    let floor = *beside.select_nth_unstable_by(k, f32::total_cmp).1 as f64;
+    Some((10.0 * (density / floor.max(1e-30)).log10()) as f32)
 }
 
 fn classify_window(shared: &Shared, rate: f64, radio: &Radio, w: &Window, chunk: &mut [Complex32], stop: &AtomicBool) -> Classification {
@@ -311,7 +424,9 @@ fn classify_window(shared: &Shared, rate: f64, radio: &Radio, w: &Window, chunk:
     if chan.is_empty() {
         return label_only("IQ expired");
     }
-    let mut c = detect::classify(&chan, ddc.fs_out, w.bandwidth_hz);
+    let mut snr_buf = Vec::new();
+    let snr_db = window_snr(shared, rate, start, end, offset, w.bandwidth_hz, &mut snr_buf);
+    let mut c = detect::classify_with(&chan, ddc.fs_out, w.bandwidth_hz, detect::Hints { snr_db });
     let ctx = detect::context::Context {
         center_hz: w.center_hz,
         tuner_hz,
@@ -321,6 +436,16 @@ fn classify_window(shared: &Shared, rate: f64, radio: &Radio, w: &Window, chunk:
         dc_spike: radio.dc_spike,
     };
     detect::context::refine(&mut c, &ctx, &chan, ddc.fs_out);
+    // A line's company: its image about the tuner centre, or a comb it
+    // belongs to, says it is the radio's (or the host's) own whatever its
+    // modulation measured as. Protocols and already-placed labels stand.
+    if c.protocol.is_none() && !crate::emitters::is_sticky(&c.label) && !matches!(c.label.as_str(), "too short" | "IQ expired" | "interrupted") {
+        let ctx = shared.records.lock().emitters.spur_context(w.center_hz, w.bandwidth_hz, tuner_hz);
+        if let Some(sc) = ctx {
+            c.label = sc.label();
+            c.confidence = 0.8;
+        }
+    }
     c
 }
 

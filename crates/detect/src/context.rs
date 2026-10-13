@@ -32,6 +32,9 @@ const NARROW_HZ: f64 = 5e3;
 const DC_HZ: f64 = 1.5e3;
 /// Within this of a spur grid point a narrow line is the radio's own.
 const GRID_HZ: f64 = 2.5e3;
+/// Widest a voice channel gets (25 kHz land mobile, airband, marine);
+/// band names for voice services apply to emissions up to this.
+const VOICE_CHANNEL_HZ: f64 = 30e3;
 
 /// Rewrites `c.label` (never a decoded protocol) using the context, and for
 /// narrow unidentified signals, the carrier measurements on `x` (the channel
@@ -43,7 +46,7 @@ const GRID_HZ: f64 = 2.5e3;
 /// confidence when it is at least unmodulated. A modulated transmitter on a
 /// grid frequency keeps its modulation label.
 pub fn refine(c: &mut Classification, ctx: &Context, x: &[Complex32], fs: f64) {
-    if c.protocol.is_some() || matches!(c.label.as_str(), "too short" | "IQ expired" | "interrupted") {
+    if c.protocol.is_some() || matches!(c.label.as_str(), "too short" | "IQ expired" | "interrupted" | "Unknown") || c.label == crate::WEAK {
         return;
     }
     let narrow = ctx.bandwidth_hz < NARROW_HZ;
@@ -92,10 +95,14 @@ pub fn refine(c: &mut Classification, ctx: &Context, x: &[Complex32], fs: f64) {
             _ => {}
         }
     }
-    // Band context: name the service where the modulation fits it.
+    // Band context: name the service where the modulation and the width
+    // fit it. A voice service's channel is 25 kHz or less; a wider
+    // emission that reads as AM in the airband is a hump of floor or
+    // several channels, not "Aviation AM".
     let Some(band) = bandplan::lookup(ctx.center_hz) else { return };
-    let am = c.label.starts_with("AM");
-    let fm = c.label.contains("FM");
+    let voice_width = ctx.bandwidth_hz <= VOICE_CHANNEL_HZ;
+    let am = c.label.starts_with("AM") && voice_width;
+    let fm = c.label.contains("FM") && voice_width;
     let named = match (band.service, band.name) {
         (Service::Aviation, _) if am => Some("Aviation AM".to_string()),
         (Service::Military, _) if am => Some("Military air AM".to_string()),
@@ -191,11 +198,21 @@ mod tests {
         let mut c = class("AM / OOK");
         refine(&mut c, &ctx(123.0145, 20e3), &x, 48e3);
         assert_eq!(c.label, "Aviation AM");
+        // A 1.4 MHz "AM" emission in the military airband is not a voice channel.
+        let mut c = class("AM / OOK");
+        refine(&mut c, &ctx(227.0, 1.4e6), &x, 48e3);
+        assert_eq!(c.label, "AM / OOK");
         let mut c = class("AM / OOK");
         refine(&mut c, &ctx(433.92, 20e3), &x, 48e3);
         assert_eq!(c.label, "ISM 433 AM / OOK");
         let mut c = class("Analog FM");
         refine(&mut c, &ctx(162.475, 12e3), &x, 48e3);
         assert_eq!(c.label, "NOAA Weather Radio");
+        // Nothing to name: a weak or unknown window stays what it is.
+        for l in [crate::WEAK, "Unknown"] {
+            let mut c = class(l);
+            refine(&mut c, &ctx(915.0, 20e3), &x, 48e3);
+            assert_eq!(c.label, l);
+        }
     }
 }

@@ -205,6 +205,9 @@ pub struct LogEntry {
     pub in_place: bool,
     /// File stem of the channel capture saved for this visit, if any.
     pub capture: Option<String>,
+    /// What the verdict rested on: the focus emitter or occupant that
+    /// supplied the label, with its tally (see `Observation::evidence`).
+    pub evidence: String,
 }
 
 impl LogEntry {
@@ -240,7 +243,18 @@ pub struct Observation {
     pub protocol: bool,
     /// A decoded identity ("NAC 0x2A5", "CC 9", a cell, a station).
     pub id: Option<String>,
+    /// Where the label came from, for the record store: "focus emitter 12
+    /// at 280.0001 MHz, 2.4 kHz, 17 records, {Internal spur: 5}" or
+    /// "occupant FM broadcast 96.5 MHz".
+    pub evidence: Option<String>,
+    /// How many classifications the label rests on (an occupant counts as
+    /// many): one look at one record is not a determination.
+    pub votes: u32,
 }
+
+/// Classifications a feature label needs behind it before an in-place
+/// determination is logged as classified.
+pub const MIN_VOTES: u32 = 2;
 
 /// A visit in progress on one receiver.
 #[derive(Debug, Clone)]
@@ -248,6 +262,7 @@ pub struct Visit {
     pub emitter: u64,
     pub center_hz: f64,
     pub bandwidth_hz: f64,
+    pub bin_hz: f64,
     pub receiver: char,
     pub reason: String,
     pub started: Instant,
@@ -258,6 +273,8 @@ pub struct Visit {
     pub protocol: bool,
     pub id: Option<String>,
     protocol_since: Option<Instant>,
+    /// Evidence behind the latest label (see `Observation::evidence`).
+    pub evidence: Option<String>,
 }
 
 /// A feature label must hold this long before it counts as classified.
@@ -283,6 +300,9 @@ impl Visit {
             }
             (Some(l), None) => self.label = Some((l.clone(), now)),
             _ => {}
+        }
+        if obs.label.is_some() || obs.id.is_some() {
+            self.evidence = obs.evidence.clone();
         }
         if obs.protocol && self.protocol_since.is_none() {
             self.protocol_since = Some(now);
@@ -349,6 +369,8 @@ pub struct Candidate {
     pub emitter: u64,
     pub center_hz: f64,
     pub bandwidth_hz: f64,
+    /// Bin width the survey saw it with (its bandwidth is whole bins).
+    pub bin_hz: f64,
     pub reason: String,
 }
 
@@ -359,9 +381,10 @@ pub struct Explorer {
     pub log: Vec<LogEntry>,
     /// Receiver letter → emitter it is visiting.
     busy: HashMap<char, u64>,
-    /// Emitters determined in place and their best kind so far, so the log
-    /// only gains a row when a determination improves.
-    in_place: HashMap<u64, Kind>,
+    /// Emitters determined in place, their best kind so far and the label
+    /// it was logged with, so the log only gains a row when a determination
+    /// improves or its label changes.
+    in_place: HashMap<u64, (Kind, String)>,
 }
 
 /// An emitter overlapping any of these spans is in a focus receiver's view.
@@ -441,7 +464,7 @@ impl Explorer {
                 best = Some((key, e, why.join(", ")));
             }
         }
-        best.map(|(_, e, reason)| Candidate { emitter: e.id, center_hz: e.center_hz, bandwidth_hz: e.bandwidth_hz, reason })
+        best.map(|(_, e, reason)| Candidate { emitter: e.id, center_hz: e.center_hz, bandwidth_hz: e.bandwidth_hz, bin_hz: e.bin_hz, reason })
     }
 
     /// Starts a visit on `receiver`.
@@ -451,6 +474,7 @@ impl Explorer {
             emitter: c.emitter,
             center_hz: c.center_hz,
             bandwidth_hz: c.bandwidth_hz,
+            bin_hz: c.bin_hz,
             receiver,
             reason: c.reason.clone(),
             started: now,
@@ -460,6 +484,7 @@ impl Explorer {
             protocol: false,
             id: None,
             protocol_since: None,
+            evidence: None,
         }
     }
 
@@ -487,6 +512,7 @@ impl Explorer {
             dwell_s: v.dwell(now).as_secs_f64(),
             in_place: false,
             capture,
+            evidence: v.evidence.clone().unwrap_or_default(),
         };
         self.log.push(entry.clone());
         Some(entry)
@@ -498,19 +524,24 @@ impl Explorer {
     }
 
     /// An emitter inside a focus span was determined without a visit (§7).
-    /// Logged when it is the first determination or a better one.
+    /// Logged when it is the first determination, a better one, or the same
+    /// kind with a different label (a changed mind is worth a row). A
+    /// feature label needs `MIN_VOTES` classifications behind it: one look
+    /// at one record is how most wrong labels were made.
     pub fn determined_in_place(&mut self, receiver: char, e: &Emitter, obs: &Observation, now: Instant) -> Option<LogEntry> {
         let kind = if obs.protocol && obs.id.is_some() {
             Kind::Identified
-        } else if obs.label.is_some() {
+        } else if obs.label.is_some() && (obs.protocol || obs.votes >= MIN_VOTES) {
             Kind::Classified
         } else {
             return None;
         };
-        if self.in_place.get(&e.id).is_some_and(|k| *k >= kind) {
-            return None;
+        let label = obs.label.clone().unwrap_or_default();
+        match self.in_place.get(&e.id) {
+            Some((k, l)) if *k > kind || (*k == kind && *l == label) => return None,
+            _ => {}
         }
-        self.in_place.insert(e.id, kind);
+        self.in_place.insert(e.id, (kind, label));
         self.history.insert(e.id, History { last: now, kind, gone_streak: 0 });
         let entry = LogEntry {
             time: SystemTime::now(),
@@ -524,6 +555,7 @@ impl Explorer {
             dwell_s: 0.0,
             in_place: true,
             capture: None,
+            evidence: obs.evidence.clone().unwrap_or_default(),
         };
         self.log.push(entry.clone());
         Some(entry)
@@ -556,30 +588,60 @@ impl Explorer {
     }
 }
 
+/// Whether a focus emitter of `focus_bw` can be what the survey saw as
+/// `survey_bw` wide in `survey_bin` bins: the survey's width beyond its
+/// bin quantisation has to be mostly accounted for. A 2 kHz spur inside a
+/// 15 MHz hump of raised floor is not the hump; a 12.5 kHz channel seen as
+/// one 54 kHz survey bin is fine.
+pub fn comparable(focus_bw: f64, survey_bw: f64, survey_bin: f64) -> bool {
+    focus_bw >= (survey_bw - 2.0 * survey_bin).max(0.0) / 3.0
+}
+
 /// Builds the focus side's observation of a survey emitter from the focus
 /// receiver's emitters that overlap it (`lo..hi` is the survey emitter's
-/// extent, widened by a survey bin). The best overlapping emitter wins:
-/// one with a protocol, else the most-seen one.
-pub fn observe(focus: &[Emitter], lo: f64, hi: f64, active_within: Duration, now: SystemTime) -> Observation {
+/// extent, widened by a survey bin; `survey_bw` and `survey_bin` its width
+/// and the bin it was measured with). The best overlapping emitter of a
+/// comparable width wins: one with a protocol, else the most-seen one. An
+/// emitter of the wrong shape (a narrow line under a wide blob) only says
+/// something is active.
+pub fn observe(focus: &[Emitter], lo: f64, hi: f64, survey_bw: f64, survey_bin: f64, active_within: Duration, now: SystemTime) -> Observation {
     let mut obs = Observation::default();
     let mut best: Option<(i64, &Emitter)> = None;
+    let mut skipped = 0usize;
     for e in focus.iter().filter(|e| e.center_hz >= lo && e.center_hz <= hi) {
         let recent = e.active || now.duration_since(e.last_seen).map(|d| d <= active_within).unwrap_or(true);
         obs.active |= recent;
+        if !comparable(e.bandwidth_hz, survey_bw, survey_bin) {
+            skipped += 1;
+            continue;
+        }
         let score = (e.has_protocol() as i64) << 40 | (e.id().is_some() as i64) << 39 | e.records as i64;
         if best.as_ref().is_none_or(|(s, _)| score > *s) {
             best = Some((score, e));
         }
     }
+    if best.is_none() && skipped > 0 {
+        obs.evidence = Some(format!("{skipped} focus emitter(s) overlap but none is as wide as the survey's {:.0} kHz", survey_bw / 1e3));
+    }
     if let Some((_, e)) = best {
         obs.protocol = e.has_protocol();
         obs.label = e.label().filter(|l| !matches!(l.as_str(), "too short" | "IQ expired" | "interrupted" | "Wideband"));
+        obs.votes = obs.label.as_ref().and_then(|l| e.tally.get(l)).copied().unwrap_or(0);
         let id = e.id_label();
         obs.id = if obs.protocol && !id.is_empty() { Some(id) } else { None };
         // Pagers identify themselves by decoding at all.
         if obs.protocol && obs.id.is_none() && obs.label.as_deref().is_some_and(|l| l.starts_with("FLEX") || l.starts_with("POCSAG")) {
             obs.id = obs.label.clone();
         }
+        obs.evidence = Some(format!(
+            "focus emitter {} at {:.4} MHz, {:.1} kHz, {} records, snr {:.0}, tally {:?}",
+            e.id,
+            e.center_hz / 1e6,
+            e.bandwidth_hz / 1e3,
+            e.records,
+            e.peak_snr_db,
+            e.tally
+        ));
     }
     obs
 }
@@ -664,7 +726,7 @@ mod tests {
     #[test]
     fn visit_reaches_each_verdict() {
         let cfg = Config::default();
-        let c = Candidate { emitter: 7, center_hz: 155e6, bandwidth_hz: 12_500.0, reason: String::new() };
+        let c = Candidate { emitter: 7, center_hz: 155e6, bandwidth_hz: 12_500.0, bin_hz: 54e3, reason: String::new() };
         let t0 = Instant::now();
         let mut ex = Explorer::default();
         // Gone: nothing shows up.
@@ -675,7 +737,7 @@ mod tests {
         assert!(ex.finish(&v, &verdict, t0 + Duration::from_secs(4), None).is_none(), "gone isn't logged");
         // Identified: protocol with an identity.
         let mut v = ex.begin('A', &c, t0);
-        let obs = Observation { active: true, label: Some("P25 Phase 1".into()), protocol: true, id: Some("NAC 0x2A5".into()) };
+        let obs = Observation { active: true, label: Some("P25 Phase 1".into()), protocol: true, id: Some("NAC 0x2A5".into()), ..Default::default() };
         let verdict = v.update(&obs, &cfg, t0 + Duration::from_secs(1)).unwrap();
         assert_eq!(verdict.kind, Kind::Identified);
         let e = ex.finish(&v, &verdict, t0 + Duration::from_secs(1), Some("cap".into())).unwrap();
@@ -742,10 +804,10 @@ mod tests {
         let mut ex = Explorer::default();
         let e = emitter(9, 460.5, true, SystemTime::now());
         let t = Instant::now();
-        let classified = Observation { active: true, label: Some("4FSK 4800 Bd".into()), ..Default::default() };
+        let classified = Observation { active: true, label: Some("4FSK 4800 Bd".into()), votes: 3, ..Default::default() };
         assert!(ex.determined_in_place('A', &e, &classified, t).is_some());
         assert!(ex.determined_in_place('A', &e, &classified, t).is_none(), "same again: no new row");
-        let identified = Observation { active: true, label: Some("NXDN48".into()), protocol: true, id: Some("RAN 12".into()) };
+        let identified = Observation { active: true, label: Some("NXDN48".into()), protocol: true, id: Some("RAN 12".into()), ..Default::default() };
         let row = ex.determined_in_place('A', &e, &identified, t).unwrap();
         assert!(row.in_place && row.kind == Kind::Identified);
         assert!(ex.determined_in_place('A', &e, &classified, t).is_none(), "a worse one isn't logged");
@@ -762,13 +824,34 @@ mod tests {
         b.protocols.insert("DMR BS".into(), 3);
         b.tally.insert("DMR BS".into(), 3);
         b.ids.insert("CC 9".into(), 12);
-        let obs = observe(&[a.clone(), b.clone()], 154.95e6, 155.05e6, Duration::from_secs(1), now);
+        let obs = observe(&[a.clone(), b.clone()], 154.95e6, 155.05e6, 54e3, 54e3, Duration::from_secs(1), now);
         assert!(obs.active && obs.protocol);
         assert_eq!(obs.id.as_deref(), Some("CC 9"));
-        let obs = observe(&[a], 154.95e6, 155.05e6, Duration::from_secs(1), now);
+        let obs = observe(&[a.clone()], 154.95e6, 155.05e6, 54e3, 54e3, Duration::from_secs(1), now);
         assert_eq!(obs.label.as_deref(), Some("Analog FM"));
+        assert_eq!(obs.votes, 4);
         assert!(!obs.protocol && obs.id.is_none());
-        let none = observe(&[b], 160e6, 161e6, Duration::from_secs(1), now);
+        let none = observe(&[b], 160e6, 161e6, 54e3, 54e3, Duration::from_secs(1), now);
         assert_eq!(none, Observation::default());
+        // A 12.5 kHz focus emitter under a 15 MHz survey blob is not the blob:
+        // active, but no label.
+        let wide = observe(&[a], 150e6, 160e6, 15e6, 54e3, Duration::from_secs(1), now);
+        assert!(wide.active && wide.label.is_none(), "{wide:?}");
+        assert!(comparable(12.5e3, 54e3, 54e3) && comparable(12.5e3, 108e3, 54e3) && !comparable(2e3, 700e3, 54e3));
+    }
+
+    #[test]
+    fn in_place_needs_votes_and_logs_label_changes() {
+        let mut ex = Explorer::default();
+        let e = emitter(3, 460.0, true, SystemTime::now());
+        let t = Instant::now();
+        let one = Observation { active: true, label: Some("AM / OOK".into()), votes: 1, ..Default::default() };
+        assert!(ex.determined_in_place('A', &e, &one, t).is_none(), "one look is not a determination");
+        let two = Observation { active: true, label: Some("AM / OOK".into()), votes: 2, ..Default::default() };
+        assert!(ex.determined_in_place('A', &e, &two, t).is_some());
+        assert!(ex.determined_in_place('A', &e, &two, t).is_none(), "the same label again isn't logged");
+        let changed = Observation { active: true, label: Some("Analog FM".into()), votes: 5, ..Default::default() };
+        let row = ex.determined_in_place('A', &e, &changed, t).unwrap();
+        assert_eq!(row.label, "Analog FM");
     }
 }

@@ -17,6 +17,7 @@ mod rds_monitor;
 mod record_all;
 mod ring;
 pub mod sigmf;
+pub mod store;
 mod sweep;
 
 use std::collections::{HashMap, VecDeque};
@@ -44,6 +45,7 @@ pub use occupancy::KnownOccupant;
 pub use rds_monitor::StationInfo;
 pub use record_all::{RecordAllConfig, RecordAllStatus};
 pub use ring::IqRing;
+pub use store::Store;
 pub use sweep::{SweepPlan, SweepStatus};
 
 #[derive(Debug, Clone)]
@@ -286,6 +288,8 @@ struct Shared {
     /// The gain last set through `Source::set_gain` (None: the backend's
     /// opening default); part of the saved hop profile's key.
     gain: Mutex<Option<sdr_core::GainSetting>>,
+    /// Where records, classifications and emitters are filed, if anywhere.
+    store: Mutex<Option<store::SourceStore>>,
 }
 
 impl Shared {
@@ -300,7 +304,13 @@ impl Shared {
                     st.emitters.by_record.remove(&old.id);
                 }
             }
-            st.emitters.observe(&r, true);
+            let em = st.emitters.observe(&r, true);
+            if let Some(db) = self.store.lock().as_ref() {
+                db.record(&r, Some(em));
+                if let Some(e) = st.emitters.get(em) {
+                    db.emitter(e);
+                }
+            }
             st.closed.push_back(r);
         }
         let open = det.open_records();
@@ -412,6 +422,7 @@ impl Source {
             record_all: Mutex::new(None),
             record_all_status: Mutex::new(Default::default()),
             gain: Mutex::new(None),
+            store: Mutex::new(None),
         });
         device.start(Box::new(RingSink { shared: shared.clone() }))?;
         let info = device.info().clone();
@@ -519,6 +530,9 @@ impl Source {
             return Ok(());
         }
         log::debug!("{}: tune {:.4} MHz", self.info.serial, hz / 1e6);
+        if let Some(db) = self.shared.store.lock().as_ref() {
+            db.note(&format!("tune {:.4} MHz", hz / 1e6));
+        }
         self.device.lock().set_center(hz)
     }
 
@@ -556,7 +570,33 @@ impl Source {
     /// Puts a label on an emitter from outside the classifier (an explore
     /// verdict made on another receiver).
     pub fn label_emitter(&self, id: u64, class: Arc<detect::Classification>) {
-        self.shared.records.lock().emitters.adopt(id, class);
+        let mut st = self.shared.records.lock();
+        st.emitters.adopt(id, class);
+        if let (Some(db), Some(e)) = (self.shared.store.lock().as_ref(), st.emitters.get(id)) {
+            db.emitter(e);
+        }
+    }
+
+    /// Files this source's records, classifications and emitters in
+    /// `store` from now on (None stops).
+    pub fn set_store(&self, store: Option<&Store>) {
+        let s = store.map(|s| s.for_source(&self.info.serial));
+        if let Some(s) = &s {
+            s.note(&format!("source opened: {} {:?}", self.info.serial, self.mode_name()));
+        }
+        *self.shared.store.lock() = s;
+    }
+
+    fn mode_name(&self) -> String {
+        match &self.mode {
+            Mode::Live => format!("live at {:.4} MHz", self.device.lock().center_hz() / 1e6),
+            Mode::Sweep(p) => format!("sweep {:.1}-{:.1} MHz", p.start_hz / 1e6, p.stop_hz / 1e6),
+        }
+    }
+
+    /// The store this source files into, if any.
+    pub fn store(&self) -> Option<store::SourceStore> {
+        self.shared.store.lock().clone()
     }
 
     /// All emitters, active first, then most recently seen.
