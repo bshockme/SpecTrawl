@@ -122,6 +122,7 @@ struct ClassRow {
     fsk_levels: u8,
     symbol_rate: Option<f64>,
     symbol_rate_raw: Option<f64>,
+    tone_hz: Option<f32>,
     decoded: Option<(usize, usize)>,
     field_id: Option<String>,
     activity: Option<String>,
@@ -186,6 +187,9 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL").map_err(|e| e.to_string())?;
         conn.pragma_update(None, "synchronous", "NORMAL").map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA_SQL).map_err(|e| e.to_string())?;
+        // Columns added since the schema was first written (older files
+        // gain them in place; the error for an existing column is ignored).
+        let _ = conn.execute("ALTER TABLE classifications ADD COLUMN tone_hz REAL", []);
         let have: Option<String> =
             conn.query_row("SELECT value FROM meta WHERE key = 'schema'", [], |r| r.get(0)).ok();
         match have.and_then(|v| v.parse::<i64>().ok()) {
@@ -294,6 +298,7 @@ impl SourceStore {
             fsk_levels: f.fsk_levels,
             symbol_rate: f.symbol_rate,
             symbol_rate_raw: f.symbol_rate_raw,
+            tone_hz: f.tone_hz,
             decoded: fields.map(|f| (f.decoded, f.tried)),
             field_id: fields.and_then(|f| f.id.clone()),
             activity: fields.and_then(|f| f.activity.map(|a| format!("{a:?}"))),
@@ -403,9 +408,9 @@ fn write_one(tx: &rusqlite::Transaction, session: i64, m: Msg, flushes: &mut Vec
                 "INSERT INTO classifications(session, serial, time, kind, record_id, emitter_id, center_hz, bandwidth_hz, tuner_hz,
                    window_start, window_end, analysed_s, snr_db, label, protocol, confidence, sync_count, sync_baud,
                    envelope_cv, deviation_hz, offset_hz, fsk_levels, symbol_rate, symbol_rate_raw,
-                   decoded, tried, field_id, activity, talk, kinds, messages, ms)
+                   decoded, tried, field_id, activity, talk, kinds, messages, ms, tone_hz)
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
-                   ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)",
+                   ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)",
                 params![
                     session,
                     &*c.serial,
@@ -438,7 +443,8 @@ fn write_one(tx: &rusqlite::Transaction, session: i64, m: Msg, flushes: &mut Vec
                     c.talk,
                     c.kinds,
                     c.messages,
-                    c.ms
+                    c.ms,
+                    c.tone_hz
                 ],
             )?;
         }

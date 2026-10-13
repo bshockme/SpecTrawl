@@ -24,6 +24,12 @@ pub struct Features {
     /// of floor alone (an empty stretch, a raised hump, a neighbour's skirt)
     /// reads near 0 dB. NaN when the caller did not measure it.
     pub snr_db: f32,
+    /// A single pure tone that dominates the instantaneous frequency, Hz:
+    /// analog FM carrying a steady tone (a repeater's idle or test tone,
+    /// a telemetry tone). Its frequency histogram has two peaks (arcsine)
+    /// and its squared derivative a line at twice the tone, which read as
+    /// 2FSK at twice the tone's rate; this says otherwise.
+    pub tone_hz: Option<f32>,
 }
 
 impl Default for Features {
@@ -36,6 +42,7 @@ impl Default for Features {
             symbol_rate: None,
             symbol_rate_raw: None,
             snr_db: f32::NAN,
+            tone_hz: None,
         }
     }
 }
@@ -104,7 +111,51 @@ pub fn extract(x: &[Complex32], disc: &[f32], fs: f64) -> Features {
     let (snapped, raw) = symbol_rate(disc, fs);
     f.symbol_rate = snapped;
     f.symbol_rate_raw = raw;
+    f.tone_hz = dominant_tone(disc, fs);
     f
+}
+
+/// Least share of the discriminator's power one line must hold to be a
+/// tone, and the most its third harmonic may hold relative to it (a square
+/// wave, which alternating data makes, has a third harmonic at -9.5 dB; a
+/// sine has none).
+const TONE_SHARE: f32 = 0.5;
+const TONE_THIRD_HARMONIC: f32 = 0.03;
+
+/// A pure tone dominating the instantaneous frequency (see `Features::tone_hz`).
+fn dominant_tone(disc: &[f32], fs: f64) -> Option<f32> {
+    let avail = disc.len().min(1 << 16);
+    if avail < 2048 {
+        return None;
+    }
+    let n = 1usize << avail.ilog2();
+    let mean = disc[..n].iter().sum::<f32>() / n as f32;
+    let mut buf: Vec<num_complex::Complex32> = disc[..n].iter().map(|&v| num_complex::Complex32::new(v - mean, 0.0)).collect();
+    FftPlanner::new().plan_fft_forward(n).process(&mut buf);
+    let bin_hz = fs / n as f64;
+    let pw: Vec<f32> = buf[..n / 2].iter().map(|c| c.norm_sqr()).collect();
+    let lo = (50.0 / bin_hz).ceil() as usize;
+    if lo + 8 >= pw.len() {
+        return None;
+    }
+    let total: f32 = pw[lo..].iter().sum();
+    if total <= 0.0 {
+        return None;
+    }
+    let (k, _) = pw[lo..].iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, v)| (i + lo, v))?;
+    let around = |c: usize| -> f32 {
+        let a = c.saturating_sub(2);
+        let b = (c + 3).min(pw.len());
+        if a >= b { 0.0 } else { pw[a..b].iter().sum() }
+    };
+    let line = around(k);
+    if line < TONE_SHARE * total {
+        return None;
+    }
+    if 3 * k + 2 < pw.len() && around(3 * k) > TONE_THIRD_HARMONIC * line {
+        return None;
+    }
+    Some((k as f64 * bin_hz) as f32)
 }
 
 /// Counts peaks in a smoothed histogram of the discriminator output. Clean
@@ -233,6 +284,33 @@ mod tests {
         assert_eq!(f.symbol_rate, Some(4800.0), "{f:?}");
         assert!(f.envelope_cv < 0.05);
         assert!((f.deviation_hz - 1800.0).abs() < 200.0, "{f:?}");
+    }
+
+    #[test]
+    fn a_steady_tone_is_not_fsk() {
+        let fs = 48_000.0;
+        // FM with a clean 1200 Hz tone at ±1.3 kHz: a repeater's idle tone.
+        let mut ph = 0.0f64;
+        let x: Vec<Complex32> = (0..96_000)
+            .map(|i| {
+                let t = i as f64 / fs;
+                ph += 2.0 * std::f64::consts::PI * 1300.0 * (2.0 * std::f64::consts::PI * 1200.0 * t).sin() / fs;
+                Complex32::from_polar(1.0, ph as f32)
+            })
+            .collect();
+        let d = discriminator(&x, fs);
+        let f = extract(&x, &d, fs);
+        // (On air the arcsine histogram read as two levels; noiseless it
+        // reads as none. Either way the rate line below is what misled.)
+        assert!(f.fsk_levels <= 2, "{f:?}");
+        assert_eq!(f.symbol_rate, Some(2400.0), "the squared derivative puts a line at twice the tone: {f:?}");
+        let tone = f.tone_hz.expect("tone");
+        assert!((tone - 1200.0).abs() < 10.0, "{tone}");
+        // Random 2FSK data at 2400 Bd has no dominant tone.
+        let x = fsk(&[-1.0, 1.0], 2400.0, 1300.0, fs, 96_000);
+        let d = discriminator(&x, fs);
+        let f = extract(&x, &d, fs);
+        assert_eq!(f.tone_hz, None, "{f:?}");
     }
 
     #[test]

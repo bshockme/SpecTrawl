@@ -436,6 +436,11 @@ pub fn classify_with(x: &[Complex32], fs: f64, bandwidth_hz: f64, hints: Hints) 
     } else if bandwidth_hz < 4.5e3 && f.fsk_levels == 0 {
         // Too narrow for voice or common FSK: a carrier or very slow data.
         ("Carrier".to_string(), 0.6)
+    } else if f.fsk_levels <= 2 && f.tone_hz.is_some() && f.envelope_cv < 0.3 {
+        // One pure tone carries the frequency: analog FM with a steady
+        // tone (an idle repeater, a test tone). Its two-peak histogram and
+        // the line at twice the tone would otherwise read as 2FSK.
+        ("Analog FM".to_string(), 0.6)
     } else if let (Some(r), 2 | 4) = (f.symbol_rate, f.fsk_levels) {
         (format!("{}FSK {:.0} Bd", f.fsk_levels, r), 0.7)
     } else if f.fsk_levels == 4 {
@@ -653,6 +658,36 @@ mod tests {
             .collect();
         let c = classify_with(&ook, fs, 8_000.0, Hints { snr_db: Some(25.0) });
         assert_eq!(c.label, "OOK", "{c:?}");
+    }
+
+    #[test]
+    fn noise_never_names_a_protocol() {
+        // Forty 1.5 s windows of floor, as an empty channel gives the
+        // classifier all day: no sync-bank entry may confirm on them.
+        let fs = 48_000.0;
+        for seed in 0..40u64 {
+            let x = noise(72_000, 1000 + seed);
+            let c = classify(&x, fs, 12_500.0);
+            assert_eq!(c.protocol, None, "seed {seed}: {c:?}");
+        }
+    }
+
+    #[test]
+    fn fm_repeater_tone_is_analog_fm() {
+        // 855.6375 MHz on air: an analog FM repeater whose idle tone came
+        // out "2FSK 2400 Bd" in half its windows.
+        let fs = 48_000.0;
+        let nz = noise(72_000, 5);
+        let mut ph = 0.0f64;
+        let x: Vec<Complex32> = (0..72_000)
+            .map(|i| {
+                let t = i as f64 / fs;
+                ph += 2.0 * std::f64::consts::PI * 1300.0 * (2.0 * std::f64::consts::PI * 1200.0 * t).sin() / fs;
+                Complex32::from_polar(30.0, ph as f32) + nz[i]
+            })
+            .collect();
+        let c = classify_with(&x, fs, 9_000.0, Hints { snr_db: Some(33.0) });
+        assert_eq!(c.label, "Analog FM", "{c:?}");
     }
 
     #[test]

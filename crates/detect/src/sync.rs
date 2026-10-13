@@ -259,7 +259,11 @@ pub fn best(hits: &[SyncHit]) -> Option<SyncResult> {
         let count = g.at.iter().map(|&a| 1 + g.at.iter().filter(|&&b| b != a && on_grid(a, b, g.period)).count()).max().unwrap_or(0);
         (g, count)
     });
-    let (g, count) = counted.filter(|(_, count)| *count >= 2).max_by_key(|(g, count)| (*count, g.len))?;
+    // An entry whose frame grid is unknown (period 0: the unverified
+    // ProVoice and X2-TDMA patterns) can't use the grid to reject chance
+    // pairs, so it needs a third occurrence instead: on a 40 s window of
+    // floor the ProVoice patterns matched twice.
+    let (g, count) = counted.filter(|(g, count)| *count >= if g.period == 0 { 3 } else { 2 }).max_by_key(|(g, count)| (*count, g.len))?;
     let confidence = match count {
         2 => 0.8,
         3..=4 => 0.9,

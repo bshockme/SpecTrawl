@@ -149,10 +149,16 @@ Still questionable in the after run, each worth a capture:
 - "Military air AM" ×5 at 240 MHz: 16 kHz wide, 7.6 dB, envelope CV 0.65,
   passed the carrier-plus-voice-band test. Plausible, unverified.
 - "AM" ×7 at the P25 site (8.4 dB, 7.7 kHz) and ×5 at 930 MHz.
-- A strong 9 kHz signal at 855.6375 MHz (33 dB) alternates between
+- A strong 9 kHz signal at 855.6375 MHz (33 dB) alternated between
   "Analog FM" (deviation 1.3–1.5 kHz) and "2FSK 2400 Bd" from one window
-  to the next. Not a protocol the sync bank knows; the emitter's majority
-  vote hides the flip but the records show it.
+  to the next. It is an analog FM repeater (an industrial railroad channel
+  nearby), so the FSK half was the error: a steady 1200 Hz tone on FM
+  gives a two-peak (arcsine) frequency histogram and, because the
+  symbol-rate detector works on the squared derivative, a line at exactly
+  2400. Fixed after run 3: `Features::tone_hz` finds a single pure tone
+  holding ≥ 50 % of the discriminator's power with no third harmonic
+  (alternating data makes a square wave, which has one), and such a window
+  is "Analog FM" before any FSK rule runs. Not in the run 3 numbers.
 
 ## 5. What is still wrong or unknown
 
