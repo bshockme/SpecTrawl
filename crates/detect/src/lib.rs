@@ -380,7 +380,7 @@ pub fn classify(x: &[Complex32], fs: f64, bandwidth_hz: f64) -> Classification {
     // frequency follows ramps at BW²/2^SF.
     if (50e3..600e3).contains(&bandwidth_hz) {
         for b in chirp::bursts(x, fs).iter().take(4) {
-            if let Some((bw, sf)) = chirp::lora_params(&chirp::analyse(&x[b.0..b.1], fs)) {
+            if let Some((bw, sf)) = chirp::lora(&x[b.0..b.1], fs) {
                 c.label = format!("LoRa {:.0} kHz SF{sf}", bw / 1e3);
                 c.confidence = 0.8;
                 return c;

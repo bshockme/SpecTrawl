@@ -398,10 +398,14 @@ impl BurstDetector {
                         t.lo = t.lo.min(o.lo);
                         t.hi = t.hi.max(o.hi);
                         t.peak_db = t.peak_db.max(o.peak_db);
-                        t.snr_sum += o.snr_sum;
-                        t.snr_max = t.snr_max.max(o.snr_max);
-                        // Rows overlap in time; keep the larger count rather than double-count.
+                        // The tracks overlap in time, so `rows` keeps the
+                        // larger count (not the sum) and `snr_sum` is rescaled
+                        // to it: the merged mean is the row-weighted mean of
+                        // the two means, never above either track's maximum.
+                        let mean = (t.snr_sum + o.snr_sum) / (t.rows + o.rows) as f32;
                         t.rows = t.rows.max(o.rows);
+                        t.snr_sum = mean * t.rows as f32;
+                        t.snr_max = t.snr_max.max(o.snr_max);
                         t.last_seq = t.last_seq.max(o.last_seq);
                         t.first_end = t.first_end.min(o.first_end);
                         t.last_end = t.last_end.max(o.last_end);

@@ -302,6 +302,17 @@ fn append(shared: &Shared, j: &mut Job, to: u64, chunk: &mut [Complex32]) {
     let mut out: Vec<Complex32> = Vec::with_capacity(CHUNK / 8);
     while j.pos < to {
         let n = ((to - j.pos) as usize).min(chunk.len());
+        let n = match shared.state.lock().run_from(j.pos, n as u64) {
+            Ok(n) => n as usize,
+            Err(resume) => {
+                // Lost samples or a retune: the capture skips the hole
+                // (it is shorter than the record, not padded with zeros).
+                log::debug!("record all: {} skips {} unusable samples", j.stem, resume.saturating_sub(j.pos));
+                j.pos = resume;
+                j.ddc.reset();
+                continue;
+            }
+        };
         if !shared.ring.lock().read(j.pos, &mut chunk[..n]) {
             break;
         }

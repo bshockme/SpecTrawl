@@ -9,3 +9,4 @@
 /testdata/*.log
 /testdata/audio/
 /.worktrees/
+/mise.toml

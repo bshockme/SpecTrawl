@@ -2,7 +2,8 @@
 //!
 //! - NFM: discriminator, voice-band low-pass, noise squelch (a carrier
 //!   quietens the discriminator's high-frequency noise).
-//! - AM: envelope, DC removed, slow AGC.
+//! - AM: envelope, DC removed, slow AGC, carrier squelch (phase coherence
+//!   of the channel across a short lag: a carrier has it, noise does not).
 //! - WFM: discriminator, 75 µs de-emphasis (US broadcast), 15 kHz low-pass.
 //!
 //! Each keeps its state across calls so a stream can be fed in chunks.
@@ -142,6 +143,12 @@ pub struct Demod {
     /// Squelch threshold on noise/level (0 = always open).
     pub squelch: f32,
     open: bool,
+    /// AM carrier squelch: the channel `lag.len()` samples ago, and the
+    /// smoothed unit phasor of the phase advance over that lag.
+    lag: Vec<Complex32>,
+    lag_pos: usize,
+    coh: [OnePole; 2],
+    coherence: f32,
     /// Resampler: position of the next output in input samples.
     pos: f64,
     last: f32,
@@ -164,9 +171,22 @@ impl Demod {
             level: OnePole::new(20.0, fs),
             squelch: 0.35,
             open: true,
+            // Noise band-limited to the channel cutoff B decorrelates over
+            // ~1/(2B); a carrier's phase advance over that lag is steady.
+            lag: vec![Complex32::default(); ((fs / (2.0 * mode.channel().0)).round() as usize).max(1)],
+            lag_pos: 0,
+            coh: [OnePole::new(10.0, fs); 2],
+            coherence: 0.0,
             pos: 0.0,
             last: 0.0,
         }
+    }
+
+    /// AM carrier squelch statistic: magnitude of the mean unit phasor of
+    /// the channel's phase advance over the lag, 0 for noise, →1 for a
+    /// carrier (whatever its envelope does). Meaningful in AM mode only.
+    pub fn coherence(&self) -> f32 {
+        self.coherence
     }
 
     /// Whether the squelch is open (NFM noise squelch, AM carrier squelch;
@@ -207,20 +227,27 @@ impl Demod {
                     let m = s.norm();
                     let dc = self.dc.push(m);
                     self.agc += 0.0005 * (dc - self.agc);
-                    // Carrier squelch: noise alone has a Rayleigh envelope
-                    // whose ripple is broadband, while a carrier's modulation
-                    // sits below the voice band. The envelope ripple above
-                    // 6 kHz, relative to the carrier, is ~0.2 for noise and
-                    // falls with SNR once a carrier is there. Hysteresis
-                    // between 0.06 and 0.12.
+                    // Carrier squelch on phase coherence. Over a lag the
+                    // channel's noise has decorrelated across, noise gives a
+                    // random phase advance and a carrier (any AM on it: the
+                    // envelope is divided out) a steady one, so the mean
+                    // unit phasor is ~0 for noise and ~1 for a carrier,
+                    // ~exp(-1/(2·SNR)) in between. Unlike an envelope ripple
+                    // measure this does not depend on the shape of the
+                    // channel filter or the modulation.
                     if self.squelch > 0.0 {
-                        let r = self.noise_hp.push(m - dc);
-                        let n = self.noise.push(r * r);
-                        let l = self.level.push(dc * dc);
-                        let cv2 = if l > 0.0 { n / l } else { 1.0 };
-                        if self.open && cv2 > AM_CLOSE_CV2 {
+                        let old = self.lag[self.lag_pos];
+                        self.lag[self.lag_pos] = s;
+                        self.lag_pos = (self.lag_pos + 1) % self.lag.len();
+                        let p = s * old.conj();
+                        let n = p.norm();
+                        let u = if n > 0.0 { p / n } else { Complex32::default() };
+                        let re = self.coh[0].push(u.re);
+                        let im = self.coh[1].push(u.im);
+                        self.coherence = (re * re + im * im).sqrt();
+                        if self.open && self.coherence < AM_CLOSE_COHERENCE {
                             self.open = false;
-                        } else if !self.open && cv2 < AM_OPEN_CV2 {
+                        } else if !self.open && self.coherence > AM_OPEN_COHERENCE {
                             self.open = true;
                         }
                     }
@@ -244,10 +271,11 @@ impl Demod {
     }
 }
 
-/// AM carrier squelch thresholds on (envelope ripple above 6 kHz / carrier)²:
-/// open below 0.06, closed above 0.12; noise alone sits near 0.2.
-const AM_OPEN_CV2: f32 = 0.06;
-const AM_CLOSE_CV2: f32 = 0.12;
+/// AM carrier squelch thresholds on the phase coherence (see `process`):
+/// noise reads ~0.1 (the estimator's bias), a carrier at 0 dB channel SNR
+/// ~0.5 and at 6 dB ~0.8. Hysteresis between the two.
+const AM_OPEN_COHERENCE: f32 = 0.5;
+const AM_CLOSE_COHERENCE: f32 = 0.35;
 
 #[cfg(test)]
 mod tests {
@@ -286,6 +314,80 @@ mod tests {
         d.process(&am, &mut out);
         assert!(d.is_open(), "a carrier should open the AM squelch");
         assert!(out[out.len() / 2..].iter().any(|v| v.abs() > 0.05));
+    }
+
+    /// Gaussian IQ noise at `fs` plus a carrier of amplitude `a` modulated
+    /// `m` × 100 % by a tone, run through the AM channel DDC like the
+    /// listener does. Returns the demod after `secs` of signal.
+    fn am_through_ddc(fs: f64, a: f32, m: f32, tone_hz: f64, secs: f64, seed: u64) -> Demod {
+        let (cutoff, target) = Mode::Am.channel();
+        let mut ddc = crate::Ddc::new(fs, 0.0, cutoff, target);
+        let mut d = Demod::new(Mode::Am, ddc.fs_out);
+        let mut seed = seed | 1;
+        let mut uni = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed >> 11) as f64 / (1u64 << 53) as f64).max(1e-12)
+        };
+        let n = (fs * secs) as usize;
+        let mut input = Vec::with_capacity(65_536);
+        let (mut chan, mut audio) = (Vec::new(), Vec::new());
+        let mut i = 0usize;
+        while i < n {
+            input.clear();
+            for _ in 0..65_536.min(n - i) {
+                let t = i as f64 / fs;
+                let env = a * (1.0 + m * (2.0 * std::f64::consts::PI * tone_hz * t).sin() as f32);
+                // Carrier 1.3 kHz off centre: the squelch must not care.
+                let ph = (2.0 * std::f64::consts::PI * 1300.0 * t) as f32;
+                let r = (-2.0 * uni().ln()).sqrt();
+                let th = 2.0 * std::f64::consts::PI * uni();
+                input.push(Complex32::from_polar(env, ph) + Complex32::new((r * th.cos()) as f32, (r * th.sin()) as f32));
+                i += 1;
+            }
+            chan.clear();
+            ddc.process(&input, &mut chan);
+            audio.clear();
+            d.process(&chan, &mut audio);
+        }
+        d
+    }
+
+    /// Carrier amplitude for a channel SNR in dB: unit-variance noise per
+    /// component (power 2) of which the ±B channel keeps 2B/fs.
+    fn amp_for_snr(fs: f64, snr_db: f32) -> f32 {
+        let noise = 2.0 * 2.0 * Mode::Am.channel().0 / fs;
+        (noise * 10f64.powf(snr_db as f64 / 10.0)).sqrt() as f32
+    }
+
+    /// Through the real AM channel filter (the review found the old
+    /// envelope-ripple squelch opened on filtered noise alone: the filter
+    /// removed the ripple it measured), at both Airspy rates. Measured
+    /// coherence: noise 0.14-0.20, carrier 0 dB 0.56-0.62, 6 dB 0.88-0.90,
+    /// 100 % tone-modulated AM 0.92+.
+    #[test]
+    fn am_squelch_through_the_channel_filter() {
+        for fs in [10e6, 2.5e6] {
+            for seed in [3, 11, 29] {
+                let d = am_through_ddc(fs, 0.0, 0.0, 1000.0, 0.6, seed);
+                assert!(!d.is_open() && d.coherence() < 0.3, "fs {fs} seed {seed}: noise alone, coherence {}", d.coherence());
+            }
+            // A weak bare carrier opens from a few dB up...
+            for snr in [3.0f32, 6.0, 10.0] {
+                let d = am_through_ddc(fs, amp_for_snr(fs, snr), 0.0, 1000.0, 0.6, 5);
+                assert!(d.is_open() && d.coherence() > 0.7, "fs {fs}: carrier at {snr} dB, coherence {}", d.coherence());
+            }
+            // ...and one well below the noise stays shut.
+            let d = am_through_ddc(fs, amp_for_snr(fs, -6.0), 0.0, 1000.0, 0.6, 5);
+            assert!(!d.is_open(), "fs {fs}: carrier at -6 dB opened, coherence {}", d.coherence());
+            // Heavy modulation, including a tone at the top of the audio
+            // band, doesn't look like noise.
+            for (m, tone) in [(0.8, 1000.0), (1.0, 4500.0), (1.0, 2400.0)] {
+                let d = am_through_ddc(fs, amp_for_snr(fs, 20.0), m, tone, 0.6, 7);
+                assert!(d.is_open() && d.coherence() > 0.85, "fs {fs}: AM m={m} at {tone} Hz, coherence {}", d.coherence());
+            }
+        }
     }
 
     fn fm(fs: f64, n: usize, tone: f64, dev: f64) -> Vec<Complex32> {

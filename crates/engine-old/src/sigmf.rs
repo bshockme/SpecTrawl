@@ -57,8 +57,6 @@ pub struct ExportResult {
 
 pub(crate) struct ExportContext {
     pub shared: Arc<Shared>,
-    pub sample_rate: f64,
-    pub tuner_center_hz: f64,
     pub hw: String,
 }
 
@@ -80,9 +78,19 @@ pub(crate) fn run(ctx: ExportContext, req: ExportRequest) -> Result<ExportResult
     if end <= start {
         return Err("that stretch of IQ is no longer in the look-back buffer".into());
     }
-    let start_time = ctx.shared.state.lock().time_of(start, ctx.sample_rate);
+    // The tunings the stretch was taken at, and where it holds no usable
+    // IQ (lost samples, the settling around a retune).
+    let (segments, holes) = {
+        let st = ctx.shared.state.lock();
+        (st.segments(start, end), st.holes_in(start, end))
+    };
+    let sample_rate = segments[0].sample_rate;
+    if segments.iter().any(|e| e.sample_rate != sample_rate) {
+        return Err("that stretch of IQ spans a sample-rate change".into());
+    }
+    let time_of = |sample: u64| ctx.shared.state.lock().time_of(sample, sample_rate);
 
-    let (datatype, out_rate, out_center, decim, mut written) = match &req.kind {
+    let (datatype, out_rate, decim, captures, mut written) = match &req.kind {
         ExportKind::Wideband => {
             let mut raw = vec![[0i16; 2]; CHUNK];
             let mut pos = start;
@@ -96,11 +104,25 @@ pub(crate) fn run(ctx: ExportContext, req: ExportRequest) -> Result<ExportResult
                 }
                 pos += n as u64;
             }
-            ("ci16_le", ctx.sample_rate, ctx.tuner_center_hz, 1.0, end - start)
+            // One SigMF capture segment per tuning: a retune inside the
+            // stretch is a new segment at its own frequency.
+            let captures = segments
+                .iter()
+                .map(|e| serde_json::json!({ "core:sample_start": e.start - start, "core:frequency": e.center_hz, "core:datetime": rfc3339(time_of(e.start)) }))
+                .collect();
+            ("ci16_le", sample_rate, 1.0, captures, end - start)
         }
         ExportKind::Channel { center_hz, bandwidth_hz } => {
+            // A channel is mixed down relative to one tuner centre: the one
+            // in force at the end of the stretch, from its first settled
+            // sample (a record never spans a retune; its margin might).
+            let epoch = *segments.last().unwrap();
+            let start = start.max(ctx.shared.state.lock().continuous_from(end));
+            if end <= start {
+                return Err("that stretch of IQ holds no settled samples at one tuning".into());
+            }
             let bw = bandwidth_hz.max(5e3);
-            let mut ddc = Ddc::new(ctx.sample_rate, center_hz - ctx.tuner_center_hz, bw * 0.65 + 1e3, (bw * 2.5).max(48e3));
+            let mut ddc = Ddc::new(sample_rate, center_hz - epoch.center_hz, bw * 0.65 + 1e3, (bw * 2.5).max(48e3));
             let mut buf = vec![Complex32::default(); CHUNK];
             let mut out = Vec::with_capacity(CHUNK / 8);
             let mut count = 0u64;
@@ -118,7 +140,9 @@ pub(crate) fn run(ctx: ExportContext, req: ExportRequest) -> Result<ExportResult
                 count += out.len() as u64;
                 pos += n as u64;
             }
-            ("cf32_le", ddc.fs_out, *center_hz, ctx.sample_rate / ddc.fs_out, count)
+            let captures =
+                vec![serde_json::json!({ "core:sample_start": 0, "core:frequency": *center_hz, "core:datetime": rfc3339(time_of(start)) })];
+            ("cf32_le", ddc.fs_out, sample_rate / ddc.fs_out, captures, count)
         }
     };
     w.flush().map_err(|e| e.to_string())?;
@@ -128,16 +152,20 @@ pub(crate) fn run(ctx: ExportContext, req: ExportRequest) -> Result<ExportResult
     }
 
     // Annotations are positioned in output samples.
-    let annotations: Vec<serde_json::Value> = req
+    let span = |s: u64, e: u64| {
+        let s = (s.max(start) - start) as f64 / decim;
+        let e = (e.min(end) - start) as f64 / decim;
+        (s as u64, ((e - s).max(1.0)) as u64)
+    };
+    let mut annotations: Vec<serde_json::Value> = req
         .annotations
         .iter()
         .filter(|a| a.end_sample > start && a.start_sample < end)
         .map(|a| {
-            let s = (a.start_sample.max(start) - start) as f64 / decim;
-            let e = (a.end_sample.min(end) - start) as f64 / decim;
+            let (s, n) = span(a.start_sample, a.end_sample);
             serde_json::json!({
-                "core:sample_start": s as u64,
-                "core:sample_count": ((e - s).max(1.0)) as u64,
+                "core:sample_start": s,
+                "core:sample_count": n,
                 "core:freq_lower_edge": a.f_lo_hz,
                 "core:freq_upper_edge": a.f_hi_hz,
                 "core:label": a.label,
@@ -145,6 +173,16 @@ pub(crate) fn run(ctx: ExportContext, req: ExportRequest) -> Result<ExportResult
             })
         })
         .collect();
+    // Where the IQ is not to be trusted (zero-filled losses, tuner settling).
+    for (hs, he) in holes.iter().filter(|&&(hs, he)| hs < end && he > start) {
+        let (s, n) = span(*hs, *he);
+        annotations.push(serde_json::json!({
+            "core:sample_start": s,
+            "core:sample_count": n,
+            "core:label": "no signal",
+            "core:comment": "lost samples or tuner settling: not real IQ",
+        }));
+    }
     let meta = serde_json::json!({
         "global": {
             "core:version": "1.2.0",
@@ -154,16 +192,12 @@ pub(crate) fn run(ctx: ExportContext, req: ExportRequest) -> Result<ExportResult
             "core:recorder": "SpecTrawl",
             "core:description": req.description,
         },
-        "captures": [{
-            "core:sample_start": 0,
-            "core:frequency": out_center,
-            "core:datetime": rfc3339(start_time),
-        }],
+        "captures": captures,
         "annotations": annotations,
     });
     std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).map_err(|e| format!("write {}: {e}", meta_path.display()))?;
     let bytes = std::fs::metadata(&data_path).map(|m| m.len()).unwrap_or(0);
-    Ok(ExportResult { data_path, meta_path, samples: written, bytes, seconds: (end - start) as f64 / ctx.sample_rate })
+    Ok(ExportResult { data_path, meta_path, samples: written, bytes, seconds: written as f64 / out_rate })
 }
 
 /// `2026-10-08T21:47:04.123Z`

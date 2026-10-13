@@ -61,6 +61,12 @@ pub(crate) fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>, rate: f64) {
             let head = r.head();
             (head.saturating_sub((LOOK_S * rate) as u64).max(r.oldest()), head)
         };
+        // Not back across a retune or a loss.
+        let start = start.max(shared.state.lock().continuous_from(end));
+        if end <= start {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
         let mut ddc = Ddc::new(rate, center_hz - tuner, 0.6e6, detect::lte::FS);
         let mut slice = Vec::with_capacity(((end - start) as f64 / rate * ddc.fs_out) as usize + 16);
         let mut pos = start;

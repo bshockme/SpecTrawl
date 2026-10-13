@@ -83,22 +83,16 @@ pub fn analyse(x: &[Complex32], fs: f64) -> ChirpStats {
     for win in sm.chunks_exact(w) {
         total += 1;
         let n = win.len() as f64;
-        let mx = (n - 1.0) / 2.0;
-        let my = win.iter().map(|v| *v as f64).sum::<f64>() / n;
-        let (mut sxy, mut sxx, mut syy) = (0.0, 0.0, 0.0);
-        for (i, v) in win.iter().enumerate() {
-            let (dx, dy) = (i as f64 - mx, *v as f64 - my);
-            sxy += dx * dy;
-            sxx += dx * dx;
-            syy += dy * dy;
-        }
-        let slope = sxy / sxx; // Hz per sample
-        let r2 = if syy > 0.0 { sxy * sxy / (sxx * syy) } else { 0.0 };
+        let (slope, r2) = fit(win); // Hz per sample
         let sweep = (slope * n).abs();
         if r2 > 0.9 && sweep > 0.1 * range {
             ramps.push(slope * fs);
-        } else if (syy / n).sqrt() < 0.05 * range {
-            levels += 1;
+        } else {
+            let my = win.iter().map(|v| *v as f64).sum::<f64>() / n;
+            let var = win.iter().map(|v| (*v as f64 - my).powi(2)).sum::<f64>() / n;
+            if var.sqrt() < 0.05 * range {
+                levels += 1;
+            }
         }
     }
     if total > 0 {
@@ -113,21 +107,98 @@ pub fn analyse(x: &[Complex32], fs: f64) -> ChirpStats {
 }
 
 /// LoRa: chirps across 125/250/500 kHz at a rate of BW²/2^SF (SF 7-12).
-/// Returns (bandwidth Hz, spreading factor) when a burst's ramps match one.
-pub fn lora_params(st: &ChirpStats) -> Option<(f64, u8)> {
-    if st.ramp_fraction < 0.5 {
+/// Returns (bandwidth Hz, spreading factor) when the burst is made of such
+/// chirps.
+///
+/// Dechirping: multiplied by the conjugate of a candidate's reference
+/// up-chirp, every LoRa symbol of that bandwidth and spreading factor
+/// becomes a tone (two tones, a bandwidth apart, where the symbol's cyclic
+/// shift wraps), so a symbol-length FFT of each frame puts nearly all of
+/// its power in a few bins. Any other candidate, or FSK, noise or a
+/// carrier, leaves a residual chirp spread over many bins. This judges each
+/// mode on its own symbol length, which `analyse`'s fixed 0.25 ms windows
+/// could not: a 33 ms SF12 symbol looked like a steady level there and a
+/// 0.26 ms SF7/500 kHz symbol wrapped inside nearly every window.
+pub fn lora(x: &[Complex32], fs: f64) -> Option<(f64, u8)> {
+    if x.len() < 64 {
         return None;
     }
-    let bw = st.f_hi_hz - st.f_lo_hz;
-    let rate = st.slope_hz_per_s.abs();
-    [125e3, 250e3, 500e3].into_iter().filter(|b| (bw - b * 0.9).abs() < 0.25 * b).find_map(|b| {
-        (7u8..=12)
-            .find(|&sf| {
-                let r = b * b / (1u64 << sf) as f64;
-                (rate - r).abs() < 0.2 * r
-            })
-            .map(|sf| (b, sf))
-    })
+    // Only bandwidths the instantaneous frequency actually spans: a chirp
+    // spends equal time at every frequency, so its 5-95 % range is 0.9 BW.
+    let d = crate::features::discriminator(x, fs);
+    let mut s = crate::frames::boxcar(&d, ((fs * 5e-5) as usize).max(1));
+    s.sort_by(f32::total_cmp);
+    let q = |p: f64| s[((s.len() as f64 * p) as usize).min(s.len() - 1)] as f64;
+    let range = q(0.95) - q(0.05);
+    let mut planner = rustfft::FftPlanner::<f32>::new();
+    for b in [125e3, 250e3, 500e3] {
+        if (range - b * 0.9).abs() >= 0.25 * b {
+            continue;
+        }
+        for sf in 7u8..=12 {
+            let n = (fs * (1u64 << sf) as f64 / b).round() as usize;
+            let frames = x.len() / n;
+            if n < 16 || frames < 2 {
+                continue;
+            }
+            // Reference up-chirp −BW/2 → +BW/2 over one symbol, conjugated.
+            let reference: Vec<Complex32> = (0..n)
+                .map(|i| {
+                    let t = i as f64 / fs;
+                    let ph = 2.0 * std::f64::consts::PI * (-b / 2.0 * t + b * b / (1u64 << sf) as f64 / 2.0 * t * t);
+                    Complex32::from_polar(1.0, -ph as f32)
+                })
+                .collect();
+            let fft = planner.plan_fft_forward(n);
+            let mut buf = vec![Complex32::default(); n];
+            let mut power = vec![0f32; n];
+            let concentrated = x
+                .chunks_exact(n)
+                .filter(|frame| {
+                    for ((o, a), r) in buf.iter_mut().zip(*frame).zip(&reference) {
+                        *o = a * r;
+                    }
+                    fft.process(&mut buf);
+                    for (p, v) in power.iter_mut().zip(&buf) {
+                        *p = v.norm_sqr();
+                    }
+                    let total: f32 = power.iter().sum();
+                    // Up to four tones per frame (two symbols, each possibly
+                    // wrapped), each leaking into two bins: the top eight
+                    // bins hold most of a LoRa frame's power.
+                    let (_, eighth, above) = power.select_nth_unstable_by(n - 8, f32::total_cmp);
+                    let peak = *eighth + above.iter().sum::<f32>();
+                    total > 0.0 && peak > LORA_CONCENTRATION * total
+                })
+                .count();
+            if concentrated * 2 >= frames {
+                return Some((b, sf));
+            }
+        }
+    }
+    None
+}
+
+/// Fraction of a dechirped frame's power in its top eight bins for the
+/// frame to count as a LoRa symbol: ~S/(S+N), 0.9 at 10 dB, 0.5 at 0 dB.
+/// A wrong candidate spreads the power over 2^SF/2 bins or more.
+const LORA_CONCENTRATION: f32 = 0.4;
+
+/// Least-squares line through `win`: (slope per sample, r²).
+fn fit(win: &[f32]) -> (f64, f64) {
+    let n = win.len() as f64;
+    let mx = (n - 1.0) / 2.0;
+    let my = win.iter().map(|v| *v as f64).sum::<f64>() / n;
+    let (mut sxy, mut sxx, mut syy) = (0.0, 0.0, 0.0);
+    for (i, v) in win.iter().enumerate() {
+        let (dx, dy) = (i as f64 - mx, *v as f64 - my);
+        sxy += dx * dy;
+        sxx += dx * dx;
+        syy += dy * dy;
+    }
+    let slope = sxy / sxx;
+    let r2 = if syy > 0.0 { sxy * sxy / (sxx * syy) } else { 0.0 };
+    (slope, r2)
 }
 
 #[cfg(test)]
@@ -136,31 +207,72 @@ mod tests {
 
     /// LoRa-like upchirps: `bw` wide, 2^sf samples per symbol at fs = bw,
     /// upsampled ×4.
-    fn lora(bw: f64, sf: u8, symbols: usize) -> (Vec<Complex32>, f64) {
+    fn lora_signal(bw: f64, sf: u8, symbols: usize) -> (Vec<Complex32>, f64) {
         let fs = bw * 4.0;
-        let n = (1usize << sf) * 4;
-        let mut x = vec![Complex32::new(0.01, 0.0); 20_000];
+        let (x, _) = chirps(bw, sf, symbols, fs, 0.0, 0.0);
+        let mut out = vec![Complex32::new(0.01, 0.0); 20_000];
+        out.extend(x);
+        out.extend(vec![Complex32::new(0.01, 0.0); 20_000]);
+        (out, fs)
+    }
+
+    /// `symbols` cyclically shifted upchirps at `fs`, the carrier `offset_hz`
+    /// off centre, with Gaussian noise `snr_db` below the chirp.
+    fn chirps(bw: f64, sf: u8, symbols: usize, fs: f64, offset_hz: f64, snr_db: f64) -> (Vec<Complex32>, f64) {
+        let n = ((1u64 << sf) as f64 * fs / bw).round() as usize;
+        let sigma = if snr_db.is_finite() { (10f64.powf(-snr_db / 10.0) / 2.0).sqrt() } else { 0.0 };
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64 ^ (sf as u64) << 40 ^ bw as u64;
+        let mut uni = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed >> 11) as f64 / (1u64 << 53) as f64).max(1e-12)
+        };
         let mut ph = 0.0f64;
+        let mut x = Vec::with_capacity(n * symbols);
         for s in 0..symbols {
             let off = (s * 37 % (1 << sf)) as f64 / (1 << sf) as f64; // symbol value shifts the start
             for i in 0..n {
                 let t = (i as f64 / n as f64 + off) % 1.0;
-                let f = -bw / 2.0 + bw * t;
+                let f = -bw / 2.0 + bw * t + offset_hz;
                 ph += 2.0 * std::f64::consts::PI * f / fs;
-                x.push(Complex32::from_polar(1.0, ph as f32));
+                let r = sigma * (-2.0 * uni().ln()).sqrt();
+                let th = 2.0 * std::f64::consts::PI * uni();
+                x.push(Complex32::from_polar(1.0, ph as f32) + Complex32::new((r * th.cos()) as f32, (r * th.sin()) as f32));
             }
         }
-        x.extend(vec![Complex32::new(0.01, 0.0); 20_000]);
         (x, fs)
     }
 
     #[test]
     fn finds_lora_sf7_125k() {
-        let (x, fs) = lora(125e3, 7, 40);
+        let (x, fs) = lora_signal(125e3, 7, 40);
         let b = bursts(&x, fs);
         assert_eq!(b.len(), 1, "{b:?}");
-        let st = analyse(&x[b[0].0..b[0].1], fs);
-        assert_eq!(lora_params(&st), Some((125e3, 7)), "{st:?}");
+        assert_eq!(lora(&x[b[0].0..b[0].1], fs), Some((125e3, 7)));
+    }
+
+    /// Every advertised mode, at the channel rate the classifier uses
+    /// (2.5 × the bandwidth), off centre, 10 dB above Gaussian noise.
+    /// The review found the fixed-window analysis rejected 125 kHz SF9-12,
+    /// 250 kHz SF10-12 and 500 kHz SF11-12 even without noise.
+    #[test]
+    fn finds_every_lora_mode_with_noise_and_offset() {
+        for bw in [125e3, 250e3, 500e3] {
+            for sf in 7u8..=12 {
+                let (x, fs) = chirps(bw, sf, 8, bw * 2.5, 0.1 * bw, 10.0);
+                assert_eq!(lora(&x, fs), Some((bw, sf)), "{bw} Hz SF{sf}");
+            }
+        }
+    }
+
+    #[test]
+    fn noise_and_carriers_are_not_lora() {
+        let fs = 312.5e3;
+        let (noise, _) = chirps(125e3, 7, 1, fs, 0.0, -40.0);
+        assert_eq!(lora(&noise, fs), None);
+        let carrier: Vec<Complex32> = (0..50_000).map(|i| Complex32::from_polar(1.0, (0.3 * i as f64) as f32)).collect();
+        assert_eq!(lora(&carrier, fs), None);
     }
 
     #[test]
@@ -176,6 +288,18 @@ mod tests {
         let b = bursts(&x, fs);
         let st = analyse(&x[b[0].0..b[0].1], fs);
         assert!(st.ramp_fraction < 0.2 && st.level_fraction > 0.6, "{st:?}");
-        assert_eq!(lora_params(&st), None);
+        assert_eq!(lora(&x[b[0].0..b[0].1], fs), None);
+        // Wide FSK whose range matches a LoRa bandwidth, with the symbol
+        // transitions where a chirp's wraps would be.
+        let fs = 312.5e3;
+        let mut ph = 0.0f64;
+        let x: Vec<Complex32> = (0..200_000usize)
+            .map(|i| {
+                let f = if (i / 128) % 2 == 0 { 56e3 } else { -56e3 };
+                ph += 2.0 * std::f64::consts::PI * f / fs;
+                Complex32::from_polar(1.0, ph as f32)
+            })
+            .collect();
+        assert_eq!(lora(&x, fs), None);
     }
 }

@@ -6,7 +6,7 @@
 //! short windowed-sinc FIR finishes the filtering and decimates by 8. The FIR
 //! is evaluated only at output points.
 
-use num_complex::{Complex, Complex32};
+use num_complex::Complex32;
 
 /// FIR decimation in the second stage.
 const STAGE2: usize = 8;
@@ -25,39 +25,57 @@ pub struct Ddc {
     pub fs_out: f64,
 }
 
-/// 2nd-order CIC decimator. Integrators run in f64: their sums grow without
-/// bound and only differences matter.
+/// 2nd-order CIC decimator in wrapping fixed point.
+///
+/// The integrators grow without bound, so they run in two's-complement i64
+/// and are allowed to wrap: the comb's differences are exact as long as the
+/// *output* fits in 64 bits, which the scale guarantees (Hogenauer's
+/// register-width argument). A floating-point integrator has no such
+/// property: after a few minutes of continuous input it loses the small
+/// differences that are the signal and the output decays into noise.
 struct Cic {
     r: usize,
     phase: usize,
-    i1: Complex<f64>,
-    i2: Complex<f64>,
-    c1: Complex<f64>,
-    c2: Complex<f64>,
+    i1: [i64; 2],
+    i2: [i64; 2],
+    c1: [i64; 2],
+    c2: [i64; 2],
+    /// Input samples are scaled by this before integration.
+    scale: f64,
+    /// Output: 1 / (scale × R²).
     gain: f64,
 }
 
 impl Cic {
     fn new(r: usize) -> Self {
-        let z = Complex::new(0.0, 0.0);
-        Self { r, phase: 0, i1: z, i2: z, c1: z, c2: z, gain: 1.0 / (r * r) as f64 }
+        // The output is at most R² × scale × |x|. Give |x| 16× headroom over
+        // full scale and the rest of the 63 bits to the fraction.
+        let growth = 2 * (usize::BITS - (r - 1).leading_zeros()) as i32;
+        let scale = 2f64.powi(62 - growth - 4);
+        Self { r, phase: 0, i1: [0; 2], i2: [0; 2], c1: [0; 2], c2: [0; 2], scale, gain: 1.0 / (scale * (r * r) as f64) }
     }
 
     #[inline]
     fn push(&mut self, x: Complex32) -> Option<Complex32> {
-        self.i1 += Complex::new(x.re as f64, x.im as f64);
-        self.i2 += self.i1;
+        let x = [(x.re as f64 * self.scale) as i64, (x.im as f64 * self.scale) as i64];
+        for ((i1, i2), x) in self.i1.iter_mut().zip(&mut self.i2).zip(x) {
+            *i1 = i1.wrapping_add(x);
+            *i2 = i2.wrapping_add(*i1);
+        }
         self.phase += 1;
         if self.phase < self.r {
             return None;
         }
         self.phase = 0;
-        let d1 = self.i2 - self.c1;
-        self.c1 = self.i2;
-        let y = d1 - self.c2;
-        self.c2 = d1;
-        let y = y * self.gain;
-        Some(Complex32::new(y.re as f32, y.im as f32))
+        let mut y = [0f32; 2];
+        for (((i2, c1), c2), y) in self.i2.iter().zip(&mut self.c1).zip(&mut self.c2).zip(&mut y) {
+            let d1 = i2.wrapping_sub(*c1);
+            *c1 = *i2;
+            let d2 = d1.wrapping_sub(*c2);
+            *c2 = d1;
+            *y = (d2 as f64 * self.gain) as f32;
+        }
+        Some(Complex32::new(y[0], y[1]))
     }
 }
 
@@ -87,6 +105,17 @@ impl Ddc {
             mixed: 0,
             cic: cic.map(Cic::new),
             fs_out,
+        }
+    }
+
+    /// Forgets the samples in flight (the oscillator keeps its phase):
+    /// for a discontinuity in the input, so the filters don't smear the
+    /// old stream into the new one.
+    pub fn reset(&mut self) {
+        self.buf.clear();
+        self.next = 0;
+        if let Some(c) = &mut self.cic {
+            *c = Cic::new(c.r);
         }
     }
 
@@ -157,6 +186,26 @@ mod tests {
     #[test]
     fn single_stage_shifts_and_rejects() {
         check(1e6, 100e3, 150e3, 8e3, 25e3, 200_000);
+    }
+
+    /// The integrators wrap every few hundred samples of a full-scale
+    /// input; after 10 s of constant input (thousands of wraps) the output
+    /// must still be the input exactly. (The review reproduced the old f64
+    /// integrators decaying to noise after ~300 s.)
+    #[test]
+    fn cic_output_is_exact_after_integrator_wraps() {
+        let mut c = Cic::new(26);
+        let x = Complex32::new(0.75, -0.25);
+        let mut worst = 0f32;
+        for i in 0..100_000_000u64 {
+            if let Some(y) = c.push(x) {
+                // Let the two combs fill (two outputs), then every output is exact.
+                if i > 3 * 26 {
+                    worst = worst.max((y - x).norm());
+                }
+            }
+        }
+        assert!(worst < 1e-6, "worst error {worst}");
     }
 
     #[test]

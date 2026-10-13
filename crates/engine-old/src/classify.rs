@@ -37,7 +37,11 @@ pub struct ClassifierLoad {
 }
 
 pub(crate) fn run(shared: Arc<Shared>, cfg: SourceConfig, stop: Arc<AtomicBool>, rate: f64, caps: sdr_core::Capabilities) {
-    let radio = Radio { spur_grid_hz: caps.spur_grid_hz, transfer_tone_hz: caps.transfer_samples.map(|n| rate / n as f64) };
+    let radio = Radio {
+        spur_grid_hz: caps.spur_grid_hz,
+        transfer_tone_hz: caps.transfer_samples.map(|n| rate / n as f64),
+        dc_spike: caps.if_arch == sdr_core::IfArchitecture::ZeroIf,
+    };
     let mut chunk = vec![Complex32::default(); 1 << 18];
     let (mut win_start, mut jobs, mut work) = (Instant::now(), 0u32, Duration::ZERO);
     while !stop.load(Ordering::Relaxed) {
@@ -239,6 +243,8 @@ fn label_only(label: &str) -> Classification {
 struct Radio {
     spur_grid_hz: Option<f64>,
     transfer_tone_hz: Option<f64>,
+    /// Zero-IF: a DC spike sits at the tuner centre.
+    dc_spike: bool,
 }
 
 fn classify_record(
@@ -274,12 +280,18 @@ fn classify_window(shared: &Shared, rate: f64, radio: &Radio, w: &Window, chunk:
     }
     let (start, end) = (w.start, w.end);
     let oldest = shared.ring.lock().oldest();
-    let start = start.max(oldest);
+    // Only IQ of one tuning, clear of retunes and losses, and mixed with
+    // the tuner centre that IQ was actually taken at.
+    let (from, tuner_hz) = {
+        let st = shared.state.lock();
+        (st.continuous_from(end), st.epoch_at(end.saturating_sub(1)).map_or(w.tuner_center_hz, |e| e.center_hz))
+    };
+    let start = start.max(oldest).max(from);
     if end <= start + (0.02 * rate) as u64 {
         return label_only(if end <= oldest { "IQ expired" } else { "too short" });
     }
 
-    let offset = w.center_hz - w.tuner_center_hz;
+    let offset = w.center_hz - tuner_hz;
     let mut ddc = Ddc::new(rate, offset, bw * 0.65 + 1e3, (bw * 2.5).max(48e3));
     let mut chan = Vec::with_capacity(((end - start) as f64 / rate * ddc.fs_out) as usize + 16);
     let mut pos = start;
@@ -302,10 +314,11 @@ fn classify_window(shared: &Shared, rate: f64, radio: &Radio, w: &Window, chunk:
     let mut c = detect::classify(&chan, ddc.fs_out, w.bandwidth_hz);
     let ctx = detect::context::Context {
         center_hz: w.center_hz,
-        tuner_hz: w.tuner_center_hz,
+        tuner_hz,
         bandwidth_hz: w.bandwidth_hz,
         spur_grid_hz: radio.spur_grid_hz,
         transfer_tone_hz: radio.transfer_tone_hz,
+        dc_spike: radio.dc_spike,
     };
     detect::context::refine(&mut c, &ctx, &chan, ddc.fs_out);
     c

@@ -60,13 +60,19 @@ fn table() -> &'static HashMap<u32, u32> {
 }
 
 /// Corrects a received codeword. Returns it and the bits fixed, or None
-/// if it can't be made valid.
+/// if it can't be made valid within two bit errors over all 32 bits.
+///
+/// The extended code has distance 4, so two errors anywhere (BCH bits or
+/// the parity bit) are corrected and three are only detected: a word that
+/// needs two BCH corrections *and* a parity flip is as close to another
+/// codeword as to this one, and is rejected rather than guessed.
 pub fn correct(cw: u32) -> Option<(u32, u32)> {
     let s = syndrome(cw);
     let fixed = if s == 0 { cw } else { cw ^ *table().get(&s)? };
-    // The parity bit: flip it if only it is wrong.
+    // The parity bit: flip it if it is wrong.
     let fixed = if fixed.count_ones() & 1 == 1 { fixed ^ 1 } else { fixed };
-    Some((fixed, (fixed ^ cw).count_ones()))
+    let errors = (fixed ^ cw).count_ones();
+    (errors <= 2).then_some((fixed, errors))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -194,6 +200,26 @@ mod tests {
         let cw = encode(0x12345);
         assert_eq!(correct(cw ^ 1 << 7 ^ 1 << 20), Some((cw, 2)));
         assert_eq!(correct(cw ^ 1 << 30), Some((cw, 1)));
+        // One BCH error plus the parity bit: still two in all.
+        assert_eq!(correct(cw ^ 1 << 7 ^ 1), Some((cw, 2)));
+        assert_eq!(correct(cw ^ 1), Some((cw, 1)));
+    }
+
+    #[test]
+    fn rejects_three_errors_instead_of_guessing() {
+        // Every valid word, three bits away in every arrangement that the
+        // syndrome table would repair as two BCH errors plus parity: the
+        // extended code can only detect that, so correct() must refuse.
+        for data in [0u32, 0x12345, 0x1F_FFFF, IDLE >> 11] {
+            let cw = encode(data);
+            for (a, b) in [(1, 2), (1, 31), (7, 20), (12, 13)] {
+                let hit = cw ^ 1 << a ^ 1 << b ^ 1;
+                assert_eq!(correct(hit), None, "data {data:#x} bits {a},{b},0 accepted as {:?}", correct(hit));
+            }
+        }
+        // The review's case: the zero word with bits 1, 2 and 5 flipped
+        // used to come back as 0x00900027, a different address.
+        assert_eq!(correct(0x26), None);
     }
 
     /// Builds frames for a sequence of codewords (sync every 16).

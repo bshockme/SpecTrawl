@@ -19,15 +19,43 @@ pub struct SyncEntry {
     /// 4-level protocol: sync symbols must all be outer (±3) levels and
     /// masked-out positions inner (±1). Binary protocols skip this check.
     pub four_level: bool,
+    /// Symbols between consecutive sync positions (a burst, a frame or a
+    /// batch): a second sync confirms the first only at a multiple of this,
+    /// missed frames allowed. 0 when the protocol's grid isn't known.
+    pub period: u32,
 }
 
-const fn e(protocol: &'static str, detail: &'static str, baud: f64, len: u8, pattern: u32, mask: u32, invertible: bool) -> SyncEntry {
-    SyncEntry { protocol, detail, baud, len, pattern, mask, invertible, four_level: true }
+#[allow(clippy::too_many_arguments)]
+const fn e(
+    protocol: &'static str,
+    detail: &'static str,
+    baud: f64,
+    len: u8,
+    pattern: u32,
+    mask: u32,
+    invertible: bool,
+    period: u32,
+) -> SyncEntry {
+    SyncEntry { protocol, detail, baud, len, pattern, mask, invertible, four_level: true, period }
 }
 
-const fn bin(protocol: &'static str, detail: &'static str, baud: f64, pattern: u32, invertible: bool) -> SyncEntry {
-    SyncEntry { protocol, detail, baud, len: 32, pattern, mask: 0xFFFF_FFFF, invertible, four_level: false }
+const fn bin(protocol: &'static str, detail: &'static str, baud: f64, pattern: u32, invertible: bool, period: u32) -> SyncEntry {
+    SyncEntry { protocol, detail, baud, len: 32, pattern, mask: 0xFFFF_FFFF, invertible, four_level: false, period }
 }
+
+/// Sync grids, in symbols. P25 Phase 1 frames (HDU 792, TDU 144, LDU 1728,
+/// TDULC 432, TSDU 360 bits, status symbols included) are all multiples of
+/// 72 bits. DMR bursts are 30 ms (264 bits + CACH) in every mode. P25 Phase
+/// 2 has an ISCH every 30 ms slot. NXDN and dPMR frames are 80 ms (384 bits
+/// at 2400 sym/s, 40 ms at NXDN96's 4800). YSF frames are 100 ms. POCSAG
+/// batches are the sync plus 16 codewords.
+const P25P1: u32 = 36;
+const DMR: u32 = 144;
+const P25P2: u32 = 180;
+const NXDN: u32 = 192;
+const DPMR: u32 = 192;
+const YSF: u32 = 480;
+const POCSAG: u32 = 544;
 
 /// NXDN frame sync + LICH: the 18 valid values (mask drops ±1 symbols).
 const NXDN_LICH: [u32; 18] = [
@@ -37,34 +65,34 @@ const NXDN_LICH: [u32; 18] = [
 
 pub fn table() -> Vec<SyncEntry> {
     let mut v = vec![
-        e("P25", "Phase 1", 4800.0, 24, 0x04CF5F, 0xFFFFFF, true),
-        e("P25", "Phase 2", 6000.0, 20, 0x0121DF, 0xFFFFF, true),
-        e("DMR", "MS voice", 4800.0, 24, 0x76286E, 0xFFFFFF, false),
-        e("DMR", "BS voice", 4800.0, 24, 0x439B4D, 0xFFFFFF, false),
-        e("DMR", "MS data", 4800.0, 24, 0x89D791, 0xFFFFFF, false),
-        e("DMR", "BS data", 4800.0, 24, 0xBC64B2, 0xFFFFFF, false),
-        e("DMR", "direct TS1 voice", 4800.0, 24, 0x21751F, 0xFFFFFF, false),
-        e("DMR", "direct TS2 voice", 4800.0, 24, 0x6F8C23, 0xFFFFFF, false),
-        e("DMR", "direct TS1 data", 4800.0, 24, 0xDE8AE0, 0xFFFFFF, false),
-        e("DMR", "direct TS2 data", 4800.0, 24, 0x9073DC, 0xFFFFFF, false),
-        e("YSF", "Fusion", 4800.0, 20, 0x84A52, 0xFFFFF, true),
-        e("dPMR", "FS1", 2400.0, 24, 0x1F3485, 0xFFFFFF, false),
-        e("dPMR", "FS1 (inv)", 2400.0, 24, 0xE0CB7A, 0xFFFFFF, false),
-        e("X2-TDMA", "sync A (unverified)", 4800.0, 24, 0xA780FD, 0xFFFFFF, true),
-        e("X2-TDMA", "sync B (unverified)", 4800.0, 24, 0xD41473, 0xFFFFFF, true),
-        bin("ProVoice", "", 9600.0, 0x57125555, true),
-        bin("ProVoice", "", 9600.0, 0x57123333, true),
-        bin("ProVoice", "", 9600.0, 0x94D83523, true),
-        bin("ProVoice", "", 9600.0, 0x57126969, true),
+        e("P25", "Phase 1", 4800.0, 24, 0x04CF5F, 0xFFFFFF, true, P25P1),
+        e("P25", "Phase 2", 6000.0, 20, 0x0121DF, 0xFFFFF, true, P25P2),
+        e("DMR", "MS voice", 4800.0, 24, 0x76286E, 0xFFFFFF, false, DMR),
+        e("DMR", "BS voice", 4800.0, 24, 0x439B4D, 0xFFFFFF, false, DMR),
+        e("DMR", "MS data", 4800.0, 24, 0x89D791, 0xFFFFFF, false, DMR),
+        e("DMR", "BS data", 4800.0, 24, 0xBC64B2, 0xFFFFFF, false, DMR),
+        e("DMR", "direct TS1 voice", 4800.0, 24, 0x21751F, 0xFFFFFF, false, DMR),
+        e("DMR", "direct TS2 voice", 4800.0, 24, 0x6F8C23, 0xFFFFFF, false, DMR),
+        e("DMR", "direct TS1 data", 4800.0, 24, 0xDE8AE0, 0xFFFFFF, false, DMR),
+        e("DMR", "direct TS2 data", 4800.0, 24, 0x9073DC, 0xFFFFFF, false, DMR),
+        e("YSF", "Fusion", 4800.0, 20, 0x84A52, 0xFFFFF, true, YSF),
+        e("dPMR", "FS1", 2400.0, 24, 0x1F3485, 0xFFFFFF, false, DPMR),
+        e("dPMR", "FS1 (inv)", 2400.0, 24, 0xE0CB7A, 0xFFFFFF, false, DPMR),
+        e("X2-TDMA", "sync A (unverified)", 4800.0, 24, 0xA780FD, 0xFFFFFF, true, 0),
+        e("X2-TDMA", "sync B (unverified)", 4800.0, 24, 0xD41473, 0xFFFFFF, true, 0),
+        bin("ProVoice", "", 9600.0, 0x57125555, true, 0),
+        bin("ProVoice", "", 9600.0, 0x57123333, true, 0),
+        bin("ProVoice", "", 9600.0, 0x94D83523, true, 0),
+        bin("ProVoice", "", 9600.0, 0x57126969, true, 0),
     ];
     // NXDN48 (2400 sym/s) and NXDN96 (4800 sym/s) share the sync.
     for &p in &NXDN_LICH {
-        v.push(e("NXDN", "NXDN48", 2400.0, 18, p, 0x2FDFF, true));
-        v.push(e("NXDN", "NXDN96", 4800.0, 18, p, 0x2FDFF, true));
+        v.push(e("NXDN", "NXDN48", 2400.0, 18, p, 0x2FDFF, true, NXDN));
+        v.push(e("NXDN", "NXDN96", 4800.0, 18, p, 0x2FDFF, true, NXDN));
     }
     // POCSAG batch sync codeword; binary FSK, so sign = bit.
     for baud in [512.0, 1200.0, 2400.0] {
-        v.push(bin("POCSAG", "", baud, 0x7CD215D8, true));
+        v.push(bin("POCSAG", "", baud, 0x7CD215D8, true, POCSAG));
     }
     v
 }
@@ -165,41 +193,79 @@ pub struct SyncResult {
     pub detail: &'static str,
     pub baud: f64,
     pub inverted: bool,
-    /// Distinct sync occurrences (merged across neighbouring phases).
+    /// Distinct sync occurrences on the protocol's grid (merged across
+    /// neighbouring phases).
     pub count: usize,
     pub confidence: f32,
 }
 
-/// Picks the protocol with the most distinct sync occurrences. Hits within a
-/// few symbols of each other (neighbouring phases seeing the same word) count
-/// once. One occurrence of a long pattern is a weak result; two or more is
-/// confirmation (a second sync within a frame period).
+struct Group {
+    protocol: &'static str,
+    detail: &'static str,
+    baud: f64,
+    inverted: bool,
+    len: u8,
+    period: u32,
+    /// Symbol index of each distinct occurrence.
+    at: Vec<usize>,
+}
+
+/// Whether two sync positions `a` and `b` symbols into the stream can
+/// belong to one transmission on a grid of `period` symbols: a whole number
+/// of periods apart, give or take the sync search's symbol resolution and
+/// a little clock error. Any spacing fits an unknown grid.
+fn on_grid(a: usize, b: usize, period: u32) -> bool {
+    if period == 0 {
+        return true;
+    }
+    let d = a.abs_diff(b) as f64;
+    let k = (d / period as f64).round();
+    k >= 1.0 && (d - k * period as f64).abs() <= 3.0 + 0.005 * d
+}
+
+/// Picks the protocol with the most distinct sync occurrences on its grid.
+/// Hits within a few symbols of each other (neighbouring phases seeing the
+/// same word) count once. A protocol needs a second sync to be
+/// believed, and the second must sit where the protocol's framing puts it
+/// (a multiple of the burst/frame/batch period after the first, missed
+/// frames allowed): two syncs at an arbitrary spacing are what noise and
+/// analog voice produce, and confirm nothing.
 pub fn best(hits: &[SyncHit]) -> Option<SyncResult> {
-    let mut groups: Vec<(&'static str, &'static str, f64, bool, Vec<usize>, u8)> = Vec::new();
+    let mut groups: Vec<Group> = Vec::new();
     for h in hits {
         let key = (h.entry.protocol, h.entry.detail, h.entry.baud, h.inverted);
-        let g = match groups.iter_mut().find(|g| (g.0, g.1, g.2, g.3) == key) {
+        let g = match groups.iter_mut().find(|g| (g.protocol, g.detail, g.baud, g.inverted) == key) {
             Some(g) => g,
             None => {
-                groups.push((key.0, key.1, key.2, key.3, Vec::new(), h.entry.len));
+                groups.push(Group {
+                    protocol: key.0,
+                    detail: key.1,
+                    baud: key.2,
+                    inverted: key.3,
+                    len: h.entry.len,
+                    period: h.entry.period,
+                    at: Vec::new(),
+                });
                 groups.last_mut().unwrap()
             }
         };
-        if !g.4.iter().any(|&s| s.abs_diff(h.symbol) <= 3) {
-            g.4.push(h.symbol);
+        if !g.at.iter().any(|&s| s.abs_diff(h.symbol) <= 3) {
+            g.at.push(h.symbol);
         }
     }
-    // A protocol needs a second sync to be believed. On real
-    // signals single hits do occur on analog voice (smooth discriminator
-    // output can pass the level check); genuine digital channels show many.
-    let g = groups.into_iter().filter(|g| g.4.len() >= 2).max_by_key(|g| (g.4.len(), g.5))?;
-    let count = g.4.len();
+    // A group's count is the most occurrences that agree with any one of
+    // them about the grid (the anchor itself included).
+    let counted = groups.into_iter().map(|g| {
+        let count = g.at.iter().map(|&a| 1 + g.at.iter().filter(|&&b| b != a && on_grid(a, b, g.period)).count()).max().unwrap_or(0);
+        (g, count)
+    });
+    let (g, count) = counted.filter(|(_, count)| *count >= 2).max_by_key(|(g, count)| (*count, g.len))?;
     let confidence = match count {
         2 => 0.8,
         3..=4 => 0.9,
         _ => 0.97,
     };
-    Some(SyncResult { protocol: g.0, detail: g.1, baud: g.2, inverted: g.3, count, confidence })
+    Some(SyncResult { protocol: g.protocol, detail: g.detail, baud: g.baud, inverted: g.inverted, count, confidence })
 }
 
 fn boxcar(x: &[f32], n: usize) -> Vec<f32> {
@@ -304,6 +370,33 @@ mod tests {
         let r = best(&search(&disc, 24_000.0, &table())).expect("hit");
         assert_eq!((r.protocol, r.detail), ("NXDN", "NXDN48"));
         assert!(r.count >= 3);
+    }
+
+    fn hit(entry: SyncEntry, symbol: usize) -> SyncHit {
+        SyncHit { entry, inverted: false, phase: 5, symbol, errors: 0 }
+    }
+
+    /// Two syncs are only a confirmation on the protocol's grid (the
+    /// review's case: DMR syncs 101 symbols apart were accepted at 0.8).
+    #[test]
+    fn syncs_off_the_frame_grid_dont_confirm() {
+        let dmr = table().into_iter().find(|e| e.protocol == "DMR" && e.detail == "BS voice").unwrap();
+        assert!(best(&[hit(dmr, 100), hit(dmr, 201)]).is_none());
+        // One burst, six bursts (a voice superframe), with a symbol of slop.
+        let r = best(&[hit(dmr, 100), hit(dmr, 244)]).expect("one burst apart");
+        assert_eq!(r.count, 2);
+        let r = best(&[hit(dmr, 100), hit(dmr, 100 + 6 * 144 + 1), hit(dmr, 100 + 12 * 144 - 2)]).expect("superframes apart");
+        assert_eq!(r.count, 3);
+        // Three on the grid plus a stray: the stray doesn't count.
+        let r = best(&[hit(dmr, 100), hit(dmr, 157), hit(dmr, 388), hit(dmr, 1252)]).unwrap();
+        assert_eq!(r.count, 3);
+        // P25 Phase 1: a TDU (72 symbols) after an LDU (864) is on the grid, 101 is not.
+        let p25 = table().into_iter().find(|e| e.protocol == "P25" && e.detail == "Phase 1").unwrap();
+        assert_eq!(best(&[hit(p25, 0), hit(p25, 864), hit(p25, 936)]).unwrap().count, 3);
+        assert!(best(&[hit(p25, 0), hit(p25, 101)]).is_none());
+        // POCSAG batches, 544 bits, over a long stretch with clock error.
+        let pocsag = table().into_iter().find(|e| e.protocol == "POCSAG" && e.baud == 1200.0).unwrap();
+        assert_eq!(best(&[hit(pocsag, 10), hit(pocsag, 554), hit(pocsag, 10 + 20 * 544 + 40)]).unwrap().count, 3);
     }
 
     #[test]

@@ -89,6 +89,20 @@ pub struct SpectrumRow {
     pub db: Vec<f32>,
 }
 
+/// A stretch of the stream with one tuning: from `start` up to the next
+/// epoch's start.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Epoch {
+    pub start: u64,
+    pub center_hz: f64,
+    pub sample_rate: f64,
+}
+
+/// IQ this close to a reported retune (either side) is not trusted: the
+/// driver reports the new tuning at a transfer boundary, the tuner moved
+/// somewhere inside the previous transfer, and its PLL settles after that.
+const RETUNE_GUARD_S: f64 = 0.01;
+
 #[derive(Default)]
 struct StreamState {
     center_hz: f64,
@@ -99,6 +113,13 @@ struct StreamState {
     lost_device: bool,
     /// Latest (sample index, wall time) pair from a TimeAnchor event.
     anchor: Option<(u64, SystemTime)>,
+    /// Tuning history, oldest first, pruned to what the ring still holds.
+    /// The ring keeps IQ from before and after a retune; this says which
+    /// tuning each sample was taken at.
+    epochs: VecDeque<Epoch>,
+    /// Sample ranges `[start, end)` holding no usable IQ: zero-filled
+    /// losses and the settling interval around each retune.
+    holes: VecDeque<(u64, u64)>,
 }
 
 impl StreamState {
@@ -109,6 +130,97 @@ impl StreamState {
             Some((at, t)) => t - Duration::from_secs_f64((at - sample) as f64 / rate),
             None => SystemTime::now(),
         }
+    }
+
+    fn retune(&mut self, at_sample: u64, center_hz: f64, sample_rate: f64) {
+        self.center_hz = center_hz;
+        self.sample_rate = sample_rate;
+        self.epochs.push_back(Epoch { start: at_sample, center_hz, sample_rate });
+        let guard = (RETUNE_GUARD_S * sample_rate) as u64;
+        self.holes.push_back((at_sample.saturating_sub(guard), at_sample + guard));
+    }
+
+    fn lost(&mut self, at_sample: u64, lost_samples: u64) {
+        self.gaps += 1;
+        self.lost_samples += lost_samples;
+        self.holes.push_back((at_sample, at_sample + lost_samples));
+    }
+
+    /// Drops history the ring no longer holds (`oldest`: the ring's oldest
+    /// sample). The epoch in force at `oldest` is kept.
+    fn prune(&mut self, oldest: u64) {
+        while self.epochs.len() > 1 && self.epochs[1].start <= oldest {
+            self.epochs.pop_front();
+        }
+        self.holes.retain(|&(_, end)| end > oldest);
+    }
+
+    /// The epoch holding `sample`: the newest that starts at or before it.
+    fn epoch_at(&self, sample: u64) -> Option<Epoch> {
+        self.epochs.iter().rev().find(|e| e.start <= sample).copied()
+    }
+
+    /// Tuning at `sample` (the current one before any epoch is known).
+    fn tuning_at(&self, sample: u64) -> Tuning {
+        match self.epoch_at(sample) {
+            Some(e) => Tuning { center_hz: e.center_hz, span_hz: e.sample_rate },
+            None => Tuning { center_hz: self.center_hz, span_hz: self.sample_rate },
+        }
+    }
+
+    fn in_hole(&self, pos: u64) -> Option<u64> {
+        self.holes.iter().find(|&&(s, e)| s <= pos && pos < e).map(|&(_, e)| e)
+    }
+
+    /// What one DSP chain may consume from `pos` as a continuous stream of
+    /// one tuning: `Ok(n)`, at most `max` samples, stopping short of the
+    /// next retune or hole; or `Err(resume)` when `pos` lies in a hole,
+    /// with the first sample after it (which may lie in another hole: call
+    /// again). A chain that skips should reset its filters.
+    fn run_from(&self, pos: u64, max: u64) -> Result<u64, u64> {
+        if let Some(end) = self.in_hole(pos) {
+            return Err(end);
+        }
+        let mut end = pos.saturating_add(max);
+        for e in &self.epochs {
+            if e.start > pos && e.start < end {
+                end = e.start;
+            }
+        }
+        for &(s, _) in &self.holes {
+            if s > pos && s < end {
+                end = s;
+            }
+        }
+        Ok(end - pos)
+    }
+
+    /// The earliest `p` such that `p..end` is one tuning with no hole: a
+    /// chain that wants to look back from `end` must not start before it.
+    fn continuous_from(&self, end: u64) -> u64 {
+        let mut p = self.epoch_at(end.saturating_sub(1)).map_or(0, |e| e.start);
+        for &(s, e) in &self.holes {
+            if s < end {
+                p = p.max(e);
+            }
+        }
+        p
+    }
+
+    /// The epochs covering `start..end`, the first clipped to `start`.
+    fn segments(&self, start: u64, end: u64) -> Vec<Epoch> {
+        let mut v = Vec::new();
+        match self.epoch_at(start) {
+            Some(e) => v.push(Epoch { start, ..e }),
+            None => v.push(Epoch { start, center_hz: self.center_hz, sample_rate: self.sample_rate }),
+        }
+        v.extend(self.epochs.iter().filter(|e| e.start > start && e.start < end).copied());
+        v
+    }
+
+    /// Holes overlapping `start..end`, clipped to it.
+    fn holes_in(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
+        self.holes.iter().filter(|&&(s, e)| s < end && e > start).map(|&(s, e)| (s.max(start), e.min(end))).collect()
     }
 }
 
@@ -221,15 +333,17 @@ impl StreamSink for RingSink {
     }
 
     fn on_event(&mut self, event: StreamEvent) {
+        // One lock at a time (see the lock-order note on `Shared`).
+        let oldest = self.shared.ring.lock().oldest();
         let mut st = self.shared.state.lock();
         match event {
-            StreamEvent::Retune { center_hz, sample_rate, .. } => {
-                st.center_hz = center_hz;
-                st.sample_rate = sample_rate;
+            StreamEvent::Retune { at_sample, center_hz, sample_rate } => {
+                st.retune(at_sample, center_hz, sample_rate);
+                st.prune(oldest);
             }
-            StreamEvent::Gap { lost_samples, .. } => {
-                st.gaps += 1;
-                st.lost_samples += lost_samples;
+            StreamEvent::Gap { at_sample, lost_samples } => {
+                st.lost(at_sample, lost_samples);
+                st.prune(oldest);
             }
             StreamEvent::Overload { .. } => st.overloads += 1,
             StreamEvent::DeviceLost => st.lost_device = true,
@@ -509,13 +623,7 @@ impl Source {
     /// Writes part of the look-back ring to SigMF on a background thread.
     /// Returns a handle to join for the result.
     pub fn export(&self, req: sigmf::ExportRequest) -> JoinHandle<Result<sigmf::ExportResult, String>> {
-        let snap = self.snapshot();
-        let ctx = sigmf::ExportContext {
-            shared: self.shared.clone(),
-            sample_rate: snap.sample_rate,
-            tuner_center_hz: snap.center_hz,
-            hw: format!("{} {}", snap.info.label, snap.info.serial),
-        };
+        let ctx = sigmf::ExportContext { shared: self.shared.clone(), hw: format!("{} {}", self.info.label, self.info.serial) };
         std::thread::Builder::new().name("export".into()).spawn(move || sigmf::run(ctx, req)).expect("spawn export")
     }
 
@@ -636,6 +744,9 @@ fn live_worker(shared: Arc<Shared>, cfg: SourceConfig, stop: Arc<AtomicBool>, mu
     let mut fft_count = 0u64;
     let mut fft_window = Instant::now();
     let mut db = Vec::with_capacity(n);
+    // Start of the epoch the accumulated FFTs were taken in: a row averages
+    // IQ of one tuning only, and is labelled with that tuning.
+    let mut row_epoch: Option<u64> = None;
 
     while !stop.load(Ordering::Relaxed) {
         let (head, oldest) = {
@@ -651,13 +762,36 @@ fn live_worker(shared: Arc<Shared>, cfg: SourceConfig, stop: Arc<AtomicBool>, mu
         // Cap the work per pass so rows keep flowing even if the CPU can't keep up.
         let mut budget = 64;
         while *cur + n as u64 <= head && budget > 0 {
+            budget -= 1;
+            did_work = true;
+            // Only whole blocks clear of retunes and losses go into the average.
+            let (run, epoch) = {
+                let st = shared.state.lock();
+                (st.run_from(*cur, n as u64), st.epoch_at(*cur).map(|e| e.start))
+            };
+            match run {
+                Err(resume) => {
+                    *cur = resume;
+                    continue;
+                }
+                Ok(m) if m < n as u64 => {
+                    *cur += m;
+                    continue;
+                }
+                Ok(_) => {}
+            }
+            if epoch != row_epoch {
+                // Drop what was averaged at the previous tuning.
+                if sa.pending() > 0 {
+                    sa.take_db(&mut db);
+                }
+                row_epoch = epoch;
+            }
             if shared.ring.lock().read(*cur, &mut block) {
                 sa.push(&block);
                 fft_count += 1;
             }
             *cur += n as u64;
-            budget -= 1;
-            did_work = true;
         }
         if budget == 0 {
             // Can't keep up: drop to the live edge.
@@ -671,10 +805,7 @@ fn live_worker(shared: Arc<Shared>, cfg: SourceConfig, stop: Arc<AtomicBool>, mu
                 next_row = now + row_interval;
             }
             if sa.take_db(&mut db) {
-                let tuning = {
-                    let st = shared.state.lock();
-                    Tuning { center_hz: st.center_hz, span_hz: st.sample_rate }
-                };
+                let tuning = shared.state.lock().tuning_at(row_epoch.unwrap_or(*cur));
                 seq += 1;
                 let row = SpectrumRow {
                     seq,
@@ -696,5 +827,50 @@ fn live_worker(shared: Arc<Shared>, cfg: SourceConfig, stop: Arc<AtomicBool>, mu
         if !did_work {
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_log_splits_at_retunes_and_losses() {
+        let mut st = StreamState::default();
+        st.retune(0, 100e6, 1e6); // hole 0..10_000
+        st.lost(50_000, 1_000); // hole 50_000..51_000
+        st.retune(200_000, 101e6, 1e6); // hole 190_000..210_000
+        assert_eq!(st.tuning_at(150_000), Tuning { center_hz: 100e6, span_hz: 1e6 });
+        assert_eq!(st.tuning_at(200_000), Tuning { center_hz: 101e6, span_hz: 1e6 });
+        assert_eq!(st.tuning_at(199_999), Tuning { center_hz: 100e6, span_hz: 1e6 });
+        // A chain reading 16k blocks: stopped short of the loss, skipped
+        // over it, stopped at the retune's guard, skipped past settling.
+        assert_eq!(st.run_from(40_000, 16_384), Ok(10_000));
+        assert_eq!(st.run_from(50_000, 16_384), Err(51_000));
+        assert_eq!(st.run_from(50_500, 16_384), Err(51_000));
+        assert_eq!(st.run_from(51_000, 16_384), Ok(16_384));
+        assert_eq!(st.run_from(180_000, 16_384), Ok(10_000));
+        assert_eq!(st.run_from(190_000, 16_384), Err(210_000));
+        assert_eq!(st.run_from(205_000, 16_384), Err(210_000));
+        assert_eq!(st.run_from(210_000, 16_384), Ok(16_384));
+        // Looking back from the live edge stays inside the new epoch, past settling.
+        assert_eq!(st.continuous_from(300_000), 210_000);
+        assert_eq!(st.continuous_from(150_000), 51_000);
+        assert_eq!(st.continuous_from(30_000), 10_000);
+        // Export segments and holes for a stretch spanning the retune.
+        let segs = st.segments(100_000, 300_000);
+        assert_eq!(segs.len(), 2);
+        assert_eq!((segs[0].start, segs[0].center_hz), (100_000, 100e6));
+        assert_eq!((segs[1].start, segs[1].center_hz), (200_000, 101e6));
+        assert_eq!(st.holes_in(100_000, 300_000), vec![(190_000, 210_000)]);
+        assert_eq!(st.holes_in(0, 50_500), vec![(0, 10_000), (50_000, 50_500)]);
+        // Pruning keeps the epoch in force at the ring's oldest sample.
+        st.prune(199_000);
+        assert_eq!(st.epochs.len(), 2);
+        assert_eq!(st.holes.len(), 1);
+        st.prune(250_000);
+        assert_eq!(st.epochs.len(), 1);
+        assert_eq!(st.tuning_at(250_000).center_hz, 101e6);
+        assert!(st.holes.is_empty());
     }
 }

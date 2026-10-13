@@ -392,10 +392,14 @@ pub(crate) fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>, rate: f64) {
                 }
             };
             let head = shared.ring.lock().head();
-            active = Some((spec, tuner, ddc, chain, head.saturating_sub((behind * rate) as u64)));
+            // Start a little behind the live edge, but not before the
+            // current tuning's first settled sample: after a retune the
+            // ring still holds IQ from the old frequency.
+            let from = shared.state.lock().continuous_from(head).max(head.saturating_sub((behind * rate) as u64));
+            active = Some((spec, tuner, ddc, chain, from));
             shared.audio.clear();
         }
-        let Some((spec, _, ddc, chain, pos)) = active.as_mut() else { continue };
+        let Some((spec, chain_tuner, ddc, chain, pos)) = active.as_mut() else { continue };
         let (oldest, head) = {
             let r = shared.ring.lock();
             (r.oldest(), r.head())
@@ -406,6 +410,21 @@ pub(crate) fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>, rate: f64) {
         let mut worked = false;
         while *pos < head {
             let n = ((head - *pos) as usize).min(chunk.len());
+            let n = match shared.state.lock().run_from(*pos, n as u64) {
+                Ok(n) => n as usize,
+                Err(resume) => {
+                    // Lost samples or a retune: skip the hole and start the
+                    // channel filter afresh. If the tuning changed, leave
+                    // the chain to be rebuilt for the new centre.
+                    *pos = resume;
+                    ddc.reset();
+                    worked = true;
+                    if shared.state.lock().epoch_at(resume).is_some_and(|e| e.center_hz != *chain_tuner) {
+                        break;
+                    }
+                    continue;
+                }
+            };
             if !shared.ring.lock().read(*pos, &mut chunk[..n]) {
                 break;
             }

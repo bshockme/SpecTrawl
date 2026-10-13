@@ -138,6 +138,16 @@ pub(crate) fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>, rate: f64) {
                 continue;
             }
             let n = ((head - pos) as usize).min(chunk.len());
+            let n = match shared.state.lock().run_from(pos, n as u64) {
+                Ok(n) => n as usize,
+                Err(resume) => {
+                    // Lost samples or a retune: skip the hole (a changed
+                    // tuning is caught above).
+                    pos = resume;
+                    ddc.reset();
+                    continue;
+                }
+            };
             if !shared.ring.lock().read(pos, &mut chunk[..n]) {
                 break;
             }
