@@ -151,19 +151,36 @@ Still questionable in the after run, each worth a capture:
 - "AM" ×7 at the P25 site (8.4 dB, 7.7 kHz) and ×5 at 930 MHz.
 - A strong 9 kHz signal at 855.6375 MHz (33 dB) alternated between
   "Analog FM" (deviation 1.3–1.5 kHz) and "2FSK 2400 Bd" from one window
-  to the next. It is an analog FM repeater (an industrial railroad channel
-  nearby), so the FSK half was the error. A capture of it keyed up shows
-  the idle carrier carrying a sub-audible tone near 65 Hz swung ±1.2 kHz
-  (over 80 % of the discriminator's power below 300 Hz): a sinusoidal
-  deviation gives a two-peak (arcsine) frequency histogram, which the
-  level counter reads as two FSK levels, and a spurious line in the
-  squared derivative then named a rate. Fixed after run 3:
-  `Features::tone_hz` finds a single tone holding ≥ 50 % of the
-  discriminator's power with no third harmonic (alternating data makes a
-  square wave, which has one), or a sub-audible band holding ≥ 70 %, and
-  such a window is "Analog FM" before any FSK rule runs. On the capture
-  every window from 0.5 to 1.5 s now reads "Analog FM"
-  (`detect/tests/real_captures.rs`). Not in the run 3 numbers.
+  to the next. It is an analog FM repeater (an industrial railroad
+  channel; the repeaters there are known for
+  a low background hum), so the FSK half was the error. A capture of it
+  keyed up shows the idle carrier swinging ±1.2 kHz between two levels at
+  134.4 bit/s with the pattern repeating every 23 bits: DCS (Digital Coded
+  Squelch), which is what the hum is. Over 80 % of the discriminator's
+  power sits below 150 Hz, the two-level swing gives a two-peak frequency
+  histogram that the level counter reads as two FSK levels, and a
+  spurious line in the squared derivative then named a rate. Fixed after
+  run 3 in two steps: `Features::tone_hz` finds a single tone holding
+  ≥ 50 % of the discriminator's power with no third harmonic, or a
+  sub-audible band holding ≥ 70 %, and such a window is "Analog FM" before
+  any FSK rule runs; then `detect::squelch` decodes the signalling itself.
+  DCS: low-pass to 300 Hz, slice at the midpoint of the two levels, bit
+  clock from the phase farthest from the threshold, ≥ 90 % agreement at a
+  lag of 23 bits, majority-fold to one word, then the rotation that passes
+  the Golay(23,12) check with the fixed 100 bits in place (the standard
+  104-code rotation preferred). CTCSS: a standard tone holding half the
+  50–300 Hz power and 13 dB over the band's median. The code is filed as
+  the record's identity like a NAC. On the capture every window from 0.5
+  to 1.5 s reads "Analog FM · DCS 205", voice windows included
+  (`detect/tests/real_captures.rs`); on air (200 s at 855.5 MHz,
+  2026-10-13) all 11 of its record and group windows did, where a first
+  live run with the decode after the modulation rules had called four of
+  eight "4FSK 2400 Bd" (the histogram sees four levels in DCS under
+  voice). The published inversion pairs
+  (023↔047, 205↔263, …) come out of the decoder, which pins the bit
+  order and polynomial; which polarity radios call "normal" is taken as a
+  one being positive deviation, unverified against a scanner. Not in the
+  run 3 numbers.
 
 ## 5. What is still wrong or unknown
 

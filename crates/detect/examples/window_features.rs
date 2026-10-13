@@ -23,7 +23,7 @@ fn main() {
         .collect();
     let lines = a.iter().any(|v| v == "--lines");
     let n = (win * fs) as usize;
-    println!("{:>6}  {:<16} {:>5} {:>6} {:>7} {:>6} {:>6} {:>7}", "t s", "label", "lv", "cv", "dev Hz", "rate", "tone", "syncs");
+    println!("{:>6}  {:<26} {:>5} {:>6} {:>7} {:>6} {:>6} {:>7}", "t s", "label", "lv", "cv", "dev Hz", "rate", "tone", "syncs");
     for (k, w) in x.chunks(n).enumerate() {
         if w.len() < n / 2 {
             break;
@@ -31,9 +31,12 @@ fn main() {
         let c = detect::classify(w, fs, bw);
         let f = &c.features;
         println!(
-            "{:>6.1}  {:<16} {:>5} {:>6.2} {:>7.0} {:>6} {:>6} {:>7}",
+            "{:>6.1}  {:<26} {:>5} {:>6.2} {:>7.0} {:>6} {:>6} {:>7}",
             k as f64 * win,
-            c.label,
+            match c.fields.as_ref().and_then(|f| f.id.as_deref()) {
+                Some(id) => format!("{} · {id}", c.label),
+                None => c.label.clone(),
+            },
             f.fsk_levels,
             f.envelope_cv,
             f.deviation_hz,

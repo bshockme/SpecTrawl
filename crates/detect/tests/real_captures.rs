@@ -165,16 +165,26 @@ fn flex_pages_decode_from_the_committed_slice() {
 }
 
 /// An analog FM repeater close by (855.6375 MHz, an industrial railroad
-/// channel): idle carrier with a sub-audible tone swinging ±1.2 kHz, then
-/// voice. Half its windows used to read "2FSK 2400 Bd".
+/// channel): idle carrier carrying DCS (134.4 bit/s swinging ±1.2 kHz),
+/// then voice over it. Half its windows used to read "2FSK 2400 Bd"; now
+/// every window is analog FM and nearly every one reads the squelch code
+/// (205 with a one as positive deviation, 263 the other way round).
 #[test]
-fn analog_fm_repeater_is_never_fsk() {
+fn analog_fm_repeater_reads_its_dcs_code_and_is_never_fsk() {
     let Some((x, fs)) = common::capture("855.6375MHz_Analog_FM_repeater") else { return };
     for win in [0.5, 0.75, 1.0, 1.5] {
         let n = (win * fs) as usize;
+        let (mut windows, mut coded) = (0, 0);
         for (k, w) in x.chunks(n).enumerate().filter(|(_, w)| w.len() == n) {
             let c = detect::classify(w, fs, 9_000.0);
             assert!(c.protocol.is_none() && !c.label.contains("FSK"), "window {k} of {win} s: {}", c.label);
+            windows += 1;
+            match c.fields.as_ref().and_then(|f| f.id.as_deref()) {
+                Some("DCS 205") => coded += 1,
+                Some(other) => panic!("window {k} of {win} s: {other}"),
+                None => {}
+            }
         }
+        assert!(coded * 10 >= windows * 8, "{win} s: DCS read in {coded}/{windows} windows");
     }
 }

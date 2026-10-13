@@ -25,6 +25,7 @@ pub mod p25p2;
 pub mod pocsag;
 pub mod rds;
 pub mod spectral;
+pub mod squelch;
 pub mod sync;
 pub mod trunk;
 
@@ -431,6 +432,21 @@ pub fn classify_with(x: &[Complex32], fs: f64, bandwidth_hz: f64, hints: Hints) 
         c.confidence = 0.1;
         return c;
     }
+    // Sub-audible squelch signalling identifies an analog FM transmitter
+    // (a DCS code or CTCSS tone stays with a repeater for years), and is
+    // what an idle repeater's carrier mostly carries. It goes before the
+    // modulation rules because DCS (two levels swinging ±1 kHz at 134
+    // bit/s) reads as 2FSK or 4FSK to the histogram, and voice over it
+    // does too; the decoder itself (a 23-bit word repeating, passing its
+    // Golay check) passes no data mode.
+    if bandwidth_hz <= 30e3 && f.envelope_cv < 0.3 {
+        if let Some(m) = squelch::measure(longest_on_run(&disc, &gate), fs) {
+            c.label = "Analog FM".into();
+            c.confidence = 0.8;
+            c.fields = Some(decode::Fields { id: Some(m.squelch.label()), decoded: m.words, tried: m.words, ..Default::default() });
+            return c;
+        }
+    }
     let (label, conf) = if bandwidth_hz > 150e3 {
         (if f.envelope_cv < 0.25 { "Wideband FM".to_string() } else { "Wideband".to_string() }, 0.5)
     } else if bandwidth_hz < 4.5e3 && f.fsk_levels == 0 {
@@ -471,6 +487,25 @@ pub fn classify_with(x: &[Complex32], fs: f64, bandwidth_hz: f64, hints: Hints) 
     c.label = label;
     c.confidence = conf;
     c
+}
+
+/// The longest contiguous stretch of `disc` where the envelope gate is on
+/// (the gate is one longer than the discriminator and leads it by one).
+fn longest_on_run<'a>(disc: &'a [f32], gate: &[bool]) -> &'a [f32] {
+    let (mut best, mut start) = ((0usize, 0usize), None);
+    for (i, g) in gate[1..].iter().chain(std::iter::once(&false)).enumerate() {
+        match (g, start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                if i - s > best.1 - best.0 {
+                    best = (s, i);
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    &disc[best.0..best.1.min(disc.len())]
 }
 
 /// Window SNR below which no feature label is given (see `classify_with`).

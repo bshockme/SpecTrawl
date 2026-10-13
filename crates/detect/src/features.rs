@@ -121,11 +121,12 @@ pub fn extract(x: &[Complex32], disc: &[f32], fs: f64) -> Features {
 /// sine has none).
 const TONE_SHARE: f32 = 0.5;
 const TONE_THIRD_HARMONIC: f32 = 0.03;
-/// A sub-audible tone (CTCSS and the like) on an otherwise idle carrier:
-/// this much of the discriminator's power below `SUBAUDIBLE_HZ`. No data
-/// mode keeps all its energy there. (A 65 Hz tone swinging ±1.2 kHz on a
-/// nearby repeater's idle carrier read as two FSK levels; its energy sits
-/// in a band around the tone rather than one sharp line.)
+/// Sub-audible signalling (CTCSS, DCS) on an otherwise idle carrier: this
+/// much of the discriminator's power below `SUBAUDIBLE_HZ`. No data mode
+/// keeps all its energy there. (A nearby repeater's idle carrier carries
+/// DCS, 134.4 bit/s NRZ swinging ±1.2 kHz, which read as two FSK levels;
+/// its energy is a comb below 150 Hz rather than one sharp line. The code
+/// itself is read by `squelch::measure`.)
 const SUBAUDIBLE_HZ: f64 = 300.0;
 const SUBAUDIBLE_SHARE: f32 = 0.7;
 
