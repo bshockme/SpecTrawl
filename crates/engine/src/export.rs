@@ -40,10 +40,9 @@ impl Source {
         if end <= start {
             return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput).into());
         }
-        let segment = self.segment_covering(start, end).map_err(|e| match e {
-            CoverError::Spans(s) => ExportError::Spans(s),
-            CoverError::Gap(_) => ExportError::Ring(ring::ReadError::Gap),
-        })?;
+        // The ring range first: once `head` has passed `end`, no boundary can
+        // still be pushed inside the range, so the segment resolved next is
+        // the one every sample in it was recorded with.
         let ring = self.ring();
         if end > ring.head() {
             return Err(ExportError::Ring(ring::ReadError::Future));
@@ -51,6 +50,10 @@ impl Source {
         if start < ring.oldest() {
             return Err(ExportError::Ring(ring::ReadError::Overwritten));
         }
+        let segment = self.segment_covering(start, end).map_err(|e| match e {
+            CoverError::Spans(s) => ExportError::Spans(s),
+            CoverError::Gap(_) => ExportError::Ring(ring::ReadError::Gap),
+        })?;
         std::fs::create_dir_all(dir)?;
         let data_path = dir.join(format!("{stem}.sigmf-data"));
         let meta_path = dir.join(format!("{stem}.sigmf-meta"));

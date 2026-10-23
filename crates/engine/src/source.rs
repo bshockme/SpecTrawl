@@ -349,8 +349,18 @@ impl Source {
         Ok(seg)
     }
 
+    /// The segment of `start .. start + len`, resolved only once the whole
+    /// range is below `head`. Order matters: a boundary is pushed at or above
+    /// the head current when it is pushed (a starvation gap lands below it,
+    /// but the ring has already made that range unreadable), so once `head`
+    /// has passed `end` no later boundary can split the range, and the
+    /// segment found here is the one the samples were recorded with.
     fn covering(&self, start: u64, len: usize) -> Result<Segment, ReadError> {
-        self.inner.segments.covering(start, start + len as u64).map_err(|e| match e {
+        let end = start + len as u64;
+        if end > self.inner.ring.head() {
+            return Err(ReadError::Future);
+        }
+        self.inner.segments.covering(start, end).map_err(|e| match e {
             CoverError::Gap(_) => ReadError::Gap,
             CoverError::Spans(_) => ReadError::SpansSegments,
         })

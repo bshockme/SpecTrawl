@@ -70,9 +70,16 @@ fn reads_and_exports_touching_a_device_gap_are_refused() {
     assert_eq!(src.read(hole.start + 100, &mut f), Err(ReadError::Gap));
     assert_eq!(src.read_raw(g.data_from(), &mut out).unwrap().id, g.id); // entirely after
     assert_ne!(src.read_raw(hole.start - 1000, &mut out).unwrap().id, g.id); // entirely before
+    // A range reaching past `head` is refused as Future before its segment is
+    // resolved (a boundary may still land inside it), even though it also
+    // touches the hole.
+    let mut long = vec![[0i16; 2]; (src.head() + 1_000_000 - hole.start) as usize];
+    assert_eq!(src.read_raw(hole.start, &mut long), Err(ReadError::Future));
     let dir = std::env::temp_dir().join(format!("spectrawl-export-gap-{}", std::process::id()));
     let over = src.export_wideband(hole.start - 100_000, hole.end + 100_000, &dir, "over");
     assert!(matches!(over, Err(ExportError::Ring(engine::ring::ReadError::Gap))), "{over:?}");
+    let ahead = src.export_wideband(hole.start, src.head() + 1_000_000, &dir, "ahead");
+    assert!(matches!(ahead, Err(ExportError::Ring(engine::ring::ReadError::Future))), "{ahead:?}");
     let inside = src.export_wideband(hole.start + 10, hole.start + 20, &dir, "inside");
     assert!(matches!(inside, Err(ExportError::Ring(engine::ring::ReadError::Gap))), "{inside:?}");
     assert!(!dir.join("over.sigmf-data").exists() && !dir.join("inside.sigmf-data").exists());
