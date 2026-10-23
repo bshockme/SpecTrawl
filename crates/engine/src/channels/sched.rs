@@ -162,7 +162,8 @@ impl Sched {
         if now.duration_since(start) < WINDOW {
             return;
         }
-        self.saturated = w.calls > 0 && w.saturated_calls as f64 >= 0.9 * w.calls as f64;
+        // `calls` counts this call, so it is never 0 here.
+        self.saturated = w.saturated_calls as f64 >= 0.9 * w.calls as f64;
         *w = Window { start: Some(now), calls: 0, saturated_calls: 0 };
         if self.saturated {
             self.shed_one();
@@ -172,14 +173,12 @@ impl Sched {
     /// Sheds the lowest-priority running subscription lagging more than
     /// `max_lag_secs` (ties: the largest lag), if there is one.
     fn shed_one(&mut self) {
-        let victim = self
+        let candidates = self
             .subs
             .iter()
             .filter(|(_, e)| !e.last_turn)
-            .map(|(&id, e)| (id, e.priority, e.lag_secs(self.latest.get(&e.info.source).copied())))
-            .filter(|&(_, _, lag)| lag > self.max_lag_secs)
-            .min_by(|a, b| a.1.cmp(&b.1).then(b.2.total_cmp(&a.2)));
-        let Some((id, priority, lag)) = victim else { return };
+            .map(|(&id, e)| (id, e.priority, e.lag_secs(self.latest.get(&e.info.source).copied())));
+        let Some((id, priority, lag)) = choose_victim(candidates, self.max_lag_secs) else { return };
         let e = self.subs.get_mut(&id).expect("just found");
         e.counters.state = ConsumerState::Shed;
         e.last_turn = true;
@@ -198,6 +197,13 @@ impl Sched {
         let id = id.0;
         log::warn!("channel bus: shed channel {id} ({priority:?}) lagging {lag:.1} s under a saturated pool");
     }
+}
+
+/// Of `(id, priority, lag_secs)` candidates (lag 0 unless running), the one
+/// to shed: the lowest priority lagging more than `max_lag_secs`; ties go to
+/// the largest lag.
+fn choose_victim(candidates: impl Iterator<Item = (ChannelId, Priority, f64)>, max_lag_secs: f64) -> Option<(ChannelId, Priority, f64)> {
+    candidates.filter(|&(_, _, lag)| lag > max_lag_secs).min_by(|a, b| a.1.cmp(&b.1).then(b.2.total_cmp(&a.2)))
 }
 
 /// What [`ChannelBus::stats`](super::ChannelBus::stats) reads under the lock.
@@ -335,6 +341,11 @@ impl Shared {
                     e.counters = counters;
                     // Shed while this ordinary turn ran: its last turn is next, unless it ended meanwhile.
                     let shed_meanwhile = e.last_turn && !last && counters.state != ConsumerState::Ended;
+                    if e.last_turn && counters.state == ConsumerState::Ended {
+                        // The consumer ended (Stop or panic) before `Shed` could be delivered:
+                        // the shed is cancelled, so it no longer counts in `shed_total`.
+                        s.shed_total -= 1;
+                    }
                     if last || counters.state == ConsumerState::Ended {
                         e.last_turn = false;
                     }
@@ -363,4 +374,33 @@ pub(super) fn spawn_workers(shared: &Arc<Shared>, n: usize) -> Vec<JoinHandle<()
             std::thread::Builder::new().name(format!("bus-worker-{i}")).spawn(move || shared.work()).expect("spawn a channel bus worker")
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_victim_is_the_lowest_priority_laggard_then_the_largest_lag() {
+        let mut c = vec![
+            (ChannelId(1), Priority::Listen, 3.0),
+            (ChannelId(2), Priority::Classify, 1.0),
+            (ChannelId(3), Priority::Recorder, 0.6),
+            (ChannelId(4), Priority::Recorder, 0.9),
+            (ChannelId(5), Priority::Recorder, 0.4), // lowest priority but within max_lag_secs
+            (ChannelId(6), Priority::PagerMonitor, 0.0),
+        ];
+        let mut order = Vec::new();
+        while let Some((id, _, _)) = choose_victim(c.iter().copied(), 0.5) {
+            order.push(id.0);
+            c.retain(|x| x.0 != id);
+        }
+        assert_eq!(order, vec![4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn nobody_is_shed_when_no_one_lags_past_the_limit() {
+        let c = [(ChannelId(1), Priority::Recorder, 0.5), (ChannelId(2), Priority::Listen, 0.1)];
+        assert_eq!(choose_victim(c.iter().copied(), 0.5), None);
+    }
 }
