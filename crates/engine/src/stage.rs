@@ -189,9 +189,9 @@ impl Worker {
                     let mut bins: Arc<[Complex32]> = std::iter::repeat_n(Complex32::default(), n).collect();
                     fft.forward(&buf, Arc::get_mut(&mut bins).expect("a fresh Arc is unique"));
                     bh_power(&bins, &mut power);
+                    self.shared.cache.insert(b, seg.clone(), bins);
                     self.accumulate(&mut row, first, first + n as u64, &seg, &power);
                     let micros = t0.elapsed().as_secs_f64() * 1e6;
-                    self.shared.cache.insert(b, seg, bins);
                     {
                         let mut s = self.shared.stats.lock();
                         s.block_micros = if s.blocks == 0 { micros } else { s.block_micros + EMA_ALPHA * (micros - s.block_micros) };
@@ -203,7 +203,11 @@ impl Worker {
                 }
                 Err(ReadError::Future) => std::thread::park_timeout(POLL),
                 Err(ReadError::Overwritten | ReadError::Lost) => {
-                    b = source.oldest() / l + 2;
+                    // A row never spans the samples jumped over.
+                    if let Some(r) = row.take() {
+                        self.publish(r);
+                    }
+                    b = next_block_after_jump(b, source.oldest(), l);
                     self.shared.stats.lock().skipped_blocks += 1;
                 }
                 Err(ReadError::Gap | ReadError::SpansSegments) => {
@@ -258,5 +262,31 @@ impl Worker {
             segment: acc.segment,
             power,
         });
+    }
+}
+
+/// Where to resume after the ring refused block `b` as overwritten or lost:
+/// just above `oldest` (`oldest/L + 2`), but never at or before `b`. A block
+/// the OS discarded inside the held range reads `Lost` while `oldest` is
+/// still below it, and the formula alone would rewind into blocks already
+/// cached, fed to rows and passed to the sink.
+fn next_block_after_jump(b: u64, oldest: u64, hop: u64) -> u64 {
+    (oldest / hop + 2).max(b + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_block_after_jump;
+
+    #[test]
+    fn a_jump_to_the_live_edge_never_goes_backwards() {
+        const L: u64 = 32_768;
+        // Overwritten: `oldest` has moved past `b`, so jump to just above it.
+        assert_eq!(next_block_after_jump(10, 100 * L + 5, L), 102);
+        // Lost above `oldest`: the formula alone would rewind to 7.
+        assert_eq!(next_block_after_jump(50, 5 * L, L), 51);
+        assert_eq!(next_block_after_jump(50, 48 * L, L), 51);
+        assert_eq!(next_block_after_jump(50, 49 * L, L), 51);
+        assert_eq!(next_block_after_jump(50, 50 * L, L), 52);
     }
 }

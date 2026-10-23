@@ -31,13 +31,13 @@ fn rows_show_the_carrier_in_the_right_bin_and_blocks_reach_the_sink() {
     let median = sorted[sorted.len() / 2];
     assert!(row.power[peak] > median * 1e2, "carrier not 20 dB above the floor");
     assert!(row.blocks >= 15 && row.blocks <= 16, "{}", row.blocks); // 50 ms at 305 blocks/s
+    stage.stop(); // the comparison below needs a thread that has finished
     let s = stage.stats();
     assert_eq!(sink.0.load(Ordering::Relaxed), s.blocks);
     assert_eq!(s.skipped_blocks, 0);
     assert!(stage.cache().get(s.latest_block.unwrap()).is_some());
     assert!(stage.cache().get(s.latest_block.unwrap() - 40).is_none(), "cache deeper than configured");
     assert!(s.block_micros > 0.0 && s.block_micros < 3000.0, "{} µs per block", s.block_micros);
-    stage.stop();
 }
 
 #[test]
