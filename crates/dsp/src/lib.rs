@@ -4,6 +4,7 @@
 pub mod ddc;
 pub mod demod;
 pub mod fir;
+pub mod spectrum;
 
 use std::sync::Arc;
 
