@@ -2,11 +2,12 @@
 
 #![allow(dead_code)]
 
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use backend_sim::{Emitter, Keying, Modulation, SimConfig, SimControl, SimDevice};
-use engine::{RingConfig, SourceConfig};
-use sdr_core::Device;
+use engine::{BudgetConfig, Consumer, Delivery, EndReason, Flow, Keeper, RingBudget, RingConfig, SourceConfig};
+use sdr_core::{Complex32, Device};
 
 /// A simulated device with no emitters (noise only) at `rate`. It never
 /// reports a lag gap (a paced sim that falls behind on a loaded runner just
@@ -20,7 +21,17 @@ pub fn sim(rate: f64, paced: bool) -> (Box<dyn Device>, SimControl) {
 /// CW carrier at `freq_hz` and `level_dbfs`. Like [`sim`], it never reports a
 /// lag gap.
 pub fn cw_sim(rate: f64, freq_hz: f64, level_dbfs: f64) -> (Box<dyn Device>, SimControl) {
-    let emitters = vec![Emitter { freq_hz, level_dbfs, modulation: Modulation::Cw, keying: Keying::Continuous }];
+    cw_emitters_sim(rate, &[freq_hz], level_dbfs)
+}
+
+/// Like [`cw_sim`] with two continuous CW carriers at `f1` and `f2`, both at `level_dbfs`.
+pub fn two_tone_sim(rate: f64, f1: f64, f2: f64, level_dbfs: f64) -> (Box<dyn Device>, SimControl) {
+    cw_emitters_sim(rate, &[f1, f2], level_dbfs)
+}
+
+fn cw_emitters_sim(rate: f64, freqs: &[f64], level_dbfs: f64) -> (Box<dyn Device>, SimControl) {
+    let emitters =
+        freqs.iter().map(|&freq_hz| Emitter { freq_hz, level_dbfs, modulation: Modulation::Cw, keying: Keying::Continuous }).collect();
     let (d, c) = SimDevice::with_config(SimConfig {
         emitters,
         rate,
@@ -30,6 +41,11 @@ pub fn cw_sim(rate: f64, freq_hz: f64, level_dbfs: f64) -> (Box<dyn Device>, Sim
         ..Default::default()
     });
     (Box::new(d), c)
+}
+
+/// A keeper holding at least 1 s, at most 256 MiB, swept every 0.2 s.
+pub fn keeper() -> Arc<Keeper> {
+    Keeper::start(RingBudget::new(BudgetConfig { guaranteed_secs: 1.0, ceiling_bytes: 256 << 20, sweep_secs: 0.2 }))
 }
 
 /// 1 MiB blocks (262,144 samples), weight 1.0.
@@ -43,5 +59,115 @@ pub fn wait_until(f: impl Fn() -> bool) {
     while !f() {
         assert!(Instant::now() < deadline, "condition not met within 20 s");
         std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// A cloneable [`Consumer`] that records what the bus delivers to it.
+#[derive(Clone)]
+pub struct Collector(Arc<Mutex<Collected>>);
+
+#[derive(Default)]
+struct Collected {
+    /// Keep the samples (false: only count them).
+    store: bool,
+    /// Return `Flow::Stop` once this many samples have arrived.
+    limit: Option<usize>,
+    /// Sleep this long in each delivery.
+    sleep: Option<Duration>,
+    stored: Vec<Complex32>,
+    samples: usize,
+    first_samples: Vec<u64>,
+    gaps: u64,
+    sheds: u64,
+    ends: u64,
+    ended: Option<EndReason>,
+}
+
+impl Collector {
+    fn with(c: Collected) -> Collector {
+        Collector(Arc::new(Mutex::new(c)))
+    }
+
+    /// Stores every sample.
+    pub fn new() -> Collector {
+        Collector::with(Collected { store: true, ..Default::default() })
+    }
+
+    /// Counts samples without storing them.
+    pub fn counting_only() -> Collector {
+        Collector::with(Collected::default())
+    }
+
+    /// Stores samples and returns `Flow::Stop` once `n` have arrived.
+    pub fn with_limit(n: usize) -> Collector {
+        Collector::with(Collected { store: true, limit: Some(n), ..Default::default() })
+    }
+
+    /// Stores samples and sleeps `d` in every delivery.
+    pub fn sleeping(d: Duration) -> Collector {
+        Collector::with(Collected { store: true, sleep: Some(d), ..Default::default() })
+    }
+
+    /// Samples received.
+    pub fn samples(&self) -> usize {
+        self.0.lock().unwrap().samples
+    }
+
+    pub fn gaps(&self) -> u64 {
+        self.0.lock().unwrap().gaps
+    }
+
+    pub fn shed_deliveries(&self) -> u64 {
+        self.0.lock().unwrap().sheds
+    }
+
+    pub fn end_deliveries(&self) -> u64 {
+        self.0.lock().unwrap().ends
+    }
+
+    pub fn ended(&self) -> Option<EndReason> {
+        self.0.lock().unwrap().ended
+    }
+
+    /// `first_sample` of the first `Samples` delivery; panics if there was none.
+    pub fn first_delivery_first_sample(&self) -> u64 {
+        *self.0.lock().unwrap().first_samples.first().expect("no Samples delivery yet")
+    }
+
+    /// Every `Samples` delivery starts `hop` input samples after the one before it.
+    pub fn first_samples_are_consecutive_by(&self, hop: u64) -> bool {
+        self.0.lock().unwrap().first_samples.windows(2).all(|w| w[1] == w[0] + hop)
+    }
+
+    /// The last `n` stored samples (fewer if fewer were stored).
+    pub fn tail(&self, n: usize) -> Vec<Complex32> {
+        let c = self.0.lock().unwrap();
+        c.stored[c.stored.len().saturating_sub(n)..].to_vec()
+    }
+}
+
+impl Consumer for Collector {
+    fn deliver(&mut self, d: Delivery<'_>) -> Flow {
+        let sleep = self.0.lock().unwrap().sleep;
+        if let Some(t) = sleep {
+            std::thread::sleep(t); // outside the lock, so the test can read meanwhile
+        }
+        let mut c = self.0.lock().unwrap();
+        match d {
+            Delivery::Samples { first_sample, samples, .. } => {
+                c.first_samples.push(first_sample);
+                c.samples += samples.len();
+                if c.store {
+                    c.stored.extend_from_slice(samples);
+                }
+            }
+            Delivery::Gap { .. } => c.gaps += 1,
+            Delivery::Shed => c.sheds += 1,
+            Delivery::Ended { reason } => {
+                c.ends += 1;
+                c.ended = Some(reason);
+            }
+        }
+        if c.limit.is_some_and(|l| c.samples >= l) { Flow::Stop } else { Flow::Continue }
     }
 }
