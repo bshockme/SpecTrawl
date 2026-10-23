@@ -1,6 +1,7 @@
 //! DSP building blocks. For now: a windowed power-spectrum analyzer that
 //! accumulates many FFTs per output frame (linear-power averaging).
 
+pub mod channelizer;
 pub mod ddc;
 pub mod demod;
 pub mod fir;
