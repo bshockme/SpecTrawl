@@ -1,0 +1,22 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arc-swap = "1.7"
+log = "0.4"
+parking_lot = "0.12"
+sdr-core = { version = "0.1.0", path = "../sdr-core" }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_System_Memory", "Win32_System_SystemInformation"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+backend-sim = { path = "../backend-sim" }
+serde_json = "1"
