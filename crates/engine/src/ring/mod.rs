@@ -75,6 +75,17 @@ pub struct RingStats {
     pub starved_total: u64,
 }
 
+/// What one [`IqRing::housekeep`] pass did.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Housekeeping {
+    /// Blocks allocated ahead of the writer.
+    pub provisioned: u32,
+    /// Blocks dropped from their slots (past the ceiling, lost, or stale below `oldest`).
+    pub retired: u32,
+    /// Blocks offered to the OS.
+    pub offered: u32,
+}
+
 pub struct IqRing {
     cfg: RingConfig,
     block_samples: u64,
@@ -310,7 +321,6 @@ impl IqRing {
     ///
     /// The keeper must never offer the block holding `head`: the writer does
     /// not look at the state.
-    #[cfg_attr(not(test), allow(dead_code))] // the keeper (Task 11) calls it
     pub(crate) fn try_offer(&self, block: &Block, priority: OfferPriority) -> bool {
         if block.state.compare_exchange(BlockState::Live as u8, BlockState::Offering as u8, Ordering::SeqCst, Ordering::SeqCst).is_err() {
             return false;
@@ -364,6 +374,122 @@ impl IqRing {
             allocated += 1;
         }
         allocated
+    }
+
+    /// One keeper pass: provision 2 blocks ahead, retire blocks beyond the
+    /// ceiling (oldest first, never the writer's block), offer every `Live`
+    /// block older than the guaranteed window with a priority by age.
+    ///
+    /// Single keeper: only one thread calls `housekeep` and `provision`.
+    ///
+    /// The protected range is every block that intersects the guaranteed
+    /// window `head - guaranteed_samples .. head` plus the block holding
+    /// `head` (the writer's, whose state the writer never looks at). It is
+    /// never retired or offered, even when the ceiling is smaller: the ring
+    /// then keeps `max(ceiling, protected blocks)`.
+    ///
+    /// Order: provision first (the writer's next block matters most), then
+    /// retire (so nothing about to be dropped is offered and the window the
+    /// offer bands are cut from is the one that stays), then offer.
+    pub fn housekeep(&self) -> Housekeeping {
+        let provisioned = self.provision(2);
+        let bs = self.block_samples;
+        // `head` only grows, so everything below this snapshot's block stays
+        // behind the writer for the rest of the pass.
+        let head = self.head();
+        let guaranteed = self.guaranteed_samples.load(Ordering::Relaxed);
+        // First block that intersects the guaranteed window or holds `head`.
+        let protected_from = head.saturating_sub(guaranteed) / bs;
+        let retired = self.retire(head, protected_from);
+        let offered = self.offer_aged(protected_from);
+        Housekeeping { provisioned, retired, offered }
+    }
+
+    /// Retire blocks below `protected_from`: first every block whose samples
+    /// lie entirely below `oldest` (left behind by starvation), then, walking
+    /// up from `oldest`, `Lost` blocks at the front and held blocks while
+    /// more than `ceiling_blocks` are held. Returns the number retired.
+    fn retire(&self, head: u64, protected_from: u64) -> u32 {
+        let bs = self.block_samples;
+        let mut retired = 0;
+        // Stale blocks: not held any more, but still in their slots.
+        let oldest = self.oldest();
+        for slot in self.slots.iter() {
+            let stale = slot.load().as_ref().is_some_and(|b| b.index < protected_from && (b.index + 1) * bs <= oldest);
+            if stale {
+                slot.store(None);
+                retired += 1;
+            }
+        }
+        // Held blocks counted as in `stats`: written, not lost.
+        let written_blocks = head.div_ceil(bs);
+        let mut held = self
+            .slots
+            .iter()
+            .filter(|slot| {
+                slot.load()
+                    .as_ref()
+                    .is_some_and(|b| b.index < written_blocks && BlockState::from_u8(b.state.load(Ordering::SeqCst)) != BlockState::Lost)
+            })
+            .count() as u64;
+        let ceiling = u64::from(self.ceiling_blocks.load(Ordering::Relaxed));
+        let mut b = self.oldest() / bs;
+        while b < protected_from {
+            let slot = self.slot(b);
+            // `None`: nothing held here (never provisioned); just step over it.
+            let block = slot.load_full().filter(|blk| blk.index == b);
+            if let Some(block) = &block
+                && BlockState::from_u8(block.state.load(Ordering::SeqCst)) != BlockState::Lost
+            {
+                if held <= ceiling {
+                    break;
+                }
+                held -= 1;
+            }
+            // Move `oldest` past the block before its slot empties: a reader
+            // then fails the `oldest` check or finds the slot empty, and one
+            // still copying re-checks `oldest` when done. The block's memory
+            // is freed when the last guard drops.
+            self.oldest.fetch_max((b + 1) * bs, Ordering::AcqRel);
+            if block.is_some() {
+                slot.store(None);
+                retired += 1;
+            }
+            b += 1;
+        }
+        retired
+    }
+
+    /// Offer every `Live` block from `oldest` up to `protected_from`, oldest
+    /// first, with a priority by age: the window is split into four equal
+    /// bands from newest to oldest (`Normal`, `BelowNormal`, `Low`,
+    /// `VeryLow`), and the oldest block is always `VeryLow`. Blocks already
+    /// offered are left alone (a block is offered at most once per reclaim);
+    /// a block a reader reclaimed is `Live` again and is offered at its
+    /// current band. Returns the number offered.
+    fn offer_aged(&self, protected_from: u64) -> u32 {
+        let first = self.oldest() / self.block_samples;
+        let n = protected_from.saturating_sub(first);
+        let mut offered = 0;
+        for b in first..protected_from {
+            let Some(block) = self.slot(b).load_full().filter(|blk| blk.index == b) else { continue };
+            if BlockState::from_u8(block.state.load(Ordering::SeqCst)) != BlockState::Live {
+                continue;
+            }
+            // 0 for the newest block of the window, n - 1 for the oldest.
+            let age = protected_from - 1 - b;
+            let band = if age == n - 1 { 3 } else { age * 4 / n };
+            let priority = match band {
+                0 => OfferPriority::Normal,
+                1 => OfferPriority::BelowNormal,
+                2 => OfferPriority::Low,
+                _ => OfferPriority::VeryLow,
+            };
+            if self.try_offer(&block, priority) {
+                offered += 1;
+            }
+        }
+        offered
     }
 
     pub fn set_ceiling_blocks(&self, n: u32) {
@@ -821,5 +947,67 @@ mod tests {
         assert_eq!(state(&b0), BlockState::Lost);
         assert_eq!(b0.readers.load(Ordering::SeqCst), 0);
         assert_eq!(r.read_raw(0, &mut out), Err(ReadError::Lost)); // returns, does not spin
+    }
+
+    #[test]
+    fn oldest_offered_blocks_are_lost_first_and_the_guaranteed_window_never_is() {
+        let mem = Arc::new(FakeVolatile::default());
+        let r = IqRing::new(RingConfig { block_bytes: 4096 }, mem.clone());
+        r.set_ceiling_blocks(12);
+        r.set_guaranteed_samples(3 * 1024);
+        for b in 0..12u64 {
+            r.housekeep();
+            r.write(b * 1024, Samples::Ci16(&ramp(b * 1024, 1024)));
+        }
+        r.housekeep();
+        let s = r.stats();
+        assert_eq!(s.blocks_live + s.blocks_offered, 12);
+        assert!(s.blocks_offered >= 8, "{s:?}"); // 12 held, 3 guaranteed, writer's block live
+        let pri: Vec<_> = mem.offered().iter().map(|o| o.1).collect();
+        assert_eq!(pri[0], OfferPriority::VeryLow); // oldest offered lowest
+        assert_eq!(*pri.last().unwrap(), OfferPriority::Normal);
+        mem.discard_oldest_offered(2); // the OS took blocks 0 and 1
+        let mut out = vec![[0i16; 2]; 10];
+        assert_eq!(r.read_raw(100, &mut out), Err(ReadError::Lost));
+        assert_eq!(r.read_raw(1100, &mut out), Err(ReadError::Lost));
+        r.read_raw(2100, &mut out).unwrap(); // block 2 reclaimed intact
+        r.read_raw(11 * 1024 + 5, &mut out[..1]).unwrap(); // newest, never offered
+        r.housekeep();
+        assert_eq!(r.stats().blocks_lost_total, 2);
+        assert_eq!(r.oldest(), 2 * 1024);
+        assert_eq!(r.read_raw(100, &mut out), Err(ReadError::Overwritten));
+    }
+
+    #[test]
+    fn ceiling_retires_oldest_and_shrinking_takes_effect_on_the_next_pass() {
+        let r = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()));
+        r.set_ceiling_blocks(6);
+        r.set_guaranteed_samples(1024);
+        for b in 0..10u64 {
+            r.housekeep();
+            r.write(b * 1024, Samples::Ci16(&ramp(b * 1024, 1024)));
+        }
+        r.housekeep();
+        assert_eq!(r.oldest(), 4 * 1024);
+        assert_eq!(r.stats().held_samples, 6 * 1024);
+        r.set_ceiling_blocks(3);
+        let h = r.housekeep();
+        assert_eq!(h.retired, 3);
+        assert_eq!(r.oldest(), 7 * 1024);
+    }
+
+    #[test]
+    fn guaranteed_window_is_never_offered_even_under_a_tiny_ceiling() {
+        let mem = Arc::new(FakeVolatile::default());
+        let r = IqRing::new(RingConfig { block_bytes: 4096 }, mem.clone());
+        r.set_ceiling_blocks(2);
+        r.set_guaranteed_samples(4 * 1024);
+        for b in 0..6u64 {
+            r.housekeep();
+            r.write(b * 1024, Samples::Ci16(&ramp(b * 1024, 1024)));
+        }
+        r.housekeep();
+        assert!(mem.offered().is_empty());
+        assert!(r.stats().held_samples >= 4 * 1024);
     }
 }
