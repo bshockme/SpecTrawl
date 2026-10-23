@@ -71,7 +71,10 @@ fn main() {
             pcm.extend(s.iter().map(|&v| v.clamp(-32768.0, 32767.0) as i16));
         }
     }
-    println!("{ldus} LDUs ({skipped} encrypted, silent); frames decoded/repeated/muted {counts:?}; {:.1} s of audio", pcm.len() as f64 / 8000.0);
+    println!(
+        "{ldus} LDUs ({skipped} encrypted, silent); frames decoded/repeated/muted {counts:?}; {:.1} s of audio",
+        pcm.len() as f64 / 8000.0
+    );
     let peak = pcm.iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
     let rms = (pcm.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / pcm.len().max(1) as f64).sqrt();
     println!("peak {peak}, rms {rms:.0}");

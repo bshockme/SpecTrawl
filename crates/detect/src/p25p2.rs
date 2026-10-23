@@ -73,12 +73,8 @@ pub fn register_nac(nac: u16) {
 /// Scrambling sequences for every known system × NAC (at most a few).
 pub fn candidate_sequences() -> Vec<std::sync::Arc<Vec<u8>>> {
     let mut k = known().lock().unwrap();
-    let keys: Vec<ScrambleKey> = k
-        .systems
-        .iter()
-        .flat_map(|&(wacn, system)| k.nacs.iter().map(move |&nac| ScrambleKey { wacn, system, nac }))
-        .take(64)
-        .collect();
+    let keys: Vec<ScrambleKey> =
+        k.systems.iter().flat_map(|&(wacn, system)| k.nacs.iter().map(move |&nac| ScrambleKey { wacn, system, nac })).take(64).collect();
     keys.into_iter().map(|key| k.sequences.entry(key).or_insert_with(|| std::sync::Arc::new(scrambling(key))).clone()).collect()
 }
 
@@ -228,11 +224,29 @@ pub enum Mac {
     /// MAC_PTT / MAC_END_PTT: the call starting (with its encryption
     /// algorithm, 0x80 for clear) or ending (with the channel's colour code,
     /// its NAC; 0 on a start, where those bits are the message indicator).
-    Ptt { end: bool, source: u32, group: u16, nac: u16, algid: u8 },
-    GroupVoice { group: u16, source: u32, encrypted: bool, emergency: bool },
-    UnitVoice { target: u32, source: u32, encrypted: bool },
+    Ptt {
+        end: bool,
+        source: u32,
+        group: u16,
+        nac: u16,
+        algid: u8,
+    },
+    GroupVoice {
+        group: u16,
+        source: u32,
+        encrypted: bool,
+        emergency: bool,
+    },
+    UnitVoice {
+        target: u32,
+        source: u32,
+        encrypted: bool,
+    },
     /// Any other PDU: its type and first opcode.
-    Other { pdu: u8, opcode: u8 },
+    Other {
+        pdu: u8,
+        opcode: u8,
+    },
 }
 
 fn field(b: &[u8], start: usize, len: usize) -> u32 {
@@ -271,7 +285,9 @@ impl Mac {
             Mac::GroupVoice { group, source, encrypted, emergency } => {
                 Some(Call { group: true, target: group as u32, source: src(source), encrypted, emergency })
             }
-            Mac::UnitVoice { target, source, encrypted } => Some(Call { group: false, target, source: src(source), encrypted, emergency: false }),
+            Mac::UnitVoice { target, source, encrypted } => {
+                Some(Call { group: false, target, source: src(source), encrypted, emergency: false })
+            }
             _ => None,
         }
     }

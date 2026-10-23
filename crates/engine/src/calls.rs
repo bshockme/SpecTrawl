@@ -109,21 +109,20 @@ impl CallLog {
                 if self.calls.len() >= MAX_CALLS {
                     self.calls.pop_front();
                 }
-                let mut e =
-                    CallEvent {
-                        first: now,
-                        last: now,
-                        center_hz: freq,
-                        slot: None,
-                        protocol: label.to_string(),
-                        system: None,
-                        call,
-                        granted: false,
-                        heard: false,
-                        granted_at: None,
-                        followed_at: None,
-                        recordings: Vec::new(),
-                    };
+                let mut e = CallEvent {
+                    first: now,
+                    last: now,
+                    center_hz: freq,
+                    slot: None,
+                    protocol: label.to_string(),
+                    system: None,
+                    call,
+                    granted: false,
+                    heard: false,
+                    granted_at: None,
+                    followed_at: None,
+                    recordings: Vec::new(),
+                };
                 mark(&mut e);
                 self.calls.push_back(e);
             }

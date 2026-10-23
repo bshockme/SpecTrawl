@@ -421,7 +421,6 @@ pub fn lco_name(lco: u8) -> &'static str {
     }
 }
 
-
 /// 12 data hexbits → the 9 link control bytes.
 fn hexbits_to_bytes(h: &[u8]) -> [u8; 9] {
     let mut out = [0u8; 9];

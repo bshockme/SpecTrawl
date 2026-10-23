@@ -91,5 +91,10 @@ fn main() {
     }
     let st = src.stats();
     let wall = t0.elapsed().as_secs_f64();
-    println!("device samples {:.0}/s over {wall:.1} s wall; gaps {} ({} samples lost)", (src.ring_head() as f64) / wall, st.gaps, st.lost_samples);
+    println!(
+        "device samples {:.0}/s over {wall:.1} s wall; gaps {} ({} samples lost)",
+        (src.ring_head() as f64) / wall,
+        st.gaps,
+        st.lost_samples
+    );
 }

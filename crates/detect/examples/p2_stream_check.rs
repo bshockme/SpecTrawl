@@ -37,7 +37,11 @@ fn main() {
             }
         }
         let dt = t0.elapsed().as_secs_f64();
-        println!("ch{ch}: {bursts} voice bursts in {starts} transmissions, {:.1} s audio, {:.1}% of real time", audio as f64 / 8000.0, 100.0 * dt / dur);
+        println!(
+            "ch{ch}: {bursts} voice bursts in {starts} transmissions, {:.1} s audio, {:.1}% of real time",
+            audio as f64 / 8000.0,
+            100.0 * dt / dur
+        );
         for (k, n) in &calls {
             println!("    {n:4} bursts  {k}");
         }

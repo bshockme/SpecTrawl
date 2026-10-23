@@ -23,9 +23,14 @@ fn main() {
         let pagers: Vec<String> = src
             .emitters()
             .iter()
-            .filter_map(|e| e.protocol_label().filter(|l| l.starts_with("FLEX") || l.starts_with("POCSAG")).map(|l| format!("{l} @ {:.4}", e.center_hz / 1e6)))
+            .filter_map(|e| {
+                e.protocol_label()
+                    .filter(|l| l.starts_with("FLEX") || l.starts_with("POCSAG"))
+                    .map(|l| format!("{l} @ {:.4}", e.center_hz / 1e6))
+            })
             .collect();
-        let mons: Vec<String> = src.monitors().iter().map(|m| format!("{} {:.4} ({} pages)", m.label, m.center_hz / 1e6, m.messages)).collect();
+        let mons: Vec<String> =
+            src.monitors().iter().map(|m| format!("{} {:.4} ({} pages)", m.label, m.center_hz / 1e6, m.messages)).collect();
         println!("{t:>4} s  pager emitters {pagers:?}  monitors {mons:?}  pages logged {}", src.pages(100_000).len());
     }
     let pages = src.pages(100_000);

@@ -263,7 +263,12 @@ pub(crate) fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>, rate: f64) {
                     .filter_map(|e| {
                         if is_p25_control(e) {
                             // "CC 0x2A5": control channel and its NAC.
-                            return Some((e.id, e.center_hz, Kind::P25, format!("CC {}", e.id().map(|i| i.trim_start_matches("NAC ")).unwrap_or("P25"))));
+                            return Some((
+                                e.id,
+                                e.center_hz,
+                                Kind::P25,
+                                format!("CC {}", e.id().map(|i| i.trim_start_matches("NAC ")).unwrap_or("P25")),
+                            ));
                         }
                         let l = e.protocol_label()?;
                         let kind = if l.starts_with("FLEX") {

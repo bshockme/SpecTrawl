@@ -375,7 +375,11 @@ impl Catalog {
     pub fn radio(&self, sys: &SystemKey, control_hz: Option<f64>, radio: u32) -> Option<&str> {
         match sys {
             SystemKey::P25 { wacn, system, .. } => self.p25_radio(*wacn, *system, control_hz, radio),
-            _ => self.tr_for_control(control_hz).and_then(|t| t.units.get(&radio)).or_else(|| self.loose_units.get(&radio)).map(String::as_str),
+            _ => self
+                .tr_for_control(control_hz)
+                .and_then(|t| t.units.get(&radio))
+                .or_else(|| self.loose_units.get(&radio))
+                .map(String::as_str),
         }
     }
 

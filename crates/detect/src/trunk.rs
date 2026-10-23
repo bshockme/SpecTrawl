@@ -36,13 +36,28 @@ impl SystemKind {
 /// are compared with [`SystemKey::same`], not `==`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SystemKey {
-    P25 { wacn: Option<u32>, system: Option<u16>, nac: u16 },
+    P25 {
+        wacn: Option<u32>,
+        system: Option<u16>,
+        nac: u16,
+    },
     /// Capacity Plus, Connect Plus or Tier III: the network id when the
     /// signalling carries one, else the colour code and the control (rest)
     /// channel it was seen on.
-    Dmr { kind: SystemKind, network: Option<u32>, colour_code: u8, control_hz: f64 },
-    Nxdn { ran: u8, control_hz: f64 },
-    Other { kind: SystemKind, key: String },
+    Dmr {
+        kind: SystemKind,
+        network: Option<u32>,
+        colour_code: u8,
+        control_hz: f64,
+    },
+    Nxdn {
+        ran: u8,
+        control_hz: f64,
+    },
+    Other {
+        kind: SystemKind,
+        key: String,
+    },
 }
 
 impl SystemKey {
@@ -63,7 +78,10 @@ impl SystemKey {
                 let known16 = |a: &Option<u16>, b: &Option<u16>| a.is_none() || b.is_none() || a == b;
                 n1 == n2 && known(w1, w2) && known16(s1, s2)
             }
-            (Self::Dmr { kind: k1, network: n1, colour_code: c1, control_hz: f1 }, Self::Dmr { kind: k2, network: n2, colour_code: c2, control_hz: f2 }) => {
+            (
+                Self::Dmr { kind: k1, network: n1, colour_code: c1, control_hz: f1 },
+                Self::Dmr { kind: k2, network: n2, colour_code: c2, control_hz: f2 },
+            ) => {
                 k1 == k2
                     && match (n1, n2) {
                         (Some(a), Some(b)) => a == b,

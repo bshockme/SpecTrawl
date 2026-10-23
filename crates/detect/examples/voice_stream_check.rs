@@ -29,16 +29,22 @@ fn main() {
     }
     let dt = t0.elapsed().as_secs_f64();
     let dur = x.len() as f64 / fs;
-    println!("{stem}: {dur:.0} s at {fs} Hz; batch {batch} LDUs, stream {ldus} LDUs in {starts} transmissions, {:.1} s audio", audio.len() as f64 / 8000.0);
+    println!(
+        "{stem}: {dur:.0} s at {fs} Hz; batch {batch} LDUs, stream {ldus} LDUs in {starts} transmissions, {:.1} s audio",
+        audio.len() as f64 / 8000.0
+    );
     println!("  {dt:.1} s to process ({:.1}% of real time)", 100.0 * dt / dur);
     if let Some(p) = args.get(2) {
         let pcm: Vec<i16> = audio.iter().map(|&v| (v * 4.0 * 32767.0).clamp(-32767.0, 32767.0) as i16).collect();
         let mut w = Vec::new();
         let data = (pcm.len() * 2) as u32;
-        for part in [&b"RIFF"[..], &(36 + data).to_le_bytes(), b"WAVEfmt ", &16u32.to_le_bytes(), &1u16.to_le_bytes(), &1u16.to_le_bytes()] {
+        for part in [&b"RIFF"[..], &(36 + data).to_le_bytes(), b"WAVEfmt ", &16u32.to_le_bytes(), &1u16.to_le_bytes(), &1u16.to_le_bytes()]
+        {
             w.extend(part);
         }
-        for part in [&8000u32.to_le_bytes()[..], &16000u32.to_le_bytes(), &2u16.to_le_bytes(), &16u16.to_le_bytes(), b"data", &data.to_le_bytes()] {
+        for part in
+            [&8000u32.to_le_bytes()[..], &16000u32.to_le_bytes(), &2u16.to_le_bytes(), &16u16.to_le_bytes(), b"data", &data.to_le_bytes()]
+        {
             w.extend(part);
         }
         pcm.iter().for_each(|s| w.extend(s.to_le_bytes()));

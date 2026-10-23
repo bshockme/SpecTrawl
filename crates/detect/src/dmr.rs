@@ -312,7 +312,12 @@ impl Csbk {
     pub fn capplus_status(&self) -> Option<CapPlusStatus> {
         (self.fid == FID_MOTOROLA && self.opcode == 0x3E).then(|| {
             let b = self.args[0];
-            CapPlusStatus { fragment: b >> 6, rest_repeater: (b >> 1 & 0xF) + 1, rest_slot: (b & 1) + 1, activity: self.args[1..8].try_into().unwrap() }
+            CapPlusStatus {
+                fragment: b >> 6,
+                rest_repeater: (b >> 1 & 0xF) + 1,
+                rest_slot: (b & 1) + 1,
+                activity: self.args[1..8].try_into().unwrap(),
+            }
         })
     }
 }

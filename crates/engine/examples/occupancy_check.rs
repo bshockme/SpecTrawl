@@ -45,13 +45,6 @@ fn main() {
     println!("{} occupants", occ.len());
     for k in &occ {
         let o = &k.occupant;
-        println!(
-            "  {:>10.4} MHz  {:>9.3}-{:<9.3}  {:>5.1} dB  {}",
-            o.center_hz / 1e6,
-            o.lo_hz / 1e6,
-            o.hi_hz / 1e6,
-            o.snr_db,
-            k.label()
-        );
+        println!("  {:>10.4} MHz  {:>9.3}-{:<9.3}  {:>5.1} dB  {}", o.center_hz / 1e6, o.lo_hz / 1e6, o.hi_hz / 1e6, o.snr_db, k.label());
     }
 }

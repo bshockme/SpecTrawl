@@ -342,7 +342,8 @@ impl SpectrumView {
         let mut cols = vec![0.0; self.tex_w];
         dsp::decimate_max(&row[c0..c1], &mut cols);
         let (lo, k, lut) = (self.db_min, 255.0 / (self.db_max - self.db_min).max(1.0), &self.lut);
-        let px: Vec<Color32> = cols.iter().map(|&v| if engine::is_empty_db(v) { GAP } else { lut[((v - lo) * k).clamp(0.0, 255.0) as usize] }).collect();
+        let px: Vec<Color32> =
+            cols.iter().map(|&v| if engine::is_empty_db(v) { GAP } else { lut[((v - lo) * k).clamp(0.0, 255.0) as usize] }).collect();
         let img = egui::ColorImage::new([self.tex_w, 1], px);
         tex.set_partial([0, self.write_row], img, TextureOptions::LINEAR);
     }

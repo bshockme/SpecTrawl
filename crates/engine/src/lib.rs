@@ -3,9 +3,9 @@
 //! steady rate) or `Sweep` (retune-and-dwell across a span, one stitched row
 //! per pass). See DESIGN.md §5.
 
+mod bursts;
 mod calls;
 mod cell_monitor;
-mod bursts;
 mod classify;
 mod emitters;
 pub mod explore;
@@ -30,16 +30,16 @@ use parking_lot::Mutex;
 use sdr_core::{Capabilities, Complex32, Device, DeviceInfo, Samples, StreamEvent, StreamSink};
 
 pub use bursts::{BurstDetector, DetectorConfig, SignalRecord};
+pub use calls::CallEvent;
 pub use classify::ClassifierLoad;
 pub use detect::demod::Mode as DemodMode;
+pub use detect::lte::LteCell;
 pub use detect::p25::SystemInfo as P25System;
 pub use detect::spectral::{EMPTY_DB, is_empty_db};
+pub use detect::trunk::{SystemKey, SystemKind};
 pub use emitters::Emitter;
 pub use listen::{AudioQueue, FollowPolicy, ListenSpec, Playback, VoiceStatus, recordings_dir};
-pub use calls::CallEvent;
-pub use detect::trunk::{SystemKey, SystemKind};
 pub use monitor::{GrantEvent, MonitorInfo, PageEvent, TrunkSystem};
-pub use detect::lte::LteCell;
 pub use occupancy::KnownOccupant;
 pub use rds_monitor::StationInfo;
 pub use record_all::{RecordAllConfig, RecordAllStatus};
@@ -310,8 +310,19 @@ impl Source {
     /// cleared because rows from different modes don't share a frequency axis.
     pub fn set_mode(&mut self, mode: Mode) {
         match &mode {
-            Mode::Live => log::info!("{}: live at {:.4} MHz, ring {:.0} s", self.info.serial, self.device.lock().center_hz() / 1e6, self.cfg.ring_seconds),
-            Mode::Sweep(p) => log::info!("{}: sweep {:.1}–{:.1} MHz, ring {:.0} s", self.info.serial, p.start_hz / 1e6, p.stop_hz / 1e6, self.cfg.ring_seconds),
+            Mode::Live => log::info!(
+                "{}: live at {:.4} MHz, ring {:.0} s",
+                self.info.serial,
+                self.device.lock().center_hz() / 1e6,
+                self.cfg.ring_seconds
+            ),
+            Mode::Sweep(p) => log::info!(
+                "{}: sweep {:.1}–{:.1} MHz, ring {:.0} s",
+                self.info.serial,
+                p.start_hz / 1e6,
+                p.stop_hz / 1e6,
+                self.cfg.ring_seconds
+            ),
         }
         self.stop_worker();
         self.shared.rows.lock().clear();
@@ -352,7 +363,9 @@ impl Source {
             Mode::Sweep(plan) => {
                 let (dev, plan) = (self.device.clone(), plan.clone());
                 let det = BurstDetector::new(DetectorConfig::sweep(), serial.clone());
-                handles.push(std::thread::Builder::new().name("sweep".into()).spawn(move || sweep::run(shared, dev, plan, cfg, st, det, serial)));
+                handles.push(
+                    std::thread::Builder::new().name("sweep".into()).spawn(move || sweep::run(shared, dev, plan, cfg, st, det, serial)),
+                );
             }
         }
         let handles = handles.into_iter().map(|h| h.expect("spawn worker")).collect();

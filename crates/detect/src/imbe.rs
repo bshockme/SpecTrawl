@@ -12,7 +12,7 @@ use std::f64::consts::PI;
 
 use crate::frames::Frame;
 use crate::imbe_tables::{BLOCKS, DCT_BITS, GAIN_ALLOC, GAIN_LEVELS};
-use crate::mbe::{self, Model, MAX_L};
+use crate::mbe::{self, MAX_L, Model};
 use crate::p25::{data_dibits, data_soft};
 use crate::p25_lc::{chase, dibit_reliability, golay23_decode, golay23_nearest};
 
@@ -213,7 +213,8 @@ pub fn decode_soft(dibits: &[u8], soft: &[f32]) -> Coded {
     let m = modulation(u[0]);
     for i in 1..7 {
         c[i] ^= m[i];
-        let cw = if i < 4 { chase(c[i], &rel[i][..23], CHASE_FLIPS, golay23_nearest) } else { chase(c[i], &rel[i][..15], CHASE_FLIPS, hamming) };
+        let cw =
+            if i < 4 { chase(c[i], &rel[i][..23], CHASE_FLIPS, golay23_nearest) } else { chase(c[i], &rel[i][..15], CHASE_FLIPS, hamming) };
         u[i] = (cw >> if i < 4 { 11 } else { 4 }) as u16;
         errors[i] = (cw ^ c[i]).count_ones() as u8;
     }
@@ -345,9 +346,8 @@ fn residuals(q: &Quantized) -> Vec<f64> {
     for m in 3..=7 {
         g[m - 1] = level(q.b[m], q.bits[m], GAIN_ALLOC[l - 9][m - 3].1);
     }
-    let r: Vec<f64> = (1..=6)
-        .map(|i| (1..=6).map(|m| alpha(m) * g[m] * (PI * (m - 1) as f64 * (i as f64 - 0.5) / 6.0).cos()).sum())
-        .collect();
+    let r: Vec<f64> =
+        (1..=6).map(|i| (1..=6).map(|m| alpha(m) * g[m] * (PI * (m - 1) as f64 * (i as f64 - 0.5) / 6.0).cos()).sum()).collect();
     let mut t = Vec::with_capacity(l);
     let mut bm = 8;
     for (i, &ji) in BLOCKS[l - 9].iter().enumerate() {
@@ -392,7 +392,14 @@ pub struct Decoder {
 
 impl Default for Decoder {
     fn default() -> Self {
-        Decoder { log_m: [0.0; MAX_L], prev: Model::initial(), rate: 0.0, repeats: 0, enhancer: Default::default(), synth: Default::default() }
+        Decoder {
+            log_m: [0.0; MAX_L],
+            prev: Model::initial(),
+            rate: 0.0,
+            repeats: 0,
+            enhancer: Default::default(),
+            synth: Default::default(),
+        }
     }
 }
 

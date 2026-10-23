@@ -176,9 +176,8 @@ impl Decoder {
         g[2..5].copy_from_slice(&PRBA24[b[3] as usize]);
         g[5..9].copy_from_slice(&PRBA58[b[4] as usize]);
         let alpha = |k: usize| if k == 1 { 1.0 } else { 2.0 };
-        let r: Vec<f64> = (1..=8)
-            .map(|i| (1..=8).map(|k| alpha(k) * g[k] * (PI * (k - 1) as f64 * (i as f64 - 0.5) / 8.0).cos()).sum())
-            .collect();
+        let r: Vec<f64> =
+            (1..=8).map(|i| (1..=8).map(|k| alpha(k) * g[k] * (PI * (k - 1) as f64 * (i as f64 - 0.5) / 8.0).cos()).sum()).collect();
         let hoc = [&HOC1[b[5] as usize], &HOC2[b[6] as usize], &HOC3[b[7] as usize], &HOC4[b[8] as usize]];
         let mut t = Vec::with_capacity(l);
         for (i, &ji) in BLOCKS[l - 9].iter().enumerate() {
@@ -247,12 +246,7 @@ mod tests {
 
     /// Encodes u0..u3 per BABA-1 5.2-5.4.
     fn encode(u: [u16; 4]) -> Vec<u8> {
-        let c = [
-            golay_encode(u[0] as u32),
-            ((golay_encode(u[1] as u32) >> 1) ^ modulation(u[0])),
-            u[2] as u32,
-            u[3] as u32,
-        ];
+        let c = [golay_encode(u[0] as u32), ((golay_encode(u[1] as u32) >> 1) ^ modulation(u[0])), u[2] as u32, u[3] as u32];
         INTERLEAVE.iter().flat_map(|p| p.iter().map(|&(v, b)| (c[v as usize] >> b & 1) as u8)).collect()
     }
 

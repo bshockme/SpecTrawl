@@ -94,10 +94,13 @@ fn main() {
         }
         let mut w = Vec::new();
         let data = (pcm.len() * 2) as u32;
-        for part in [&b"RIFF"[..], &(36 + data).to_le_bytes(), b"WAVEfmt ", &16u32.to_le_bytes(), &1u16.to_le_bytes(), &1u16.to_le_bytes()] {
+        for part in [&b"RIFF"[..], &(36 + data).to_le_bytes(), b"WAVEfmt ", &16u32.to_le_bytes(), &1u16.to_le_bytes(), &1u16.to_le_bytes()]
+        {
             w.extend(part);
         }
-        for part in [&8000u32.to_le_bytes()[..], &16000u32.to_le_bytes(), &2u16.to_le_bytes(), &16u16.to_le_bytes(), b"data", &data.to_le_bytes()] {
+        for part in
+            [&8000u32.to_le_bytes()[..], &16000u32.to_le_bytes(), &2u16.to_le_bytes(), &16u16.to_le_bytes(), b"data", &data.to_le_bytes()]
+        {
             w.extend(part);
         }
         pcm.iter().for_each(|s| w.extend(s.to_le_bytes()));

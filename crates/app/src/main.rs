@@ -26,11 +26,7 @@ fn main() -> eframe::Result {
         Some(w) => viewport.with_position(w.pos).with_inner_size(w.size),
         None => viewport.with_inner_size([1600.0, 960.0]),
     };
-    let options = eframe::NativeOptions {
-        viewport,
-        renderer: eframe::Renderer::Wgpu,
-        ..Default::default()
-    };
+    let options = eframe::NativeOptions { viewport, renderer: eframe::Renderer::Wgpu, ..Default::default() };
     eframe::run_native("SpecTrawl", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
 
@@ -71,9 +67,18 @@ enum Selection {
     Receiver(ReceiverId),
     Record(ReceiverId, u64),
     Emitter(ReceiverId, u64),
-    Talkgroup { system: Option<engine::SystemKey>, tg: u32 },
-    Radio { system: Option<engine::SystemKey>, id: u32 },
-    Capcode { protocol: String, capcode: u64 },
+    Talkgroup {
+        system: Option<engine::SystemKey>,
+        tg: u32,
+    },
+    Radio {
+        system: Option<engine::SystemKey>,
+        id: u32,
+    },
+    Capcode {
+        protocol: String,
+        capcode: u64,
+    },
 }
 
 impl Selection {
@@ -179,7 +184,12 @@ fn gain_ui(ui: &mut egui::Ui, p: &mut Receiver) -> Option<String> {
     let mut changed = false;
     ui.horizontal(|ui| {
         ui.label("Gain");
-        for (m, name) in [(GainMode::Linearity, "Linearity"), (GainMode::Sensitivity, "Sensitivity"), (GainMode::Agc, "AGC"), (GainMode::Manual, "Manual")] {
+        for (m, name) in [
+            (GainMode::Linearity, "Linearity"),
+            (GainMode::Sensitivity, "Sensitivity"),
+            (GainMode::Agc, "AGC"),
+            (GainMode::Manual, "Manual"),
+        ] {
             changed |= ui.selectable_value(&mut p.gain_mode, m, name).changed();
         }
     });
@@ -404,7 +414,17 @@ enum Tab {
 
 impl Tab {
     /// Every pane that isn't a receiver.
-    const PANELS: [Tab; 9] = [Tab::Sources, Tab::Inspector, Tab::Emitters, Tab::Records, Tab::Trunking, Tab::Calls, Tab::Pages, Tab::Exploration, Tab::Diagnostics];
+    const PANELS: [Tab; 9] = [
+        Tab::Sources,
+        Tab::Inspector,
+        Tab::Emitters,
+        Tab::Records,
+        Tab::Trunking,
+        Tab::Calls,
+        Tab::Pages,
+        Tab::Exploration,
+        Tab::Diagnostics,
+    ];
 
     fn name(&self) -> String {
         match self {
@@ -703,7 +723,13 @@ impl App {
             (Some(w), true) => w.maximized = true,
             // A maximized window's own rect hangs off the screen edge; what's
             // noted is where it would restore to.
-            (w, max) => *w = Some(WindowRect { pos: [outer.min.x.max(0.0), outer.min.y.max(0.0)], size: [inner.width(), inner.height()], maximized: max }),
+            (w, max) => {
+                *w = Some(WindowRect {
+                    pos: [outer.min.x.max(0.0), outer.min.y.max(0.0)],
+                    size: [inner.width(), inner.height()],
+                    maximized: max,
+                })
+            }
         }
     }
 
@@ -730,7 +756,12 @@ impl App {
         let ids: Vec<ReceiverId> = self.panes.iter().map(|p| p.id).collect();
         let w = match read_workspace(&workspace_dir().join(format!("{name}.json"))) {
             Some(w) => w,
-            None if PRESETS.contains(&name) => Workspace { main: preset_dock(name, width, &ids), tune_target: self.tune_target.0, popouts: Vec::new(), window: self.window },
+            None if PRESETS.contains(&name) => Workspace {
+                main: preset_dock(name, width, &ids),
+                tune_target: self.tune_target.0,
+                popouts: Vec::new(),
+                window: self.window,
+            },
             None => return,
         };
         self.dock = Some(w.main);
@@ -804,14 +835,19 @@ impl App {
             ui.close();
         }
         let present: Vec<Tab> = self.dock.as_ref().map(|d| d.iter_all_tabs().map(|(_, t)| t.clone()).collect()).unwrap_or_default();
-        let present: Vec<Tab> = present.into_iter().chain(self.popouts.iter().flat_map(|p| p.dock.iter_all_tabs().map(|(_, t)| t.clone()))).collect();
+        let present: Vec<Tab> =
+            present.into_iter().chain(self.popouts.iter().flat_map(|p| p.dock.iter_all_tabs().map(|(_, t)| t.clone()))).collect();
         for t in Tab::PANELS {
             if !present.contains(&t) && ui.button(format!("Show {}", t.name())).clicked() {
                 self.dock_requests.push(DockReq::Show(t));
                 ui.close();
             }
         }
-        ui.label(egui::RichText::new("Drag a tab to move it, or off the strip to float it;\nright-click a tab to pop it out to its own window").small().color(theme::MUTED));
+        ui.label(
+            egui::RichText::new("Drag a tab to move it, or off the strip to float it;\nright-click a tab to pop it out to its own window")
+                .small()
+                .color(theme::MUTED),
+        );
     }
 
     /// Priority and lockout talkgroups, editable.
@@ -861,13 +897,22 @@ impl App {
             changed |= ui.add(egui::DragValue::new(&mut self.settings.ring_seconds).speed(1.0).range(2.0..=600.0).suffix(" s")).changed();
             let per = self.settings.ring_bytes(rate) / 1e9;
             let n = self.panes.len().max(1);
-            ui.label(egui::RichText::new(format!("≈ {per:.2} GB per device at {:.0} MS/s · {:.1} GB for {n}", rate / 1e6, per * n as f64)).small().color(theme::MUTED));
+            ui.label(
+                egui::RichText::new(format!("≈ {per:.2} GB per device at {:.0} MS/s · {:.1} GB for {n}", rate / 1e6, per * n as f64))
+                    .small()
+                    .color(theme::MUTED),
+            );
         });
         ui.horizontal(|ui| {
             let cur: Vec<f64> = self.panes.iter().map(|p| p.source.config().ring_seconds).collect();
             let stale = cur.iter().any(|s| (*s - self.settings.ring_seconds).abs() > 0.5);
             ui.label(egui::RichText::new("Applies to devices opened from now on.").small().color(theme::MUTED));
-            if stale && ui.small_button("Reopen devices now").on_hover_text("Restarts every open device with the new ring length (emitters and records start over)").clicked() {
+            if stale
+                && ui
+                    .small_button("Reopen devices now")
+                    .on_hover_text("Restarts every open device with the new ring length (emitters and records start over)")
+                    .clicked()
+            {
                 self.reopen_all();
                 ui.close();
             }
@@ -879,14 +924,19 @@ impl App {
             ui.label(egui::RichText::new("← → step the target receiver (Shift ×10, Alt ÷10)").small().color(theme::MUTED));
         });
         ui.horizontal(|ui| {
-            changed |= ui.add(egui::DragValue::new(&mut self.settings.survey_nudge_mhz).speed(0.5).range(0.1..=100.0).suffix(" MHz")).changed();
+            changed |=
+                ui.add(egui::DragValue::new(&mut self.settings.survey_nudge_mhz).speed(0.5).range(0.1..=100.0).suffix(" MHz")).changed();
             ui.label(egui::RichText::new("Ctrl ← → shift the survey span, Ctrl ↑ ↓ widen / narrow it").small().color(theme::MUTED));
         });
         ui.add_space(4.0);
         ui.label(egui::RichText::new("New signals").small().color(theme::MUTED));
         ui.horizontal(|ui| {
             changed |= ui.add(egui::DragValue::new(&mut self.settings.new_signal_s).speed(5.0).range(0.0..=3600.0).suffix(" s")).changed();
-            ui.label(egui::RichText::new("emitters first seen within this long are outlined on the waterfalls and marked ✦ in the table").small().color(theme::MUTED));
+            ui.label(
+                egui::RichText::new("emitters first seen within this long are outlined on the waterfalls and marked ✦ in the table")
+                    .small()
+                    .color(theme::MUTED),
+            );
         });
         ui.add_space(4.0);
         ui.label(egui::RichText::new("Logging").small().color(theme::MUTED));
@@ -940,7 +990,11 @@ impl App {
         ] {
             ui.horizontal(|ui| {
                 if ui.small_button("Open").clicked() {
-                    let dir = if path.is_dir() || path.extension().is_none() { path.clone() } else { path.parent().map(|p| p.to_path_buf()).unwrap_or(path.clone()) };
+                    let dir = if path.is_dir() || path.extension().is_none() {
+                        path.clone()
+                    } else {
+                        path.parent().map(|p| p.to_path_buf()).unwrap_or(path.clone())
+                    };
                     let _ = std::fs::create_dir_all(&dir);
                     open_path(&dir);
                 }
@@ -1003,7 +1057,11 @@ impl App {
             let on = self.receiver(*id).is_some_and(|p| p.mode == RxMode::Explore);
             v.push((format!("{} explore on {id}", if on { "Stop" } else { "Start" }), "explore auto visit survey", Cmd::Explore(*id, !on)));
             let on = self.receiver(*id).is_some_and(|p| p.mode == RxMode::Scan);
-            v.push((format!("{} scanner on {id}", if on { "Stop" } else { "Start" }), "scan scanner follow active audio", Cmd::Scan(*id, !on)));
+            v.push((
+                format!("{} scanner on {id}", if on { "Stop" } else { "Start" }),
+                "scan scanner follow active audio",
+                Cmd::Scan(*id, !on),
+            ));
         }
         v.push(("Export emitters and records (CSV)".into(), "export csv emitters records", Cmd::ExportEmitters));
         v.push(("Reset layout".into(), "reset layout", Cmd::Reset));
@@ -1017,7 +1075,11 @@ impl App {
         let next = self.next_live_id();
         for d in self.devices.iter().filter(|d| !self.panes.iter().any(|p| same_device(p.source.info(), d))) {
             v.push((format!("Open {} ({}) as {next}", d.label, d.serial), "open device focus live", Cmd::Open(d.clone(), next)));
-            v.push((format!("Open {} ({}) as survey", d.label, d.serial), "open device survey sweep", Cmd::Open(d.clone(), ReceiverId::SWEEP)));
+            v.push((
+                format!("Open {} ({}) as survey", d.label, d.serial),
+                "open device survey sweep",
+                Cmd::Open(d.clone(), ReceiverId::SWEEP),
+            ));
         }
         let mut names = list_workspaces();
         for p in PRESETS {
@@ -1028,7 +1090,11 @@ impl App {
         for n in names {
             v.push((format!("Workspace: {n}"), "workspace layout load", Cmd::Workspace(n)));
         }
-        let filter: Vec<&str> = words.iter().copied().filter(|w| w.parse::<f64>().is_err() && letter.is_none_or(|l| *w != l.0.to_ascii_lowercase().to_string())).collect();
+        let filter: Vec<&str> = words
+            .iter()
+            .copied()
+            .filter(|w| w.parse::<f64>().is_err() && letter.is_none_or(|l| *w != l.0.to_ascii_lowercase().to_string()))
+            .collect();
         v.into_iter()
             .filter(|(label, keys, _)| {
                 let hay = format!("{} {keys}", label.to_lowercase());
@@ -1045,7 +1111,10 @@ impl App {
             Cmd::Listen(rx, spec) => self.start_listen(rx, spec),
             Cmd::Follow(rx) => {
                 let hz = self.receiver(rx).and_then(|p| p.view.span()).map(|(lo, hi)| (lo + hi) / 2.0).unwrap_or(self.listen_mhz * 1e6);
-                self.start_listen(rx, engine::ListenSpec { center_hz: hz, mode: engine::DemodMode::P25, follow: true, tdma: false, slot: None });
+                self.start_listen(
+                    rx,
+                    engine::ListenSpec { center_hz: hz, mode: engine::DemodMode::P25, follow: true, tdma: false, slot: None },
+                );
             }
             Cmd::Stop => {
                 if let Some(pb) = &self.playback {
@@ -1204,7 +1273,8 @@ impl App {
                 DockReq::Remove(tab) => self.take_tab(&tab),
                 DockReq::AddReceiver(id) => {
                     let tab = Tab::Receiver(id);
-                    if self.dock.as_ref().unwrap().find_tab(&tab).is_none() && !self.popouts.iter().any(|p| p.dock.find_tab(&tab).is_some()) {
+                    if self.dock.as_ref().unwrap().find_tab(&tab).is_none() && !self.popouts.iter().any(|p| p.dock.find_tab(&tab).is_some())
+                    {
                         place_tab(self.dock.as_mut().unwrap(), tab);
                     }
                 }
@@ -1360,13 +1430,21 @@ impl App {
         for id in &lost_now {
             if !self.lost.iter().any(|(r, _, _)| r == id) {
                 let info = self.receiver(*id).map(|p| p.source.info().clone());
-                log::warn!("receiver {id}: device lost ({}); will reopen when it is back", info.map(|i| format!("{} {}", i.label, i.serial)).unwrap_or_default());
+                log::warn!(
+                    "receiver {id}: device lost ({}); will reopen when it is back",
+                    info.map(|i| format!("{} {}", i.label, i.serial)).unwrap_or_default()
+                );
                 self.lost.push((*id, now, now - std::time::Duration::from_secs(10)));
             }
         }
         let open: Vec<ReceiverId> = self.panes.iter().map(|p| p.id).collect();
         self.lost.retain(|(r, _, _)| lost_now.contains(r) || !open.contains(r));
-        let due: Vec<ReceiverId> = self.lost.iter().filter(|(_, _, last)| now.duration_since(*last) >= std::time::Duration::from_secs(5)).map(|(r, _, _)| *r).collect();
+        let due: Vec<ReceiverId> = self
+            .lost
+            .iter()
+            .filter(|(_, _, last)| now.duration_since(*last) >= std::time::Duration::from_secs(5))
+            .map(|(r, _, _)| *r)
+            .collect();
         if due.is_empty() {
             return;
         }
@@ -1391,7 +1469,8 @@ impl App {
 
     /// Reopens every open device (after a change to the ring length).
     fn reopen_all(&mut self) {
-        let open: Vec<(DeviceInfo, ReceiverId, f64)> = self.panes.iter().map(|p| (p.source.info().clone(), p.id, p.source.snapshot().center_hz)).collect();
+        let open: Vec<(DeviceInfo, ReceiverId, f64)> =
+            self.panes.iter().map(|p| (p.source.info().clone(), p.id, p.source.snapshot().center_hz)).collect();
         for (d, id, hz) in open {
             self.open_as(&d, id);
             if !id.is_sweep() {
@@ -1509,7 +1588,9 @@ impl App {
     /// Copies the survey's history over a focus receiver's new span into
     /// its waterfall so it doesn't start blank after a retune.
     fn backfill(&mut self, id: ReceiverId, center_hz: f64) {
-        let (Some(si), Some(fi)) = (self.panes.iter().position(|p| p.id.is_sweep()), self.panes.iter().position(|p| p.id == id)) else { return };
+        let (Some(si), Some(fi)) = (self.panes.iter().position(|p| p.id.is_sweep()), self.panes.iter().position(|p| p.id == id)) else {
+            return;
+        };
         if si == fi {
             return;
         }
@@ -1600,7 +1681,10 @@ impl App {
                 }
             }
             // Candidates, by rule.
-            let mut cands: Vec<&engine::Emitter> = survey.iter().filter(|e| eligible(e) && !taken.iter().any(|t| *t == e.id && current.as_ref().is_none_or(|c| c.emitter != e.id))).collect();
+            let mut cands: Vec<&engine::Emitter> = survey
+                .iter()
+                .filter(|e| eligible(e) && !taken.iter().any(|t| *t == e.id && current.as_ref().is_none_or(|c| c.emitter != e.id)))
+                .collect();
             if scan.rule == settings::ScanRule::MostSignals {
                 if let Some(b) = &busiest {
                     cands.retain(|e| &range_of(e.center_hz) == b);
@@ -1609,7 +1693,9 @@ impl App {
             cands.sort_by(|a, b| b.first_seen.cmp(&a.first_seen).then(b.last_seen.cmp(&a.last_seen)));
             let pick = match (&current, scan.rule) {
                 (Some(_), settings::ScanRule::Stay) => None,
-                (Some(c), _) => cands.first().filter(|e| e.id != c.emitter && e.first_seen > c.first_seen + std::time::Duration::from_secs(1)).copied(),
+                (Some(c), _) => {
+                    cands.first().filter(|e| e.id != c.emitter && e.first_seen > c.first_seen + std::time::Duration::from_secs(1)).copied()
+                }
                 (None, _) => cands.first().copied(),
             };
             if let Some(e) = pick {
@@ -1819,7 +1905,14 @@ impl App {
                 Some(mut v) => {
                     let obs = Self::observe(p, v.center_hz, v.bandwidth_hz);
                     if let Some(verdict) = v.update(&obs, &cfg, now) {
-                        log::debug!("explore {id}: emitter {} {} {:?} {:?} after {:.1} s", v.emitter, verdict.kind.name(), verdict.label, verdict.id, v.dwell(now).as_secs_f64());
+                        log::debug!(
+                            "explore {id}: emitter {} {} {:?} {:?} after {:.1} s",
+                            v.emitter,
+                            verdict.kind.name(),
+                            verdict.label,
+                            verdict.id,
+                            v.dwell(now).as_secs_f64()
+                        );
                         let text = format!(
                             "{:.4} MHz: {}{}",
                             v.center_hz / 1e6,
@@ -1860,7 +1953,20 @@ impl App {
         ui.horizontal(|ui| {
             let n = self.explorer.log.len();
             let in_place = self.explorer.log.iter().filter(|e| e.in_place).count();
-            ui.label(egui::RichText::new(format!("{n} verdicts · {} visits · {in_place} in place · exploring: {}", n - in_place, if exploring.is_empty() { "nobody".to_string() } else { exploring.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(" ") })).small().monospace().color(theme::MUTED));
+            ui.label(
+                egui::RichText::new(format!(
+                    "{n} verdicts · {} visits · {in_place} in place · exploring: {}",
+                    n - in_place,
+                    if exploring.is_empty() {
+                        "nobody".to_string()
+                    } else {
+                        exploring.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(" ")
+                    }
+                ))
+                .small()
+                .monospace()
+                .color(theme::MUTED),
+            );
             ui.menu_button(egui::RichText::new("Filters ⏷").small(), |ui| {
                 ui.set_min_width(360.0);
                 ui.label(egui::RichText::new("Band presets").small().color(theme::MUTED));
@@ -1869,11 +1975,14 @@ impl App {
                         let cur = self.settings.explore.presets.get(p.name).and_then(|s| Rule::parse(s)).unwrap_or_default();
                         let mut sel = cur;
                         ui.label(egui::RichText::new(p.name).small());
-                        egui::ComboBox::from_id_salt(format!("preset_{}", p.name)).selected_text(sel.name()).width(110.0).show_ui(ui, |ui| {
-                            for r in Rule::ALL {
-                                ui.selectable_value(&mut sel, r, r.name());
-                            }
-                        });
+                        egui::ComboBox::from_id_salt(format!("preset_{}", p.name)).selected_text(sel.name()).width(110.0).show_ui(
+                            ui,
+                            |ui| {
+                                for r in Rule::ALL {
+                                    ui.selectable_value(&mut sel, r, r.name());
+                                }
+                            },
+                        );
                         if sel != cur {
                             if sel == Rule::Ignore {
                                 self.settings.explore.presets.remove(p.name);
@@ -1929,9 +2038,15 @@ impl App {
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new("Dwell").small().color(theme::MUTED));
                 ui.horizontal(|ui| {
-                    changed |= ui.add(egui::DragValue::new(&mut self.settings.explore.settle_s).speed(0.1).range(0.0..=10.0).suffix(" s settle")).changed();
-                    changed |= ui.add(egui::DragValue::new(&mut self.settings.explore.silence_s).speed(0.1).range(0.5..=60.0).suffix(" s silence")).changed();
-                    changed |= ui.add(egui::DragValue::new(&mut self.settings.explore.cap_s).speed(0.5).range(2.0..=300.0).suffix(" s cap")).changed();
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut self.settings.explore.settle_s).speed(0.1).range(0.0..=10.0).suffix(" s settle"))
+                        .changed();
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut self.settings.explore.silence_s).speed(0.1).range(0.5..=60.0).suffix(" s silence"))
+                        .changed();
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut self.settings.explore.cap_s).speed(0.5).range(2.0..=300.0).suffix(" s cap"))
+                        .changed();
                 });
             });
             if ui.small_button("Open CSV folder").clicked() {
@@ -2437,12 +2552,8 @@ impl App {
         if self.known.0.elapsed() < std::time::Duration::from_secs(1) {
             return;
         }
-        let mut all: Vec<(f64, f64, String)> = self
-            .panes
-            .iter()
-            .flat_map(|p| p.source.occupants())
-            .map(|k| (k.occupant.lo_hz, k.occupant.hi_hz, k.label()))
-            .collect();
+        let mut all: Vec<(f64, f64, String)> =
+            self.panes.iter().flat_map(|p| p.source.occupants()).map(|k| (k.occupant.lo_hz, k.occupant.hi_hz, k.label())).collect();
         all.sort_by(|a, b| a.0.total_cmp(&b.0));
         let mut merged: Vec<(f64, f64, String)> = Vec::new();
         for k in all {
@@ -2494,7 +2605,8 @@ impl App {
         }
         let live = self.live_ids();
         let target = self.tune_target;
-        let live_spans: Vec<(ReceiverId, (f64, f64))> = live.iter().filter_map(|id| Some((*id, self.receiver(*id)?.view.span()?))).collect();
+        let live_spans: Vec<(ReceiverId, (f64, f64))> =
+            live.iter().filter_map(|id| Some((*id, self.receiver(*id)?.view.span()?))).collect();
         // Each Airspy radiates a little of its local oscillator at its
         // centre + 5 MHz; the survey blanks those spots so they don't read
         // as carriers that follow the focus receivers around.
@@ -2636,7 +2748,13 @@ impl App {
             } else {
                 let snap = p.source.snapshot();
                 let lost = p.source.stats().device_lost;
-                let title = format!("{id} · {} · {:.3} MHz · {:.1} MS/s{}", info.label, snap.center_hz / 1e6, snap.sample_rate / 1e6, if lost { " · DEVICE LOST, waiting for it to return" } else { "" });
+                let title = format!(
+                    "{id} · {} · {:.3} MHz · {:.1} MS/s{}",
+                    info.label,
+                    snap.center_hz / 1e6,
+                    snap.sample_rate / 1e6,
+                    if lost { " · DEVICE LOST, waiting for it to return" } else { "" }
+                );
                 let res = p.view.show(ui, r, &title, None, &records, sel_record, sel_emitter);
                 if p.mode == RxMode::Scan {
                     let line = match &p.scan {
@@ -2648,12 +2766,18 @@ impl App {
                             t.started.elapsed().as_secs_f64(),
                             if scan_aviation { " · aviation AM" } else { "" }
                         ),
-                        None => format!("SCAN · {} · waiting for activity{}", scan_rule_name, if scan_aviation { " · aviation AM" } else { "" }),
+                        None => {
+                            format!("SCAN · {} · waiting for activity{}", scan_rule_name, if scan_aviation { " · aviation AM" } else { "" })
+                        }
                     };
                     let painter = ui.painter_at(r);
                     let g = painter.layout_no_wrap(line, egui::FontId::monospace(11.0), theme::TEXT);
                     let at = egui::pos2(r.left() + 8.0, r.top() + spectrum_view::HEADER_H + 6.0);
-                    painter.rect_filled(egui::Rect::from_min_size(at - egui::vec2(5.0, 2.0), g.size() + egui::vec2(10.0, 4.0)), 3.0, theme::PANEL.gamma_multiply(0.9));
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(at - egui::vec2(5.0, 2.0), g.size() + egui::vec2(10.0, 4.0)),
+                        3.0,
+                        theme::PANEL.gamma_multiply(0.9),
+                    );
                     painter.galley(at, g, theme::TEXT);
                 }
                 if p.mode == RxMode::Explore {
@@ -2674,19 +2798,29 @@ impl App {
                                 queue_len.map(|n| format!(" · queue {n}")).unwrap_or_default()
                             )
                         }
-                        None => format!("EXPLORE · waiting for the survey{}", queue_len.map(|n| format!(" · queue {n}")).unwrap_or_default()),
+                        None => {
+                            format!("EXPLORE · waiting for the survey{}", queue_len.map(|n| format!(" · queue {n}")).unwrap_or_default())
+                        }
                     };
                     let painter = ui.painter_at(r);
                     let font = egui::FontId::monospace(11.0);
                     let g = painter.layout_no_wrap(line, font.clone(), theme::TEXT);
                     let at = egui::pos2(r.left() + 8.0, r.top() + spectrum_view::HEADER_H + 6.0);
-                    painter.rect_filled(egui::Rect::from_min_size(at - egui::vec2(5.0, 2.0), g.size() + egui::vec2(10.0, 4.0)), 3.0, theme::PANEL.gamma_multiply(0.9));
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(at - egui::vec2(5.0, 2.0), g.size() + egui::vec2(10.0, 4.0)),
+                        3.0,
+                        theme::PANEL.gamma_multiply(0.9),
+                    );
                     painter.galley(at, g, theme::TEXT);
                     if let Some((t, text)) = &p.last_verdict {
                         if t.elapsed() < std::time::Duration::from_secs(8) {
                             let g = painter.layout_no_wrap(format!("last: {text}"), font, theme::TEXT2);
                             let at2 = at + egui::vec2(0.0, 18.0);
-                            painter.rect_filled(egui::Rect::from_min_size(at2 - egui::vec2(5.0, 2.0), g.size() + egui::vec2(10.0, 4.0)), 3.0, theme::PANEL.gamma_multiply(0.9));
+                            painter.rect_filled(
+                                egui::Rect::from_min_size(at2 - egui::vec2(5.0, 2.0), g.size() + egui::vec2(10.0, 4.0)),
+                                3.0,
+                                theme::PANEL.gamma_multiply(0.9),
+                            );
                             painter.galley(at2, g, theme::TEXT2);
                         }
                     }
@@ -2702,7 +2836,11 @@ impl App {
             // Clicking the title selects the receiver (the inspector shows it).
             let hdr = egui::Rect::from_min_size(r.min, egui::vec2(r.width(), spectrum_view::HEADER_H)).shrink2(egui::vec2(6.0, 2.0));
             let title_rect = egui::Rect::from_min_size(hdr.min, egui::vec2(hdr.width() * 0.4, hdr.height()));
-            if ui.interact(title_rect, ui.id().with(("header", id.0)), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            if ui
+                .interact(title_rect, ui.id().with(("header", id.0)), egui::Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+            {
                 acts.push(Act::Select(Selection::Receiver(id)));
             }
             if selection == Selection::Receiver(id) {
@@ -2961,10 +3099,15 @@ impl App {
                     }
                 });
                 self.settings.scan.rule = rule;
-                ch |= ui.checkbox(&mut self.settings.scan.aviation, "Aviation AM").on_hover_text("Only the Aviation preset (108–137, 225–400 MHz), AM with carrier squelch").changed();
+                ch |= ui
+                    .checkbox(&mut self.settings.scan.aviation, "Aviation AM")
+                    .on_hover_text("Only the Aviation preset (108–137, 225–400 MHz), AM with carrier squelch")
+                    .changed();
             });
             ui.horizontal(|ui| {
-                ch |= ui.add(egui::DragValue::new(&mut self.settings.scan.silence_s).speed(0.1).range(0.5..=60.0).suffix(" s silence")).changed();
+                ch |= ui
+                    .add(egui::DragValue::new(&mut self.settings.scan.silence_s).speed(0.1).range(0.5..=60.0).suffix(" s silence"))
+                    .changed();
                 ch |= ui.add(egui::DragValue::new(&mut self.settings.scan.max_s).speed(1.0).range(5.0..=3600.0).suffix(" s max")).changed();
                 ui.label(egui::RichText::new("ranges and presets: Exploration tab → Filters").small().color(theme::MUTED));
             });
@@ -3032,9 +3175,14 @@ impl App {
             let label = r.display_class().map(|c| c.label.clone()).unwrap_or_else(|| "unclassified".into());
             ui.label(egui::RichText::new(format!("Record #{} · {}", r.id, label)).strong());
             ui.label(
-                egui::RichText::new(format!("{:.4} MHz · {:.1} kHz · {:.2} s · on {rx}", r.center_hz() / 1e6, r.bandwidth_hz() / 1e3, r.duration_s()))
-                    .monospace()
-                    .color(theme::TEXT2),
+                egui::RichText::new(format!(
+                    "{:.4} MHz · {:.1} kHz · {:.2} s · on {rx}",
+                    r.center_hz() / 1e6,
+                    r.bandwidth_hz() / 1e3,
+                    r.duration_s()
+                ))
+                .monospace()
+                .color(theme::TEXT2),
             );
             kv(ui, "SNR", &format!("{:.0} / {:.0} dB · peak {:.1} dBFS", r.mean_snr_db, r.max_snr_db, r.peak_dbfs));
             kv(ui, "Seen", &format!("{} – {}{}", hms(r.t_start), hms(r.t_end), if r.active { " · active" } else { "" }));
@@ -3092,9 +3240,14 @@ impl App {
             let label = em.label().unwrap_or_else(|| "unclassified".into());
             ui.label(egui::RichText::new(format!("Emitter E{} · {}", em.id, label)).strong());
             ui.label(
-                egui::RichText::new(format!("{:.4} MHz · {:.1} kHz · {} bursts · on {rx}", em.center_hz / 1e6, em.bandwidth_hz / 1e3, em.records))
-                    .monospace()
-                    .color(theme::TEXT2),
+                egui::RichText::new(format!(
+                    "{:.4} MHz · {:.1} kHz · {} bursts · on {rx}",
+                    em.center_hz / 1e6,
+                    em.bandwidth_hz / 1e3,
+                    em.records
+                ))
+                .monospace()
+                .color(theme::TEXT2),
             );
             kv(ui, "Seen", &format!("{} – {}{}", hms(em.first_seen), hms(em.last_seen), if em.active { " · active" } else { "" }));
             kv(ui, "Duty", &format!("{:.0}% · peak SNR {:.0} dB", em.duty() * 100.0, em.peak_snr_db));
@@ -3206,11 +3359,13 @@ impl App {
         }
         .filter(|n| !n.is_empty());
         let head = if group { format!("TG {id}") } else { format!("Radio {id}") };
-        ui.label(egui::RichText::new(match &name {
-            Some(n) => format!("{head} · {n}"),
-            None => head,
-        })
-        .strong());
+        ui.label(
+            egui::RichText::new(match &name {
+                Some(n) => format!("{head} · {n}"),
+                None => head,
+            })
+            .strong(),
+        );
         if let Some((k, _)) = &sys {
             ui.label(egui::RichText::new(format!("{} · {}", k.kind().name(), k.short())).small().color(theme::MUTED));
         }
@@ -3218,7 +3373,11 @@ impl App {
         if group {
             let fp = &self.follow_policy;
             ui.horizontal(|ui| {
-                if ui.selectable_label(fp.priority.contains(&id), "★ Priority").on_hover_text("Followed first, interrupting other talkgroups").clicked() {
+                if ui
+                    .selectable_label(fp.priority.contains(&id), "★ Priority")
+                    .on_hover_text("Followed first, interrupting other talkgroups")
+                    .clicked()
+                {
                     toggle = Some((id, true));
                 }
                 if ui.selectable_label(fp.lockout.contains(&id), "⊘ Lock out").on_hover_text("Never followed").clicked() {
@@ -3240,7 +3399,8 @@ impl App {
         for c in calls.iter().take(5) {
             ui.horizontal(|ui| {
                 let secs = c.last.duration_since(c.first).unwrap_or_default().as_secs();
-                let who = if group { c.call.source.map(|s| format!("← {s}")).unwrap_or_default() } else { format!("TG {}", c.call.target) };
+                let who =
+                    if group { c.call.source.map(|s| format!("← {s}")).unwrap_or_default() } else { format!("TG {}", c.call.target) };
                 let flags = format!("{}{}", if c.call.emergency { " EMERG" } else { "" }, if c.call.encrypted { " enc" } else { "" });
                 ui.label(egui::RichText::new(format!("{} · {secs}s · {who}{flags}", hms(c.first))).monospace().small().color(theme::TEXT2));
                 if let Some(last) = c.recordings.last() {
@@ -3261,7 +3421,8 @@ impl App {
     /// A pager capcode: its protocol and last messages.
     fn inspect_capcode(&mut self, ui: &mut egui::Ui, protocol: &str, capcode: u64) {
         ui.label(egui::RichText::new(format!("Capcode {capcode:09} · {protocol}")).strong());
-        let mut pages: Vec<engine::PageEvent> = self.panes.iter().flat_map(|p| p.source.pages(5000)).filter(|p| p.capcode == capcode).collect();
+        let mut pages: Vec<engine::PageEvent> =
+            self.panes.iter().flat_map(|p| p.source.pages(5000)).filter(|p| p.capcode == capcode).collect();
         pages.sort_by(|a, b| b.last.cmp(&a.last));
         if let Some(p) = pages.first() {
             ui.label(egui::RichText::new(format!("{:.4} MHz", p.center_hz / 1e6)).small().color(theme::MUTED));
@@ -3319,7 +3480,10 @@ impl App {
             }
             ui.separator();
             refresh |= ui.checkbox(&mut v.unconfirmed, egui::RichText::new("show unconfirmed").small()).changed();
-            refresh |= ui.checkbox(&mut v.new_first, egui::RichText::new("new first").small()).on_hover_text("Emitters first seen within the new-signal window (⚙) sort to the top and are marked ✦").changed();
+            refresh |= ui
+                .checkbox(&mut v.new_first, egui::RichText::new("new first").small())
+                .on_hover_text("Emitters first seen within the new-signal window (⚙) sort to the top and are marked ✦")
+                .changed();
             ui.separator();
             if ui
                 .button(egui::RichText::new("Export CSV").small())
@@ -3406,9 +3570,17 @@ impl App {
                 ui.label(egui::RichText::new(format!("{} busy bands:", bands.len())).small().color(theme::MUTED));
                 for (lo, hi, n, act, labels) in &bands {
                     let top = labels.iter().max_by_key(|(_, c)| **c).map(|(l, c)| format!(" · {l}×{c}")).unwrap_or_default();
-                    let text = if (hi - lo) < 0.5e6 { format!("{:.2} MHz · {n}", lo / 1e6) } else { format!("{:.1}–{:.1} MHz · {n}", lo / 1e6, hi / 1e6) };
+                    let text = if (hi - lo) < 0.5e6 {
+                        format!("{:.2} MHz · {n}", lo / 1e6)
+                    } else {
+                        format!("{:.1}–{:.1} MHz · {n}", lo / 1e6, hi / 1e6)
+                    };
                     let text = if *act > 0 { format!("{text} ({act} active)") } else { text };
-                    if ui.add(egui::Button::new(egui::RichText::new(text).small()).small()).on_hover_text(format!("{n} emitters{top}")).clicked() {
+                    if ui
+                        .add(egui::Button::new(egui::RichText::new(text).small()).small())
+                        .on_hover_text(format!("{n} emitters{top}"))
+                        .clicked()
+                    {
                         tune_band = Some((lo + hi) / 2.0);
                     }
                 }
@@ -3568,10 +3740,15 @@ impl App {
     fn trunking_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.menu_button(egui::RichText::new("Import names ⏷").small(), |ui| self.import_menu(ui));
-            let names = if self.catalog.sources.is_empty() { "no names imported".to_string() } else { format!("names: {}", self.catalog.sources.join(" · ")) };
+            let names = if self.catalog.sources.is_empty() {
+                "no names imported".to_string()
+            } else {
+                format!("names: {}", self.catalog.sources.join(" · "))
+            };
             ui.label(egui::RichText::new(names).small().color(theme::MUTED));
         });
-        let rows: Vec<(ReceiverId, engine::TrunkSystem)> = self.panes.iter().flat_map(|p| p.source.systems().into_iter().map(move |s| (p.id, s))).collect();
+        let rows: Vec<(ReceiverId, engine::TrunkSystem)> =
+            self.panes.iter().flat_map(|p| p.source.systems().into_iter().map(move |s| (p.id, s))).collect();
         if rows.is_empty() {
             let monitors = self.panes.iter().flat_map(|p| p.source.monitors()).filter(|m| m.label.starts_with("CC")).count();
             ui.label(
@@ -3614,7 +3791,9 @@ impl App {
                     let text = |ui: &mut egui::Ui, s: String, c: egui::Color32| {
                         ui.add(egui::Label::new(egui::RichText::new(s).monospace().color(c)).selectable(false).truncate());
                     };
-                    let recent = sys.last_activity.is_some_and(|t| std::time::SystemTime::now().duration_since(t).map(|d| d.as_secs() < 10).unwrap_or(true));
+                    let recent = sys
+                        .last_activity
+                        .is_some_and(|t| std::time::SystemTime::now().duration_since(t).map(|d| d.as_secs() < 10).unwrap_or(true));
                     let c = if recent { theme::TEXT } else { theme::TEXT2 };
                     let site = sys.site.and_then(|(r, t)| cat.site(&sys.key, r, t)).unwrap_or("");
                     let net = cat.network(&sys.key).unwrap_or("");
@@ -3641,7 +3820,9 @@ impl App {
                         })
                         .collect();
                     row.col(|ui| text(ui, rx.to_string(), c));
-                    row.col(|ui| text(ui, sys.kind.name().to_string(), theme::class_color(None).unwrap_or(egui::Color32::from_rgb(0xf2, 0xa3, 0x3a))));
+                    row.col(|ui| {
+                        text(ui, sys.kind.name().to_string(), theme::class_color(None).unwrap_or(egui::Color32::from_rgb(0xf2, 0xa3, 0x3a)))
+                    });
                     row.col(|ui| text(ui, sys.identity.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(" · "), c));
                     row.col(|ui| text(ui, names, theme::TEXT2));
                     row.col(|ui| text(ui, sys.control_hz.iter().map(|f| format!("{:.5}", f / 1e6)).collect::<Vec<_>>().join(", "), c));
@@ -3649,7 +3830,8 @@ impl App {
                     row.col(|ui| text(ui, sys.last_activity.map(hms).unwrap_or_default(), theme::MUTED));
                     row.col(|ui| {
                         let a = adjacent.join(", ");
-                        ui.add(egui::Label::new(egui::RichText::new(&a).monospace().color(theme::MUTED)).selectable(false).truncate()).on_hover_text(&a);
+                        ui.add(egui::Label::new(egui::RichText::new(&a).monospace().color(theme::MUTED)).selectable(false).truncate())
+                            .on_hover_text(&a);
                     });
                     if row.response().double_clicked() {
                         tune = sys.control_hz.first().copied();
@@ -3691,7 +3873,9 @@ impl App {
             .column(egui_extras::Column::exact(44.0))
             .column(egui_extras::Column::remainder())
             .header(row_h, |mut h| {
-                for t in ["Last", "First", "Talkgroup", "Name (imported)", "Voice MHz", "Slot", "Radio ID", "Radio (imported)", "×", "System"] {
+                for t in
+                    ["Last", "First", "Talkgroup", "Name (imported)", "Voice MHz", "Slot", "Radio ID", "Radio (imported)", "×", "System"]
+                {
                     h.col(|ui| {
                         ui.label(egui::RichText::new(t).small().color(theme::MUTED));
                     });
@@ -3765,15 +3949,20 @@ impl App {
         let mut view = self.calls_view;
         ui.horizontal(|ui| {
             ui.selectable_value(&mut view, CallsView::Calls, egui::RichText::new("Calls").small());
-            ui.selectable_value(&mut view, CallsView::Grants, egui::RichText::new("Grants").small()).on_hover_text("The raw control-channel grants calls are built from");
+            ui.selectable_value(&mut view, CallsView::Grants, egui::RichText::new("Grants").small())
+                .on_hover_text("The raw control-channel grants calls are built from");
             ui.separator();
             ui.label(egui::RichText::new("Filter").small().color(theme::MUTED));
             ui.add(egui::TextEdit::singleline(&mut self.call_filter).desired_width(200.0).hint_text("talkgroup, radio or name"));
             ui.label(
-                egui::RichText::new(format!("{} calls · {} heard on their voice channel", calls.len(), calls.iter().filter(|c| c.heard).count()))
-                    .small()
-                    .monospace()
-                    .color(theme::MUTED),
+                egui::RichText::new(format!(
+                    "{} calls · {} heard on their voice channel",
+                    calls.len(),
+                    calls.iter().filter(|c| c.heard).count()
+                ))
+                .small()
+                .monospace()
+                .color(theme::MUTED),
             );
             ui.separator();
             let fp = &self.follow_policy;
@@ -3782,8 +3971,10 @@ impl App {
                 Some(rx) => format!("following on {rx}"),
                 None => "not following".to_string(),
             };
-            ui.label(egui::RichText::new(format!("{state} · ★ {} · ⊘ {}", list(&fp.priority), list(&fp.lockout))).small().color(theme::MUTED))
-                .on_hover_text("Priority (★) and locked-out (⊘) talkgroups: right-click a call, or the ★ rail button");
+            ui.label(
+                egui::RichText::new(format!("{state} · ★ {} · ⊘ {}", list(&fp.priority), list(&fp.lockout))).small().color(theme::MUTED),
+            )
+            .on_hover_text("Priority (★) and locked-out (⊘) talkgroups: right-click a call, or the ★ rail button");
         });
         self.calls_view = view;
         if view == CallsView::Grants {
@@ -3832,7 +4023,20 @@ impl App {
             .column(egui_extras::Column::exact(48.0))
             .column(egui_extras::Column::remainder())
             .header(row_h, |mut h| {
-                for t in ["Start", "Secs", "MHz", "Protocol", "Talkgroup", "★⊘", "Name (imported)", "Radio", "Radio (imported)", "Flags", "Audio", "Seen"] {
+                for t in [
+                    "Start",
+                    "Secs",
+                    "MHz",
+                    "Protocol",
+                    "Talkgroup",
+                    "★⊘",
+                    "Name (imported)",
+                    "Radio",
+                    "Radio (imported)",
+                    "Flags",
+                    "Audio",
+                    "Seen",
+                ] {
                     h.col(|ui| {
                         ui.label(egui::RichText::new(t).small().color(theme::MUTED));
                     });
@@ -3852,7 +4056,9 @@ impl App {
                     let recent = std::time::SystemTime::now().duration_since(c.last).map(|d| d.as_secs() < 10).unwrap_or(true);
                     let col = if recent { theme::TEXT } else { theme::TEXT2 };
                     row.col(|ui| text(ui, hms(c.first), col));
-                    row.col(|ui| text(ui, format!("{:.0}", c.last.duration_since(c.first).unwrap_or_default().as_secs_f64()), theme::MUTED));
+                    row.col(|ui| {
+                        text(ui, format!("{:.0}", c.last.duration_since(c.first).unwrap_or_default().as_secs_f64()), theme::MUTED)
+                    });
                     row.col(|ui| text(ui, c.center_hz.map(|f| format!("{:.5}", f / 1e6)).unwrap_or("?".into()), col));
                     row.col(|ui| text(ui, c.protocol.clone(), theme::TEXT2));
                     let mark = match (c.call.group, prio.contains(&c.call.target), locked.contains(&c.call.target)) {
@@ -3872,7 +4078,9 @@ impl App {
                         if let Some(last) = c.recordings.last() {
                             let n = c.recordings.len();
                             let label = if n > 1 { format!("▶ {n}") } else { "▶".into() };
-                            let b = ui.small_button(label).on_hover_text(format!("Play {}\nRight-click: open in the system player", last.display()));
+                            let b = ui
+                                .small_button(label)
+                                .on_hover_text(format!("Play {}\nRight-click: open in the system player", last.display()));
                             if b.clicked() {
                                 play = Some(last.clone());
                             }
@@ -3939,10 +4147,14 @@ impl App {
             ui.label(egui::RichText::new("Filter").small().color(theme::MUTED));
             ui.add(egui::TextEdit::singleline(&mut self.page_filter).desired_width(200.0).hint_text("capcode or text"));
             ui.label(
-                egui::RichText::new(format!("{} pages · {pagers} pager channel{} monitored", pages.len(), if pagers == 1 { "" } else { "s" }))
-                    .small()
-                    .monospace()
-                    .color(theme::MUTED),
+                egui::RichText::new(format!(
+                    "{} pages · {pagers} pager channel{} monitored",
+                    pages.len(),
+                    if pagers == 1 { "" } else { "s" }
+                ))
+                .small()
+                .monospace()
+                .color(theme::MUTED),
             );
         });
         if pages.is_empty() {
@@ -4022,7 +4234,6 @@ impl App {
         }
     }
 
-
     /// Every receiver's statistics in full, then audio and the UI itself.
     fn diagnostics_panel(&mut self, ui: &mut egui::Ui) {
         fn section(ui: &mut egui::Ui, title: &str) {
@@ -4067,14 +4278,27 @@ impl App {
                     kv(
                         ui,
                         "Look-back ring",
-                        &format!("{:.1} of {:.1} s · {:.0} MB", st.ring_samples as f64 / rate, st.ring_capacity as f64 / rate, st.ring_capacity as f64 * 4.0 / 1e6),
+                        &format!(
+                            "{:.1} of {:.1} s · {:.0} MB",
+                            st.ring_samples as f64 / rate,
+                            st.ring_capacity as f64 / rate,
+                            st.ring_capacity as f64 * 4.0 / 1e6
+                        ),
                     );
                     section(ui, "PROCESSING");
                     kv(ui, "FFT", &format!("{} pt · {:.0}/s · {:.0} Hz/bin", cfg.fft_size, st.ffts_per_sec, rate / cfg.fft_size as f64));
-                    kv(ui, "Classifier", &format!("{:.1} jobs/s · {:.0} ms · {:.0}% busy", load.jobs_per_sec, load.avg_job_ms, load.busy * 100.0));
+                    kv(
+                        ui,
+                        "Classifier",
+                        &format!("{:.1} jobs/s · {:.0} ms · {:.0}% busy", load.jobs_per_sec, load.avg_job_ms, load.busy * 100.0),
+                    );
                     if !id.is_sweep() {
                         let detail = match (&p.visit, &p.scan) {
-                            (Some(v), _) => format!(" · visiting {:.4} MHz, {:.1} s", v.center_hz / 1e6, v.dwell(std::time::Instant::now()).as_secs_f64()),
+                            (Some(v), _) => format!(
+                                " · visiting {:.4} MHz, {:.1} s",
+                                v.center_hz / 1e6,
+                                v.dwell(std::time::Instant::now()).as_secs_f64()
+                            ),
                             (None, Some(t)) => format!(" · on {:.4} MHz, {:.0} s", t.center_hz / 1e6, t.started.elapsed().as_secs_f64()),
                             _ => String::new(),
                         };
@@ -4131,11 +4355,20 @@ impl App {
                                 None => egui::Color32::from_gray(40),
                             };
                             let x0 = r.min.x + w * i as f32;
-                            painter.rect_filled(egui::Rect::from_min_max(egui::pos2(x0, r.min.y), egui::pos2(x0 + w - 0.5, r.max.y)), 0.0, col);
+                            painter.rect_filled(
+                                egui::Rect::from_min_max(egui::pos2(x0, r.min.y), egui::pos2(x0 + w - 0.5, r.max.y)),
+                                0.0,
+                                col,
+                            );
                         }
                         if let Some(pos) = resp.hover_pos() {
                             let i = (((pos.x - r.min.x) / w) as usize).min(s.hop_times.len().saturating_sub(1));
-                            let age = s.hop_times.get(i).copied().flatten().map_or("not yet".to_string(), |t| format!("{:.2} s ago", t.elapsed().as_secs_f64()));
+                            let age = s
+                                .hop_times
+                                .get(i)
+                                .copied()
+                                .flatten()
+                                .map_or("not yet".to_string(), |t| format!("{:.2} s ago", t.elapsed().as_secs_f64()));
                             resp.on_hover_text(format!("hop {i} · {:.2} MHz · {age}", (s.start_hz + s.hop_hz * (i as f64 + 0.5)) / 1e6));
                         }
                     }
@@ -4159,7 +4392,13 @@ impl App {
                         kv(
                             ui,
                             &format!("Listening {}", p.id),
-                            &format!("{:.4} MHz · {}{}{}", l.center_hz / 1e6, l.mode.name(), if l.follow { " · follow" } else { "" }, if l.tdma { " · TDMA" } else { "" }),
+                            &format!(
+                                "{:.4} MHz · {}{}{}",
+                                l.center_hz / 1e6,
+                                l.mode.name(),
+                                if l.follow { " · follow" } else { "" },
+                                if l.tdma { " · TDMA" } else { "" }
+                            ),
                         );
                         kv(ui, "Queue", &format!("{:.2} s{}", depth, if starved { " · gathering" } else { "" }));
                         let v = p.source.voice();
@@ -4184,7 +4423,16 @@ impl App {
                 if let Some(pb) = &self.playback {
                     any = true;
                     let (depth, _) = pb.queue.depth();
-                    kv(ui, "Playing", &format!("{} · {:.1} s · queue {:.2} s", pb.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(), pb.seconds, depth));
+                    kv(
+                        ui,
+                        "Playing",
+                        &format!(
+                            "{} · {:.1} s · queue {:.2} s",
+                            pb.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+                            pb.seconds,
+                            depth
+                        ),
+                    );
                 }
                 if !any {
                     kv(ui, "Listening", "nothing");
@@ -4198,8 +4446,18 @@ impl App {
                 if let Some(m) = monitor {
                     kv(ui, "Monitor", &format!("{:.0} × {:.0} pt", m.x, m.y));
                 }
-                let tabs = self.dock.as_ref().map_or(0, |d| d.iter_all_tabs().count()) + self.popouts.iter().map(|p| p.dock.iter_all_tabs().count()).sum::<usize>();
-                kv(ui, "Layout", &format!("{} tabs · {} pop-out windows · {}", tabs, self.popouts.len(), self.workspace_name.as_deref().unwrap_or("unsaved")));
+                let tabs = self.dock.as_ref().map_or(0, |d| d.iter_all_tabs().count())
+                    + self.popouts.iter().map(|p| p.dock.iter_all_tabs().count()).sum::<usize>();
+                kv(
+                    ui,
+                    "Layout",
+                    &format!(
+                        "{} tabs · {} pop-out windows · {}",
+                        tabs,
+                        self.popouts.len(),
+                        self.workspace_name.as_deref().unwrap_or("unsaved")
+                    ),
+                );
                 let names = if self.catalog.sources.is_empty() { "none".to_string() } else { self.catalog.sources.join(" · ") };
                 kv(ui, "Names", &names);
             });
@@ -4221,31 +4479,60 @@ impl App {
                 let _ = std::fs::create_dir_all(&d);
                 open_path(&d);
             }
-            ui.label(egui::RichText::new(format!("levels: {}", logging::AREAS.iter().map(|a| format!("{a} {}", logging::level_str(self.settings.log.level(a)))).collect::<Vec<_>>().join(" · "))).small().color(theme::MUTED));
+            ui.label(
+                egui::RichText::new(format!(
+                    "levels: {}",
+                    logging::AREAS
+                        .iter()
+                        .map(|a| format!("{a} {}", logging::level_str(self.settings.log.level(a))))
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                ))
+                .small()
+                .color(theme::MUTED),
+            );
         });
         let (entries, _) = logging::recent(400);
         let q = self.log_filter.to_lowercase();
         let shown: Vec<&logging::Entry> = entries
             .iter()
-            .filter(|e| q.is_empty() || e.area.contains(&q) || e.target.to_lowercase().contains(&q) || e.message.to_lowercase().contains(&q) || e.level.as_str().to_lowercase() == q)
+            .filter(|e| {
+                q.is_empty()
+                    || e.area.contains(&q)
+                    || e.target.to_lowercase().contains(&q)
+                    || e.message.to_lowercase().contains(&q)
+                    || e.level.as_str().to_lowercase() == q
+            })
             .collect();
         let row_h = ui.text_style_height(&egui::TextStyle::Small);
-        egui::ScrollArea::vertical().id_salt("log_rows").max_height(260.0).stick_to_bottom(true).show_rows(ui, row_h, shown.len(), |ui, range| {
-            for e in &shown[range] {
-                let col = match e.level {
-                    log::Level::Error => theme::ALERT,
-                    log::Level::Warn => theme::ACCENT,
-                    log::Level::Info => theme::TEXT,
-                    _ => theme::TEXT2,
-                };
-                ui.label(
-                    egui::RichText::new(format!("{} {:<5} [{}] {}: {}", &logging::stamp(e.time)[11..], e.level, e.area, e.target, e.message))
+        egui::ScrollArea::vertical().id_salt("log_rows").max_height(260.0).stick_to_bottom(true).show_rows(
+            ui,
+            row_h,
+            shown.len(),
+            |ui, range| {
+                for e in &shown[range] {
+                    let col = match e.level {
+                        log::Level::Error => theme::ALERT,
+                        log::Level::Warn => theme::ACCENT,
+                        log::Level::Info => theme::TEXT,
+                        _ => theme::TEXT2,
+                    };
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} {:<5} [{}] {}: {}",
+                            &logging::stamp(e.time)[11..],
+                            e.level,
+                            e.area,
+                            e.target,
+                            e.message
+                        ))
                         .small()
                         .monospace()
                         .color(col),
-                );
-            }
-        });
+                    );
+                }
+            },
+        );
     }
 
     /// Newest records from all panes, most recent first. Virtualised.
@@ -4391,7 +4678,13 @@ impl eframe::App for App {
                             nudge_sweep = Some((0.0, dir));
                         }
                     } else if left || right {
-                        let scale = if i.modifiers.shift { 10.0 } else if i.modifiers.alt { 0.1 } else { 1.0 };
+                        let scale = if i.modifiers.shift {
+                            10.0
+                        } else if i.modifiers.alt {
+                            0.1
+                        } else {
+                            1.0
+                        };
                         nudge = Some(dir * scale);
                     }
                 }
@@ -4664,7 +4957,12 @@ fn list_workspaces() -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir(workspace_dir())
         .map(|d| {
             d.filter_map(|e| e.ok())
-                .filter_map(|e| e.path().file_stem().map(|s| s.to_string_lossy().to_string()).filter(|_| e.path().extension().is_some_and(|x| x == "json")))
+                .filter_map(|e| {
+                    e.path()
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .filter(|_| e.path().extension().is_some_and(|x| x == "json"))
+                })
                 .filter(|n| n != "last")
                 .collect()
         })

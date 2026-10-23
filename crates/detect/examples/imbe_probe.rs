@@ -45,7 +45,9 @@ fn main() {
                 }
             }
             if decode::p25_nid(f).map(|n| n.duid) == Some(0xA) {
-                let a = detect::p25_lc::ldu2(f).map(|e| format!("{} 0x{:02X} key {}", e.algorithm(), e.algid, e.kid)).unwrap_or("RS failed".into());
+                let a = detect::p25_lc::ldu2(f)
+                    .map(|e| format!("{} 0x{:02X} key {}", e.algorithm(), e.algid, e.kid))
+                    .unwrap_or("RS failed".into());
                 *algs.entry(a).or_default() += 1;
             }
             for c in v {
