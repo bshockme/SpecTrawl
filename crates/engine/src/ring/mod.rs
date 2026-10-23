@@ -15,6 +15,7 @@
 //! guard keeps a retired block's memory alive until its copy ends.
 
 pub mod block;
+pub mod keeper;
 pub mod volatile;
 
 use std::sync::Arc;
@@ -28,6 +29,8 @@ use self::volatile::{OfferPriority, PAGE, VolatileMemory};
 
 /// Default block size: 64 MiB, 16 Mi samples.
 pub const DEFAULT_BLOCK_BYTES: usize = 64 << 20;
+/// Blocks provisioned ahead of the writer until [`IqRing::set_provision_ahead`] changes it.
+pub const DEFAULT_PROVISION_AHEAD: u32 = 2;
 /// Number of block slots: 256 GiB at the default block size.
 pub const MAX_SLOTS: usize = 4096;
 
@@ -98,6 +101,8 @@ pub struct IqRing {
     /// The block the writer needs next; the keeper provisions from here.
     wanted_block: AtomicU64,
     ceiling_blocks: AtomicU32,
+    /// Blocks `housekeep` provisions past the writer's block.
+    provision_ahead: AtomicU32,
     guaranteed_samples: AtomicU64,
     blocks_lost_total: AtomicU64,
     starved_total: AtomicU64,
@@ -126,6 +131,7 @@ impl IqRing {
             oldest: AtomicU64::new(0),
             wanted_block: AtomicU64::new(0),
             ceiling_blocks: AtomicU32::new(slots as u32),
+            provision_ahead: AtomicU32::new(DEFAULT_PROVISION_AHEAD),
             guaranteed_samples: AtomicU64::new(0),
             blocks_lost_total: AtomicU64::new(0),
             starved_total: AtomicU64::new(0),
@@ -376,7 +382,7 @@ impl IqRing {
         allocated
     }
 
-    /// One keeper pass: provision 2 blocks ahead, retire blocks beyond the
+    /// One keeper pass: provision [`IqRing::set_provision_ahead`] blocks ahead (2 by default), retire blocks beyond the
     /// ceiling (oldest first, never the writer's block), offer every `Live`
     /// block older than the guaranteed window with a priority by age.
     ///
@@ -392,7 +398,7 @@ impl IqRing {
     /// retire (so nothing about to be dropped is offered and the window the
     /// offer bands are cut from is the one that stays), then offer.
     pub fn housekeep(&self) -> Housekeeping {
-        let provisioned = self.provision(2);
+        let provisioned = self.provision(self.provision_ahead.load(Ordering::Relaxed));
         let bs = self.block_samples;
         // `head` only grows, so everything below this snapshot's block stays
         // behind the writer for the rest of the pass.
@@ -490,6 +496,14 @@ impl IqRing {
             }
         }
         offered
+    }
+
+    /// How many blocks past the writer's `housekeep` provisions (default 2).
+    /// The keeper sizes this to cover 250 ms of samples at the source's rate,
+    /// so a keeper stalled for a tick or more (20 ms each) never starves a
+    /// real device even with small blocks.
+    pub fn set_provision_ahead(&self, blocks: u32) {
+        self.provision_ahead.store(blocks, Ordering::Relaxed);
     }
 
     pub fn set_ceiling_blocks(&self, n: u32) {
@@ -620,6 +634,17 @@ mod tests {
         let mut f = vec![Complex32::default(); 4];
         r.read(100, &mut f).unwrap();
         assert!((f[0].re - 100.0 / 32768.0).abs() < 1e-7);
+    }
+
+    #[test]
+    fn housekeep_provisions_the_configured_number_of_blocks_ahead() {
+        let r = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()));
+        r.set_provision_ahead(5);
+        assert_eq!(r.housekeep().provisioned, 6); // blocks 0..=5
+        for b in 0..=5 {
+            assert!(r.block_at(b).is_some(), "block {b}");
+        }
+        assert!(r.block_at(6).is_none());
     }
 
     #[test]

@@ -1081,7 +1081,8 @@ impl Drop for Source { /* budget.leave, device.stop */ }
 #[test]
 fn streams_into_the_ring_and_reports_seconds() {
     let keeper = Keeper::start(RingBudget::new(BudgetConfig { guaranteed_secs: 0.5, ceiling_bytes: 64 << 20, sweep_secs: 0.2 }));
-    let (d, _c) = sim(10e6, false);
+    // The unpaced sim runs at ~280 MS/s, far beyond any real device, and starves the keeper's provisioning.
+    let (d, _c) = sim(10e6, true);
     let src = Source::start(d, cfg(), Mode::Live, &keeper).unwrap();
     wait_until(|| src.stats().held_secs >= 1.0);
     let s = src.stats();
@@ -1137,8 +1138,9 @@ fn device_loss_is_flagged_without_a_restart() {
 #[test]
 fn two_live_sources_hold_equal_seconds_and_a_mode_change_redistributes_without_restart() {
     let keeper = Keeper::start(RingBudget::new(BudgetConfig { guaranteed_secs: 0.25, ceiling_bytes: 100 << 20, sweep_secs: 0.1 }));
-    let (d1, c1) = sim(10e6, false);
-    let (d2, c2) = sim(2.5e6, false);
+    // The unpaced sim runs at ~280 MS/s, far beyond any real device, and starves the keeper's provisioning.
+    let (d1, c1) = sim(10e6, true);
+    let (d2, c2) = sim(2.5e6, true);
     let a = Source::start(d1, cfg(), Mode::Live, &keeper).unwrap();
     let b = Source::start(d2, cfg(), Mode::Live, &keeper).unwrap();
     wait_until(|| a.stats().held_secs >= a.stats().ceiling_secs - 0.1 && b.stats().held_secs >= b.stats().ceiling_secs - 0.1);

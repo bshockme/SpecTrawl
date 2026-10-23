@@ -1,0 +1,29 @@
+//! Shared helpers for the engine's integration tests.
+
+#![allow(dead_code)]
+
+use std::time::{Duration, Instant};
+
+use backend_sim::{SimConfig, SimControl, SimDevice};
+use engine::{RingConfig, SourceConfig};
+use sdr_core::Device;
+
+/// A simulated device with no emitters (noise only) at `rate`.
+pub fn sim(rate: f64, paced: bool) -> (Box<dyn Device>, SimControl) {
+    let (d, c) = SimDevice::with_config(SimConfig { emitters: vec![], rate, paced, ..Default::default() });
+    (Box::new(d), c)
+}
+
+/// 1 MiB blocks (262,144 samples), weight 1.0.
+pub fn cfg() -> SourceConfig {
+    SourceConfig { ring: RingConfig { block_bytes: 1 << 20 }, weight: 1.0 }
+}
+
+/// Poll `f` every 5 ms; panic if it is not true within 20 s.
+pub fn wait_until(f: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !f() {
+        assert!(Instant::now() < deadline, "condition not met within 20 s");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
