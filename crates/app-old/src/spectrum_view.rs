@@ -8,7 +8,7 @@
 use std::collections::VecDeque;
 
 use egui::{Color32, Mesh, Pos2, Rect, Shape, Stroke, TextureHandle, TextureOptions, pos2, vec2};
-use engine::{SignalRecord, Source, SweepStatus, Tuning};
+use engine_old::{SignalRecord, Source, SweepStatus, Tuning};
 
 use crate::theme;
 
@@ -170,7 +170,7 @@ impl SpectrumView {
             return;
         }
         // Unmeasured stretches (survey segments) aren't spectrum.
-        let mut v: Vec<f32> = self.trace.iter().copied().filter(|v| !engine::is_empty_db(*v)).collect();
+        let mut v: Vec<f32> = self.trace.iter().copied().filter(|v| !engine_old::is_empty_db(*v)).collect();
         if v.is_empty() {
             return;
         }
@@ -181,7 +181,7 @@ impl SpectrumView {
     }
 
     /// Starts (or restarts) the traces on a row with a new tuning or size.
-    fn retune_to(&mut self, row: &engine::SpectrumRow) {
+    fn retune_to(&mut self, row: &engine_old::SpectrumRow) {
         let first = self.tuning.is_none();
         self.tuning = Some(row.tuning);
         if let (Some((a, b)), Some((f0, f1))) = (self.zoom, self.full_span()) {
@@ -343,7 +343,7 @@ impl SpectrumView {
         dsp::decimate_max(&row[c0..c1], &mut cols);
         let (lo, k, lut) = (self.db_min, 255.0 / (self.db_max - self.db_min).max(1.0), &self.lut);
         let px: Vec<Color32> =
-            cols.iter().map(|&v| if engine::is_empty_db(v) { GAP } else { lut[((v - lo) * k).clamp(0.0, 255.0) as usize] }).collect();
+            cols.iter().map(|&v| if engine_old::is_empty_db(v) { GAP } else { lut[((v - lo) * k).clamp(0.0, 255.0) as usize] }).collect();
         let img = egui::ColorImage::new([self.tex_w, 1], px);
         tex.set_partial([0, self.write_row], img, TextureOptions::LINEAR);
     }
@@ -352,7 +352,7 @@ impl SpectrumView {
         let lo = self.db_min;
         let k = 255.0 / (self.db_max - self.db_min).max(1.0);
         out.clear();
-        out.extend(db.iter().map(|&v| if engine::is_empty_db(v) { GAP } else { self.lut[((v - lo) * k).clamp(0.0, 255.0) as usize] }));
+        out.extend(db.iter().map(|&v| if engine_old::is_empty_db(v) { GAP } else { self.lut[((v - lo) * k).clamp(0.0, 255.0) as usize] }));
     }
 
     fn push_tex_row(&mut self) {
@@ -367,7 +367,7 @@ impl SpectrumView {
         let mut px = Vec::with_capacity(self.tex_w);
         // Borrow juggling: colourise with a copy of the parameters.
         let (lo, k, lut) = (self.db_min, 255.0 / (self.db_max - self.db_min).max(1.0), &self.lut);
-        px.extend(cols.iter().map(|&v| if engine::is_empty_db(v) { GAP } else { lut[((v - lo) * k).clamp(0.0, 255.0) as usize] }));
+        px.extend(cols.iter().map(|&v| if engine_old::is_empty_db(v) { GAP } else { lut[((v - lo) * k).clamp(0.0, 255.0) as usize] }));
         self.write_row = (self.write_row + ROWS - 1) % ROWS;
         let img = egui::ColorImage::new([self.tex_w, 1], px);
         tex.set_partial([0, self.write_row], img, TextureOptions::LINEAR);
@@ -628,7 +628,7 @@ impl SpectrumView {
             let mut out: Vec<Vec<Pos2>> = Vec::new();
             let mut cur: Vec<Pos2> = Vec::new();
             for (p, v) in pts.iter().zip(vals) {
-                if engine::is_empty_db(*v) {
+                if engine_old::is_empty_db(*v) {
                     if cur.len() > 1 {
                         out.push(std::mem::take(&mut cur));
                     } else {
@@ -645,7 +645,7 @@ impl SpectrumView {
         };
         let mut gap_from: Option<f32> = None;
         for (i, v) in self.scratch.iter().enumerate() {
-            let empty = engine::is_empty_db(*v);
+            let empty = engine_old::is_empty_db(*v);
             match (gap_from, empty) {
                 (None, true) => gap_from = Some(x_of(i)),
                 (Some(x0), false) => {

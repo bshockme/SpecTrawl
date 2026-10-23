@@ -1,11 +1,11 @@
 //! Runs an Airspy on a band and prints what the P25 control-channel monitors
 //! learn: systems, sites, band plans and talkgroup grants.
 //!
-//!     cargo run --release -p engine --example p25_watch -- <serial> <MHz> <seconds>
+//!     cargo run --release -p engine-old --example p25_watch -- <serial> <MHz> <seconds>
 
 use std::time::{Duration, Instant};
 
-use engine::{Mode, Source, SourceConfig};
+use engine_old::{Mode, Source, SourceConfig};
 use sdr_core::Backend;
 
 fn main() {

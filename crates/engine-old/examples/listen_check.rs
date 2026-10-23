@@ -1,11 +1,11 @@
 //! Listens to one channel and writes the audio to a WAV file.
 //!
-//!     cargo run --release -p engine --example listen_check -- <serial> <tune MHz> <channel MHz> <nfm|am|wfm|p25|p25p2|follow> <seconds> <out.wav> [priority=tg,tg] [lockout=tg,tg]
+//!     cargo run --release -p engine-old --example listen_check -- <serial> <tune MHz> <channel MHz> <nfm|am|wfm|p25|p25p2|follow> <seconds> <out.wav> [priority=tg,tg] [lockout=tg,tg]
 
 use std::io::Write;
 use std::time::Duration;
 
-use engine::{DemodMode, ListenSpec, Mode, Source, SourceConfig};
+use engine_old::{DemodMode, ListenSpec, Mode, Source, SourceConfig};
 use sdr_core::Backend;
 
 fn main() {
@@ -27,7 +27,7 @@ fn main() {
     std::thread::sleep(Duration::from_millis(500));
     src.listen(Some(ListenSpec { center_hz: chan, mode, follow, tdma: a[4] == "p25p2", slot: None }));
     let mut last_status = String::new();
-    let mut policy = engine::FollowPolicy::default();
+    let mut policy = engine_old::FollowPolicy::default();
     for arg in a.iter().skip(7) {
         if let Some((k, v)) = arg.split_once('=') {
             let tgs = v.split(',').filter_map(|t| t.parse::<u32>().ok());

@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use engine::{Mode, RecordAllConfig, Source, SourceConfig};
+use engine_old::{Mode, RecordAllConfig, Source, SourceConfig};
 use sdr_core::Backend;
 
 #[test]

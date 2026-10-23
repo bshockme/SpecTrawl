@@ -2,11 +2,11 @@
 //! identified as FLEX/POCSAG, monitors running, page counts. Message text
 //! only with `--show` (pager traffic is often personal or medical).
 //!
-//!     cargo run --release -p engine --example pager_check -- <serial> <MHz> <seconds> [--show]
+//!     cargo run --release -p engine-old --example pager_check -- <serial> <MHz> <seconds> [--show]
 
 use std::time::Duration;
 
-use engine::{Mode, Source, SourceConfig};
+use engine_old::{Mode, Source, SourceConfig};
 use sdr_core::Backend;
 
 fn main() {

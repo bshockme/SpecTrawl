@@ -1,13 +1,13 @@
 //! Runs an Airspy on one band, then saves the look-back channel IQ of every
 //! emitter the classifier identified, as SigMF test material.
 //!
-//!     cargo run --release -p engine --example capture_identified -- <serial> <MHz> <seconds> <out-dir>
+//!     cargo run --release -p engine-old --example capture_identified -- <serial> <MHz> <seconds> <out-dir>
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-use engine::sigmf::{ExportKind, ExportRequest};
-use engine::{Mode, Source, SourceConfig};
+use engine_old::sigmf::{ExportKind, ExportRequest};
+use engine_old::{Mode, Source, SourceConfig};
 use sdr_core::Backend;
 
 fn main() {
@@ -22,7 +22,7 @@ fn main() {
     let (s, e) = src.ring_range();
     for em in src.emitters().into_iter().filter(|e| e.has_protocol()) {
         let label = em.label().unwrap_or_default();
-        let stem = engine::sigmf::sanitize(&format!("{:.4}MHz_{}", em.center_hz / 1e6, label));
+        let stem = engine_old::sigmf::sanitize(&format!("{:.4}MHz_{}", em.center_hz / 1e6, label));
         let r = src
             .export(ExportRequest {
                 start_sample: s,

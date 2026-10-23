@@ -1,7 +1,7 @@
 //! Streams channels to cf32 SigMF files for longer than the look-back ring
 //! holds: follows the ring's live edge and down-converts as it goes.
 //!
-//!     cargo run --release -p engine --example capture_channel -- [--gain L,M,V] <serial> <tune MHz> <channel MHz>[,<channel MHz>...] <bandwidth kHz> <seconds> <out stem>
+//!     cargo run --release -p engine-old --example capture_channel -- [--gain L,M,V] <serial> <tune MHz> <channel MHz>[,<channel MHz>...] <bandwidth kHz> <seconds> <out stem>
 //!
 //! With several channels, each file's stem gets "_<channel MHz>" appended.
 //! A channel may carry its own bandwidth as `<MHz>:<kHz>`, otherwise the
@@ -12,7 +12,7 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use detect::Ddc;
-use engine::{Mode, Source, SourceConfig};
+use engine_old::{Mode, Source, SourceConfig};
 use sdr_core::{Backend, Complex32, GainSetting};
 
 fn main() {

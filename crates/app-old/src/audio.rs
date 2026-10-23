@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use engine::AudioQueue;
+use engine_old::AudioQueue;
 use parking_lot::Mutex;
 
 pub struct AudioOut {

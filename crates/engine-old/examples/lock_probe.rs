@@ -7,7 +7,7 @@
 //! at the new tuning shows the tuner has arrived whatever is on the air, and
 //! the spur seen at the old tuning shows it hasn't left.
 //!
-//!     cargo run --release -p engine --example lock_probe -- <serial> <from MHz> <to MHz> [repeats] [reg]
+//!     cargo run --release -p engine-old --example lock_probe -- <serial> <from MHz> <to MHz> [repeats] [reg]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

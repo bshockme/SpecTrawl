@@ -3,8 +3,8 @@
 //! the emitter list with labels, and channel IQ (SigMF) of the strongest
 //! emitters.
 //!
-//!     cargo run --release -p engine --example trawl -- live <serial> <secs> <out-dir> <MHz>...
-//!     cargo run --release -p engine --example trawl -- sweep <serial> <lo MHz> <hi MHz> <secs> <out-dir>
+//!     cargo run --release -p engine-old --example trawl -- live <serial> <secs> <out-dir> <MHz>...
+//!     cargo run --release -p engine-old --example trawl -- sweep <serial> <lo MHz> <hi MHz> <secs> <out-dir>
 //!
 //! Spectra are written as `<stem>.spec` (little-endian f32: mean dB, then
 //! max dB, `bins` each) with a `<stem>.json` describing the axis.
@@ -13,8 +13,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use engine::sigmf::{ExportKind, ExportRequest};
-use engine::{Mode, Source, SourceConfig, SpectrumRow, SweepPlan};
+use engine_old::sigmf::{ExportKind, ExportRequest};
+use engine_old::{Mode, Source, SourceConfig, SpectrumRow, SweepPlan};
 use sdr_core::Backend;
 
 /// Channel captures per tuning (strongest confirmed emitters first).
@@ -132,7 +132,7 @@ fn save_emitters(src: &Source, out: &Path, stem: &str, centre: f64, since_sample
     let (s, e) = src.ring_range();
     for em in em.iter().take(MAX_CAPTURES) {
         let label = em.label().unwrap_or_else(|| "unlabelled".into());
-        let cstem = engine::sigmf::sanitize(&format!("{stem}_{:.4}MHz_{label}", em.center_hz / 1e6));
+        let cstem = engine_old::sigmf::sanitize(&format!("{stem}_{:.4}MHz_{label}", em.center_hz / 1e6));
         let r = src
             .export(ExportRequest {
                 start_sample: s.max(since_sample),

@@ -1,11 +1,11 @@
 //! Headless end-to-end check: run a source through the engine and print what
 //! each emitter was classified as.
 //!
-//!     cargo run --release -p engine --example classify_sim -- [seconds] [airspy-serial freq-MHz]
+//!     cargo run --release -p engine-old --example classify_sim -- [seconds] [airspy-serial freq-MHz]
 
 use std::time::Duration;
 
-use engine::{Mode, Source, SourceConfig};
+use engine_old::{Mode, Source, SourceConfig};
 use sdr_core::Backend;
 
 fn main() {

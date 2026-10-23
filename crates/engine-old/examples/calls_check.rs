@@ -1,11 +1,11 @@
 //! Runs a source live and prints the call log: grants from control-channel
 //! monitors merged with what voice channels' signalling said.
 //!
-//!     cargo run --release -p engine --example calls_check -- <serial> <MHz> <seconds>
+//!     cargo run --release -p engine-old --example calls_check -- <serial> <MHz> <seconds>
 
 use std::time::Duration;
 
-use engine::{Mode, Source, SourceConfig};
+use engine_old::{Mode, Source, SourceConfig};
 use sdr_core::Backend;
 
 fn main() {

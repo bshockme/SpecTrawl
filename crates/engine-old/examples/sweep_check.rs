@@ -1,11 +1,11 @@
 //! Runs one Airspy in Sweep mode and prints the stitched spectrum, coarsely,
 //! for checking against known signals.
 //!
-//!     cargo run --release -p engine --example sweep_check -- <serial> <lo MHz> <hi MHz> <seconds> [guard ms]
+//!     cargo run --release -p engine-old --example sweep_check -- <serial> <lo MHz> <hi MHz> <seconds> [guard ms]
 
 use std::time::Duration;
 
-use engine::{Mode, Source, SourceConfig, SweepPlan};
+use engine_old::{Mode, Source, SourceConfig, SweepPlan};
 use sdr_core::Backend;
 
 fn main() {

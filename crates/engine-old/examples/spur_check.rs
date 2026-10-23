@@ -2,11 +2,11 @@
 //! grid step stand above their surroundings, against control offsets. Internal
 //! clock spurs line up on the grid; real signals don't.
 //!
-//!     cargo run --release -p engine --example spur_check -- <serial> <lo MHz> <hi MHz> <seconds> [blank]
+//!     cargo run --release -p engine-old --example spur_check -- <serial> <lo MHz> <hi MHz> <seconds> [blank]
 
 use std::time::Duration;
 
-use engine::{Mode, Source, SourceConfig, SweepPlan};
+use engine_old::{Mode, Source, SourceConfig, SweepPlan};
 use sdr_core::Backend;
 
 fn main() {

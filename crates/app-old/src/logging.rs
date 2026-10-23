@@ -101,14 +101,14 @@ pub fn area_of(target: &str) -> &'static str {
     let t = target;
     if t.starts_with("backend_") || t.starts_with("sdr_core") {
         "device"
-    } else if t.starts_with("engine::sweep") {
+    } else if t.starts_with("engine_old::sweep") {
         "sweep"
-    } else if t.starts_with("engine::listen") || t.starts_with("app::audio") {
+    } else if t.starts_with("engine_old::listen") || t.starts_with("app::audio") {
         "audio"
-    } else if t.starts_with("engine::monitor")
-        || t.starts_with("engine::calls")
-        || t.starts_with("engine::rds")
-        || t.starts_with("engine::cell")
+    } else if t.starts_with("engine_old::monitor")
+        || t.starts_with("engine_old::calls")
+        || t.starts_with("engine_old::rds")
+        || t.starts_with("engine_old::cell")
         || (t.starts_with("detect::")
             && !t.starts_with("detect::spectral")
             && !t.starts_with("detect::features")
@@ -152,7 +152,7 @@ static LOGGER: OnceLock<Logger> = OnceLock::new();
 
 /// Where the log files go.
 pub fn log_dir() -> PathBuf {
-    engine::sigmf::default_dir().parent().map(|p| p.join("logs")).unwrap_or_else(|| "logs".into())
+    engine_old::sigmf::default_dir().parent().map(|p| p.join("logs")).unwrap_or_else(|| "logs".into())
 }
 
 fn open_file(dir: &PathBuf) -> (Option<BufWriter<File>>, u64) {
@@ -307,11 +307,11 @@ mod tests {
 
     #[test]
     fn areas() {
-        assert_eq!(area_of("engine::sweep"), "sweep");
+        assert_eq!(area_of("engine_old::sweep"), "sweep");
         assert_eq!(area_of("backend_airspy"), "device");
         assert_eq!(area_of("detect::flex"), "decoders");
         assert_eq!(area_of("detect::spectral"), "detection");
-        assert_eq!(area_of("engine::occupancy"), "detection");
+        assert_eq!(area_of("engine_old::occupancy"), "detection");
         assert_eq!(area_of("app"), "ui");
         assert_eq!(area_of("spectrawl::logging"), "ui");
         assert_eq!(area_of("wgpu_core::device"), "other");

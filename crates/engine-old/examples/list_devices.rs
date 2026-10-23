@@ -1,6 +1,6 @@
 //! Lists the devices the Airspy backend can see.
 //!
-//!     cargo run --release -p engine --example list_devices
+//!     cargo run --release -p engine-old --example list_devices
 
 use sdr_core::Backend;
 

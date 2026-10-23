@@ -824,7 +824,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "engine"
+name = "engine-old"
 version = "0.1.0"
 dependencies = [
  "backend-airspy",
@@ -2882,7 +2882,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "spectrawl"
+name = "spectrawl-old"
 version = "0.1.0"
 dependencies = [
  "backend-airspy",
@@ -2895,7 +2895,7 @@ dependencies = [
  "egui",
  "egui_dock",
  "egui_extras",
- "engine",
+ "engine-old",
  "log",
  "parking_lot",
  "rfd",

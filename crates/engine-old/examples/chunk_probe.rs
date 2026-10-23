@@ -7,7 +7,7 @@
 //! start of the next chunk: if it's reliably early, the tail of that chunk can
 //! be measured and the sweep can do one hop per chunk.
 //!
-//!     cargo run --release -p engine --example chunk_probe -- <serial> <a MHz> <b MHz> [cycles]
+//!     cargo run --release -p engine-old --example chunk_probe -- <serial> <a MHz> <b MHz> [cycles]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -7,7 +7,7 @@ mod theme;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use egui_dock::{DockState, NodeIndex, SurfaceIndex};
-use engine::{Mode, Source, SourceConfig, SweepPlan};
+use engine_old::{Mode, Source, SourceConfig, SweepPlan};
 use sdr_core::{Backend, DeviceInfo, GainSetting};
 use serde::{Deserialize, Serialize};
 use spectrum_view::SpectrumView;
@@ -68,11 +68,11 @@ enum Selection {
     Record(ReceiverId, u64),
     Emitter(ReceiverId, u64),
     Talkgroup {
-        system: Option<engine::SystemKey>,
+        system: Option<engine_old::SystemKey>,
         tg: u32,
     },
     Radio {
-        system: Option<engine::SystemKey>,
+        system: Option<engine_old::SystemKey>,
         id: u32,
     },
     Capcode {
@@ -153,13 +153,13 @@ struct Receiver {
     view: SpectrumView,
     mode: RxMode,
     /// The explore visit in progress.
-    visit: Option<engine::explore::Visit>,
+    visit: Option<engine_old::explore::Visit>,
     /// The scanner's current signal.
     scan: Option<ScanTarget>,
     /// The last verdict, shown in the pane for a moment.
     last_verdict: Option<(std::time::Instant, String)>,
     /// Records for the boxes, refetched only when new rows arrive.
-    records: (Option<u64>, std::time::Instant, std::sync::Arc<[engine::SignalRecord]>),
+    records: (Option<u64>, std::time::Instant, std::sync::Arc<[engine_old::SignalRecord]>),
     gain_mode: GainMode,
     /// Preset step 0..=21 (Airspy's linearity/sensitivity tables).
     gain_step: u8,
@@ -276,11 +276,11 @@ struct App {
     catalog: catalog::Catalog,
     catalog_msg: Option<(std::time::Instant, String)>,
     /// Running SigMF export (description, handle) and the last result.
-    export: Option<(String, std::thread::JoinHandle<Result<engine::sigmf::ExportResult, String>>)>,
+    export: Option<(String, std::thread::JoinHandle<Result<engine_old::sigmf::ExportResult, String>>)>,
     export_msg: Option<String>,
     /// Emitter table, refreshed a few times a second rather than every frame.
     /// Also holds how many emitters the view leaves out as unconfirmed.
-    emitter_cache: (std::time::Instant, Vec<(ReceiverId, engine::Emitter)>, usize),
+    emitter_cache: (std::time::Instant, Vec<(ReceiverId, engine_old::Emitter)>, usize),
     /// Emitters the view leaves out as known occupants (squelch on).
     emitter_squelched: usize,
     emitter_view: EmitterView,
@@ -290,13 +290,13 @@ struct App {
     audio_out: Option<audio::AudioOut>,
     audio_err: Option<String>,
     /// A recording being played (takes the audio output while it plays).
-    playback: Option<engine::Playback>,
+    playback: Option<engine_old::Playback>,
     /// Talkgroups following prefers or ignores (saved in follow.txt), and
     /// (generation, panes) last given to the sources.
-    follow_policy: engine::FollowPolicy,
+    follow_policy: engine_old::FollowPolicy,
     policy_gen: (u64, u64, usize),
     /// None = pick the mode from the signal's label.
-    listen_mode: Option<engine::DemodMode>,
+    listen_mode: Option<engine_old::DemodMode>,
     /// P25: Phase 2 TDMA (picked from the label when the mode is Auto).
     listen_tdma: bool,
     listen_mhz: f64,
@@ -314,7 +314,7 @@ struct App {
     /// Diagnostics log view: text filter.
     log_filter: String,
     /// Auto-explore: the shared queue, history and log.
-    explorer: engine::explore::Explorer,
+    explorer: engine_old::explore::Explorer,
     /// When exploring was first switched on (emitters seen after it are new).
     explore_since: Option<SystemTime>,
     /// Set around the explorer's own retunes, which must not drop the
@@ -329,7 +329,7 @@ struct App {
     /// LO-leak masks last given to the survey (other Airspys' centre + 5 MHz).
     lo_masks: Vec<(f64, f64)>,
     /// Channel captures the explorer started (stem, handle), logged when done.
-    explore_exports: Vec<(String, std::thread::JoinHandle<Result<engine::sigmf::ExportResult, String>>)>,
+    explore_exports: Vec<(String, std::thread::JoinHandle<Result<engine_old::sigmf::ExportResult, String>>)>,
     frame_count: u64,
 }
 
@@ -366,7 +366,7 @@ enum EmitterSort {
 }
 
 impl EmitterSort {
-    fn cmp(self, a: &engine::Emitter, b: &engine::Emitter) -> std::cmp::Ordering {
+    fn cmp(self, a: &engine_old::Emitter, b: &engine_old::Emitter) -> std::cmp::Ordering {
         match self {
             Self::Freq => a.center_hz.total_cmp(&b.center_hz),
             Self::Class => a.label().cmp(&b.label()),
@@ -505,7 +505,7 @@ const PRESETS: [&str; 3] = ["survey", "trunking", "paging"];
 enum Cmd {
     Tune(ReceiverId, f64),
     Open(DeviceInfo, ReceiverId),
-    Listen(ReceiverId, engine::ListenSpec),
+    Listen(ReceiverId, engine_old::ListenSpec),
     Follow(ReceiverId),
     Stop,
     Mute,
@@ -640,7 +640,7 @@ impl App {
             settings: settings::Settings::load(),
             sweep_dirty: None,
             log_filter: String::new(),
-            explorer: engine::explore::Explorer::default(),
+            explorer: engine_old::explore::Explorer::default(),
             explore_since: None,
             explore_tuning: false,
             explore_tick: std::time::Instant::now(),
@@ -741,7 +741,7 @@ impl App {
     }
 
     fn save_workspace_as(&mut self, name: &str) {
-        let name = engine::sigmf::sanitize(name.trim());
+        let name = engine_old::sigmf::sanitize(name.trim());
         if name.is_empty() {
             return;
         }
@@ -980,8 +980,8 @@ impl App {
         ui.add_space(4.0);
         ui.label(egui::RichText::new("Folders").small().color(theme::MUTED));
         for (what, path) in [
-            ("Recordings", engine::recordings_dir()),
-            ("Captures (SigMF, CSV)", engine::sigmf::default_dir()),
+            ("Recordings", engine_old::recordings_dir()),
+            ("Captures (SigMF, CSV)", engine_old::sigmf::default_dir()),
             ("Workspaces", workspace_dir()),
             ("Names catalog", catalog_path()),
             ("Follow lists", follow_policy_path()),
@@ -1113,7 +1113,7 @@ impl App {
                 let hz = self.receiver(rx).and_then(|p| p.view.span()).map(|(lo, hi)| (lo + hi) / 2.0).unwrap_or(self.listen_mhz * 1e6);
                 self.start_listen(
                     rx,
-                    engine::ListenSpec { center_hz: hz, mode: engine::DemodMode::P25, follow: true, tdma: false, slot: None },
+                    engine_old::ListenSpec { center_hz: hz, mode: engine_old::DemodMode::P25, follow: true, tdma: false, slot: None },
                 );
             }
             Cmd::Stop => {
@@ -1631,15 +1631,15 @@ impl App {
 
     /// The scanner's turn (same cadence as the explorer): keep or leave the
     /// current signal by the rule, and pick the next active one.
-    fn scan_step(&mut self, survey: &[engine::Emitter], now: std::time::Instant) {
+    fn scan_step(&mut self, survey: &[engine_old::Emitter], now: std::time::Instant) {
         let scanning: Vec<ReceiverId> = self.panes.iter().filter(|p| p.mode == RxMode::Scan).map(|p| p.id).collect();
         if scanning.is_empty() {
             return;
         }
         let cfg = self.settings.explore.to_config();
         let scan = self.settings.scan.clone();
-        let aviation = engine::explore::preset("Aviation");
-        let eligible = |e: &engine::Emitter| {
+        let aviation = engine_old::explore::preset("Aviation");
+        let eligible = |e: &engine_old::Emitter| {
             e.confirmed && e.active && cfg.allowed(e.center_hz) && (!scan.aviation || aviation.is_some_and(|p| p.contains(e.center_hz)))
         };
         // Activity per range, for the busiest-range rule: a user range, else
@@ -1649,7 +1649,7 @@ impl App {
             if let Some((lo, hi)) = cfg.ranges_mhz.iter().find(|(lo, hi)| (*lo..=*hi).contains(&mhz)) {
                 return format!("{lo:.1}-{hi:.1}");
             }
-            if let Some(p) = engine::explore::PRESETS.iter().find(|p| p.contains(hz)) {
+            if let Some(p) = engine_old::explore::PRESETS.iter().find(|p| p.contains(hz)) {
                 return p.name.to_string();
             }
             format!("{:.0} MHz", mhz.floor())
@@ -1681,7 +1681,7 @@ impl App {
                 }
             }
             // Candidates, by rule.
-            let mut cands: Vec<&engine::Emitter> = survey
+            let mut cands: Vec<&engine_old::Emitter> = survey
                 .iter()
                 .filter(|e| eligible(e) && !taken.iter().any(|t| *t == e.id && current.as_ref().is_none_or(|c| c.emitter != e.id)))
                 .collect();
@@ -1700,10 +1700,10 @@ impl App {
             };
             if let Some(e) = pick {
                 let label = e.label().unwrap_or_default();
-                let mode = if scan.aviation { engine::DemodMode::Am } else { self.auto_mode(e.center_hz, &label, e.bandwidth_hz) };
+                let mode = if scan.aviation { engine_old::DemodMode::Am } else { self.auto_mode(e.center_hz, &label, e.bandwidth_hz) };
                 log::debug!("scan {id}: {:.4} MHz {} ({label}), {} eligible", e.center_hz / 1e6, mode.name(), cands.len());
                 self.explore_tuning = true;
-                self.start_listen(id, engine::ListenSpec { center_hz: e.center_hz, mode, follow: false, tdma: false, slot: None });
+                self.start_listen(id, engine_old::ListenSpec { center_hz: e.center_hz, mode, follow: false, tdma: false, slot: None });
                 self.explore_tuning = false;
                 current = Some(ScanTarget {
                     emitter: e.id,
@@ -1724,16 +1724,16 @@ impl App {
     }
 
     /// Appends a verdict to the exploration CSV next to the emitter exports.
-    fn explore_csv(&mut self, e: &engine::explore::LogEntry) {
+    fn explore_csv(&mut self, e: &engine_old::explore::LogEntry) {
         use std::io::Write;
-        let path = engine::sigmf::default_dir().join("exploration_log.csv");
-        let _ = std::fs::create_dir_all(engine::sigmf::default_dir());
+        let path = engine_old::sigmf::default_dir().join("exploration_log.csv");
+        let _ = std::fs::create_dir_all(engine_old::sigmf::default_dir());
         let fresh = !path.exists();
         match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
             Ok(mut f) => {
                 if fresh || !self.explore_csv_ready {
                     if fresh {
-                        let _ = writeln!(f, "{}", engine::explore::LogEntry::CSV_HEADER);
+                        let _ = writeln!(f, "{}", engine_old::explore::LogEntry::CSV_HEADER);
                     }
                     self.explore_csv_ready = true;
                 }
@@ -1745,7 +1745,12 @@ impl App {
 
     /// Starts a channel capture of a finished visit (the dwell, from the
     /// look-back ring) under captures/explore; returns its file stem.
-    fn explore_capture(&mut self, id: ReceiverId, v: &engine::explore::Visit, verdict: &engine::explore::Verdict) -> Option<String> {
+    fn explore_capture(
+        &mut self,
+        id: ReceiverId,
+        v: &engine_old::explore::Visit,
+        verdict: &engine_old::explore::Verdict,
+    ) -> Option<String> {
         let p = self.receiver(id)?;
         let rate = p.source.snapshot().sample_rate;
         let (oldest, head) = p.source.ring_range();
@@ -1755,19 +1760,19 @@ impl App {
             return None;
         }
         let label = verdict.label.clone().unwrap_or_else(|| verdict.kind.name().to_string());
-        let stem = engine::sigmf::sanitize(&format!(
+        let stem = engine_old::sigmf::sanitize(&format!(
             "{}_{:.4}MHz_{}_{}_E{}_explore",
-            engine::sigmf::stamp(SystemTime::now()),
+            engine_old::sigmf::stamp(SystemTime::now()),
             v.center_hz / 1e6,
             verdict.kind.name(),
             label,
             v.emitter
         ));
-        let dir = engine::sigmf::default_dir().join("explore");
-        let req = engine::sigmf::ExportRequest {
+        let dir = engine_old::sigmf::default_dir().join("explore");
+        let req = engine_old::sigmf::ExportRequest {
             start_sample: start,
             end_sample: head,
-            kind: engine::sigmf::ExportKind::Channel { center_hz: v.center_hz, bandwidth_hz: v.bandwidth_hz.max(12_500.0) },
+            kind: engine_old::sigmf::ExportKind::Channel { center_hz: v.center_hz, bandwidth_hz: v.bandwidth_hz.max(12_500.0) },
             dir,
             stem: stem.clone(),
             description: format!("SpecTrawl explore visit on {id}: {} {label} ({})", verdict.kind.name(), v.reason),
@@ -1797,8 +1802,8 @@ impl App {
     }
 
     /// Writes a verdict onto the survey's emitter so its table shows it.
-    fn adopt_verdict(&self, e: &engine::explore::LogEntry) {
-        use engine::explore::Kind;
+    fn adopt_verdict(&self, e: &engine_old::explore::LogEntry) {
+        use engine_old::explore::Kind;
         if e.kind < Kind::Classified || e.label.is_empty() {
             return;
         }
@@ -1817,10 +1822,10 @@ impl App {
 
     /// What a focus receiver sees of a survey emitter: its own emitters and
     /// known occupants overlapping the emitter's extent.
-    fn observe(p: &Receiver, e_center: f64, e_bw: f64) -> engine::explore::Observation {
+    fn observe(p: &Receiver, e_center: f64, e_bw: f64) -> engine_old::explore::Observation {
         let half = e_bw.max(54e3) / 2.0 + 27e3;
         let (lo, hi) = (e_center - half, e_center + half);
-        let mut obs = engine::explore::observe(&p.source.emitters(), lo, hi, std::time::Duration::from_secs(1), SystemTime::now());
+        let mut obs = engine_old::explore::observe(&p.source.emitters(), lo, hi, std::time::Duration::from_secs(1), SystemTime::now());
         // A known wideband occupant covering it is a classification in
         // itself, an identity when a decoder named it.
         if obs.id.is_none() {
@@ -1856,11 +1861,12 @@ impl App {
         let now = std::time::Instant::now();
         let baseline = self.explore_since.unwrap_or_else(SystemTime::now);
         let spans = self.frame.live_spans.clone();
-        let mut rows: Vec<engine::explore::LogEntry> = Vec::new();
+        let mut rows: Vec<engine_old::explore::LogEntry> = Vec::new();
         // In place (§7): survey emitters inside any focus span.
         for (rx, (lo, hi)) in &spans {
             let Some(p) = self.receiver(*rx) else { continue };
-            let inside: Vec<&engine::Emitter> = survey.iter().filter(|e| e.confirmed && e.center_hz >= *lo && e.center_hz <= *hi).collect();
+            let inside: Vec<&engine_old::Emitter> =
+                survey.iter().filter(|e| e.confirmed && e.center_hz >= *lo && e.center_hz <= *hi).collect();
             if inside.is_empty() {
                 continue;
             }
@@ -1869,7 +1875,7 @@ impl App {
             for e in inside {
                 let half = e.bandwidth_hz.max(54e3) / 2.0 + 27e3;
                 let (elo, ehi) = (e.center_hz - half, e.center_hz + half);
-                let mut obs = engine::explore::observe(&focus, elo, ehi, std::time::Duration::from_secs(1), SystemTime::now());
+                let mut obs = engine_old::explore::observe(&focus, elo, ehi, std::time::Duration::from_secs(1), SystemTime::now());
                 if obs.id.is_none() {
                     if let Some(k) = occupants.iter().find(|k| k.occupant.lo_hz <= ehi && k.occupant.hi_hz >= elo) {
                         let named = k.station.is_some() || k.cell.as_ref().is_some_and(|c| c.sync.is_some());
@@ -1921,8 +1927,8 @@ impl App {
                         );
                         // A channel capture of the visit, when the setting asks for one.
                         let want = match self.settings.explore.capture.as_str() {
-                            "all" => verdict.kind != engine::explore::Kind::Gone,
-                            "unknown" => verdict.kind == engine::explore::Kind::Unknown,
+                            "all" => verdict.kind != engine_old::explore::Kind::Gone,
+                            "unknown" => verdict.kind == engine_old::explore::Kind::Unknown,
                             _ => false,
                         };
                         let capture = if want { self.explore_capture(id, &v, &verdict) } else { None };
@@ -1947,7 +1953,7 @@ impl App {
 
     /// The Exploration tab: filters, and one row per verdict.
     fn exploration_panel(&mut self, ui: &mut egui::Ui) {
-        use engine::explore::{Kind, PRESETS, Rule};
+        use engine_old::explore::{Kind, PRESETS, Rule};
         let exploring: Vec<ReceiverId> = self.panes.iter().filter(|p| p.mode == RxMode::Explore).map(|p| p.id).collect();
         let mut changed = false;
         ui.horizontal(|ui| {
@@ -2050,7 +2056,7 @@ impl App {
                 });
             });
             if ui.small_button("Open CSV folder").clicked() {
-                let d = engine::sigmf::default_dir();
+                let d = engine_old::sigmf::default_dir();
                 let _ = std::fs::create_dir_all(&d);
                 open_path(&d);
             }
@@ -2061,7 +2067,7 @@ impl App {
         if changed {
             self.settings.save();
         }
-        let rows: Vec<engine::explore::LogEntry> = self.explorer.log.iter().rev().cloned().collect();
+        let rows: Vec<engine_old::explore::LogEntry> = self.explorer.log.iter().rev().cloned().collect();
         let manual: Option<ReceiverId> = Some(self.tune_target)
             .filter(|t| self.receiver(*t).is_some_and(|p| p.mode == RxMode::Manual))
             .or_else(|| self.panes.iter().find(|p| !p.id.is_sweep() && p.mode == RxMode::Manual).map(|p| p.id));
@@ -2290,31 +2296,31 @@ impl App {
     }
 
     /// The demodulation a signal's label suggests.
-    fn auto_mode(&self, hz: f64, label: &str, bw: f64) -> engine::DemodMode {
+    fn auto_mode(&self, hz: f64, label: &str, bw: f64) -> engine_old::DemodMode {
         let broadcast = self.known.1.iter().any(|(lo, hi, k)| (*lo..=*hi).contains(&hz) && k.starts_with("FM broadcast"));
         if broadcast || label.contains("Wideband FM") || bw > 100e3 {
-            engine::DemodMode::Wfm
+            engine_old::DemodMode::Wfm
         } else if label.contains("P25") && !label.contains("Phase 2") {
-            engine::DemodMode::P25
+            engine_old::DemodMode::P25
         } else if label.starts_with("AM") || label.contains(" AM") {
-            engine::DemodMode::Am
+            engine_old::DemodMode::Am
         } else {
-            engine::DemodMode::Nfm
+            engine_old::DemodMode::Nfm
         }
     }
 
     /// How to listen to a signal: the chosen mode, else the one its label
     /// suggests.
-    fn spec_for(&self, hz: f64, label: &str, bw: f64) -> engine::ListenSpec {
+    fn spec_for(&self, hz: f64, label: &str, bw: f64) -> engine_old::ListenSpec {
         let tdma = if self.listen_mode.is_none() { label.contains("Phase 2") } else { self.listen_tdma };
-        let mode = self.listen_mode.unwrap_or_else(|| if tdma { engine::DemodMode::P25 } else { self.auto_mode(hz, label, bw) });
-        engine::ListenSpec { center_hz: hz, mode, follow: false, tdma, slot: None }
+        let mode = self.listen_mode.unwrap_or_else(|| if tdma { engine_old::DemodMode::P25 } else { self.auto_mode(hz, label, bw) });
+        engine_old::ListenSpec { center_hz: hz, mode, follow: false, tdma, slot: None }
     }
 
     /// Plays receiver `rx` demodulated as `spec` (retuning it there first if
     /// the channel is outside its span). One audio output: any other
     /// receiver's listener and a playing recording stop.
-    fn start_listen(&mut self, rx: ReceiverId, spec: engine::ListenSpec) {
+    fn start_listen(&mut self, rx: ReceiverId, spec: engine_old::ListenSpec) {
         if let Some(focus) = self.receiver(rx).filter(|_| !spec.follow) {
             if focus.view.span().is_none_or(|(lo, hi)| spec.center_hz < lo + 0.5e6 || spec.center_hz > hi - 0.5e6) {
                 self.retune(rx, (spec.center_hz / 1e3).round() / 1e3);
@@ -2355,9 +2361,10 @@ impl App {
     /// What's playing, on one line: live listening or a recording, with
     /// the mode popover, volume and Stop; the engine summary at the right.
     fn transport_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let listening: Option<(ReceiverId, engine::ListenSpec)> = self.panes.iter().find_map(|p| p.source.listening().map(|l| (p.id, l)));
+        let listening: Option<(ReceiverId, engine_old::ListenSpec)> =
+            self.panes.iter().find_map(|p| p.source.listening().map(|l| (p.id, l)));
         let rx = listening.map(|(r, _)| r).unwrap_or(self.working_id());
-        let mut start: Option<(ReceiverId, engine::ListenSpec)> = None;
+        let mut start: Option<(ReceiverId, engine_old::ListenSpec)> = None;
         let mut stop = false;
         ui.horizontal_centered(|ui| {
             if let Some(pb) = &self.playback {
@@ -2366,7 +2373,7 @@ impl App {
             } else if let Some((rx, l)) = &listening {
                 theme::chip(ui, &rx.to_string(), theme::CHIP_FOCUS_BG, theme::CHIP_FOCUS_FG);
                 if let Some(p) = self.receiver(*rx) {
-                    if l.mode == engine::DemodMode::P25 {
+                    if l.mode == engine_old::DemodMode::P25 {
                         let v = p.source.voice();
                         let what = match (v.center_hz, v.slot) {
                             (Some(hz), Some(ts)) => format!("{:.5} MHz · P25 Phase 2 TS{}", hz / 1e6, ts + 1),
@@ -2437,21 +2444,21 @@ impl App {
                     ui.horizontal(|ui| {
                         for (m, name) in [
                             (None, "Auto"),
-                            (Some(engine::DemodMode::Nfm), "NFM"),
-                            (Some(engine::DemodMode::Am), "AM"),
-                            (Some(engine::DemodMode::Wfm), "WFM"),
-                            (Some(engine::DemodMode::P25), "P25"),
+                            (Some(engine_old::DemodMode::Nfm), "NFM"),
+                            (Some(engine_old::DemodMode::Am), "AM"),
+                            (Some(engine_old::DemodMode::Wfm), "WFM"),
+                            (Some(engine_old::DemodMode::P25), "P25"),
                         ] {
                             if ui.selectable_value(&mut self.listen_mode, m, egui::RichText::new(name).small()).changed() {
                                 // Re-apply to what's playing.
                                 if let Some((r, l)) = listening.filter(|(_, l)| !l.follow) {
                                     let mode = m.unwrap_or(l.mode);
-                                    start = Some((r, engine::ListenSpec { center_hz: l.center_hz, mode, follow: false, tdma: self.listen_tdma, slot: None }));
+                                    start = Some((r, engine_old::ListenSpec { center_hz: l.center_hz, mode, follow: false, tdma: self.listen_tdma, slot: None }));
                                 }
                             }
                         }
                     });
-                    if self.listen_mode == Some(engine::DemodMode::P25) {
+                    if self.listen_mode == Some(engine_old::DemodMode::P25) {
                         ui.checkbox(&mut self.listen_tdma, egui::RichText::new("Phase 2").small())
                             .on_hover_text("TDMA: plays whichever timeslot starts talking");
                     }
@@ -2463,7 +2470,7 @@ impl App {
                         .clicked()
                     {
                         let hz = self.receiver(rx).and_then(|p| p.view.span()).map(|(lo, hi)| (lo + hi) / 2.0).unwrap_or(self.listen_mhz * 1e6);
-                        start = Some((rx, engine::ListenSpec { center_hz: hz, mode: engine::DemodMode::P25, follow: true, tdma: false, slot: None }));
+                        start = Some((rx, engine_old::ListenSpec { center_hz: hz, mode: engine_old::DemodMode::P25, follow: true, tdma: false, slot: None }));
                         ui.close();
                     }
                     let fp = &self.follow_policy;
@@ -2481,8 +2488,8 @@ impl App {
                             ui.close();
                         }
                     });
-                    if ui.small_button("Recordings folder").on_hover_text(engine::recordings_dir().display().to_string()).clicked() {
-                        let dir = engine::recordings_dir();
+                    if ui.small_button("Recordings folder").on_hover_text(engine_old::recordings_dir().display().to_string()).clicked() {
+                        let dir = engine_old::recordings_dir();
                         let _ = std::fs::create_dir_all(&dir);
                         open_path(&dir);
                         ui.close();
@@ -2517,7 +2524,7 @@ impl App {
                 }
             }
         }
-        match engine::Playback::start(path) {
+        match engine_old::Playback::start(path) {
             Ok(pb) => {
                 if let Some(a) = &self.audio_out {
                     a.set_source(Some(pb.queue.clone()));
@@ -2947,7 +2954,7 @@ impl App {
                 Act::RecordAll(id, on) => {
                     if let Some(p) = self.receiver(id) {
                         log::info!("receiver {id}: record every signal {}", if on { "on" } else { "off" });
-                        p.source.set_record_all(on.then(engine::RecordAllConfig::default));
+                        p.source.set_record_all(on.then(engine_old::RecordAllConfig::default));
                     }
                 }
             }
@@ -3162,14 +3169,14 @@ impl App {
             ui.label(egui::RichText::new(format!("Receiver {rx} is not open.")).color(theme::MUTED));
             return;
         };
-        let records: Vec<engine::SignalRecord> = focus.records.2.iter().cloned().collect();
+        let records: Vec<engine_old::SignalRecord> = focus.records.2.iter().cloned().collect();
         let record = record.and_then(|id| {
             records.iter().find(|r| r.id == id).cloned().or_else(|| focus.source.recent_records(3000).into_iter().find(|r| r.id == id))
         });
         let emitter = emitter.and_then(|id| focus.source.emitters().into_iter().find(|e| e.id == id));
         let busy = self.export.is_some();
-        let dir = engine::sigmf::default_dir();
-        let mut req: Option<(String, engine::sigmf::ExportRequest)> = None;
+        let dir = engine_old::sigmf::default_dir();
+        let mut req: Option<(String, engine_old::sigmf::ExportRequest)> = None;
         let mut listen: Option<(f64, String, f64)> = None;
         if let Some(r) = &record {
             let label = r.display_class().map(|c| c.label.clone()).unwrap_or_else(|| "unclassified".into());
@@ -3193,7 +3200,12 @@ impl App {
                 listen = Some((r.center_hz(), label.clone(), r.bandwidth_hz()));
             }
             let stem = |kind: &str| {
-                engine::sigmf::sanitize(&format!("{}_{:.4}MHz_{}_{kind}", engine::sigmf::stamp(r.t_start), r.center_hz() / 1e6, label))
+                engine_old::sigmf::sanitize(&format!(
+                    "{}_{:.4}MHz_{}_{kind}",
+                    engine_old::sigmf::stamp(r.t_start),
+                    r.center_hz() / 1e6,
+                    label
+                ))
             };
             let (s, e) = focus.source.record_sample_range(r);
             ui.horizontal(|ui| {
@@ -3204,10 +3216,10 @@ impl App {
                 {
                     req = Some((
                         format!("record #{} channel", r.id),
-                        engine::sigmf::ExportRequest {
+                        engine_old::sigmf::ExportRequest {
                             start_sample: s,
                             end_sample: e,
-                            kind: engine::sigmf::ExportKind::Channel { center_hz: r.center_hz(), bandwidth_hz: r.bandwidth_hz() },
+                            kind: engine_old::sigmf::ExportKind::Channel { center_hz: r.center_hz(), bandwidth_hz: r.bandwidth_hz() },
                             dir: dir.clone(),
                             stem: stem("ch"),
                             description: format!("SpecTrawl record #{} ({label}), channel", r.id),
@@ -3220,14 +3232,14 @@ impl App {
                     .on_hover_text("Raw 10 MHz capture for the record's time span (ci16)")
                     .clicked()
                 {
-                    let overlapping: Vec<engine::SignalRecord> =
+                    let overlapping: Vec<engine_old::SignalRecord> =
                         records.iter().filter(|o| o.last_row_end_sample >= s && o.first_row_end_sample <= e).cloned().collect();
                     req = Some((
                         format!("record #{} full band", r.id),
-                        engine::sigmf::ExportRequest {
+                        engine_old::sigmf::ExportRequest {
                             start_sample: s,
                             end_sample: e,
-                            kind: engine::sigmf::ExportKind::Wideband,
+                            kind: engine_old::sigmf::ExportKind::Wideband,
                             dir: dir.clone(),
                             stem: stem("wide"),
                             description: format!("SpecTrawl record #{} ({label}), full band", r.id),
@@ -3269,17 +3281,17 @@ impl App {
                 .clicked()
             {
                 let (s, e) = focus.source.ring_range();
-                let mine: Vec<engine::SignalRecord> = records.iter().filter(|r| r.emitter == Some(em.id)).cloned().collect();
+                let mine: Vec<engine_old::SignalRecord> = records.iter().filter(|r| r.emitter == Some(em.id)).cloned().collect();
                 req = Some((
                     format!("emitter E{} channel", em.id),
-                    engine::sigmf::ExportRequest {
+                    engine_old::sigmf::ExportRequest {
                         start_sample: s,
                         end_sample: e,
-                        kind: engine::sigmf::ExportKind::Channel { center_hz: em.center_hz, bandwidth_hz: em.bandwidth_hz },
+                        kind: engine_old::sigmf::ExportKind::Channel { center_hz: em.center_hz, bandwidth_hz: em.bandwidth_hz },
                         dir: dir.clone(),
-                        stem: engine::sigmf::sanitize(&format!(
+                        stem: engine_old::sigmf::sanitize(&format!(
                             "{}_{:.4}MHz_{}_E{}_ch",
-                            engine::sigmf::stamp(std::time::SystemTime::now()),
+                            engine_old::sigmf::stamp(std::time::SystemTime::now()),
                             em.center_hz / 1e6,
                             label,
                             em.id
@@ -3308,7 +3320,7 @@ impl App {
     /// Look-back export of receiver `rx`'s whole buffer, and export status.
     fn export_footer(&mut self, ui: &mut egui::Ui, rx: ReceiverId) {
         let busy = self.export.is_some();
-        let dir = engine::sigmf::default_dir();
+        let dir = engine_old::sigmf::default_dir();
         if let Some(focus) = self.receiver(rx) {
             if ui
                 .add_enabled(!busy, egui::Button::new("Export look-back (full band)"))
@@ -3317,15 +3329,15 @@ impl App {
             {
                 let (s, e) = focus.source.ring_range();
                 let snap = focus.source.snapshot();
-                let records: Vec<engine::SignalRecord> = focus.records.2.iter().cloned().collect();
-                let r = engine::sigmf::ExportRequest {
+                let records: Vec<engine_old::SignalRecord> = focus.records.2.iter().cloned().collect();
+                let r = engine_old::sigmf::ExportRequest {
                     start_sample: s,
                     end_sample: e,
-                    kind: engine::sigmf::ExportKind::Wideband,
+                    kind: engine_old::sigmf::ExportKind::Wideband,
                     dir: dir.clone(),
-                    stem: engine::sigmf::sanitize(&format!(
+                    stem: engine_old::sigmf::sanitize(&format!(
                         "{}_{:.3}MHz_lookback_wide",
-                        engine::sigmf::stamp(std::time::SystemTime::now()),
+                        engine_old::sigmf::stamp(std::time::SystemTime::now()),
                         snap.center_hz / 1e6
                     )),
                     description: "SpecTrawl look-back buffer, full band".into(),
@@ -3349,8 +3361,8 @@ impl App {
 
     /// A talkgroup (`group`) or a radio: its imported name, following
     /// controls, and its last calls.
-    fn inspect_call_party(&mut self, ui: &mut egui::Ui, system: Option<engine::SystemKey>, id: u32, group: bool) {
-        let systems: Vec<engine::TrunkSystem> = self.panes.iter().flat_map(|p| p.source.systems()).collect();
+    fn inspect_call_party(&mut self, ui: &mut egui::Ui, system: Option<engine_old::SystemKey>, id: u32, group: bool) {
+        let systems: Vec<engine_old::TrunkSystem> = self.panes.iter().flat_map(|p| p.source.systems()).collect();
         let sys = system_for(&systems, &system);
         let name = match (&sys, group) {
             (Some((k, cc)), true) => self.catalog.group(k, *cc, id).map(|g| g.name().to_string()),
@@ -3385,7 +3397,7 @@ impl App {
                 }
             });
         }
-        let mut calls: Vec<engine::CallEvent> = self
+        let mut calls: Vec<engine_old::CallEvent> = self
             .panes
             .iter()
             .flat_map(|p| p.source.calls(2000))
@@ -3421,7 +3433,7 @@ impl App {
     /// A pager capcode: its protocol and last messages.
     fn inspect_capcode(&mut self, ui: &mut egui::Ui, protocol: &str, capcode: u64) {
         ui.label(egui::RichText::new(format!("Capcode {capcode:09} · {protocol}")).strong());
-        let mut pages: Vec<engine::PageEvent> =
+        let mut pages: Vec<engine_old::PageEvent> =
             self.panes.iter().flat_map(|p| p.source.pages(5000)).filter(|p| p.capcode == capcode).collect();
         pages.sort_by(|a, b| b.last.cmp(&a.last));
         if let Some(p) = pages.first() {
@@ -3462,7 +3474,7 @@ impl App {
             Some(p) => (p.source.p25_grants(500), p.source.p25_systems()),
             None => (Vec::new(), Vec::new()),
         };
-        let grant_talk = |e: &engine::Emitter| -> Option<String> {
+        let grant_talk = |e: &engine_old::Emitter| -> Option<String> {
             let g = grants.iter().filter(|g| g.freq_hz.is_some_and(|f| (f - e.center_hz).abs() < 3e3)).max_by_key(|g| g.last)?;
             let sys = systems.iter().find(|(n, _)| *n == g.nac).map(|(_, s)| s);
             let alias =
@@ -3502,7 +3514,7 @@ impl App {
         if refresh || self.emitter_cache.0.elapsed() > std::time::Duration::from_millis(300) {
             let v = &self.emitter_view;
             let spans: Vec<(f64, f64)> = self.panes.iter().filter(|q| !q.id.is_sweep()).filter_map(|q| q.view.span()).collect();
-            let mut rows: Vec<(ReceiverId, engine::Emitter)> = Vec::new();
+            let mut rows: Vec<(ReceiverId, engine_old::Emitter)> = Vec::new();
             let mut hidden = 0;
             let mut squelched = 0;
             // With the chosen receiver not open, show every receiver rather than nothing.
@@ -3527,7 +3539,7 @@ impl App {
             let new_first = v.new_first;
             let window = std::time::Duration::from_secs_f64(self.settings.new_signal_s.max(0.0));
             let now = SystemTime::now();
-            let is_new = |e: &engine::Emitter| now.duration_since(e.first_seen).map(|d| d <= window).unwrap_or(false);
+            let is_new = |e: &engine_old::Emitter| now.duration_since(e.first_seen).map(|d| d <= window).unwrap_or(false);
             rows.sort_by(|a, b| {
                 let o = sort.cmp(&a.1, &b.1).then(a.1.center_hz.total_cmp(&b.1.center_hz));
                 let o = if desc { o.reverse() } else { o };
@@ -3544,7 +3556,7 @@ impl App {
         let mut band_tune: Option<f64> = None;
         if self.emitter_view.source == Some(ReceiverId::SWEEP) && !rows.is_empty() {
             let mut bands: Vec<(f64, f64, usize, usize, std::collections::BTreeMap<String, usize>)> = Vec::new();
-            let mut sorted: Vec<&engine::Emitter> = rows.iter().filter(|r| r.0.is_sweep()).map(|r| &r.1).collect();
+            let mut sorted: Vec<&engine_old::Emitter> = rows.iter().filter(|r| r.0.is_sweep()).map(|r| &r.1).collect();
             sorted.sort_by(|a, b| a.center_hz.total_cmp(&b.center_hz));
             for e in sorted {
                 match bands.last_mut() {
@@ -3747,7 +3759,7 @@ impl App {
             };
             ui.label(egui::RichText::new(names).small().color(theme::MUTED));
         });
-        let rows: Vec<(ReceiverId, engine::TrunkSystem)> =
+        let rows: Vec<(ReceiverId, engine_old::TrunkSystem)> =
             self.panes.iter().flat_map(|p| p.source.systems().into_iter().map(move |s| (p.id, s))).collect();
         if rows.is_empty() {
             let monitors = self.panes.iter().flat_map(|p| p.source.monitors()).filter(|m| m.label.starts_with("CC")).count();
@@ -3845,8 +3857,8 @@ impl App {
 
     /// The raw control-channel grants, every receiver, newest first.
     fn grants_table(&mut self, ui: &mut egui::Ui) {
-        let systems: Vec<engine::TrunkSystem> = self.panes.iter().flat_map(|p| p.source.systems()).collect();
-        let mut grants: Vec<engine::GrantEvent> = self.panes.iter().flat_map(|p| p.source.p25_grants(2000)).collect();
+        let systems: Vec<engine_old::TrunkSystem> = self.panes.iter().flat_map(|p| p.source.systems()).collect();
+        let mut grants: Vec<engine_old::GrantEvent> = self.panes.iter().flat_map(|p| p.source.p25_grants(2000)).collect();
         grants.sort_by(|a, b| b.last.cmp(&a.last));
         if grants.is_empty() {
             ui.label(egui::RichText::new("No grants yet.").color(theme::MUTED));
@@ -3889,7 +3901,7 @@ impl App {
                     };
                     let recent = std::time::SystemTime::now().duration_since(g.last).map(|d| d.as_secs() < 5).unwrap_or(true);
                     let c = if recent { theme::TEXT } else { theme::TEXT2 };
-                    let key = engine::SystemKey::P25 { wacn: None, system: None, nac: g.nac };
+                    let key = engine_old::SystemKey::P25 { wacn: None, system: None, nac: g.nac };
                     let sys = systems.iter().find(|s| s.key.same(&key));
                     let (key, cc) = match sys {
                         Some(s) => (s.key.clone(), s.control_hz.first().copied()),
@@ -3925,21 +3937,21 @@ impl App {
         // (talkgroup, list: true = priority, false = lockout) to toggle.
         let mut toggle: Option<(u32, bool)> = None;
         let (prio, locked) = (self.follow_policy.priority.clone(), self.follow_policy.lockout.clone());
-        let mut calls: Vec<engine::CallEvent> = self.panes.iter().flat_map(|p| p.source.calls(5000)).collect();
+        let mut calls: Vec<engine_old::CallEvent> = self.panes.iter().flat_map(|p| p.source.calls(5000)).collect();
         calls.sort_by(|a, b| b.last.cmp(&a.last));
         // Names from the imported catalog, by each call's own system. A call
         // only heard on its voice channel names no system; with one system
         // known, it's that one.
-        let systems: Vec<engine::TrunkSystem> = self.panes.iter().flat_map(|p| p.source.systems()).collect();
+        let systems: Vec<engine_old::TrunkSystem> = self.panes.iter().flat_map(|p| p.source.systems()).collect();
         let cat = &self.catalog;
-        let system_of = |c: &engine::CallEvent| system_for(&systems, &c.system);
-        let tg_name = |c: &engine::CallEvent| -> String {
+        let system_of = |c: &engine_old::CallEvent| system_for(&systems, &c.system);
+        let tg_name = |c: &engine_old::CallEvent| -> String {
             match (c.call.group, system_of(c)) {
                 (true, Some((k, cc))) => cat.group(&k, cc, c.call.target).map(|i| i.name().to_string()).unwrap_or_default(),
                 _ => String::new(),
             }
         };
-        let radio_name = |c: &engine::CallEvent| -> String {
+        let radio_name = |c: &engine_old::CallEvent| -> String {
             match (c.call.source, system_of(c)) {
                 (Some(r), Some((k, cc))) => cat.radio(&k, cc, r).unwrap_or("").to_string(),
                 _ => String::new(),
@@ -4140,7 +4152,7 @@ impl App {
 
     /// Pager messages (FLEX, POCSAG) decoded by the monitors, newest first.
     fn pages_panel(&mut self, ui: &mut egui::Ui) {
-        let mut pages: Vec<engine::PageEvent> = self.panes.iter().flat_map(|p| p.source.pages(5000)).collect();
+        let mut pages: Vec<engine_old::PageEvent> = self.panes.iter().flat_map(|p| p.source.pages(5000)).collect();
         pages.sort_by(|a, b| b.last.cmp(&a.last));
         let pagers = self.panes.iter().flat_map(|p| p.source.monitors()).filter(|m| !m.label.starts_with("CC")).count();
         ui.horizontal(|ui| {
@@ -4537,7 +4549,7 @@ impl App {
 
     /// Newest records from all panes, most recent first. Virtualised.
     fn signal_list(&mut self, ui: &mut egui::Ui) {
-        let mut rows: Vec<(ReceiverId, engine::SignalRecord)> = Vec::new();
+        let mut rows: Vec<(ReceiverId, engine_old::SignalRecord)> = Vec::new();
         for p in &self.panes {
             rows.extend(p.source.recent_records(500).into_iter().map(|r| (p.id, r)));
         }
@@ -5043,7 +5055,7 @@ fn read_workspace(path: &std::path::Path) -> Option<Workspace> {
 
 /// The pane's records for drawing, refetched when the view has new rows (or
 /// every half second, so classifications show up) instead of every frame.
-fn pane_records(p: &mut Receiver) -> std::sync::Arc<[engine::SignalRecord]> {
+fn pane_records(p: &mut Receiver) -> std::sync::Arc<[engine_old::SignalRecord]> {
     let newest = p.view.newest_seq();
     if p.records.0 != newest || p.records.1.elapsed() > std::time::Duration::from_millis(500) {
         p.records = (newest, std::time::Instant::now(), p.source.records_since(p.view.oldest_seq()).into());
@@ -5065,12 +5077,12 @@ fn survey_view(row_s: f64) -> SpectrumView {
 const SURVEY_ROW_CHOICES: [(f64, &str); 6] = [(0.0, "per pass"), (0.5, "0.5 s"), (1.0, "1 s"), (2.0, "2 s"), (5.0, "5 s"), (10.0, "10 s")];
 
 /// SigMF annotations for records on a receiver.
-fn annotations(focus: &Receiver, rs: &[engine::SignalRecord]) -> Vec<engine::sigmf::ExportAnnotation> {
+fn annotations(focus: &Receiver, rs: &[engine_old::SignalRecord]) -> Vec<engine_old::sigmf::ExportAnnotation> {
     rs.iter()
         .map(|r| {
             let (s, e) = focus.source.record_sample_range(r);
             let label = r.display_class().map(|c| c.label.clone()).unwrap_or_else(|| format!("#{}", r.id));
-            engine::sigmf::ExportAnnotation {
+            engine_old::sigmf::ExportAnnotation {
                 start_sample: s,
                 end_sample: e,
                 f_lo_hz: r.f_lo_hz,
@@ -5085,7 +5097,7 @@ fn annotations(focus: &Receiver, rs: &[engine::SignalRecord]) -> Vec<engine::sig
 /// The identified system a call belongs to (its key and control channel,
 /// for name lookups). A call only heard on its voice channel names no
 /// system; with one system known, it's that one.
-fn system_for(systems: &[engine::TrunkSystem], key: &Option<engine::SystemKey>) -> Option<(engine::SystemKey, Option<f64>)> {
+fn system_for(systems: &[engine_old::TrunkSystem], key: &Option<engine_old::SystemKey>) -> Option<(engine_old::SystemKey, Option<f64>)> {
     let s = match key {
         Some(k) => systems.iter().find(|s| s.key.same(k)),
         None if systems.len() == 1 => systems.first(),
@@ -5146,7 +5158,10 @@ fn in_focus_zone(f: f64, spans: &[(f64, f64)]) -> bool {
     spans.iter().any(|(lo, hi)| f > lo - FOCUS_ZONE_MARGIN_HZ && f < hi + FOCUS_ZONE_MARGIN_HZ)
 }
 
-fn survey_outside_focus(records: std::sync::Arc<[engine::SignalRecord]>, spans: &[(f64, f64)]) -> std::sync::Arc<[engine::SignalRecord]> {
+fn survey_outside_focus(
+    records: std::sync::Arc<[engine_old::SignalRecord]>,
+    spans: &[(f64, f64)],
+) -> std::sync::Arc<[engine_old::SignalRecord]> {
     if spans.is_empty() {
         return records;
     }
@@ -5159,7 +5174,7 @@ fn survey_outside_focus(records: std::sync::Arc<[engine::SignalRecord]>, spans: 
 /// file's path and the counts.
 fn export_emitters(panes: &[Receiver]) -> std::io::Result<(std::path::PathBuf, usize, usize)> {
     use std::io::Write;
-    let dir = engine::sigmf::default_dir();
+    let dir = engine_old::sigmf::default_dir();
     std::fs::create_dir_all(&dir)?;
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let unix = |t: SystemTime| t.duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
@@ -5255,8 +5270,8 @@ fn follow_policy_path() -> std::path::PathBuf {
 }
 
 /// `priority <talkgroup>` / `lockout <talkgroup>` lines.
-fn load_follow_policy() -> engine::FollowPolicy {
-    let mut p = engine::FollowPolicy::default();
+fn load_follow_policy() -> engine_old::FollowPolicy {
+    let mut p = engine_old::FollowPolicy::default();
     for line in std::fs::read_to_string(follow_policy_path()).unwrap_or_default().lines() {
         let mut w = line.split_whitespace();
         match (w.next(), w.next().and_then(|t| t.parse::<u32>().ok())) {
@@ -5272,7 +5287,7 @@ fn load_follow_policy() -> engine::FollowPolicy {
     p
 }
 
-fn save_follow_policy(p: &engine::FollowPolicy) {
+fn save_follow_policy(p: &engine_old::FollowPolicy) {
     let mut text = String::from("# Talkgroups for call following: priority <tg> / lockout <tg>\n");
     p.priority.iter().for_each(|t| text.push_str(&format!("priority {t}\n")));
     p.lockout.iter().for_each(|t| text.push_str(&format!("lockout {t}\n")));
@@ -5286,7 +5301,7 @@ fn save_follow_policy(p: &engine::FollowPolicy) {
 }
 
 fn catalog_path() -> std::path::PathBuf {
-    engine::sigmf::default_dir().parent().map(|p| p.join("catalog.json")).unwrap_or_else(|| "catalog.json".into())
+    engine_old::sigmf::default_dir().parent().map(|p| p.join("catalog.json")).unwrap_or_else(|| "catalog.json".into())
 }
 
 fn hms(t: SystemTime) -> String {

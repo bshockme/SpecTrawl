@@ -1,13 +1,13 @@
 //! Prints the known wideband occupants a source identifies.
 //!
-//!     cargo run --release -p engine --example occupancy_check -- <serial> <MHz | loMHz-hiMHz> <seconds> [--hint loMHz-hiMHz]
+//!     cargo run --release -p engine-old --example occupancy_check -- <serial> <MHz | loMHz-hiMHz> <seconds> [--hint loMHz-hiMHz]
 //!
 //! `--hint` tells a live source about a cellular block it can't see the
 //! edges of (as the app's survey would), so the cell monitor runs on it.
 
 use std::time::Duration;
 
-use engine::{Mode, Source, SourceConfig, SweepPlan};
+use engine_old::{Mode, Source, SourceConfig, SweepPlan};
 use sdr_core::Backend;
 
 fn main() {

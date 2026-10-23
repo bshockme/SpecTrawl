@@ -2,13 +2,13 @@
 //! emitters that sit closer together than a channel (likely one transmitter
 //! split in two), with the records that went into each.
 //!
-//!     cargo run --release -p engine --example emitter_check -- <serial> <MHz | loMHz-hiMHz> <seconds> [channel kHz]
+//!     cargo run --release -p engine-old --example emitter_check -- <serial> <MHz | loMHz-hiMHz> <seconds> [channel kHz]
 //!
 //! A range runs the device in Sweep mode (the survey) instead of live.
 
 use std::time::Duration;
 
-use engine::{Mode, Source, SourceConfig, SweepPlan};
+use engine_old::{Mode, Source, SourceConfig, SweepPlan};
 use sdr_core::Backend;
 
 fn main() {

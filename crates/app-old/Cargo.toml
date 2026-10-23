@@ -1,8 +1,12 @@
 [package]
-name = "spectrawl"
+name = "spectrawl-old"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[[bin]]
+name = "spectrawl"
+path = "src/main.rs"
 
 [dependencies]
 backend-airspy = { version = "0.1.0", path = "../backend-airspy" }
@@ -15,7 +19,7 @@ eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "de
 egui = "0.36.2"
 egui_dock = { version = "0.21", features = ["serde"] }
 egui_extras = "0.36"
-engine = { version = "0.1.0", path = "../engine" }
+engine-old = { version = "0.1.0", path = "../engine-old" }
 log = "0.4.34"
 parking_lot = { version = "0.12.5", features = ["deadlock_detection"] }
 rfd = "0.17.2"

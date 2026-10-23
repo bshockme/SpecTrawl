@@ -2,8 +2,8 @@
 
 use std::time::Duration;
 
-use engine::sigmf::{ExportKind, ExportRequest};
-use engine::{Mode, Source, SourceConfig};
+use engine_old::sigmf::{ExportKind, ExportRequest};
+use engine_old::{Mode, Source, SourceConfig};
 use sdr_core::Backend;
 
 #[test]

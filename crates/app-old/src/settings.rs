@@ -74,7 +74,7 @@ impl Default for ScanSettings {
     }
 }
 
-/// Serialisable form of `engine::explore::Config`.
+/// Serialisable form of `engine_old::explore::Config`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExploreSettings {
@@ -93,12 +93,12 @@ pub struct ExploreSettings {
 
 impl Default for ExploreSettings {
     fn default() -> Self {
-        Self::from_config(&engine::explore::Config::default())
+        Self::from_config(&engine_old::explore::Config::default())
     }
 }
 
 impl ExploreSettings {
-    pub fn from_config(c: &engine::explore::Config) -> Self {
+    pub fn from_config(c: &engine_old::explore::Config) -> Self {
         Self {
             ranges_mhz: c.ranges_mhz.clone(),
             presets: c.presets.iter().map(|(k, r)| (k.clone(), r.name().to_string())).collect(),
@@ -109,10 +109,10 @@ impl ExploreSettings {
         }
     }
 
-    pub fn to_config(&self) -> engine::explore::Config {
-        engine::explore::Config {
+    pub fn to_config(&self) -> engine_old::explore::Config {
+        engine_old::explore::Config {
             ranges_mhz: self.ranges_mhz.clone(),
-            presets: self.presets.iter().filter_map(|(k, v)| engine::explore::Rule::parse(v).map(|r| (k.clone(), r))).collect(),
+            presets: self.presets.iter().filter_map(|(k, v)| engine_old::explore::Rule::parse(v).map(|r| (k.clone(), r))).collect(),
             settle_s: self.settle_s.clamp(0.0, 10.0),
             silence_s: self.silence_s.clamp(0.5, 60.0),
             cap_s: self.cap_s.clamp(2.0, 300.0),
@@ -137,7 +137,7 @@ impl Default for Settings {
 }
 
 pub fn path() -> PathBuf {
-    engine::sigmf::default_dir().parent().map(|p| p.join("settings.json")).unwrap_or_else(|| "settings.json".into())
+    engine_old::sigmf::default_dir().parent().map(|p| p.join("settings.json")).unwrap_or_else(|| "settings.json".into())
 }
 
 impl Settings {
