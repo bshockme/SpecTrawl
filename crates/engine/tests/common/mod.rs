@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use backend_sim::{Emitter, Keying, Modulation, SimConfig, SimControl, SimDevice};
-use engine::{BudgetConfig, Consumer, Delivery, EndReason, Flow, Keeper, RingBudget, RingConfig, SourceConfig};
+use engine::{BudgetConfig, Consumer, Delivery, EndReason, Flow, GapReason, Keeper, RingBudget, RingConfig, SourceConfig};
 use sdr_core::{Complex32, Device};
 
 /// A simulated device with no emitters (noise only) at `rate`. It never
@@ -62,6 +62,13 @@ pub fn wait_until(f: impl Fn() -> bool) {
     }
 }
 
+/// A `Samples` or `Gap` delivery, in the order they arrived.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Event {
+    Samples { first_sample: u64, len: usize },
+    Gap { from_sample: u64, to_sample: u64, reason: GapReason },
+}
+
 /// A cloneable [`Consumer`] that records what the bus delivers to it.
 #[derive(Clone)]
 pub struct Collector(Arc<Mutex<Collected>>);
@@ -77,6 +84,7 @@ struct Collected {
     stored: Vec<Complex32>,
     samples: usize,
     first_samples: Vec<u64>,
+    events: Vec<Event>,
     gaps: u64,
     sheds: u64,
     ends: u64,
@@ -139,6 +147,11 @@ impl Collector {
         self.0.lock().unwrap().first_samples.windows(2).all(|w| w[1] == w[0] + hop)
     }
 
+    /// Every `Samples` and `Gap` delivery so far, in order.
+    pub fn events(&self) -> Vec<Event> {
+        self.0.lock().unwrap().events.clone()
+    }
+
     /// The last `n` stored samples (fewer if fewer were stored).
     pub fn tail(&self, n: usize) -> Vec<Complex32> {
         let c = self.0.lock().unwrap();
@@ -156,12 +169,16 @@ impl Consumer for Collector {
         match d {
             Delivery::Samples { first_sample, samples, .. } => {
                 c.first_samples.push(first_sample);
+                c.events.push(Event::Samples { first_sample, len: samples.len() });
                 c.samples += samples.len();
                 if c.store {
                     c.stored.extend_from_slice(samples);
                 }
             }
-            Delivery::Gap { .. } => c.gaps += 1,
+            Delivery::Gap { from_sample, to_sample, reason } => {
+                c.gaps += 1;
+                c.events.push(Event::Gap { from_sample, to_sample, reason });
+            }
             Delivery::Shed => c.sheds += 1,
             Delivery::Ended { reason } => {
                 c.ends += 1;

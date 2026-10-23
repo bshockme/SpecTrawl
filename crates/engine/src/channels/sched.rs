@@ -7,7 +7,9 @@
 //! the subscription's own mutex; then it re-takes the scheduler lock and puts
 //! the subscription at the back of its FIFO if it is still behind, else
 //! marks it idle until the next `on_block`. One block per turn is the
-//! round-robin.
+//! round-robin. A subscription out of span stays idle until a block of
+//! another segment is cached: it then skips the out-of-span stretch in one
+//! turn instead of spending a turn on every block of it.
 //!
 //! Lock order: the scheduler lock and a subscription's lock are never held
 //! together; the scheduler lock is never held while a block runs or a
@@ -20,9 +22,10 @@ use std::thread::JoinHandle;
 
 use parking_lot::{Condvar, Mutex};
 
-use super::sub::{Counters, Sub};
-use super::{ChannelId, ChannelInfo, Priority};
+use super::sub::{Counters, Ran, Sub};
+use super::{ChannelId, ChannelInfo, ConsumerState, Priority};
 use crate::budget::SourceId;
+use crate::segments::SegmentId;
 
 const PRIORITIES: usize = Priority::Listen as usize + 1;
 
@@ -45,10 +48,24 @@ struct Entry {
     turn: Turn,
 }
 
+/// A source's latest cached block and its segment (`None`: not known).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Latest {
+    pub block: u64,
+    pub segment: Option<SegmentId>,
+}
+
 impl Entry {
-    /// Has a block to run once `latest` is cached.
-    fn behind(&self, latest: Option<u64>) -> bool {
-        self.counters.live() && latest.is_some_and(|l| self.counters.next_block <= l)
+    /// Has a block to run once `latest` is cached. Out of span, only once
+    /// the latest block lies in another segment.
+    fn behind(&self, latest: Option<Latest>) -> bool {
+        let Some(latest) = latest else { return false };
+        let c = &self.counters;
+        match c.state {
+            ConsumerState::Running => c.next_block <= latest.block,
+            ConsumerState::OutOfSpan => c.next_block <= latest.block && latest.segment != Some(c.segment),
+            ConsumerState::Shed | ConsumerState::Ended => false,
+        }
     }
 }
 
@@ -56,7 +73,7 @@ impl Entry {
 struct Sched {
     subs: HashMap<ChannelId, Entry>,
     queues: [VecDeque<ChannelId>; PRIORITIES],
-    latest: HashMap<SourceId, u64>,
+    latest: HashMap<SourceId, Latest>,
     stop: bool,
     panicked_total: u64,
     shed_total: u64,
@@ -88,7 +105,7 @@ impl Sched {
 
 /// What [`ChannelBus::stats`](super::ChannelBus::stats) reads under the lock.
 pub(super) struct Snapshot {
-    pub latest: HashMap<SourceId, u64>,
+    pub latest: HashMap<SourceId, Latest>,
     pub panicked_total: u64,
     pub shed_total: u64,
     pub consumers: Vec<(ChannelInfo, Priority, Counters)>,
@@ -126,15 +143,15 @@ impl Shared {
         entry.is_some()
     }
 
-    /// Block `block` of `source` is cached: queue every idle subscription of
-    /// that source that it brings work for.
-    pub fn on_block(&self, source: SourceId, block: u64) {
+    /// Block `latest.block` of `source` is cached: queue every idle
+    /// subscription of that source that it brings work for.
+    pub fn on_block(&self, source: SourceId, latest: Latest) {
         let mut s = self.sched.lock();
-        s.latest.insert(source, block);
+        s.latest.insert(source, latest);
         let ready: Vec<ChannelId> = s
             .subs
             .iter()
-            .filter(|(_, e)| e.info.source == source && e.turn == Turn::Idle && e.behind(Some(block)))
+            .filter(|(_, e)| e.info.source == source && e.turn == Turn::Idle && e.behind(Some(latest)))
             .map(|(&id, _)| id)
             .collect();
         for &id in &ready {
@@ -178,27 +195,27 @@ impl Shared {
                     self.ready.wait(&mut s);
                 }
             };
-            let (counters, panicked) = {
+            let (counters, ran) = {
                 let mut g = sub.lock();
-                let panicked = match catch_unwind(AssertUnwindSafe(|| g.run_block())) {
-                    Ok(p) => p,
+                let ran = match catch_unwind(AssertUnwindSafe(|| g.run_block())) {
+                    Ok(ran) => ran,
                     Err(_) => {
                         log::warn!("channel bus: channel {} panicked outside its consumer; ended", id.0);
                         g.abandon();
-                        true
+                        Ran { panicked: true, wait: false }
                     }
                 };
-                (g.counters(), panicked)
+                (g.counters(), ran)
             };
             {
                 let mut guard = self.sched.lock();
                 let s = &mut *guard;
-                if panicked {
+                if ran.panicked {
                     s.panicked_total += 1;
                 }
                 if let Some(e) = s.subs.get_mut(&id) {
                     e.counters = counters;
-                    if e.behind(s.latest.get(&e.info.source).copied()) {
+                    if !ran.wait && e.behind(s.latest.get(&e.info.source).copied()) {
                         e.turn = Turn::Queued;
                         s.queues[e.priority as usize].push_back(id);
                     } else {

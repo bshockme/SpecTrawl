@@ -22,7 +22,7 @@ use crate::budget::SourceId;
 use crate::source::{ReadError, Source};
 use crate::stage::{BlockSink, Stage, StageConfig};
 
-use sched::Shared;
+use sched::{Latest, Shared};
 use sub::Sub;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -293,7 +293,11 @@ impl ChannelBus {
             .consumers
             .into_iter()
             .map(|(channel, priority, c)| {
-                let lag_blocks = snap.latest.get(&channel.source).map_or(0, |&b| (b + 1).saturating_sub(c.next_block));
+                // Only a running consumer lags: one out of span, shed or ended waits for nothing.
+                let lag_blocks = match (c.state, snap.latest.get(&channel.source)) {
+                    (ConsumerState::Running, Some(l)) => (l.block + 1).saturating_sub(c.next_block),
+                    _ => 0,
+                };
                 let lag_secs = rates.get(&channel.source).map_or(0.0, |r| (lag_blocks * channel.hop) as f64 / r);
                 ConsumerStats {
                     channel,
@@ -336,7 +340,9 @@ impl ChannelBus {
     }
 
     fn on_block(&self, source: SourceId, block: u64) {
-        self.shared.on_block(source, block);
+        // The block's segment, for subscriptions waiting out of span in another.
+        let segment = self.stage(source).and_then(|s| s.cache().get(block)).map(|(seg, _)| seg.id);
+        self.shared.on_block(source, Latest { block, segment });
     }
 }
 

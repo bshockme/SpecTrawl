@@ -21,13 +21,19 @@ pub(crate) struct Counters {
     pub recomputed: u64,
     pub gaps: u64,
     pub state: ConsumerState,
+    /// The segment the channel was last designed for; while `OutOfSpan`,
+    /// the one it is out of span in.
+    pub segment: SegmentId,
 }
 
-impl Counters {
-    /// Still has a consumer to feed.
-    pub fn live(&self) -> bool {
-        matches!(self.state, ConsumerState::Running | ConsumerState::OutOfSpan)
-    }
+/// How a turn ended, for the scheduler.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Ran {
+    /// The consumer (or the turn) panicked.
+    pub panicked: bool,
+    /// Nothing to do until the stage caches another block: wait idle even
+    /// if `next_block` is not past the latest block.
+    pub wait: bool,
 }
 
 /// Input samples `from .. to` that produced no output yet reported.
@@ -52,8 +58,6 @@ pub(crate) struct Sub {
     stage: Arc<Stage>,
     /// `None` once the subscription has ended.
     consumer: Option<Box<dyn Consumer>>,
-    /// The segment the extractor (or its absence: out of span) was designed for.
-    segment: SegmentId,
     extractor: Option<Extractor>,
     recompute: Option<Recompute>,
     out: Vec<Complex32>,
@@ -61,6 +65,8 @@ pub(crate) struct Sub {
     pending: Vec<PendingGap>,
     /// Set when the consumer panicked during the current turn.
     panicked: bool,
+    /// Set when the current turn found nothing to do until the next block.
+    wait: bool,
     counters: Counters,
 }
 
@@ -83,13 +89,13 @@ impl Sub {
             usable_fraction,
             stage,
             consumer: Some(consumer),
-            segment,
             extractor: Some(Extractor::new(design)),
             recompute: None,
             out,
             pending: Vec::new(),
             panicked: false,
-            counters: Counters { next_block, blocks: 0, recomputed: 0, gaps: 0, state: ConsumerState::Running },
+            wait: false,
+            counters: Counters { next_block, blocks: 0, recomputed: 0, gaps: 0, state: ConsumerState::Running, segment },
         }
     }
 
@@ -102,10 +108,21 @@ impl Sub {
     }
 
     /// One turn: deliver block `next_block` (preceded by any pending gap), or
-    /// record why it cannot be. Returns true if the consumer panicked.
-    pub fn run_block(&mut self) -> bool {
+    /// record why it cannot be.
+    pub fn run_block(&mut self) -> Ran {
+        let panicked = self.turn();
+        Ran { panicked, wait: self.wait }
+    }
+
+    /// [`Sub::run_block`]'s work; returns true if the consumer panicked.
+    fn turn(&mut self) -> bool {
         self.panicked = false;
+        self.wait = false;
         if self.consumer.is_none() {
+            return false;
+        }
+        if self.counters.state == ConsumerState::OutOfSpan && !self.leave_out_of_span() {
+            self.wait = true;
             return false;
         }
         let b = self.counters.next_block;
@@ -118,7 +135,13 @@ impl Sub {
             }
             None => match self.recompute_block(b) {
                 Ok(seg) => (seg, None),
-                Err(ReadError::Future) => return false, // not written yet: try again next turn
+                Err(ReadError::Future) => {
+                    // Unreachable while `b ≤ latest` (the stage only caches a block
+                    // once all its input is written), but must not hot-spin: wait
+                    // for the next block.
+                    self.wait = true;
+                    return false;
+                }
                 Err(e) => {
                     let mut next = b + 1;
                     if matches!(e, ReadError::Overwritten | ReadError::Lost) {
@@ -131,13 +154,14 @@ impl Sub {
                 }
             },
         };
-        if seg.id != self.segment {
+        if seg.id != self.counters.segment {
             self.redesign(&seg);
             if self.consumer.is_none() {
                 return self.panicked;
             }
         }
         let Some(extractor) = self.extractor.as_mut() else {
+            // Out of span from here: the gap grows when the segment ends.
             self.add_gap(b * l, (b + 1) * l, GapReason::OutOfSpan);
             self.counters.next_block = b + 1;
             return false;
@@ -168,6 +192,29 @@ impl Sub {
         self.finish();
     }
 
+    /// Out of span in `counters.segment`: skip, in one step, every block up to
+    /// the first whose input starts in a later segment (or past the latest
+    /// block), extending the pending `OutOfSpan` gap over them. Blocks that
+    /// straddle the segment's end are part of the gap. Returns true if such a
+    /// block exists, so the turn can run it.
+    fn leave_out_of_span(&mut self) -> bool {
+        let (l, source) = (self.stage.hop(), self.stage.source().clone());
+        let b = self.counters.next_block;
+        let Some(latest) = self.stage.latest_block() else { return false };
+        // Binary search: the first block in b ..= latest + 1 whose input
+        // starts outside the segment (segments are contiguous in samples).
+        let (mut lo, mut hi) = (b, latest.max(b - 1) + 1);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if source.segment_at((mid - 1) * l).id == self.counters.segment { lo = mid + 1 } else { hi = mid }
+        }
+        if lo > b {
+            self.add_gap(b * l, lo * l, GapReason::OutOfSpan);
+            self.counters.next_block = lo;
+        }
+        lo <= latest
+    }
+
     /// Block `b`'s bins from the ring, into the recompute scratch.
     fn recompute_block(&mut self, b: u64) -> Result<Segment, ReadError> {
         let (n, l) = (self.stage.fft_size(), self.stage.hop());
@@ -184,7 +231,7 @@ impl Sub {
 
     /// A new segment: design the channel for its tuning and rate.
     fn redesign(&mut self, seg: &Segment) {
-        self.segment = seg.id;
+        self.counters.segment = seg.id;
         let s = &self.spec;
         let design = design_channel(
             self.stage.fft_size(),

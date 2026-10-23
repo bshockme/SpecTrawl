@@ -81,7 +81,8 @@ fn bad_subscriptions_are_refused() {
 fn a_panicking_consumer_is_ended_and_the_others_continue() {
     let (d, _c) = cw_sim(10e6, 855.25e6 + TONE_OFFSET, -20.0);
     let src = Arc::new(Source::start(d, cfg(), Mode::Live, &keeper()).unwrap());
-    let bus = ChannelBus::new(BusConfig { workers: 2, ..Default::default() });
+    // One worker: deliveries after the panic prove the worker that caught it survived.
+    let bus = ChannelBus::new(BusConfig { workers: 1, ..Default::default() });
     bus.attach(src.clone());
     let mut seen = 0;
     let bad = move |d: Delivery<'_>| {
@@ -100,9 +101,7 @@ fn a_panicking_consumer_is_ended_and_the_others_continue() {
     wait_until(|| state(bad.id).state == ConsumerState::Ended && bus.stats().panicked_total == 1);
     let n = got.samples();
     wait_until(|| got.samples() >= n + 78_125);
-    let stats = bus.stats();
-    assert_eq!(stats.workers, 2);
-    assert_eq!(stats.panicked_total, 1);
+    assert_eq!(bus.stats().panicked_total, 1);
     let g = state(good.id);
     assert_eq!(g.state, ConsumerState::Running);
     assert!(g.lag_secs < 0.5, "{g:?}");
