@@ -228,7 +228,8 @@ fn windowed_sinc_has_unit_dc_gain_and_rejects_the_stopband() {
     // Response at 25 kHz (adjacent channel): below −60 dB.
     let resp = |f: f64| -> f32 {
         let w = 2.0 * std::f64::consts::PI * f / 78_125.0;
-        taps.iter().enumerate().map(|(i, &t)| t as f64 * (w * i as f64).cos()).sum::<f64>().abs() as f32
+        let (re, im) = taps.iter().enumerate().fold((0.0f64, 0.0f64), |(re, im), (i, &t)| (re + t as f64 * (w * i as f64).cos(), im - t as f64 * (w * i as f64).sin()));
+        (re * re + im * im).sqrt() as f32          // |H(f)|, not Re H(f): the linear phase would halve the passband reading
     };
     assert!(20.0 * resp(25_000.0).log10() < -60.0);
     assert!((resp(1_000.0) - 1.0).abs() < 0.01);
@@ -302,7 +303,7 @@ out[i] = |Xw[(i + N/2) mod N]|² / (N·a0)²
 
 (`N·a0` is the window's coherent gain, the sum of `blackman_harris(N)`.)
 
-- [ ] **Step 4: Run it to see it pass** — Expected: PASS. Also `cargo clippy -p dsp --all-targets -- -D warnings` clean.
+- [ ] **Step 4: Run it to see it pass** — Expected: PASS. Also `cargo clippy -p dsp --all-targets -- -D warnings` clean. If the bin-for-bin check fails only in bins more than 60 dB below the tone (f32 cancellation in the deep sidelobes), change that assertion to `(g - w).abs() < 1e-3 * w + 1e-9` and say so in the report; a failure in any bin within 60 dB of the tone is a real defect.
 
 - [ ] **Step 5: Commit** — `git commit -m "dsp: shared forward FFT and Blackman-Harris power from the same bins"`.
 
@@ -351,7 +352,7 @@ for j in 0..K:  m = if j < K/2 { j } else { j − K }
                 Y[j] = X[(c + m) mod N] · H[j]
 y = IFFT_K(Y) / N                       (rustfft's inverse is unnormalised; 1/N gives unit gain)
 keep y[K/2 .. K]  (the first K/2 are the circular wrap, discarded)
-rot = exp(−i·2π·((c mod N)·(n0 mod N) mod N)/N)     (the mixer's phase at the block start; with L = N/2 this is ±1)
+rot = exp(−i·2π·((c mod N)·(n0 mod N) mod N)/N)     (the mixer's phase at the block start; with L = N/2 this is ±1; `c` may be negative, so use `rem_euclid`)
 for i in 0..K/2:  out[i] = y[K/2 + i] · rot · exp(−i·2π·residual_hz·(n0 + L + D·i)/fs)    with D = N/K
 ```
 
@@ -590,6 +591,8 @@ Semantics:
 - Scheduler (`sched.rs`): a `Mutex<Sched>` + `Condvar`; `Sched` holds the subscriptions, one `VecDeque<ChannelId>` per priority, `latest_block` per source, and the busy counters. `on_block(source, b)` marks every idle subscription of that source with `next_block ≤ b` ready and notifies. A worker pops from the highest non-empty queue, marks the subscription running, releases the lock, runs **one block** (`sub.run_block`), then re-queues it at the back of its queue if still behind, else marks it idle. One block per turn is the round-robin.
 - `run_block(b)` (`sub.rs`): bins from `cache.get(b)`; on a miss, read `(b−1)·L .. (b+1)·L` from the ring with the subscription's own lazily created `SharedFft` (dropped again on the next cache hit) and count `recomputed`. A ring error extends the pending gap by `[b·L, (b+1)·L)` with `Unreadable(e)`; on `Overwritten | Lost` also jump `next_block = max(next_block + 1, oldest / L + 2)`. The segment from the cache or the read selects the extractor: redesigned when `segment.id` changes; `sample_rate` differing from `ChannelInfo.sample_rate` → `Ended { RateChanged }`; `OutsideSpan` → pending gap `OutOfSpan` and state `OutOfSpan`. Before any `Samples` the pending gap (if any) is delivered as one `Gap`. `Flow::Stop` ends the subscription silently. A panic inside `deliver` is caught (`catch_unwind`), the subscription is ended with `Ended { Panicked }` (delivered on the next turn if the consumer can still be called, otherwise just dropped), `panicked_total += 1`, and the worker continues.
 - Lag: `lag_blocks = latest_block + 1 − next_block` (0 when caught up), `lag_secs = lag_blocks·L / sample_rate` of the source's current segment.
+- Lifetime: a subscription that ended (`Flow::Stop`, `Ended`, `Shed`) drops its consumer at once but keeps its entry in `stats().consumers` with its final state until `unsubscribe(id)` removes it (so a test or UI can read why it stopped); `unsubscribe` returns `true` for any entry it removed, `false` for an unknown id.
+- The round-robin test measures priority by wall clock; if Windows timer granularity makes C's inter-delivery gaps jitter past 10 ms while the ordering is right, assert the ordering directly instead: for every block delivered to all three, C's delivery `Instant` is not later than A's or B's for that block, and keep the A/B count balance assertion.
 
 - [ ] **Step 1: Write the failing tests** (`tests/channel_live.rs`). Shared helpers go in `tests/common/mod.rs` for Tasks 7–10: `keeper()` (a keeper with `guaranteed_secs: 1.0, ceiling_bytes: 256 << 20, sweep_secs: 0.2`), `cw_sim` (moved from Task 6's test), `two_tone_sim(rate, f1, f2, level_dbfs)`, and `Collector`: a cloneable `Consumer` over `Arc<Mutex<..>>` that stores samples (or only counts them, `counting_only()`), counts deliveries by kind (`samples()`, `gaps()`, `shed_deliveries()`, `end_deliveries()`, `ended() -> Option<EndReason>`, `first_delivery_first_sample()`, `first_samples_are_consecutive_by(hop)`, `tail(n)`), returns `Flow::Stop` once `with_limit(n)` is reached, and can sleep per delivery (`sleeping(d)`).
 
@@ -649,7 +652,7 @@ fn consumers_are_scheduled_by_priority_then_round_robin() {
 
 - [ ] **Step 2: Run them to see them fail** — `cargo test -p engine --test channel_live`; Expected: compile errors.
 
-- [ ] **Step 3: Implement `channels/mod.rs`, `channels/sub.rs`, `channels/sched.rs`** (ChannelBus implements `BlockSink` via `on_block`; `attach` calls `Stage::start(source, cfg.stage.clone(), self.clone())`). `detach` and shedding are stubs that return `false` / do nothing until Tasks 9–10.
+- [ ] **Step 3: Implement `channels/mod.rs`, `channels/sub.rs`, `channels/sched.rs`** (`BusSink(Weak<ChannelBus>)` implements `BlockSink` by upgrading and calling `ChannelBus::on_block`; `attach` calls `Stage::start(source, cfg.stage.clone(), Arc::new(BusSink(Arc::downgrade(self))))`, never `self.clone()`, so the stage does not keep the bus alive). `detach` and shedding are stubs that return `false` / do nothing until Tasks 9–10.
 
 - [ ] **Step 4: Run them to see them pass** — Expected: PASS (four tests). Then clippy.
 
@@ -684,7 +687,7 @@ fn a_channel_backfilled_from_five_seconds_ago_matches_a_direct_ddc() {
     let start = ((src.head() - 50_000_000) / 32_768) * 32_768;        // 5 s ago, on a hop
     let want = 78_125usize;                                            // 1 s of channel output
     // Reference: the old-style DDC straight off the ring (same rate: 10e6 / 128 = 78125).
-    let mut raw = vec![Complex32::default(); 1_200_000];
+    let mut raw = vec![Complex32::default(); 12_000_000];               // 1.2 s: the reference must be ≥ `want` long for the slice below
     src.read(start - 32_768, &mut raw).unwrap();
     let mut ddc = Ddc::new(fs, TONE_OFFSET, 6_250.0, 78_125.0);
     assert_eq!(ddc.fs_out, 78_125.0);
