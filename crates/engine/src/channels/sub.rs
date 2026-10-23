@@ -24,6 +24,8 @@ pub(crate) struct Counters {
     /// The segment the channel was last designed for; while `OutOfSpan`,
     /// the one it is out of span in.
     pub segment: SegmentId,
+    /// Set when the state becomes `Ended` (see `ConsumerStats::end_reason`).
+    pub end_reason: Option<EndReason>,
 }
 
 /// How a turn ended, for the scheduler.
@@ -95,7 +97,7 @@ impl Sub {
             pending: Vec::new(),
             panicked: false,
             wait: false,
-            counters: Counters { next_block, blocks: 0, recomputed: 0, gaps: 0, state: ConsumerState::Running, segment },
+            counters: Counters { next_block, blocks: 0, recomputed: 0, gaps: 0, state: ConsumerState::Running, segment, end_reason: None },
         }
     }
 
@@ -193,7 +195,7 @@ impl Sub {
         self.wait = false;
         if self.consumer.is_some() {
             self.deliver(Delivery::Shed);
-            self.finish();
+            self.finish(None);
             self.counters.state = ConsumerState::Shed;
         }
         Ran { panicked: self.panicked, wait: true }
@@ -213,7 +215,7 @@ impl Sub {
     /// Something other than the consumer panicked during a turn: end the
     /// subscription without calling the consumer again.
     pub fn abandon(&mut self) {
-        self.finish();
+        self.finish(Some(EndReason::Panicked));
     }
 
     /// Out of span in `counters.segment`: skip, in one step, every block up to
@@ -294,12 +296,12 @@ impl Sub {
         match catch_unwind(AssertUnwindSafe(|| consumer.deliver(d))) {
             Ok(Flow::Continue) => true,
             Ok(Flow::Stop) => {
-                self.finish();
+                self.finish(None);
                 false
             }
             Err(_) => {
                 self.panicked = true;
-                self.finish();
+                self.finish(Some(EndReason::Panicked));
                 false
             }
         }
@@ -307,12 +309,18 @@ impl Sub {
 
     /// Tell the consumer why it ends, then end.
     fn end(&mut self, reason: EndReason) {
+        // The reason stands even if the consumer stops or panics on hearing it.
+        self.counters.end_reason = Some(reason);
         self.deliver(Delivery::Ended { reason });
-        self.finish();
+        self.finish(None);
     }
 
     /// Drop the consumer and the scratch; the counters stay for the stats.
-    fn finish(&mut self) {
+    /// `reason` becomes the end reason unless one is already set.
+    fn finish(&mut self, reason: Option<EndReason>) {
+        if self.counters.end_reason.is_none() {
+            self.counters.end_reason = reason;
+        }
         if let Some(c) = self.consumer.take() {
             // A consumer that panicked may panic again in its Drop.
             let _ = catch_unwind(AssertUnwindSafe(move || drop(c)));

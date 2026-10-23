@@ -413,7 +413,7 @@ impl Shared {
                     if e.last_turn == Some(LastTurn::Shed) && last.is_none() && counters.state == ConsumerState::Ended {
                         // The consumer ended (Stop or panic) before `Shed` could be delivered:
                         // the shed is cancelled, so it no longer counts in `shed_total`.
-                        s.shed_total -= 1;
+                        s.shed_total = s.shed_total.saturating_sub(1);
                     }
                     if last.is_some() || counters.state == ConsumerState::Ended {
                         e.last_turn = None;

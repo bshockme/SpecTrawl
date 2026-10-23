@@ -24,7 +24,8 @@ pub struct Engine {
     cfg: EngineConfig,
     bus: Arc<ChannelBus>,
     sources: Mutex<HashMap<SourceId, Arc<Source>>>,
-    /// Last, so it is dropped after the bus and the sources.
+    /// The engine's handle; each `Source` holds the keeper too, so it lives
+    /// as long as the last of them whatever the field order.
     keeper: Arc<Keeper>,
 }
 
@@ -72,8 +73,7 @@ impl Engine {
 
 impl Drop for Engine {
     /// Detaches every source (its consumers end with `SourceDetached`),
-    /// stops the bus, drops the sources; the keeper goes last (the last
-    /// field, dropped after this runs).
+    /// stops the bus and drops the engine's handles on the sources.
     fn drop(&mut self) {
         let ids: Vec<SourceId> = self.sources.lock().keys().copied().collect();
         for id in ids {

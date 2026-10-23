@@ -17,6 +17,10 @@ Ideas and known rough edges that aren't scheduled yet. Newest at the top of each
 - **NXDN golden capture** (2026-10-23): `nxdn_control_channel` stays ignored, not on air in the owner's area (two 40 s runs at 460.6 MHz found only DMR). Re-record if an NXDN control channel turns up.
 - **P25 Phase 2 golden captures** (2026-10-23): the local site (WACN 0xBEE00, system 0x348) has Phase 2 channels near 855.78 and 859.08 MHz, but their FACCH/SACCH decode nothing on the recorded slices, even with every NAC the Phase 1 channels show (0x340/0x343/0x344/0x34D) registered or a brute force over all NACs. `p25_phase2_talkgroups_after_learning_the_nac` and `p25_phase2_voice_and_encryption_sync` stay ignored until that is understood and slices are recorded. The 770.3 MHz site of the old tests is not on air here.
 - **ADP golden slice** (2026-10-23): `p25_phase1_voice_frames_and_encryption` now covers only a clear call; record a slice with an encrypted Phase 1 call to pin ADP (0xAA) again.
+- **`Start::At` designs the channel against the head's segment** (2026-10-23): `subscribe` designs a back-filling channel for `segment_at(head)`, not `segment_at(start)`, so a back-fill across a retune may be refused `OutsideSpan` or end `RateChanged` although the channel was valid at `start`.
+- **A back-filling subscription counts as a laggard for shedding** (2026-10-23): its distance from the live edge is lag like any other, so under a saturated pool it can be shed while it back-fills on purpose.
+- **Ended entries are scanned until unsubscribed** (2026-10-23): `on_block` and `stats` walk every entry, ended ones included, until `unsubscribe` removes them; keep a per-source live set if apps churn channels.
+- **`Engine::bus().detach` leaves `Engine::sources` stale** (2026-10-23): detaching through the bus directly does not remove the source from the engine's map; use `Engine::remove_source`.
 - **Golden captures re-recorded** (2026-10-23): the original P25/DMR/NXDN slices stayed on another machine; new ones live under testdata/small and the tests were re-pinned to the local systems.
 - DESIGN §1 L11: Find every emission, then classify and decode it — PARTIAL — step 6
 - DESIGN §1 L12: Browse, search, filter and sort records — PARTIAL — step 4
@@ -78,7 +82,7 @@ Ideas and known rough edges that aren't scheduled yet. Newest at the top of each
 - DESIGN §10 L252: Per source: one USB thread plus one FFT/channelizer thread — DONE (done 2026-10-23, step 2): the device's USB thread plus the stage's FFT thread per source; channels are cut on the bus's worker pool
 - DESIGN §10 L253: Detectors run on a worker pool — CONTRADICTED — step 6
 - DESIGN §10 L254: UI never blocks on the engine — CONTRADICTED — step 3
-- DESIGN §10 L259: Benchmark early — DONE (done 2026-10-23, step 2): first numbers from `channels_200`: `200 channels @ 10 MS/s: max lag 0.000 s, mean lag 0.000 s, stage 1018 µs/block, recomputed 0 blocks, workers 14 (16 logical CPUs)`
+- DESIGN §10 L259: Benchmark early — DONE (done 2026-10-23, step 2): numbers from `channels_200` (16 logical CPUs): `200 channels @ 10 MS/s: max lag 0.000 s, mean lag 0.000 s, stage 1015 µs/block, stage behind 0.000 s, recomputed 0 blocks, workers 14`
 - DESIGN §11 L274: dsp crate holds FFT, filters, channelizer, demodulators — DONE (done 2026-10-23, step 2): `dsp` holds the shared FFT, the windowed-sinc filters, the fast-convolution channelizer and `Ddc`/`Demod`
 - DESIGN §12 L288: Labelled SigMF corpus — DONE (done 2026-10-23, step 0/1)
 - DESIGN §12 L289: Synthetic generators with detection-rate and false-alarm tests — PARTIAL — not scheduled

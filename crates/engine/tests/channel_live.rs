@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use common::{Collector, cfg, cw_sim, keeper, wait_until};
 use dsp::channelizer::DesignError;
 use engine::{
-    BudgetConfig, BusConfig, BusError, ChannelBus, ChannelId, ChannelSpec, ConsumerState, Delivery, Flow, Keeper, Mode, Priority,
-    RingBudget, Source, SourceId, Start,
+    BudgetConfig, BusConfig, BusError, ChannelBus, ChannelId, ChannelSpec, ConsumerState, Delivery, EndReason, Flow, Keeper, Mode,
+    Priority, RingBudget, Source, SourceId, Start,
 };
 use sdr_core::Complex32;
 
@@ -78,6 +78,11 @@ fn bad_subscriptions_are_refused() {
 }
 
 #[test]
+fn a_bus_has_at_least_one_worker() {
+    assert_eq!(ChannelBus::new(BusConfig { workers: 0, ..Default::default() }).stats().workers, 1);
+}
+
+#[test]
 fn a_panicking_consumer_is_ended_and_the_others_continue() {
     let (d, _c) = cw_sim(10e6, 855.25e6 + TONE_OFFSET, -20.0);
     let src = Arc::new(Source::start(d, cfg(), Mode::Live, &keeper()).unwrap());
@@ -103,8 +108,10 @@ fn a_panicking_consumer_is_ended_and_the_others_continue() {
     let n = got.samples();
     wait_until(|| got.samples() >= n + 78_125);
     assert_eq!(bus.stats().panicked_total, 1);
+    assert_eq!(state(bad.id).end_reason, Some(EndReason::Panicked));
     let g = state(good.id);
     assert_eq!(g.state, ConsumerState::Running);
+    assert_eq!(g.end_reason, None);
     assert!(g.lag_secs < 0.5, "{g:?}");
     assert!(bus.unsubscribe(bad.id), "an ended subscription keeps its entry until unsubscribed");
     assert!(!bus.unsubscribe(bad.id));

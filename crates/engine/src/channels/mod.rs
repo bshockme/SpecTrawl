@@ -152,11 +152,18 @@ pub struct ConsumerStats {
     /// `Gap` deliveries.
     pub gaps: u64,
     pub state: ConsumerState,
+    /// Why the subscription ended: `Panicked` when its consumer (or its turn)
+    /// panicked, `RateChanged` or `SourceDetached` for those ends; `None`
+    /// while it runs, after `Flow::Stop` and when it was shed.
+    pub end_reason: Option<EndReason>,
 }
 
 #[derive(Debug, Clone)]
 pub struct BusStats {
     pub workers: usize,
+    /// Whether the last completed one-second window was saturated (at least
+    /// 90 % of its blocks found every worker busy with work queued). Decided
+    /// as blocks arrive, so it goes stale when they stop.
     pub saturated: bool,
     pub shed_total: u64,
     pub panicked_total: u64,
@@ -177,6 +184,7 @@ pub enum BusError {
 #[derive(Debug, Clone)]
 pub struct BusConfig {
     /// Worker threads; default `available_parallelism − 2`, at least 1.
+    /// [`ChannelBus::new`] raises 0 to 1.
     pub workers: usize,
     /// Lag beyond which the lowest-priority consumer is shed while the pool is saturated.
     pub max_lag_secs: f64,
@@ -211,8 +219,9 @@ impl BlockSink for BusSink {
 }
 
 impl ChannelBus {
-    /// Starts threads "bus-worker-<i>".
-    pub fn new(cfg: BusConfig) -> Arc<ChannelBus> {
+    /// Starts threads "bus-worker-<i>" (at least one, whatever `cfg.workers` says).
+    pub fn new(mut cfg: BusConfig) -> Arc<ChannelBus> {
+        cfg.workers = cfg.workers.max(1);
         let shared = Arc::new(Shared::new(cfg.workers, cfg.max_lag_secs));
         let workers = sched::spawn_workers(&shared, cfg.workers);
         Arc::new(ChannelBus {
@@ -317,8 +326,10 @@ impl ChannelBus {
         Ok(info)
     }
 
-    /// The consumer is dropped by the pool after any delivery in progress;
-    /// no callback. Also removes the entry of a subscription that ended.
+    /// No callback. An idle subscription's consumer is dropped here, on the
+    /// caller's thread; one in the middle of a delivery is dropped by the
+    /// pool once that delivery returns. Also removes the entry of a
+    /// subscription that ended.
     pub fn unsubscribe(&self, id: ChannelId) -> bool {
         self.shared.remove(id)
     }
@@ -347,6 +358,7 @@ impl ChannelBus {
                     recomputed: c.recomputed,
                     gaps: c.gaps,
                     state: c.state,
+                    end_reason: c.end_reason,
                 }
             })
             .collect();

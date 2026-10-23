@@ -54,13 +54,17 @@ pub trait BlockSink: Send + Sync {
 pub struct StageStats {
     /// Blocks transformed and cached.
     pub blocks: u64,
-    /// Ring refusals: one per jump to the live edge, one per block skipped
-    /// over a gap or a segment boundary.
+    /// Ring refusals: one per jump after an overwritten or lost block (the
+    /// jump lands at the live edge, however many blocks it passes over), and
+    /// one per block skipped over a gap or a segment boundary.
     pub skipped_blocks: u64,
     /// EMA (α = 0.05) of the FFT + rows time per block.
     pub block_micros: f64,
     /// The last block inserted into the cache.
     pub latest_block: Option<u64>,
+    /// How far the stage trails the source: `(head − (latest_block + 1)·L) / fs`
+    /// seconds at the block's sample rate, 0 when caught up. Updated per block.
+    pub behind_secs: f64,
 }
 
 /// What the stage and its thread share.
@@ -80,8 +84,10 @@ pub struct Stage {
 }
 
 impl Stage {
-    /// Starts thread "fft-<source id>". `sink.on_block` is called after each block is cached.
-    pub fn start(source: Arc<Source>, cfg: StageConfig, sink: Arc<dyn BlockSink>) -> Arc<Stage> {
+    /// Starts thread "fft-<source id>". `sink.on_block` is called after each
+    /// block is cached. The bus is the only creator (`ChannelBus::attach`);
+    /// apps reach a stage through `ChannelBus::stage`.
+    pub(crate) fn start(source: Arc<Source>, cfg: StageConfig, sink: Arc<dyn BlockSink>) -> Arc<Stage> {
         let fft_size = cfg.fft_size;
         let hop = if fft_size == FFT_SIZE { HOP as u64 } else { (fft_size / 2) as u64 };
         let shared = Arc::new(Shared {
@@ -178,7 +184,8 @@ impl Worker {
         let mut row: Option<RowAcc> = None;
         let mut b = (source.oldest() / l + 1).max(1);
         while !self.shared.stop.load(Ordering::SeqCst) {
-            if source.head() < (b + 1) * l {
+            let head = source.head();
+            if head < (b + 1) * l {
                 std::thread::park_timeout(POLL);
                 continue;
             }
@@ -197,6 +204,7 @@ impl Worker {
                         s.block_micros = if s.blocks == 0 { micros } else { s.block_micros + EMA_ALPHA * (micros - s.block_micros) };
                         s.blocks += 1;
                         s.latest_block = Some(b);
+                        s.behind_secs = head.saturating_sub((b + 1) * l) as f64 / seg.sample_rate;
                     }
                     self.sink.on_block(id, b);
                     b += 1;
@@ -207,7 +215,7 @@ impl Worker {
                     if let Some(r) = row.take() {
                         self.publish(r);
                     }
-                    b = next_block_after_jump(b, source.oldest(), l);
+                    b = next_block_after_jump(b, source.oldest(), source.head(), l);
                     self.shared.stats.lock().skipped_blocks += 1;
                 }
                 Err(ReadError::Gap | ReadError::SpansSegments) => {
@@ -266,12 +274,13 @@ impl Worker {
 }
 
 /// Where to resume after the ring refused block `b` as overwritten or lost:
-/// just above `oldest` (`oldest/L + 2`), but never at or before `b`. A block
-/// the OS discarded inside the held range reads `Lost` while `oldest` is
-/// still below it, and the formula alone would rewind into blocks already
-/// cached, fed to rows and passed to the sink.
-fn next_block_after_jump(b: u64, oldest: u64, hop: u64) -> u64 {
-    (oldest / hop + 2).max(b + 1)
+/// at the live edge, `head/L − 1` (the newest block whose input is complete
+/// at `head`), or at least just above `oldest` (`oldest/L + 2`), and never at
+/// or before `b`. A block the OS discarded inside the held range reads `Lost`
+/// while `oldest` is still below it, and a formula without `b + 1` would
+/// rewind into blocks already cached, fed to rows and passed to the sink.
+fn next_block_after_jump(b: u64, oldest: u64, head: u64, hop: u64) -> u64 {
+    (b + 1).max(oldest / hop + 2).max((head / hop).saturating_sub(1))
 }
 
 #[cfg(test)]
@@ -279,14 +288,20 @@ mod tests {
     use super::next_block_after_jump;
 
     #[test]
-    fn a_jump_to_the_live_edge_never_goes_backwards() {
+    fn a_jump_lands_at_the_live_edge_and_never_goes_backwards() {
         const L: u64 = 32_768;
-        // Overwritten: `oldest` has moved past `b`, so jump to just above it.
-        assert_eq!(next_block_after_jump(10, 100 * L + 5, L), 102);
-        // Lost above `oldest`: the formula alone would rewind to 7.
-        assert_eq!(next_block_after_jump(50, 5 * L, L), 51);
-        assert_eq!(next_block_after_jump(50, 48 * L, L), 51);
-        assert_eq!(next_block_after_jump(50, 49 * L, L), 51);
-        assert_eq!(next_block_after_jump(50, 50 * L, L), 52);
+        // Overwritten: `oldest` has moved past `b` and the head is far ahead: jump to the head.
+        assert_eq!(next_block_after_jump(10, 100 * L + 5, 400 * L + 7, L), 399);
+        // The head just above `oldest`: no further than just above `oldest`.
+        assert_eq!(next_block_after_jump(10, 100 * L + 5, 101 * L, L), 102);
+        // Lost above `oldest` with the head close by: the formula alone would rewind.
+        assert_eq!(next_block_after_jump(50, 5 * L, 51 * L, L), 51);
+        assert_eq!(next_block_after_jump(50, 48 * L, 50 * L, L), 51);
+        assert_eq!(next_block_after_jump(50, 49 * L, 52 * L, L), 51);
+        assert_eq!(next_block_after_jump(50, 50 * L, 52 * L, L), 52);
+        // Lost with the head far ahead: to the live edge.
+        assert_eq!(next_block_after_jump(50, 5 * L, 90 * L + 3, L), 89);
+        // Head 0 (nothing written yet) never underflows.
+        assert_eq!(next_block_after_jump(1, 0, 0, L), 2);
     }
 }

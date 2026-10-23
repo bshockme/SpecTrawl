@@ -1,5 +1,8 @@
-//! DSP building blocks. For now: a windowed power-spectrum analyzer that
-//! accumulates many FFTs per output frame (linear-power averaging).
+//! DSP building blocks: the forward FFT and Blackman-Harris spectrum rows
+//! (`spectrum`, and the averaging [`SpectrumAnalyzer`]), the overlap-save
+//! channelizer that cuts channels from shared FFT bins (`channelizer`), FIR
+//! filter design (`fir`), the down-converter [`Ddc`] (`ddc`) and the
+//! demodulators (`demod`).
 
 pub mod channelizer;
 pub mod ddc;

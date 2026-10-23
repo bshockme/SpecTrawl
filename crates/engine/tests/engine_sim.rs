@@ -19,13 +19,20 @@ fn removing_a_source_ends_its_consumers_once_and_stops_its_stage() {
     let src = engine.add_source(d, Mode::Live).unwrap();
     let spec = ChannelSpec { source: src.id(), center_hz: 852.0e6, bandwidth_hz: 12_500.0, min_rate: 48e3, parent: None };
     let got = Collector::new();
-    engine.bus().subscribe(spec.clone(), Start::Live, Priority::Classify, Box::new(got.clone())).unwrap();
+    let info = engine.bus().subscribe(spec.clone(), Start::Live, Priority::Classify, Box::new(got.clone())).unwrap();
     wait_until(|| got.samples() > 78_125);
+    let stage = engine.bus().stage(src.id()).unwrap();
     assert!(engine.remove_source(src.id()));
     wait_until(|| got.ended() == Some(EndReason::SourceDetached));
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(got.end_deliveries(), 1);
+    let entry = engine.bus().stats().consumers.into_iter().find(|c| c.channel.id == info.id).unwrap();
+    assert_eq!(entry.end_reason, Some(EndReason::SourceDetached));
     assert!(engine.bus().stage(src.id()).is_none());
+    // The stage thread has exited: no block is transformed any more.
+    let blocks = stage.stats().blocks;
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(stage.stats().blocks, blocks, "the stage still runs after its source was removed");
     assert!(matches!(
         engine.bus().subscribe(spec, Start::Live, Priority::Classify, Box::new(Collector::new())),
         Err(BusError::NoSuchSource)

@@ -2,7 +2,7 @@
 
 mod common;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use backend_sim::{SimConfig, SimDevice};
 use common::{Collector, cfg};
@@ -35,18 +35,25 @@ fn two_hundred_channels_at_ten_megasamples_keep_up() {
             )
             .unwrap();
     }
+    let (t0, head_before) = (Instant::now(), src.head());
     std::thread::sleep(Duration::from_secs(5));
+    let (elapsed, head_after) = (t0.elapsed().as_secs_f64(), src.head());
     let s = engine.bus().stats();
     let stage = engine.bus().stage(src.id()).unwrap().stats();
+    let delivered_secs = (head_after - head_before) as f64 / 10e6;
     let lags: Vec<f64> = s.consumers.iter().map(|c| c.lag_secs).collect();
     let max_lag = lags.iter().cloned().fold(0.0, f64::max);
     println!(
-        "200 channels @ 10 MS/s: max lag {max_lag:.3} s, mean lag {:.3} s, stage {:.0} µs/block, recomputed {} blocks, workers {}",
+        "200 channels @ 10 MS/s: max lag {max_lag:.3} s, mean lag {:.3} s, stage {:.0} µs/block, stage behind {:.3} s, recomputed {} blocks, workers {}",
         lags.iter().sum::<f64>() / 200.0,
         stage.block_micros,
+        stage.behind_secs,
         s.consumers.iter().map(|c| c.recomputed).sum::<u64>(),
         s.workers
     );
+    // The source delivered real time, and the stage kept up with it.
+    assert!((delivered_secs - elapsed).abs() <= 0.1 * elapsed, "{delivered_secs:.3} s of samples in {elapsed:.3} s");
+    assert!(stage.behind_secs < 0.2, "{stage:?}");
     assert_eq!(s.shed_total, 0, "{s:?}");
     assert!(max_lag < 1.0, "max lag {max_lag} s");
     assert!(s.consumers.iter().all(|c| c.gaps == 0 && c.state == ConsumerState::Running));
