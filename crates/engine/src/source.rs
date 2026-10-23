@@ -16,7 +16,7 @@ use sdr_core::{Capabilities, Complex32, Device, DeviceInfo, GainSetting, Samples
 use crate::budget::{Allowance, Mode, RingBudget, SourceId};
 use crate::ring::keeper::{Housekept, Keeper};
 use crate::ring::{self, IqRing, RingConfig, RingStats};
-use crate::segments::{Boundary, Segment, SegmentTable};
+use crate::segments::{Boundary, CoverError, Segment, SegmentTable};
 use crate::timeline::Timeline;
 
 /// Seconds of samples the keeper keeps provisioned ahead of the writer.
@@ -73,8 +73,10 @@ pub enum ReadError {
     Overwritten,
     Lost,
     Future,
-    /// The range crosses a retune or a gap.
+    /// The range crosses a retune or a gap boundary.
     SpansSegments,
+    /// Part of the range lies in a gap: samples the device never delivered.
+    Gap,
 }
 
 impl From<ring::ReadError> for ReadError {
@@ -83,6 +85,7 @@ impl From<ring::ReadError> for ReadError {
             ring::ReadError::Overwritten => ReadError::Overwritten,
             ring::ReadError::Lost => ReadError::Lost,
             ring::ReadError::Future => ReadError::Future,
+            ring::ReadError::Gap => ReadError::Gap,
         }
     }
 }
@@ -139,11 +142,17 @@ impl SourceInner {
     fn on_samples(&self, first_sample: u64, samples: Samples<'_>) {
         let out = self.ring.write(first_sample, samples);
         if out.starved > 0 {
-            // The ring moved `oldest` up to the new head: what follows is a new run.
+            // The ring moved `oldest` up to the new head, so nothing below it
+            // reads any more; the segment's hole runs from the first skipped
+            // sample to that head and what follows is a new run. (The ring
+            // refuses the range before this push lands, so a reader that
+            // resolves its segment in between still gets no samples.)
             self.lost_samples.fetch_add(out.starved, Ordering::Relaxed);
             self.gaps.fetch_add(1, Ordering::Relaxed);
             let cur = self.segments.current();
-            self.segments.push(self.ring.head(), cur.center_hz, cur.sample_rate, Boundary::Gap { lost_samples: out.starved });
+            let head = self.ring.head();
+            let from = out.first_starved.max(cur.from_sample);
+            self.segments.push(from, cur.center_hz, cur.sample_rate, Boundary::Gap { lost_samples: head - from });
         }
         self.last_samples_at.store(nanos_at(Instant::now()), Ordering::Relaxed);
     }
@@ -164,8 +173,10 @@ impl SourceInner {
                 }
             }
             StreamEvent::Gap { at_sample, lost_samples } => {
+                // The segment starts at the first lost sample; its hole is
+                // `at_sample .. at_sample + lost_samples` and is never readable.
                 let cur = self.segments.current();
-                self.segments.push(at_sample + lost_samples, cur.center_hz, cur.sample_rate, Boundary::Gap { lost_samples });
+                self.segments.push(at_sample, cur.center_hz, cur.sample_rate, Boundary::Gap { lost_samples });
                 self.gaps.fetch_add(1, Ordering::Relaxed);
                 self.lost_samples.fetch_add(lost_samples, Ordering::Relaxed);
             }
@@ -319,7 +330,7 @@ impl Source {
     }
 
     /// Copy `start .. start + out.len()` as stored; refuses a range that
-    /// crosses a segment boundary.
+    /// crosses a segment boundary or touches a gap's hole.
     pub fn read_raw(&self, start: u64, out: &mut [[i16; 2]]) -> Result<Segment, ReadError> {
         let seg = self.covering(start, out.len())?;
         self.inner.ring.read_raw(start, out)?;
@@ -327,7 +338,7 @@ impl Source {
     }
 
     /// Copy `start .. start + out.len()` scaled to ±1.0; refuses a range that
-    /// crosses a segment boundary.
+    /// crosses a segment boundary or touches a gap's hole.
     pub fn read(&self, start: u64, out: &mut [Complex32]) -> Result<Segment, ReadError> {
         let seg = self.covering(start, out.len())?;
         self.inner.ring.read(start, out)?;
@@ -335,11 +346,14 @@ impl Source {
     }
 
     fn covering(&self, start: u64, len: usize) -> Result<Segment, ReadError> {
-        self.inner.segments.covering(start, start + len as u64).map_err(|_| ReadError::SpansSegments)
+        self.inner.segments.covering(start, start + len as u64).map_err(|e| match e {
+            CoverError::Gap(_) => ReadError::Gap,
+            CoverError::Spans(_) => ReadError::SpansSegments,
+        })
     }
 
-    /// The segment holding `start .. end`, or the segments it spans.
-    pub(crate) fn segment_covering(&self, start: u64, end: u64) -> Result<Segment, crate::segments::SpansSegments> {
+    /// The segment holding `start .. end`, or why it is refused.
+    pub(crate) fn segment_covering(&self, start: u64, end: u64) -> Result<Segment, CoverError> {
         self.inner.segments.covering(start, end)
     }
 

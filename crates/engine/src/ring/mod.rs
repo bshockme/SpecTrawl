@@ -13,6 +13,13 @@
 //! `head`, so within a block the writer and readers touch disjoint ranges.
 //! Blocks are published and retired through `ArcSwapOption` slots; a reader's
 //! guard keeps a retired block's memory alive until its copy ends.
+//!
+//! Holes: a write that starts past `head` (the device lost samples) leaves
+//! `head .. first_sample` unwritten. The ring records that range in a small
+//! hole table before publishing the new `head`, and a read that intersects a
+//! recorded hole returns `Err(Gap)`, so no read ever returns samples the
+//! device did not deliver. The table holds the newest [`HOLES`] holes; when a
+//! hole is evicted, `oldest` first moves past it.
 
 pub mod block;
 pub mod keeper;
@@ -33,6 +40,9 @@ pub const DEFAULT_BLOCK_BYTES: usize = 64 << 20;
 pub const DEFAULT_PROVISION_AHEAD: u32 = 2;
 /// Number of block slots: 256 GiB at the default block size.
 pub const MAX_SLOTS: usize = 4096;
+/// Holes (device gaps) the ring remembers; an older hole is dropped from the
+/// held range (`oldest` moves past it) when a newer one needs its entry.
+pub const HOLES: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct RingConfig {
@@ -54,12 +64,25 @@ pub enum ReadError {
     Lost,
     /// Some of the range has not been written yet.
     Future,
+    /// Some of the range lies in a gap: the device never delivered it.
+    Gap,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WriteOutcome {
     /// Samples skipped because their block was not provisioned.
     pub starved: u64,
+    /// First skipped sample (meaningful when `starved > 0`). Everything below
+    /// the new `head` is then unreadable (`oldest` moved up to it).
+    pub first_starved: u64,
+}
+
+/// One entry of the hole table: `start .. end` was never written. Empty
+/// entries are `0 .. 0`, which intersect nothing.
+#[derive(Default)]
+struct Hole {
+    start: AtomicU64,
+    end: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -106,6 +129,10 @@ pub struct IqRing {
     guaranteed_samples: AtomicU64,
     blocks_lost_total: AtomicU64,
     starved_total: AtomicU64,
+    /// The newest [`HOLES`] holes, entry `k % HOLES` for the `k`-th hole.
+    holes: Box<[Hole]>,
+    /// Holes recorded so far. Stored by the writer only.
+    holes_recorded: AtomicU64,
 }
 
 impl IqRing {
@@ -135,6 +162,8 @@ impl IqRing {
             guaranteed_samples: AtomicU64::new(0),
             blocks_lost_total: AtomicU64::new(0),
             starved_total: AtomicU64::new(0),
+            holes: (0..HOLES).map(|_| Hole::default()).collect::<Vec<_>>().into_boxed_slice(),
+            holes_recorded: AtomicU64::new(0),
         })
     }
 
@@ -157,7 +186,8 @@ impl IqRing {
 
     /// Append `samples` starting at absolute index `first_sample`. Single
     /// writer; never blocks, never allocates. Samples already behind `head`
-    /// are dropped; a `first_sample` past `head` makes `head` jump (no fill).
+    /// are dropped; a `first_sample` past `head` makes `head` jump and records
+    /// `head .. first_sample` as a hole (reads of it return `Err(Gap)`).
     /// Samples whose block was not provisioned are skipped and counted as
     /// starved; `head` still advances past them, and `oldest` moves up to the
     /// new `head` because the held range is no longer continuous.
@@ -169,8 +199,14 @@ impl IqRing {
         if end <= head {
             return WriteOutcome::default();
         }
+        if first_sample > head {
+            // Recorded before `head` moves past it (the Release store below),
+            // so a reader that sees the new `head` also sees the hole.
+            self.record_hole(head, first_sample);
+        }
         let mut pos = first_sample.max(head);
         let mut starved = 0;
+        let mut first_starved = 0;
         while pos < end {
             let b = pos / bs;
             let off = (pos % bs) as usize;
@@ -189,7 +225,12 @@ impl IqRing {
                     let dst = unsafe { std::slice::from_raw_parts_mut(block.samples().add(off), run) };
                     convert(dst, samples, src);
                 }
-                _ => starved += run as u64,
+                _ => {
+                    if starved == 0 {
+                        first_starved = pos;
+                    }
+                    starved += run as u64;
+                }
             }
             pos += run as u64;
         }
@@ -204,7 +245,31 @@ impl IqRing {
         // that is at or past the skipped block, which is no longer worth filling).
         self.wanted_block.store(end / bs, Ordering::Release);
         self.head.store(end, Ordering::Release);
-        WriteOutcome { starved }
+        WriteOutcome { starved, first_starved }
+    }
+
+    /// Writer side: record `start .. end` as a hole. If the entry still holds
+    /// an older hole, `oldest` moves past that hole first (SeqCst, before the
+    /// entry changes): a reader that loads any new value of the entry then
+    /// also sees the new `oldest` in its final check, so a torn entry can
+    /// never let a read of the old hole succeed.
+    fn record_hole(&self, start: u64, end: u64) {
+        let k = self.holes_recorded.load(Ordering::Relaxed);
+        let h = &self.holes[(k % HOLES as u64) as usize];
+        if k >= HOLES as u64 {
+            self.oldest.fetch_max(h.end.load(Ordering::Relaxed), Ordering::SeqCst);
+        }
+        h.start.store(start, Ordering::SeqCst);
+        h.end.store(end, Ordering::SeqCst);
+        self.holes_recorded.store(k + 1, Ordering::Relaxed);
+    }
+
+    /// Whether `start .. end` intersects a recorded hole.
+    fn in_hole(&self, start: u64, end: u64) -> bool {
+        self.holes.iter().any(|h| {
+            let (s, e) = (h.start.load(Ordering::SeqCst), h.end.load(Ordering::SeqCst));
+            s < end && start < e
+        })
     }
 
     /// Copy the stored i16 samples `start .. start + out.len()` into `out`.
@@ -234,6 +299,12 @@ impl IqRing {
         }
         if start < self.oldest.load(Ordering::Acquire) {
             return Err(ReadError::Overwritten);
+        }
+        // Every hole below the `head` loaded above was recorded before that
+        // `head` was stored, so it is visible here; an evicted one is caught
+        // by the `oldest` re-check at the end.
+        if self.in_hole(start, end) {
+            return Err(ReadError::Gap);
         }
         let bs = self.block_samples;
         let mut pos = start;
@@ -673,6 +744,44 @@ mod tests {
         let mut out = vec![[0i16; 2]; 1];
         assert_eq!(r.read_raw(10_050, &mut out), Err(ReadError::Overwritten)); // never stored
         r.read_raw(10_150, &mut out).unwrap();
+    }
+
+    #[test]
+    fn a_jump_past_head_is_a_hole_that_never_reads_as_samples() {
+        let r = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()));
+        r.provision(3); // blocks 0..=3: the hole lands in provisioned (zeroed) memory
+        r.write(0, Samples::Ci16(&ramp(0, 1000)));
+        assert_eq!(r.write(1500, Samples::Ci16(&ramp(1500, 1000))).starved, 0);
+        let mut out = vec![[0i16; 2]; 10];
+        assert_eq!(r.read_raw(1200, &mut out), Err(ReadError::Gap)); // inside
+        assert_eq!(r.read_raw(995, &mut out), Err(ReadError::Gap)); // data, then hole
+        assert_eq!(r.read_raw(1495, &mut out), Err(ReadError::Gap)); // hole, then data
+        assert_eq!(r.read_raw(990, &mut out), Ok(())); // ends at the hole
+        assert_eq!(out[9], [999, 7]);
+        r.read_raw(1500, &mut out).unwrap(); // after it
+        assert_eq!(out[0], [1500, 7]);
+        let mut f = vec![Complex32::default(); 600];
+        assert_eq!(r.read(900, &mut f), Err(ReadError::Gap));
+    }
+
+    #[test]
+    fn an_evicted_hole_moves_oldest_past_it() {
+        let r = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()));
+        r.provision(200);
+        let mut at = 0;
+        for _ in 0..=HOLES {
+            r.write(at, Samples::Ci16(&ramp(at, 10)));
+            at += 20; // a 10-sample hole after every write
+        }
+        // `HOLES + 1` writes made `HOLES` holes: none evicted yet.
+        assert_eq!(r.oldest(), 0);
+        r.write(at, Samples::Ci16(&ramp(at, 10)));
+        // The first hole (10 .. 20) was evicted: `oldest` moved past it.
+        assert_eq!(r.oldest(), 20);
+        let mut out = vec![[0i16; 2]; 5];
+        assert_eq!(r.read_raw(12, &mut out), Err(ReadError::Overwritten));
+        assert_eq!(r.read_raw(32, &mut out), Err(ReadError::Gap));
+        r.read_raw(20, &mut out).unwrap();
     }
 
     #[test]

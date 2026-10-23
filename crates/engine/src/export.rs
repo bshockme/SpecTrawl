@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::ring;
-use crate::segments::{Segment, SpansSegments};
+use crate::segments::{CoverError, Segment, SpansSegments};
 use crate::sigmf::{self, Meta};
 use crate::source::Source;
 
@@ -13,6 +13,8 @@ const CHUNK_SAMPLES: usize = 262_144;
 #[derive(Debug)]
 pub enum ExportError {
     Spans(SpansSegments),
+    /// `Ring(ReadError::Gap)` when the range touches a gap's hole (found in
+    /// the segment table or by the ring).
     Ring(ring::ReadError),
     Io(std::io::Error),
 }
@@ -38,7 +40,10 @@ impl Source {
         if end <= start {
             return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput).into());
         }
-        let segment = self.segment_covering(start, end).map_err(ExportError::Spans)?;
+        let segment = self.segment_covering(start, end).map_err(|e| match e {
+            CoverError::Spans(s) => ExportError::Spans(s),
+            CoverError::Gap(_) => ExportError::Ring(ring::ReadError::Gap),
+        })?;
         let ring = self.ring();
         if end > ring.head() {
             return Err(ExportError::Ring(ring::ReadError::Future));

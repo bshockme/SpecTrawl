@@ -2,8 +2,13 @@
 //!
 //! Every retune and every gap is a segment boundary. A read of a sample range is tagged
 //! with its segment, and a range spanning two segments is refused.
+//!
+//! A `Gap` segment starts at the first lost sample: its first `lost_samples` samples
+//! (`Segment::hole`) were never delivered, and the device's samples resume at
+//! `Segment::data_from`. A range that intersects a hole is refused too.
 
 use parking_lot::Mutex;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -25,11 +30,36 @@ pub struct Segment {
     pub boundary: Boundary,
 }
 
+impl Segment {
+    /// The samples at the start of a `Gap` segment that the device never
+    /// delivered: `from_sample .. from_sample + lost_samples`. `None` otherwise.
+    pub fn hole(&self) -> Option<Range<u64>> {
+        match self.boundary {
+            Boundary::Gap { lost_samples } if lost_samples > 0 => Some(self.from_sample..self.from_sample + lost_samples),
+            _ => None,
+        }
+    }
+
+    /// The first sample of the segment that holds data (past its hole, if any).
+    pub fn data_from(&self) -> u64 {
+        self.hole().map_or(self.from_sample, |h| h.end)
+    }
+}
+
 /// A range that crosses a segment boundary: the first and last segments it touches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpansSegments {
     pub first: SegmentId,
     pub last: SegmentId,
+}
+
+/// Why [`SegmentTable::covering`] refused a range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverError {
+    /// Part of the range lies in the hole of this `Gap` segment.
+    Gap(SegmentId),
+    /// The range crosses a segment boundary.
+    Spans(SpansSegments),
 }
 
 /// Segments in ascending `from_sample` order, never empty. The lock is taken on
@@ -68,16 +98,21 @@ impl SegmentTable {
         v[Self::index_of(&v, sample)].clone()
     }
 
-    /// The segment holding all of `[start, end)` (half-open), or the first and last
-    /// segments it touches. An empty range is covered by `at(start)`.
-    pub fn covering(&self, start: u64, end: u64) -> Result<Segment, SpansSegments> {
+    /// The segment holding all of `[start, end)` (half-open). Refused with
+    /// `CoverError::Gap` if the range intersects any segment's hole (checked
+    /// first), else with `CoverError::Spans` if it touches more than one
+    /// segment. An empty range is covered by `at(start)`.
+    pub fn covering(&self, start: u64, end: u64) -> Result<Segment, CoverError> {
         let v = self.inner.lock();
         let first = Self::index_of(&v, start);
         if end <= start {
             return Ok(v[first].clone());
         }
         let last = Self::index_of(&v, end - 1);
-        if first == last { Ok(v[first].clone()) } else { Err(SpansSegments { first: v[first].id, last: v[last].id }) }
+        if let Some(s) = v[first..=last].iter().find(|s| s.hole().is_some_and(|h| h.start < end && start < h.end)) {
+            return Err(CoverError::Gap(s.id));
+        }
+        if first == last { Ok(v[first].clone()) } else { Err(CoverError::Spans(SpansSegments { first: v[first].id, last: v[last].id })) }
     }
 
     /// Drop segments that end before `oldest`; the one containing `oldest` is kept.
@@ -113,8 +148,16 @@ mod tests {
         assert_eq!(t.at(999).center_hz, 855e6);
         assert_eq!(t.at(1_000).id, s1);
         assert_eq!(t.covering(1_000, 5_000).unwrap().id, s1);
-        assert_eq!(t.covering(900, 1_100), Err(SpansSegments { first: t.at(900).id, last: s1 }));
-        assert_eq!(t.covering(4_000, 6_000), Err(SpansSegments { first: s1, last: s2 }));
+        assert_eq!(t.covering(900, 1_100), Err(CoverError::Spans(SpansSegments { first: t.at(900).id, last: s1 })));
+        assert_eq!(t.covering(4_000, 5_000).unwrap().id, s1);
+        // 5_000 .. 5_300 is s2's hole: refused alone, with data either side, or across s1.
+        assert_eq!(t.covering(4_000, 6_000), Err(CoverError::Gap(s2)));
+        assert_eq!(t.covering(5_100, 5_200), Err(CoverError::Gap(s2)));
+        assert_eq!(t.covering(5_200, 5_400), Err(CoverError::Gap(s2)));
+        assert_eq!(t.covering(5_300, 6_000).unwrap().id, s2);
+        assert_eq!(t.at(5_000).hole(), Some(5_000..5_300));
+        assert_eq!(t.at(5_000).data_from(), 5_300);
+        assert_eq!(t.at(1_000).hole(), None);
         t.prune_before(3_000);
         assert_eq!(t.len(), 2);
         assert_eq!(t.at(3_000).id, s1);
