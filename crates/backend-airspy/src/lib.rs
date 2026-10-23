@@ -2,15 +2,16 @@
 //! runtime so a missing library just hides the backend.
 //!
 //! Samples are requested as FLOAT32_IQ (libairspy scales to ±1.0) and stored
-//! by the engine as i16. Retunes are reported in-band at the sample count the
-//! callback has reached when it notices the change, which is within one USB
-//! transfer of the true switch.
+//! by the engine as i16. Retunes are reported in-band at the sample where the
+//! tune is estimated to have landed: the request time plus `LANDS_AFTER`,
+//! placed inside the transfer that first shows the new centre. A `TimeAnchor`
+//! follows at least once a second and `Overload` marks clipping blocks.
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use libloading::Library;
 use sdr_core::{
@@ -38,6 +39,60 @@ type RxCb = unsafe extern "C" fn(*mut Transfer) -> c_int;
 const SAMPLE_FLOAT32_IQ: c_int = 0;
 const SUCCESS: c_int = 0;
 const TRUE: c_int = 1;
+
+/// How long after `set_freq` the tuner's output actually changes (midpoint of
+/// the measured 1.4-2.4 ms).
+const LANDS_AFTER: Duration = Duration::from_millis(2);
+
+/// Fraction of clipped samples in a block that counts as overload.
+const OVERLOAD_FRACTION: f32 = 0.01;
+
+/// Process-wide epoch for passing `Instant`s through an `AtomicU64`.
+static EPOCH: OnceLock<Instant> = OnceLock::new();
+
+fn epoch() -> Instant {
+    *EPOCH.get_or_init(Instant::now)
+}
+
+/// Nanoseconds since the epoch (saturating at `u64::MAX`, ~584 years).
+fn instant_to_nanos(t: Instant) -> u64 {
+    u64::try_from(t.saturating_duration_since(epoch()).as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn nanos_to_instant(n: u64) -> Instant {
+    epoch() + Duration::from_nanos(n)
+}
+
+/// The sample index inside `[block_first, block_first + block_len]` where a
+/// retune requested at `set_at` took effect, assuming the block's last sample
+/// arrived at `block_end` and the hardware applies a tune `lands_after` after
+/// the request. Clamped to the block.
+pub(crate) fn landing_sample(
+    block_first: u64,
+    block_len: usize,
+    rate: f64,
+    block_end: Instant,
+    set_at: Instant,
+    lands_after: Duration,
+) -> u64 {
+    let block_time = Duration::from_secs_f64(block_len as f64 / rate);
+    let block_start = block_end.checked_sub(block_time).unwrap_or(block_end);
+    let landing = set_at + lands_after;
+    let offset = (landing.saturating_duration_since(block_start).as_secs_f64() * rate) as u64;
+    block_first + offset.min(block_len as u64)
+}
+
+/// Fraction of samples with `|re| >= 0.999 || |im| >= 0.999`.
+pub(crate) fn clipped_fraction(s: &[Complex32]) -> f32 {
+    if s.is_empty() {
+        return 0.0;
+    }
+    let mut clipped = 0usize;
+    for c in s {
+        clipped += usize::from((c.re.abs() >= 0.999) | (c.im.abs() >= 0.999));
+    }
+    clipped as f32 / s.len() as f32
+}
 
 /// Resolved libairspy entry points. The `Library` is kept alive alongside.
 struct Api {
@@ -262,6 +317,7 @@ impl AirspyBackend {
                 transfer_samples: Some(65536),
             },
             center: Arc::new(AtomicU64::new(100e6f64.to_bits())),
+            center_set_at: Arc::new(AtomicU64::new(0)),
             rate,
             ctx: std::ptr::null_mut(),
         };
@@ -287,12 +343,18 @@ struct CbCtx {
     sink: Box<dyn StreamSink>,
     n: u64,
     center: Arc<AtomicU64>,
+    /// When the centre was last requested, nanoseconds since `EPOCH`.
+    center_set_at: Arc<AtomicU64>,
     reported_center: u64,
     rate: f64,
+    last_anchor: u64,
+    last_overload: u64,
 }
 
 unsafe extern "C" fn rx_callback(t: *mut Transfer) -> c_int {
     // Never unwind into C.
+    // The transfer just completed, so "now" is when its last sample arrived.
+    let block_end = Instant::now();
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         let t = &*t;
         let ctx = &mut *(t.ctx as *mut CbCtx);
@@ -300,14 +362,26 @@ unsafe extern "C" fn rx_callback(t: *mut Transfer) -> c_int {
             ctx.sink.on_event(StreamEvent::Gap { at_sample: ctx.n, lost_samples: t.dropped_samples });
             ctx.n += t.dropped_samples;
         }
-        let c = ctx.center.load(Ordering::Relaxed);
+        let s = std::slice::from_raw_parts(t.samples as *const Complex32, t.sample_count.max(0) as usize);
+        // Centre first, then its request time: `set_center` stores them in the
+        // opposite order with Release, so a new centre comes with its time.
+        let c = ctx.center.load(Ordering::Acquire);
         if c != ctx.reported_center {
             ctx.reported_center = c;
-            ctx.sink.on_event(StreamEvent::Retune { at_sample: ctx.n, center_hz: f64::from_bits(c), sample_rate: ctx.rate });
+            let set_at = nanos_to_instant(ctx.center_set_at.load(Ordering::Acquire));
+            let at_sample = landing_sample(ctx.n, s.len(), ctx.rate, block_end, set_at, LANDS_AFTER);
+            ctx.sink.on_event(StreamEvent::Retune { at_sample, center_hz: f64::from_bits(c), sample_rate: ctx.rate });
         }
-        let s = std::slice::from_raw_parts(t.samples as *const Complex32, t.sample_count.max(0) as usize);
+        if clipped_fraction(s) >= OVERLOAD_FRACTION && ctx.n - ctx.last_overload >= ctx.rate as u64 {
+            ctx.last_overload = ctx.n;
+            ctx.sink.on_event(StreamEvent::Overload { at_sample: ctx.n });
+        }
         ctx.sink.on_samples(ctx.n, Samples::Cf32(s));
         ctx.n += s.len() as u64;
+        if ctx.n - ctx.last_anchor >= ctx.rate as u64 {
+            ctx.last_anchor = ctx.n;
+            ctx.sink.on_event(StreamEvent::TimeAnchor { at_sample: ctx.n, host_time: SystemTime::now() });
+        }
     }));
     if r.is_err() { -1 } else { 0 }
 }
@@ -318,6 +392,7 @@ pub struct AirspyDevice {
     info: DeviceInfo,
     caps: Capabilities,
     center: Arc<AtomicU64>,
+    center_set_at: Arc<AtomicU64>,
     rate: f64,
     ctx: *mut CbCtx,
 }
@@ -350,7 +425,10 @@ impl Device for AirspyDevice {
             return Err(Error::Unsupported(format!("{:.3} MHz out of range", hz / 1e6)));
         }
         self.api.check("set_freq", unsafe { (self.api.set_freq)(self.dev, hz.round() as u32) })?;
-        self.center.store(hz.round().to_bits(), Ordering::Relaxed);
+        // Time first, centre second (Release): the callback reads them in the
+        // opposite order, so a new centre is never paired with a stale time.
+        self.center_set_at.store(instant_to_nanos(Instant::now()), Ordering::Release);
+        self.center.store(hz.round().to_bits(), Ordering::Release);
         Ok(())
     }
 
@@ -396,7 +474,16 @@ impl Device for AirspyDevice {
         let center = self.center.load(Ordering::Relaxed);
         sink.on_event(StreamEvent::Retune { at_sample: 0, center_hz: f64::from_bits(center), sample_rate: self.rate });
         sink.on_event(StreamEvent::TimeAnchor { at_sample: 0, host_time: SystemTime::now() });
-        let ctx = Box::into_raw(Box::new(CbCtx { sink, n: 0, center: self.center.clone(), reported_center: center, rate: self.rate }));
+        let ctx = Box::into_raw(Box::new(CbCtx {
+            sink,
+            n: 0,
+            center: self.center.clone(),
+            center_set_at: self.center_set_at.clone(),
+            reported_center: center,
+            rate: self.rate,
+            last_anchor: 0,
+            last_overload: 0,
+        }));
         let rc = unsafe { (self.api.start_rx)(self.dev, rx_callback, ctx as *mut c_void) };
         if let Err(e) = self.api.check("start_rx", rc) {
             drop(unsafe { Box::from_raw(ctx) });
@@ -426,5 +513,32 @@ impl Drop for AirspyDevice {
     fn drop(&mut self) {
         let _ = self.stop();
         unsafe { (self.api.close)(self.dev) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn landing_sample_is_inside_the_block_and_follows_the_request_time() {
+        let t0 = Instant::now();
+        let rate = 10e6;
+        let block_end = t0 + Duration::from_micros(6554); // 65536 samples at 10 MS/s
+        // Requested 1 ms into the block: lands 3 ms in = sample 30000.
+        let s = landing_sample(1_000_000, 65_536, rate, block_end, t0 + Duration::from_millis(1), Duration::from_millis(2));
+        assert!((29_000..31_000).contains(&(s - 1_000_000)), "{s}");
+        // Requested long before the block: clamps to its first sample.
+        assert_eq!(landing_sample(1_000_000, 65_536, rate, block_end, t0 - Duration::from_secs(1), Duration::from_millis(2)), 1_000_000);
+        // Requested after the block ended: clamps to its last sample.
+        assert_eq!(landing_sample(1_000_000, 65_536, rate, block_end, block_end, Duration::from_millis(2)), 1_000_000 + 65_536);
+    }
+
+    #[test]
+    fn clipped_fraction_counts_full_scale_samples() {
+        let mut v = vec![Complex32::new(0.1, 0.1); 100];
+        v[3] = Complex32::new(1.0, 0.0);
+        v[7] = Complex32::new(0.0, -0.9995);
+        assert!((clipped_fraction(&v) - 0.02).abs() < 1e-6);
     }
 }
