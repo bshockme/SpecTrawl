@@ -107,9 +107,17 @@ pub fn batch_codewords(f: &Frame) -> Option<[u32; 16]> {
     Some(out)
 }
 
+/// Codewords a batch must have that are valid as received for it to count
+/// as signal: a random word is within two bits of a codeword about half the
+/// time, so noise decodes freely with corrections, but is valid uncorrected
+/// only once in 2048.
+const CLEAN_PER_BATCH: usize = 2;
+
 /// Pages from POCSAG frames (sliced with at least 512 symbols after the
 /// sync), in order. A page runs from its address codeword to the next
-/// address or idle codeword, across batches.
+/// address or idle codeword, across batches. A batch without
+/// `CLEAN_PER_BATCH` uncorrected codewords is noise (on air, quiet channels
+/// gave 40 to 100 such pages an hour) and ends any open page.
 pub fn pages(frames: &[Frame]) -> Vec<Page> {
     let mut out = Vec::new();
     let mut cur: Option<(Page, Vec<u8>)> = None;
@@ -138,6 +146,10 @@ pub fn pages(frames: &[Frame]) -> Vec<Page> {
         }
         last_at = Some(f.at_symbol);
         let Some(cws) = batch_codewords(f) else { continue };
+        if cws.iter().filter(|&&raw| correct(raw).is_some_and(|c| c.1 == 0)).count() < CLEAN_PER_BATCH {
+            finish(&mut cur, &mut out);
+            continue;
+        }
         for (k, &raw) in cws.iter().enumerate() {
             let Some((cw, fixed)) = correct(raw) else {
                 // Uncorrectable: the page is broken here.
@@ -229,6 +241,24 @@ mod tests {
         assert_eq!((p[0].address, p[0].function), (addr, 3));
         assert_eq!(p[0].text, text);
         assert_eq!(p[0].corrected, 2);
+    }
+
+    #[test]
+    fn noise_batches_make_no_pages() {
+        // Random bits pass BCH with two corrections half the time; a batch
+        // of them used to yield tone pages and short garbage texts.
+        let mut x = 0x2545_F491u32;
+        let mut frames = frames_for(&[IDLE; 16]);
+        for f in frames.iter_mut() {
+            for v in f.soft.iter_mut().skip(32) {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                *v = if x & 1 == 1 { 1.0 } else { -1.0 };
+            }
+        }
+        let noise: Vec<Frame> = (0..40).flat_map(|_| frames.clone()).collect();
+        assert!(pages(&noise).is_empty());
     }
 
     #[test]

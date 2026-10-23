@@ -34,6 +34,10 @@ use crate::pocsag;
 /// Sync 1 speed codes: (code, baud, levels).
 const SPEEDS: [(u16, u32, u8); 5] = [(0x870C, 1600, 2), (0xB068, 1600, 4), (0x7B18, 3200, 2), (0xDEA0, 3200, 4), (0x4C7C, 3200, 4)];
 const MARKER: u32 = 0xA6C6_AAAA;
+/// Bit errors allowed over the 64 bits of sync 1 (the frame information
+/// word, BCH-protected, confirms the frame). multimon-ng allows three in
+/// the marker and three more between the speed code and its complement.
+const SYNC1_ERRORS: u32 = 3;
 const HEADER_BAUD: f64 = 1600.0;
 const SYNC2_S: f64 = 0.025;
 const BLOCKS: usize = 11;
@@ -157,8 +161,14 @@ fn find_sync1(d: &[f32], fs: f64) -> Vec<(f64, usize, bool)> {
             if n >= 64 {
                 for inv in [false, true] {
                     let v = if inv { !w } else { w };
-                    let (code, marker, tail) = ((v >> 48) as u16, (v >> 16) as u32, v as u16);
-                    if let Some(s) = SPEEDS.iter().position(|s| s.0 == code).filter(|_| marker == MARKER && tail == !code) {
+                    // The speed whose full 64-bit pattern is nearest, if near enough.
+                    let best = SPEEDS
+                        .iter()
+                        .enumerate()
+                        .map(|(s, (code, _, _))| ((v ^ ((*code as u64) << 48 | (MARKER as u64) << 16 | (!code) as u64)).count_ones(), s))
+                        .min()
+                        .filter(|(e, _)| *e <= SYNC1_ERRORS);
+                    if let Some((_, s)) = best {
                         hits.push((t, s, inv));
                     }
                 }
@@ -236,7 +246,7 @@ fn sync2_timing(d: &[f32], start: f64, s: f64, inv: bool, level: f32, span: f64)
 }
 
 /// Slices one block into each phase's 256 bits.
-fn slice_block(d: &[f32], t0: f64, s: f64, n: usize, levels: u8, inv: bool, header_level: f32) -> Vec<Vec<u8>> {
+fn slice_block(d: &[f32], t0: f64, s: f64, n: usize, levels: u8, inv: bool, header_level: f32, thr_ratio: f32) -> Vec<Vec<u8>> {
     let mut v: Vec<f32> = (0..n).map(|k| at(d, t0 + (k as f64 + 0.5) * s)).collect();
     // The carrier drifts a few hundred Hz between blocks, and idle fill
     // makes the symbol mix lopsided (so no percentile midpoint): estimate
@@ -265,7 +275,7 @@ fn slice_block(d: &[f32], t0: f64, s: f64, n: usize, levels: u8, inv: bool, head
     for x in v.iter_mut() {
         *x = if inv { dc - *x } else { *x - dc };
     }
-    let thr = outer * 2.0 / 3.0;
+    let thr = outer * thr_ratio;
     // Data bits: bit a is the sign (positive = 1); with 4 levels, bit b is
     // set on the inner levels.
     let bits: Vec<(u8, u8)> = v.iter().map(|&x| ((x > 0.0) as u8, (x.abs() < thr) as u8)).collect();
@@ -346,12 +356,18 @@ pub fn decode(x: &[Complex32], fs: f64) -> Vec<FlexFrame> {
     // The 1600-baud header is read through a one-symbol filter; the data
     // through a shorter one, which keeps the four levels further apart.
     let dh = discriminator(x, fs, 1.0);
-    let d = discriminator(x, fs, DATA_FILTER);
+    // The data filter is a fraction of the symbol: twice as long at 1600 baud.
+    let d32 = discriminator(x, fs, DATA_FILTER);
+    let mut d16: Option<Vec<f32>> = None;
+    // Longer filters, made when a weak block first asks for them, keyed by
+    // length in 3200-baud symbols.
+    let mut longer: Vec<(f64, Vec<f32>)> = Vec::new();
     let sps = fs / HEADER_BAUD;
     let mut out = Vec::new();
     for (end, speed, inv) in find_sync1(&dh, fs) {
         let Some((cycle, frame)) = fiw(&dh, fs, end, inv) else { continue };
         let (_, baud, levels) = SPEEDS[speed];
+        let d: &[f32] = if baud == 1600 { d16.get_or_insert_with(|| discriminator(x, fs, DATA_FILTER * 2.0)) } else { &d32 };
         let s = fs / baud as f64;
         let n = (baud as f64 * 0.16).round() as usize;
         // First data symbol: after the FIW and sync 2.
@@ -374,7 +390,7 @@ pub fn decode(x: &[Complex32], fs: f64) -> Vec<FlexFrame> {
         // searches wide for the data start and later ones follow the
         // best-decoding block so far: idle fill decodes equally well at
         // several offsets and would let a tracking loop wander.
-        let locked = if (baud, levels) == (3200, 4) { sync2_timing(&d, end + 48.5 * sps, s, inv, level, 4.0) } else { None };
+        let locked = if (baud, levels) == (3200, 4) { sync2_timing(d, end + 48.5 * sps, s, inv, level, 4.0) } else { None };
         let mut anchor = (locked.unwrap_or(0.0), 0usize);
         for (blk, ok_out) in block_ok.iter_mut().enumerate() {
             // Timing: the offset whose words need the fewest corrections.
@@ -385,29 +401,64 @@ pub fn decode(x: &[Complex32], fs: f64) -> Vec<FlexFrame> {
             } else {
                 5
             };
-            let mut best: Option<(u32, f64, Vec<BlockWords>)> = None;
-            // Nearest offsets first, so ties (idle fill decodes at several)
-            // keep the timing where it is.
-            for o in (0..=2 * span).map(|k| if k % 2 == 0 { k / 2 } else { -(k + 1) / 2 }) {
-                let off = anchor.0 + o as f64 * 0.1;
+            // Slices the block at `off` through `d` with threshold `thr`:
+            // (corrections, words needing at most one, words).
+            let slice = |d: &[f32], off: f64, thr: f32| {
                 let mut cost = 0;
-                let words: Vec<BlockWords> = slice_block(&d, t0 + ((blk * n) as f64 + off) * s, s, n, levels, inv, level)
+                let mut good = 0;
+                let words: Vec<BlockWords> = slice_block(d, t0 + ((blk * n) as f64 + off) * s, s, n, levels, inv, level, thr)
                     .iter()
                     .map(|b| {
                         block_words(b).map(|w| {
                             let c = pocsag::correct(w);
                             // Corrected bits, or 9 for a word past repair.
                             cost += c.map_or(9, |c| c.1);
+                            good += c.is_some_and(|c| c.1 <= 1) as usize;
                             c
                         })
                     })
                     .collect();
+                (cost, good, words)
+            };
+            let mut best: Option<(u32, f64, Vec<BlockWords>)> = None;
+            // Nearest offsets first, so ties (idle fill decodes at several)
+            // keep the timing where it is.
+            for o in (0..=2 * span).map(|k| if k % 2 == 0 { k / 2 } else { -(k + 1) / 2 }) {
+                let off = anchor.0 + o as f64 * 0.1;
+                let (cost, _, words) = slice(d, off, 2.0 / 3.0);
                 if best.as_ref().is_none_or(|b| cost < b.0) {
                     best = Some((cost, off, words));
                 }
             }
-            let (_, off, words) = best.expect("offset range is non-empty");
-            let ok = words.iter().flatten().filter(|w| w.is_some()).count();
+            let (_, mut off, mut words) = best.expect("offset range is non-empty");
+            let mut ok = words.iter().flatten().filter(|w| w.is_some()).count();
+            if ok < nph * 8 {
+                // A weak block (a fade, noise): the short filter and the
+                // nominal thresholds are not always the best read of it.
+                // Try longer filters and other thresholds around the chosen
+                // timing; keep what gives the most words within one
+                // correction (the only ones a weak block keeps).
+                let mut good = words.iter().flatten().filter(|w| w.is_some_and(|c| c.1 <= 1)).count();
+                let base = off;
+                let sym32 = 3200.0 / baud as f64;
+                for frac in [DATA_FILTER * sym32, DATA_FILTER * 2.0 * sym32, DATA_FILTER * 3.0 * sym32] {
+                    if !longer.iter().any(|(f, _)| *f == frac) {
+                        longer.push((frac, discriminator(x, fs, frac)));
+                    }
+                    let dl = &longer.iter().find(|(f, _)| *f == frac).unwrap().1;
+                    for thr in [0.55f32, 2.0 / 3.0, 0.8] {
+                        for o in -3..=3 {
+                            let (_, g, w) = slice(dl, base + o as f64 * 0.1, thr);
+                            if g > good {
+                                good = g;
+                                words = w;
+                                off = base + o as f64 * 0.1;
+                            }
+                        }
+                    }
+                }
+                ok = words.iter().flatten().filter(|w| w.is_some()).count();
+            }
             *ok_out = ok as u8;
             block_off[blk] = off as f32;
             if locked.is_none() && ok > anchor.1 {
@@ -473,7 +524,8 @@ fn phase_pages(dw: &[Option<u32>], phase: char) -> Vec<Page> {
         let (kind, text, damaged, continued, fragment, message_no) = match kind_bits {
             5 => alpha(dw, mw1, len, header, long),
             3 | 4 | 7 => {
-                let (t, dmg) = numeric(dw, mw1, len, header, long, kind_bits == 7);
+                // Numeric vectors carry a 3-bit length (words beyond the first).
+                let (t, dmg) = numeric(dw, mw1, (vec >> 14 & 7) as usize, header, long, kind_bits == 7);
                 ("numeric", t, dmg, false, 3, 0)
             }
             2 => ("tone", String::new(), false, false, 3, 0),
@@ -492,8 +544,10 @@ fn phase_pages(dw: &[Option<u32>], phase: char) -> Vec<Page> {
 /// Alphanumeric text: three 7-bit characters per word (bits 0-6, 7-13,
 /// 14-20). The message header (fragment number, continuation) is the first
 /// message word for short addresses; for long ones it's the second vector
-/// word and the message starts at `mw1`. A message that isn't the first
-/// fragment (fragment ≠ 3) starts with a signature character, not text.
+/// word and the message starts at `mw1`. Either way the vector's length
+/// counts the header word. A first fragment (fragment 3) opens with a
+/// signature character, not text; continuations start with text at once
+/// (as multimon-ng reads them, and as seen on air).
 fn alpha(dw: &[Option<u32>], mw1: usize, len: usize, header: Option<u32>, long: bool) -> (&'static str, String, bool, bool, u8, u8) {
     let (header, first) = if long { (header, mw1) } else { (dw.get(mw1).copied().flatten(), mw1 + 1) };
     // Without a header the fragment number is unknown; 3 (a whole message)
@@ -501,7 +555,7 @@ fn alpha(dw: &[Option<u32>], mw1: usize, len: usize, header: Option<u32>, long: 
     let frag = header.map_or(3, |h| h >> 11 & 3);
     let continued = header.is_some_and(|h| h >> 10 & 1 == 1);
     let message_no = header.map_or(0, |h| (h >> 4 & 0x3F) as u8);
-    let last = (mw1 + len).min(dw.len());
+    let last = (mw1 + len - usize::from(long)).min(dw.len());
     let mut text = String::new();
     let mut damaged = header.is_none();
     for (k, w) in dw.iter().enumerate().take(last).skip(first) {
@@ -511,7 +565,7 @@ fn alpha(dw: &[Option<u32>], mw1: usize, len: usize, header: Option<u32>, long: 
             continue;
         };
         for sh in [0, 7, 14] {
-            if k == first && sh == 0 && frag != 3 {
+            if k == first && sh == 0 && frag == 3 {
                 continue;
             }
             match (w >> sh & 0x7F) as u8 {
@@ -527,15 +581,21 @@ fn alpha(dw: &[Option<u32>], mw1: usize, len: usize, header: Option<u32>, long: 
 
 /// Numeric digits: 4 bits each, LSB first, packed across words. The first
 /// 2 bits are a checksum (10 bits of checksum and message number for
-/// numbered numeric). Long addresses start the message in the second
-/// vector word.
+/// numbered numeric). The message is `len` + 1 words: for a short address
+/// from `mw1`; for a long one the second vector word (`header`) then `len`
+/// words from `mw1` (as multimon-ng reads them). Fill digits (0xC) show as
+/// spaces: on air they separate the groups of a phone number.
 fn numeric(dw: &[Option<u32>], mw1: usize, len: usize, header: Option<u32>, long: bool, numbered: bool) -> (String, bool) {
     const DIGITS: &[u8; 16] = b"0123456789 U -][";
     let mut words: Vec<Option<u32>> = Vec::new();
-    if long {
+    let from = if long {
         words.push(header);
-    }
-    words.extend(dw.iter().take((mw1 + len).min(dw.len())).skip(mw1).take(if long { len.saturating_sub(1) } else { len }));
+        mw1
+    } else {
+        words.push(dw.get(mw1).copied().flatten());
+        mw1 + 1
+    };
+    words.extend(dw.iter().take((from + len).min(dw.len())).skip(from));
     let damaged = words.iter().any(|w| w.is_none());
     let bits: Vec<u8> = words.iter().flat_map(|w| (0..21).map(move |b| w.map_or(0, |w| (w >> b & 1) as u8))).collect();
     let skip = if numbered { 10 } else { 2 };
@@ -642,8 +702,9 @@ mod tests {
     fn frame_with_short_and_long_pages() {
         let short_text = "SPECTRAWL FLEX TEST 123";
         let long_text = "LONG ADDRESS PAGE";
-        let short_msg = alpha_words(short_text);
-        let long_msg = alpha_words(long_text);
+        // A first fragment's text opens with a signature character.
+        let short_msg = alpha_words(&format!("${short_text}"));
+        let long_msg = alpha_words(&format!("${long_text}"));
         // Phase A: BIW (address at 1, vectors from 4), short address,
         // long address (2 words), then vectors, then messages.
         let aoff = 1u32;
@@ -661,8 +722,9 @@ mod tests {
             word(aw2),
             // Short alpha vector: header word + message words.
             word(5 << 4 | mw_short << 7 | (1 + short_msg.len() as u32) << 14),
-            // Long alpha vector, then the header (fragment 3) word.
-            word(5 << 4 | mw_long << 7 | (long_msg.len() as u32) << 14),
+            // Long alpha vector (its length counts the header word, which
+            // follows as the second vector word).
+            word(5 << 4 | mw_long << 7 | (1 + long_msg.len() as u32) << 14),
             word(3 << 11),
         ];
         a.push(word(3 << 11)); // short message header: fragment 3
@@ -685,5 +747,90 @@ mod tests {
         assert_eq!((c.protocol.as_deref(), c.label.as_str()), (Some("FLEX"), "FLEX 3200/4"), "{c:?}");
         let c = crate::classify(&x, fs, 16e3);
         assert_eq!(c.fields.unwrap().messages[0], format!("001234567 A alpha: {short_text}"));
+    }
+
+    /// Numeric message words: 2 skipped bits, then 4-bit digits LSB first,
+    /// packed LSB first across 21-bit words, padded with fill (0xC).
+    fn numeric_words(digits: &str) -> Vec<u32> {
+        const T: &[u8; 16] = b"0123456789 U -][";
+        let mut bits: Vec<u32> = vec![0, 0];
+        for c in digits.bytes() {
+            let v = T.iter().position(|&t| t == c).unwrap() as u32;
+            bits.extend((0..4).map(|b| v >> b & 1));
+        }
+        while !bits.len().is_multiple_of(21) {
+            let n = bits.len();
+            bits.extend((0..4).map(|b| 0xCu32 >> b & 1).take(21 - n % 21));
+        }
+        bits.chunks(21).map(|c| word(c.iter().enumerate().fold(0, |a, (i, b)| a | b << i))).collect()
+    }
+
+    #[test]
+    fn numeric_pages_use_the_three_bit_length() {
+        // On air (929.6125) numeric pages came out as the number followed by
+        // a tail of fill and the next page's words: the vector's length is
+        // only 3 bits (at most 7 words beyond the first), the rest of the
+        // field is not length.
+        let digits = "937 527-9895";
+        let msg = numeric_words(digits);
+        assert_eq!(msg.len(), 3);
+        let capcode_long = 8_007_940u64;
+        // The first address word carries the capcode's low 15 bits.
+        let aw1 = ((capcode_long - 2_068_480) % 32_768) as u32;
+        let aw2 = ((((capcode_long - 2_068_480 - aw1 as u64) >> 15) as u32) ^ 0x1F_FFFF) & 0x1F_FFFF;
+        // BIW: addresses from 1, vectors from 4. Short address, long address.
+        let biw = 0 << 8 | 4 << 10;
+        let mw_short = 7u32;
+        let mw_long = mw_short + msg.len() as u32;
+        let junk = 0b1011u32 << 17;
+        let a = [
+            vec![
+                word(biw | (0xF - ((0..6).map(|k| biw >> (4 * k) & 0xF).sum::<u32>() & 0xF))),
+                word(0x8000 + 4_320_054 - 4_000_000),
+                word(aw1),
+                word(aw2),
+                // Short numeric: 3 words from mw1 (length 2 = two more).
+                word(3 << 4 | mw_short << 7 | 2 << 14 | junk),
+                // Long numeric: the first word is the second vector word, then 2 from mw1.
+                word(3 << 4 | mw_long << 7 | 2 << 14 | junk),
+                msg[0],
+            ],
+            msg.clone(),
+            msg[1..].to_vec(),
+        ]
+        .concat();
+        let fs = 62_500.0;
+        let fr = decode(&modulate(&a, 2, 5, fs, 0.0), fs);
+        assert_eq!(fr.len(), 1);
+        let p = &fr[0].pages;
+        assert_eq!(p.len(), 2, "{p:?}");
+        assert_eq!((p[0].capcode, p[0].kind, p[0].text.as_str()), (320_054, "numeric", digits));
+        assert_eq!((p[1].capcode, p[1].kind, p[1].text.as_str()), (capcode_long, "numeric", digits));
+        assert!(!p[0].damaged && !p[1].damaged);
+    }
+
+    #[test]
+    fn continuation_fragment_keeps_its_first_character() {
+        // Fragment 0 of a long message: no signature, the text starts at
+        // once (on air, the "W" of "WITH TOOL MAKER" was being dropped).
+        let text = "WITH TOOL MAKER";
+        let msg = alpha_words(text);
+        let biw = 0 << 8 | 2 << 10;
+        let a = [
+            vec![
+                word(biw | (0xF - ((0..6).map(|k| biw >> (4 * k) & 0xF).sum::<u32>() & 0xF))),
+                word(0x8000 + 1_234_567),
+                word(5 << 4 | 3 << 7 | (1 + msg.len() as u32) << 14),
+                word(0 << 11),
+            ],
+            msg,
+        ]
+        .concat();
+        let fs = 62_500.0;
+        let fr = decode(&modulate(&a, 1, 2, fs, 0.0), fs);
+        assert_eq!(fr.len(), 1);
+        let p = &fr[0].pages;
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert_eq!((p[0].fragment, p[0].continued, p[0].text.as_str()), (0, false, text));
     }
 }

@@ -400,6 +400,10 @@ fn decode_pages(shared: &Shared, m: &mut Mon, fs: f64) {
         // straight through.
         let mut whole: Vec<flex::Page> = Vec::new();
         for f in flex::decode(&m.buf, fs) {
+            // Buffers overlap, so a frame can come round twice.
+            if !m.joiner.new_frame(f.cycle, f.frame) {
+                continue;
+            }
             for p in f.pages {
                 whole.extend(m.joiner.push(p, f.cycle, f.frame));
             }
