@@ -1,10 +1,16 @@
 //! The look-back IQ ring: a chain of fixed-size blocks reached through atomics.
 //!
-//! One writer (the device callback) appends samples by absolute index without
-//! taking a lock; any thread reads by absolute index; a keeper thread
-//! provisions blocks ahead of the writer (and, from Task 11, offers and retires
-//! old ones). A read that races the writer or the keeper returns
+//! One writer (the device callback, through the ring's only [`RingWriter`])
+//! appends samples by absolute index without taking a lock; any thread reads
+//! by absolute index through `&IqRing`; a single keeper (in this crate)
+//! provisions blocks ahead of the writer, offers aged ones and retires old
+//! ones. A read that races the writer or the keeper returns
 //! `Err(Overwritten)` and the reader skips ahead.
+//!
+//! The single-writer rule is enforced by the type system: [`IqRing::new`]
+//! returns the one `RingWriter`, which is not `Clone` and writes through
+//! `&mut self`. The keeper's operations are `pub(crate)`; the keeper is the
+//! only in-crate caller.
 //!
 //! Memory ordering: the writer copies samples into block memory through raw
 //! pointers and only then stores `head` with `Release`; readers load `head`
@@ -135,21 +141,39 @@ pub struct IqRing {
     holes_recorded: AtomicU64,
 }
 
+/// The ring's only writer. Not `Clone`; [`IqRing::new`] makes exactly one.
+pub struct RingWriter {
+    ring: Arc<IqRing>,
+}
+
+impl RingWriter {
+    /// Append `samples` starting at absolute index `first_sample`; see
+    /// [`IqRing`]'s module docs. Never blocks, never allocates.
+    pub fn write(&mut self, first_sample: u64, samples: Samples<'_>) -> WriteOutcome {
+        self.ring.write(first_sample, samples)
+    }
+
+    pub fn ring(&self) -> &Arc<IqRing> {
+        &self.ring
+    }
+}
+
 impl IqRing {
-    pub fn new(cfg: RingConfig, mem: Arc<dyn VolatileMemory>) -> Arc<IqRing> {
+    /// A ring and its only writer.
+    pub fn new(cfg: RingConfig, mem: Arc<dyn VolatileMemory>) -> (Arc<IqRing>, RingWriter) {
         IqRing::with_slots(cfg, mem, MAX_SLOTS)
     }
 
     /// A ring with `slots` block slots instead of [`MAX_SLOTS`] (tests use a
     /// handful to exercise slot reuse).
-    pub(crate) fn with_slots(cfg: RingConfig, mem: Arc<dyn VolatileMemory>, slots: usize) -> Arc<IqRing> {
+    pub(crate) fn with_slots(cfg: RingConfig, mem: Arc<dyn VolatileMemory>, slots: usize) -> (Arc<IqRing>, RingWriter) {
         assert!(
             cfg.block_bytes != 0 && cfg.block_bytes.is_multiple_of(PAGE) && cfg.block_bytes.is_multiple_of(4),
             "RingConfig::block_bytes must be a non-zero multiple of {PAGE} bytes, got {}",
             cfg.block_bytes
         );
         assert!(slots >= 2, "a ring needs at least two slots");
-        Arc::new(IqRing {
+        let ring = Arc::new(IqRing {
             block_samples: (cfg.block_bytes / 4) as u64,
             cfg,
             mem,
@@ -164,7 +188,8 @@ impl IqRing {
             starved_total: AtomicU64::new(0),
             holes: (0..HOLES).map(|_| Hole::default()).collect::<Vec<_>>().into_boxed_slice(),
             holes_recorded: AtomicU64::new(0),
-        })
+        });
+        (ring.clone(), RingWriter { ring })
     }
 
     pub fn block_samples(&self) -> u64 {
@@ -184,14 +209,15 @@ impl IqRing {
         &self.slots[(block % self.slots.len() as u64) as usize]
     }
 
-    /// Append `samples` starting at absolute index `first_sample`. Single
-    /// writer; never blocks, never allocates. Samples already behind `head`
+    /// Append `samples` starting at absolute index `first_sample`. Only
+    /// [`RingWriter::write`] calls this, so there is a single writer; never
+    /// blocks, never allocates. Samples already behind `head`
     /// are dropped; a `first_sample` past `head` makes `head` jump and records
     /// `head .. first_sample` as a hole (reads of it return `Err(Gap)`).
     /// Samples whose block was not provisioned are skipped and counted as
     /// starved; `head` still advances past them, and `oldest` moves up to the
     /// new `head` because the held range is no longer continuous.
-    pub fn write(&self, first_sample: u64, samples: Samples<'_>) -> WriteOutcome {
+    fn write(&self, first_sample: u64, samples: Samples<'_>) -> WriteOutcome {
         let bs = self.block_samples;
         // Only this thread stores `head`.
         let head = self.head.load(Ordering::Relaxed);
@@ -424,8 +450,8 @@ impl IqRing {
     /// exist (`ahead` is capped at one less than the slot count so the
     /// writer's block is never replaced). A slot that holds an older block is
     /// overwritten and `oldest` moves past that block. Returns the number of
-    /// blocks allocated.
-    pub fn provision(&self, ahead: u32) -> u32 {
+    /// blocks allocated. Keeper side: one caller at a time.
+    pub(crate) fn provision(&self, ahead: u32) -> u32 {
         let bs = self.block_samples;
         let ahead = u64::from(ahead).min(self.slots.len() as u64 - 1);
         let first = self.wanted_block.load(Ordering::Acquire);
@@ -468,7 +494,7 @@ impl IqRing {
     /// Order: provision first (the writer's next block matters most), then
     /// retire (so nothing about to be dropped is offered and the window the
     /// offer bands are cut from is the one that stays), then offer.
-    pub fn housekeep(&self) -> Housekeeping {
+    pub(crate) fn housekeep(&self) -> Housekeeping {
         let provisioned = self.provision(self.provision_ahead.load(Ordering::Relaxed));
         let bs = self.block_samples;
         // `head` only grows, so everything below this snapshot's block stays
@@ -573,15 +599,15 @@ impl IqRing {
     /// The keeper sizes this to cover 250 ms of samples at the source's rate,
     /// so a keeper stalled for a tick or more (20 ms each) never starves a
     /// real device even with small blocks.
-    pub fn set_provision_ahead(&self, blocks: u32) {
+    pub(crate) fn set_provision_ahead(&self, blocks: u32) {
         self.provision_ahead.store(blocks, Ordering::Relaxed);
     }
 
-    pub fn set_ceiling_blocks(&self, n: u32) {
+    pub(crate) fn set_ceiling_blocks(&self, n: u32) {
         self.ceiling_blocks.store(n, Ordering::Relaxed);
     }
 
-    pub fn set_guaranteed_samples(&self, n: u64) {
+    pub(crate) fn set_guaranteed_samples(&self, n: u64) {
         self.guaranteed_samples.store(n, Ordering::Relaxed);
     }
 
@@ -692,10 +718,10 @@ mod tests {
 
     #[test]
     fn writes_across_blocks_and_reads_back_by_absolute_index() {
-        let r = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()));
+        let (r, mut w) = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()));
         assert_eq!(r.provision(3), 4); // blocks 0..=3
-        assert_eq!(r.write(0, Samples::Ci16(&ramp(0, 1500))).starved, 0);
-        assert_eq!(r.write(1500, Samples::Ci16(&ramp(1500, 1500))).starved, 0);
+        assert_eq!(w.write(0, Samples::Ci16(&ramp(0, 1500))).starved, 0);
+        assert_eq!(w.write(1500, Samples::Ci16(&ramp(1500, 1500))).starved, 0);
         assert_eq!(r.head(), 3000);
         let mut out = vec![[0i16; 2]; 2048];
         r.read_raw(900, &mut out).unwrap(); // spans blocks 0, 1, 2
@@ -709,7 +735,7 @@ mod tests {
 
     #[test]
     fn housekeep_provisions_the_configured_number_of_blocks_ahead() {
-        let r = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()));
+        let (r, _w) = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()));
         r.set_provision_ahead(5);
         assert_eq!(r.housekeep().provisioned, 6); // blocks 0..=5
         for b in 0..=5 {
@@ -720,10 +746,10 @@ mod tests {
 
     #[test]
     fn out_of_order_block_is_ignored() {
-        let r = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()));
+        let (r, mut w) = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()));
         r.provision(2);
-        r.write(0, Samples::Ci16(&ramp(0, 1000)));
-        r.write(500, Samples::Ci16(&vec![[-1, -1]; 700])); // overlaps 500..1000, adds 1000..1200
+        w.write(0, Samples::Ci16(&ramp(0, 1000)));
+        w.write(500, Samples::Ci16(&vec![[-1, -1]; 700])); // overlaps 500..1000, adds 1000..1200
         assert_eq!(r.head(), 1200);
         let mut out = vec![[0i16; 2]; 2];
         r.read_raw(999, &mut out).unwrap();
@@ -732,15 +758,16 @@ mod tests {
 
     #[test]
     fn large_gap_starves_until_provisioned() {
-        let r = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()));
+        let (r, mut w) = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()));
         r.provision(1); // blocks 0, 1
-        r.write(0, Samples::Ci16(&ramp(0, 1000)));
-        let w = r.write(10_000, Samples::Ci16(&ramp(10_000, 100))); // block 9 does not exist
-        assert_eq!(w.starved, 100);
+        w.write(0, Samples::Ci16(&ramp(0, 1000)));
+        let jump = w.write(10_000, Samples::Ci16(&ramp(10_000, 100))); // block 9 does not exist
+        assert_eq!(jump.starved, 100);
+        assert_eq!(jump.first_starved, 10_000);
         assert_eq!(r.head(), 10_100);
         assert_eq!(r.stats().starved_total, 100);
         r.provision(1); // keeper catches up: blocks 9, 10
-        assert_eq!(r.write(10_100, Samples::Ci16(&ramp(10_100, 100))).starved, 0);
+        assert_eq!(w.write(10_100, Samples::Ci16(&ramp(10_100, 100))).starved, 0);
         let mut out = vec![[0i16; 2]; 1];
         assert_eq!(r.read_raw(10_050, &mut out), Err(ReadError::Overwritten)); // never stored
         r.read_raw(10_150, &mut out).unwrap();
@@ -748,10 +775,10 @@ mod tests {
 
     #[test]
     fn a_jump_past_head_is_a_hole_that_never_reads_as_samples() {
-        let r = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()));
+        let (r, mut w) = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()));
         r.provision(3); // blocks 0..=3: the hole lands in provisioned (zeroed) memory
-        r.write(0, Samples::Ci16(&ramp(0, 1000)));
-        assert_eq!(r.write(1500, Samples::Ci16(&ramp(1500, 1000))).starved, 0);
+        w.write(0, Samples::Ci16(&ramp(0, 1000)));
+        assert_eq!(w.write(1500, Samples::Ci16(&ramp(1500, 1000))).starved, 0);
         let mut out = vec![[0i16; 2]; 10];
         assert_eq!(r.read_raw(1200, &mut out), Err(ReadError::Gap)); // inside
         assert_eq!(r.read_raw(995, &mut out), Err(ReadError::Gap)); // data, then hole
@@ -766,16 +793,16 @@ mod tests {
 
     #[test]
     fn an_evicted_hole_moves_oldest_past_it() {
-        let r = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()));
+        let (r, mut w) = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()));
         r.provision(200);
         let mut at = 0;
         for _ in 0..=HOLES {
-            r.write(at, Samples::Ci16(&ramp(at, 10)));
+            w.write(at, Samples::Ci16(&ramp(at, 10)));
             at += 20; // a 10-sample hole after every write
         }
         // `HOLES + 1` writes made `HOLES` holes: none evicted yet.
         assert_eq!(r.oldest(), 0);
-        r.write(at, Samples::Ci16(&ramp(at, 10)));
+        w.write(at, Samples::Ci16(&ramp(at, 10)));
         // The first hole (10 .. 20) was evicted: `oldest` moved past it.
         assert_eq!(r.oldest(), 20);
         let mut out = vec![[0i16; 2]; 5];
@@ -786,10 +813,10 @@ mod tests {
 
     #[test]
     fn converts_ci8_and_cf32_like_the_old_ring() {
-        let r = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()));
+        let (r, mut w) = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()));
         r.provision(0);
-        r.write(0, Samples::Ci8(&[[1, -2]]));
-        r.write(1, Samples::Cf32(&[Complex32::new(0.5, -2.0)]));
+        w.write(0, Samples::Ci8(&[[1, -2]]));
+        w.write(1, Samples::Cf32(&[Complex32::new(0.5, -2.0)]));
         let mut out = vec![[0i16; 2]; 2];
         r.read_raw(0, &mut out).unwrap();
         assert_eq!(out, [[256, -512], [16383, -32768]]);
@@ -797,11 +824,11 @@ mod tests {
 
     #[test]
     fn provisioning_over_an_older_block_moves_oldest_past_it() {
-        let r = IqRing::with_slots(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()), 8);
+        let (r, mut w) = IqRing::with_slots(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()), 8);
         let bs = r.block_samples();
         for k in 0..10 {
             assert_eq!(r.provision(0), 1);
-            assert_eq!(r.write(k * bs, Samples::Ci16(&ramp(k * bs, bs as usize))).starved, 0);
+            assert_eq!(w.write(k * bs, Samples::Ci16(&ramp(k * bs, bs as usize))).starved, 0);
         }
         // Block 8 landed on block 0's slot and block 9 on block 1's.
         assert_eq!(r.oldest(), 2 * bs);
@@ -817,11 +844,11 @@ mod tests {
 
     #[test]
     fn blocks_provisioned_ahead_of_head_are_not_counted() {
-        let r = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()));
+        let (r, mut w) = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()));
         assert_eq!(r.stats().blocks_live, 0);
         r.provision(3);
         assert_eq!(r.stats().blocks_live, 0);
-        r.write(0, Samples::Ci16(&ramp(0, 1025)));
+        w.write(0, Samples::Ci16(&ramp(0, 1025)));
         assert_eq!(r.stats().blocks_live, 2);
         assert_eq!(r.provision(3), 1); // wanted block is now 1: only block 4 is new
     }
@@ -840,7 +867,7 @@ mod tests {
         const BLOCKS: u64 = 200;
         const READS: u64 = 2000;
         const LEN: u64 = 1500;
-        let r = IqRing::with_slots(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()), 8);
+        let (r, mut w) = IqRing::with_slots(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()), 8);
         let bs = r.block_samples();
         let reads_done = Arc::new(AtomicU64::new(0));
         let go = Arc::new(Barrier::new(2));
@@ -850,11 +877,13 @@ mod tests {
             std::thread::spawn(move || {
                 go.wait();
                 for k in 0..BLOCKS {
+                    // This thread is the ring's only writer (it owns `w`) and
+                    // also its only keeper, so provisioning stays in step.
                     r.provision(2);
                     // Several writes per block so reads land mid-block too.
                     for c in 0..4 {
                         let s = k * bs + c * bs / 4;
-                        assert_eq!(r.write(s, Samples::Ci16(&ramp(s, (bs / 4) as usize))).starved, 0);
+                        assert_eq!(w.write(s, Samples::Ci16(&ramp(s, (bs / 4) as usize))).starved, 0);
                     }
                     // Keep the two threads interleaved: let the reader catch up a little.
                     while k >= 2 && reads_done.load(Ordering::Relaxed) < (k - 1) * (READS / BLOCKS) {
@@ -925,9 +954,9 @@ mod tests {
     /// A ring with blocks 0 and 1 full of ramp; returns its fake memory too.
     fn two_full_blocks() -> (Arc<IqRing>, Arc<FakeVolatile>) {
         let mem = Arc::new(FakeVolatile::default());
-        let r = IqRing::new(RingConfig { block_bytes: 4096 }, mem.clone());
+        let (r, mut w) = IqRing::new(RingConfig { block_bytes: 4096 }, mem.clone());
         r.provision(1);
-        r.write(0, Samples::Ci16(&ramp(0, 2048)));
+        w.write(0, Samples::Ci16(&ramp(0, 2048)));
         (r, mem)
     }
 
@@ -997,9 +1026,9 @@ mod tests {
     fn concurrent_offers_and_reads_never_copy_offered_memory() {
         const CYCLES: u64 = 5000;
         let mem = Arc::new(FakeVolatile::default());
-        let r = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(SlowOffer(mem.clone(), Default::default())));
+        let (r, mut w) = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(SlowOffer(mem.clone(), Default::default())));
         r.provision(1);
-        r.write(0, Samples::Ci16(&ramp(0, 2048)));
+        w.write(0, Samples::Ci16(&ramp(0, 2048)));
         let go = Arc::new(Barrier::new(2));
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let keeper = {
@@ -1070,9 +1099,9 @@ mod tests {
 
     #[test]
     fn a_reclaim_that_unwinds_leaves_the_block_lost_not_stuck() {
-        let r = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(PanickyReclaim(FakeVolatile::default())));
+        let (r, mut w) = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(PanickyReclaim(FakeVolatile::default())));
         r.provision(1);
-        r.write(0, Samples::Ci16(&ramp(0, 2048)));
+        w.write(0, Samples::Ci16(&ramp(0, 2048)));
         let b0 = r.block_at(0).unwrap();
         assert!(r.try_offer(&b0, OfferPriority::Low));
         let mut out = vec![[0i16; 2]; 4];
@@ -1086,12 +1115,12 @@ mod tests {
     #[test]
     fn oldest_offered_blocks_are_lost_first_and_the_guaranteed_window_never_is() {
         let mem = Arc::new(FakeVolatile::default());
-        let r = IqRing::new(RingConfig { block_bytes: 4096 }, mem.clone());
+        let (r, mut w) = IqRing::new(RingConfig { block_bytes: 4096 }, mem.clone());
         r.set_ceiling_blocks(12);
         r.set_guaranteed_samples(3 * 1024);
         for b in 0..12u64 {
             r.housekeep();
-            r.write(b * 1024, Samples::Ci16(&ramp(b * 1024, 1024)));
+            w.write(b * 1024, Samples::Ci16(&ramp(b * 1024, 1024)));
         }
         r.housekeep();
         let s = r.stats();
@@ -1114,12 +1143,12 @@ mod tests {
 
     #[test]
     fn ceiling_retires_oldest_and_shrinking_takes_effect_on_the_next_pass() {
-        let r = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()));
+        let (r, mut w) = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()));
         r.set_ceiling_blocks(6);
         r.set_guaranteed_samples(1024);
         for b in 0..10u64 {
             r.housekeep();
-            r.write(b * 1024, Samples::Ci16(&ramp(b * 1024, 1024)));
+            w.write(b * 1024, Samples::Ci16(&ramp(b * 1024, 1024)));
         }
         r.housekeep();
         assert_eq!(r.oldest(), 4 * 1024);
@@ -1133,12 +1162,12 @@ mod tests {
     #[test]
     fn guaranteed_window_is_never_offered_even_under_a_tiny_ceiling() {
         let mem = Arc::new(FakeVolatile::default());
-        let r = IqRing::new(RingConfig { block_bytes: 4096 }, mem.clone());
+        let (r, mut w) = IqRing::new(RingConfig { block_bytes: 4096 }, mem.clone());
         r.set_ceiling_blocks(2);
         r.set_guaranteed_samples(4 * 1024);
         for b in 0..6u64 {
             r.housekeep();
-            r.write(b * 1024, Samples::Ci16(&ramp(b * 1024, 1024)));
+            w.write(b * 1024, Samples::Ci16(&ramp(b * 1024, 1024)));
         }
         r.housekeep();
         assert!(mem.offered().is_empty());

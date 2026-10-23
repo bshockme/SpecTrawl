@@ -15,7 +15,7 @@ use sdr_core::{Capabilities, Complex32, Device, DeviceInfo, GainSetting, Samples
 
 use crate::budget::{Allowance, Mode, RingBudget, SourceId};
 use crate::ring::keeper::{Housekept, Keeper};
-use crate::ring::{self, IqRing, RingConfig, RingStats};
+use crate::ring::{self, IqRing, RingConfig, RingStats, RingWriter, WriteOutcome};
 use crate::segments::{Boundary, CoverError, Segment, SegmentTable};
 use crate::timeline::Timeline;
 
@@ -138,9 +138,9 @@ impl SourceInner {
         self.ring.set_guaranteed_samples(a.guaranteed_samples);
     }
 
-    /// Driver thread. No lock unless the ring starved (a gap).
-    fn on_samples(&self, first_sample: u64, samples: Samples<'_>) {
-        let out = self.ring.write(first_sample, samples);
+    /// Driver thread, after the sink's [`RingWriter`] wrote a block. No lock
+    /// unless the ring starved (a gap).
+    fn after_write(&self, out: WriteOutcome) {
         if out.starved > 0 {
             // The ring moved `oldest` up to the new head, so nothing below it
             // reads any more; the segment's hole runs from the first skipped
@@ -228,14 +228,17 @@ impl Housekept for SourceInner {
     }
 }
 
-/// The device's view of a source, called on the driver's thread.
+/// The device's view of a source, called on the driver's thread. It owns the
+/// ring's only writer.
 struct Sink {
     inner: Arc<SourceInner>,
+    writer: RingWriter,
 }
 
 impl StreamSink for Sink {
     fn on_samples(&mut self, first_sample: u64, samples: Samples<'_>) {
-        self.inner.on_samples(first_sample, samples);
+        let out = self.writer.write(first_sample, samples);
+        self.inner.after_write(out);
     }
 
     fn on_event(&mut self, event: StreamEvent) {
@@ -257,9 +260,10 @@ impl Source {
         let (center, rate) = (device.center_hz(), device.sample_rate());
         let device: SharedDevice = Arc::new(Mutex::new(device));
         let budget = keeper.budget().clone();
+        let (ring, writer) = IqRing::new(cfg.ring.clone(), ring::volatile::system());
         let inner = Arc::new(SourceInner {
             id,
-            ring: IqRing::new(cfg.ring.clone(), ring::volatile::system()),
+            ring,
             segments: SegmentTable::new(0, center, rate),
             timeline: Timeline::new(rate),
             mode: AtomicU8::new(mode_to_u8(mode)),
@@ -281,7 +285,7 @@ impl Source {
         inner.ring.housekeep();
         let member: Arc<dyn Housekept> = inner.clone();
         keeper.register(Arc::downgrade(&member));
-        let started = device.lock().start(Box::new(Sink { inner: inner.clone() }));
+        let started = device.lock().start(Box::new(Sink { inner: inner.clone(), writer }));
         if let Err(e) = started {
             budget.leave(id);
             return Err(e);
