@@ -132,13 +132,29 @@ pub struct DeviceInfo {
 }
 
 /// In-band events, positioned on the sample counter of the stream.
+///
+/// Contract every backend honours:
+/// - `TimeAnchor`: sent at stream start and at least once per second of
+///   samples; `at_sample` is the sample that `host_time` corresponds to.
+/// - `Retune`: stamped at the first sample that carries the new tuning, as
+///   closely as the backend can determine.
+/// - `Gap`: `at_sample` is the index of the first lost sample; the next
+///   `on_samples` starts at `at_sample + lost_samples`.
+/// - `Overload`: at most once per second while the input clips.
+/// - `DeviceLost`: sent once, after which no more samples arrive.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
+    /// The centre frequency or sample rate changed.
     Retune { at_sample: u64, center_hz: f64, sample_rate: f64 },
+    /// Samples were lost.
     Gap { at_sample: u64, lost_samples: u64 },
+    /// Pairs a sample index with host wall-clock time.
     TimeAnchor { at_sample: u64, host_time: SystemTime },
+    /// The gain changed.
     GainChange { at_sample: u64, gain: GainSetting },
+    /// The input is clipping.
     Overload { at_sample: u64 },
+    /// The device went away; the stream has ended.
     DeviceLost,
 }
 

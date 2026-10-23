@@ -3,7 +3,7 @@
 //! Used for UI work without a device and as the base of the test suite.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -183,7 +183,84 @@ impl Backend for SimBackend {
 }
 
 fn info() -> DeviceInfo {
-    DeviceInfo { backend: "sim".into(), serial: "SIM-0001".into(), label: "Simulated SDR".into() }
+    info_for("SIM-0001")
+}
+
+fn info_for(serial: &str) -> DeviceInfo {
+    DeviceInfo { backend: "sim".into(), serial: serial.into(), label: "Simulated SDR".into() }
+}
+
+/// Everything needed to build a simulated device.
+#[derive(Debug, Clone)]
+pub struct SimConfig {
+    pub emitters: Vec<Emitter>,
+    pub rate: f64,
+    pub center_hz: f64,
+    /// Pace generation to real time. When false the generator runs as fast as
+    /// the CPU allows and never reports a `Gap` for falling behind.
+    pub paced: bool,
+    pub serial: String,
+}
+
+impl Default for SimConfig {
+    fn default() -> Self {
+        // The centre keeps every default-scenario emitter inside the 90% usable band.
+        Self { emitters: default_scenario(), rate: 10e6, center_hz: 855.25e6, paced: true, serial: "SIM-0001".into() }
+    }
+}
+
+/// State shared between a `SimDevice`, its generator thread and its `SimControl`s.
+#[derive(Default)]
+pub struct SimShared {
+    pending_gap: AtomicU64,
+    pending_overload: AtomicBool,
+    pending_drop: AtomicBool,
+    starts: AtomicU32,
+    samples_sent: AtomicU64,
+    /// True from `start` until the generator thread exits.
+    alive: AtomicBool,
+}
+
+/// Test handle for a `SimDevice`: injects faults and observes the stream.
+/// Injections are consumed by the generator at its next block boundary, in the
+/// order gap, overload, samples, device loss.
+#[derive(Clone)]
+pub struct SimControl(Arc<SimShared>);
+
+impl SimControl {
+    /// Next block: `Gap { at_sample: n, lost_samples }`, then `n += lost_samples`.
+    pub fn inject_gap(&self, lost_samples: u64) {
+        self.0.pending_gap.fetch_add(lost_samples, Ordering::Relaxed);
+    }
+
+    /// Next block: `Overload { at_sample: n }`.
+    pub fn inject_overload(&self) {
+        self.0.pending_overload.store(true, Ordering::Relaxed);
+    }
+
+    /// Next block: `DeviceLost`, then the generator exits and `is_streaming()` becomes false.
+    pub fn drop_device(&self) {
+        self.0.pending_drop.store(true, Ordering::Relaxed);
+    }
+
+    /// How many times `Device::start` ran.
+    pub fn starts(&self) -> u32 {
+        self.0.starts.load(Ordering::Relaxed)
+    }
+
+    /// Samples delivered through `on_samples` (gaps excluded).
+    pub fn samples_sent(&self) -> u64 {
+        self.0.samples_sent.load(Ordering::Relaxed)
+    }
+}
+
+/// Clears `alive` when the generator thread ends, however it ends.
+struct AliveGuard(Arc<SimShared>);
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0.alive.store(false, Ordering::Relaxed);
+    }
 }
 
 pub struct SimDevice {
@@ -195,12 +272,19 @@ pub struct SimDevice {
     noise_dbfs: f64,
     running: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    paced: bool,
+    shared: Arc<SimShared>,
 }
 
 impl SimDevice {
     pub fn new(emitters: Vec<Emitter>) -> Self {
-        Self {
-            info: info(),
+        Self::with_config(SimConfig { emitters, ..Default::default() }).0
+    }
+
+    pub fn with_config(cfg: SimConfig) -> (SimDevice, SimControl) {
+        let shared = Arc::new(SimShared::default());
+        let dev = Self {
+            info: info_for(&cfg.serial),
             caps: Capabilities {
                 freq_ranges_hz: vec![(24e6, 1.8e9)],
                 tuning_step_hz: 1.0,
@@ -220,14 +304,16 @@ impl SimDevice {
                 spur_grid_hz: None,
                 transfer_samples: None,
             },
-            emitters: Arc::new(emitters),
-            // Keeps every scripted emitter inside the 90% usable band.
-            center: Arc::new(AtomicU64::new(855.25e6f64.to_bits())),
-            rate: 10e6,
+            emitters: Arc::new(cfg.emitters),
+            center: Arc::new(AtomicU64::new(cfg.center_hz.to_bits())),
+            rate: cfg.rate,
             noise_dbfs: -62.0,
             running: Arc::new(AtomicBool::new(false)),
             worker: None,
-        }
+            paced: cfg.paced,
+            shared: shared.clone(),
+        };
+        (dev, SimControl(shared))
     }
 }
 
@@ -272,13 +358,21 @@ impl Device for SimDevice {
         if self.is_streaming() {
             return Ok(());
         }
+        // Reap a generator that already exited (after `drop_device`).
+        if let Some(w) = self.worker.take() {
+            let _ = w.join();
+        }
         self.running.store(true, Ordering::Relaxed);
+        self.shared.alive.store(true, Ordering::Relaxed);
+        self.shared.starts.fetch_add(1, Ordering::Relaxed);
         let generator = Generator {
             emitters: self.emitters.clone(),
             center: self.center.clone(),
             rate: self.rate,
             noise_amp: 10f64.powf(self.noise_dbfs / 20.0) as f32,
             running: self.running.clone(),
+            paced: self.paced,
+            shared: self.shared.clone(),
         };
         self.worker = Some(std::thread::Builder::new().name("sim-sdr".into()).spawn(move || generator.run(sink)).unwrap());
         Ok(())
@@ -293,7 +387,7 @@ impl Device for SimDevice {
     }
 
     fn is_streaming(&self) -> bool {
-        self.worker.is_some()
+        self.shared.alive.load(Ordering::Relaxed)
     }
 }
 
@@ -309,6 +403,8 @@ struct Generator {
     rate: f64,
     noise_amp: f32,
     running: Arc<AtomicBool>,
+    paced: bool,
+    shared: Arc<SimShared>,
 }
 
 struct EmState {
@@ -323,10 +419,10 @@ struct EmState {
 impl Generator {
     fn run(self, mut sink: Box<dyn StreamSink>) {
         const BLOCK: usize = 65_536;
+        let _alive = AliveGuard(self.shared.clone());
         let fs = self.rate;
         let mut center = f64::from_bits(self.center.load(Ordering::Relaxed));
         sink.on_event(StreamEvent::Retune { at_sample: 0, center_hz: center, sample_rate: fs });
-        sink.on_event(StreamEvent::TimeAnchor { at_sample: 0, host_time: SystemTime::now() });
         let mut st: Vec<EmState> = self
             .emitters
             .iter()
@@ -343,9 +439,26 @@ impl Generator {
         let mut acc = vec![Complex32::default(); BLOCK];
         let mut out = vec![[0i16; 2]; BLOCK];
         let mut n: u64 = 0;
-        let t0 = Instant::now();
+        let mut t0 = Instant::now();
+        let mut last_anchor: Option<u64> = None;
 
         while self.running.load(Ordering::Relaxed) {
+            // Pending injections, in order: gap, overload, (samples), device loss.
+            let lost = self.shared.pending_gap.swap(0, Ordering::Relaxed);
+            if lost > 0 {
+                sink.on_event(StreamEvent::Gap { at_sample: n, lost_samples: lost });
+                n += lost;
+                // The lost span did not take real time; keep the pacing clock in step.
+                let skipped = Duration::from_secs_f64(lost as f64 / fs);
+                t0 = t0.checked_sub(skipped).unwrap_or(t0);
+            }
+            if self.shared.pending_overload.swap(false, Ordering::Relaxed) {
+                sink.on_event(StreamEvent::Overload { at_sample: n });
+            }
+            if last_anchor.is_none_or(|a| (n - a) as f64 >= fs) {
+                sink.on_event(StreamEvent::TimeAnchor { at_sample: n, host_time: SystemTime::now() });
+                last_anchor = Some(n);
+            }
             let c = f64::from_bits(self.center.load(Ordering::Relaxed));
             if c != center {
                 center = c;
@@ -420,6 +533,15 @@ impl Generator {
             }
             sink.on_samples(n, Samples::Ci16(&out));
             n += BLOCK as u64;
+            self.shared.samples_sent.fetch_add(BLOCK as u64, Ordering::Relaxed);
+
+            if self.shared.pending_drop.swap(false, Ordering::Relaxed) {
+                sink.on_event(StreamEvent::DeviceLost);
+                return;
+            }
+            if !self.paced {
+                continue;
+            }
 
             // Pace to real time; if we fall behind, report the skipped span as a gap.
             let due = t0 + Duration::from_secs_f64(n as f64 / fs);
@@ -461,5 +583,110 @@ impl XorShift {
         let x = self.next();
         let s = (x & 0xffff) + ((x >> 16) & 0xffff) + ((x >> 32) & 0xffff) + (x >> 48);
         ((s as f32 / 65535.0) - 2.0) * 1.732
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Log {
+        blocks: Vec<(u64, usize)>,
+        events: Vec<StreamEvent>,
+    }
+
+    #[derive(Clone, Default)]
+    struct Recorder(Arc<Mutex<Log>>);
+
+    impl Recorder {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn samples(&self) -> u64 {
+            self.0.lock().unwrap().blocks.iter().map(|b| b.1 as u64).sum()
+        }
+
+        fn events(&self, pred: impl Fn(&StreamEvent) -> bool) -> Vec<StreamEvent> {
+            self.0.lock().unwrap().events.iter().filter(|e| pred(e)).cloned().collect()
+        }
+
+        fn has(&self, pred: impl Fn(&StreamEvent) -> bool) -> bool {
+            self.0.lock().unwrap().events.iter().any(pred)
+        }
+
+        /// `first_sample` of the first block whose `first_sample >= at`.
+        fn first_sample_after(&self, at: u64) -> u64 {
+            self.0.lock().unwrap().blocks.iter().map(|b| b.0).find(|&f| f >= at).expect("no block at or after sample")
+        }
+    }
+
+    impl StreamSink for Recorder {
+        fn on_samples(&mut self, first_sample: u64, samples: Samples<'_>) {
+            self.0.lock().unwrap().blocks.push((first_sample, samples.len()));
+        }
+
+        fn on_event(&mut self, event: StreamEvent) {
+            self.0.lock().unwrap().events.push(event);
+        }
+    }
+
+    fn at_sample(e: &StreamEvent) -> u64 {
+        match e {
+            StreamEvent::Retune { at_sample, .. }
+            | StreamEvent::Gap { at_sample, .. }
+            | StreamEvent::TimeAnchor { at_sample, .. }
+            | StreamEvent::GainChange { at_sample, .. }
+            | StreamEvent::Overload { at_sample } => *at_sample,
+            StreamEvent::DeviceLost => panic!("DeviceLost has no sample position"),
+        }
+    }
+
+    fn wait_until(pred: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !pred() {
+            assert!(Instant::now() < deadline, "wait_until timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn anchors_once_per_second_and_retune_at_block_start() {
+        let (mut d, _c) = SimDevice::with_config(SimConfig { emitters: vec![], paced: false, ..Default::default() });
+        let log = Recorder::new();
+        d.start(Box::new(log.clone())).unwrap();
+        wait_until(|| log.samples() >= 25_000_000);
+        d.set_center(860e6).unwrap();
+        wait_until(|| log.samples() >= 30_000_000);
+        d.stop().unwrap();
+        let at: Vec<u64> = log.events(|e| matches!(e, StreamEvent::TimeAnchor { .. })).iter().map(at_sample).collect();
+        assert!(at.len() >= 3, "{at:?}");
+        assert_eq!(at[0], 0);
+        assert!(at.windows(2).all(|w| w[1] - w[0] >= 10_000_000 && w[1] - w[0] < 10_000_000 + 65_536), "{at:?}");
+        let retunes = log.events(|e| matches!(e, StreamEvent::Retune { center_hz, .. } if *center_hz == 860e6));
+        assert_eq!(retunes.len(), 1);
+        assert_eq!(at_sample(&retunes[0]) % 65_536, 0);
+    }
+
+    #[test]
+    fn injected_gap_overload_and_loss_arrive_in_order() {
+        let (mut d, c) = SimDevice::with_config(SimConfig { emitters: vec![], paced: false, ..Default::default() });
+        let log = Recorder::new();
+        d.start(Box::new(log.clone())).unwrap();
+        wait_until(|| log.samples() >= 1_000_000);
+        c.inject_gap(123_456);
+        c.inject_overload();
+        wait_until(|| log.has(|e| matches!(e, StreamEvent::Overload { .. })));
+        c.drop_device();
+        wait_until(|| !d.is_streaming());
+        let StreamEvent::Gap { at_sample, lost_samples } = log.events(|e| matches!(e, StreamEvent::Gap { .. }))[0].clone() else {
+            unreachable!()
+        };
+        assert_eq!(lost_samples, 123_456);
+        assert_eq!(log.first_sample_after(at_sample), at_sample + 123_456);
+        assert_eq!(log.events(|e| matches!(e, StreamEvent::DeviceLost)).len(), 1);
+        assert_eq!(c.starts(), 1);
     }
 }
