@@ -10,7 +10,11 @@ impl VolatileMemory for FallbackVolatile {
         heap_alloc(bytes)
     }
 
-    fn offer(&self, _r: &Region, _priority: OfferPriority) {}
+    /// No offer facility: every offer is refused (not an error, so not
+    /// logged), the region stays committed and the ring keeps it `Live`.
+    fn offer(&self, _r: &Region, _priority: OfferPriority) -> bool {
+        false
+    }
 
     fn reclaim(&self, _r: &Region) -> bool {
         true

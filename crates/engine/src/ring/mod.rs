@@ -411,7 +411,9 @@ impl IqRing {
     }
 
     /// Keeper side: offer `block`'s memory to the OS if no reader is in it.
-    /// Returns `true` if the block is now `Offered`.
+    /// Returns `true` if the block is now `Offered`. If the backend refuses
+    /// the offer the block goes back to `Live` (its memory is intact), so it
+    /// is not counted as offered and the next keeper pass tries again.
     ///
     /// Protocol (pairs with the reader's `readers += 1` then state load, all
     /// `SeqCst`): CAS `Live → Offering`; if `readers != 0`, revert to `Live`
@@ -434,10 +436,11 @@ impl IqRing {
         }
         // If `offer` unwinds, treat the offer as not made: back to `Live`.
         let settle = StateOnUnwind(block, BlockState::Live);
-        block.mem().offer(block.region(), priority);
+        let accepted = block.mem().offer(block.region(), priority);
         std::mem::forget(settle);
-        block.state.store(BlockState::Offered as u8, Ordering::SeqCst);
-        true
+        let state = if accepted { BlockState::Offered } else { BlockState::Live };
+        block.state.store(state as u8, Ordering::SeqCst);
+        accepted
     }
 
     /// The block in `b`'s slot, if it is block `b`.
@@ -1005,13 +1008,14 @@ mod tests {
         fn alloc(&self, bytes: usize) -> Option<volatile::Region> {
             self.0.alloc(bytes)
         }
-        fn offer(&self, r: &volatile::Region, priority: OfferPriority) {
+        fn offer(&self, r: &volatile::Region, priority: OfferPriority) -> bool {
             let t = std::time::Instant::now();
             while t.elapsed() < std::time::Duration::from_micros(2) {
                 std::hint::spin_loop();
             }
-            self.0.offer(r, priority);
+            let accepted = self.0.offer(r, priority);
             self.1.store(true, Ordering::SeqCst);
+            accepted
         }
         fn reclaim(&self, r: &volatile::Region) -> bool {
             assert!(self.1.swap(false, Ordering::SeqCst), "reclaim of a region whose offer had not completed");
@@ -1086,7 +1090,7 @@ mod tests {
         fn alloc(&self, bytes: usize) -> Option<volatile::Region> {
             self.0.alloc(bytes)
         }
-        fn offer(&self, r: &volatile::Region, priority: OfferPriority) {
+        fn offer(&self, r: &volatile::Region, priority: OfferPriority) -> bool {
             self.0.offer(r, priority)
         }
         fn reclaim(&self, _: &volatile::Region) -> bool {
@@ -1110,6 +1114,50 @@ mod tests {
         assert_eq!(state(&b0), BlockState::Lost);
         assert_eq!(b0.readers.load(Ordering::SeqCst), 0);
         assert_eq!(r.read_raw(0, &mut out), Err(ReadError::Lost)); // returns, does not spin
+    }
+
+    /// The fake, refusing the first `refusals` offers.
+    struct Refusing(FakeVolatile, AtomicU64);
+
+    impl VolatileMemory for Refusing {
+        fn alloc(&self, bytes: usize) -> Option<volatile::Region> {
+            self.0.alloc(bytes)
+        }
+        fn offer(&self, r: &volatile::Region, priority: OfferPriority) -> bool {
+            if self.1.load(Ordering::SeqCst) > 0 {
+                self.1.fetch_sub(1, Ordering::SeqCst);
+                return false;
+            }
+            self.0.offer(r, priority)
+        }
+        fn reclaim(&self, r: &volatile::Region) -> bool {
+            self.0.reclaim(r)
+        }
+        fn free(&self, r: volatile::Region) {
+            self.0.free(r)
+        }
+    }
+
+    #[test]
+    fn a_refused_offer_leaves_the_block_live_and_the_next_pass_retries() {
+        let mem = Arc::new(Refusing(FakeVolatile::default(), AtomicU64::new(1)));
+        let (r, mut w) = IqRing::new(RingConfig { block_bytes: 4096 }, mem.clone());
+        r.set_guaranteed_samples(1024);
+        r.provision(3);
+        w.write(0, Samples::Ci16(&ramp(0, 3 * 1024)));
+        // Blocks 0 and 1 are past the guaranteed window: block 0's offer is refused.
+        let h = r.housekeep();
+        assert_eq!(h.offered, 1);
+        assert_eq!(state(&r.block_at(0).unwrap()), BlockState::Live);
+        assert_eq!(state(&r.block_at(1).unwrap()), BlockState::Offered);
+        let s = r.stats();
+        assert_eq!((s.blocks_live, s.blocks_offered), (2, 1), "{s:?}");
+        let mut out = vec![[0i16; 2]; 4];
+        r.read_raw(10, &mut out).unwrap(); // live block: read straight through
+        assert_eq!(out[0], [10, 7]);
+        assert_eq!(r.housekeep().offered, 1); // retried, now accepted
+        assert_eq!(state(&r.block_at(0).unwrap()), BlockState::Offered);
+        assert_eq!(mem.0.offered().len(), 2);
     }
 
     #[test]

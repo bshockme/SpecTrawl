@@ -76,14 +76,17 @@ pub trait VolatileMemory: Send + Sync {
     /// [`PAGE`]), committed lazily by the OS. `None` if `bytes` is not such a
     /// size or the allocation fails.
     fn alloc(&self, bytes: usize) -> Option<Region>;
-    /// Let the OS discard `r` under memory pressure. The caller must not touch
-    /// the region's memory until it has been reclaimed.
+    /// Let the OS discard `r` under memory pressure. Returns whether the offer
+    /// was accepted. `true`: the region is offered and the caller must not
+    /// touch its memory until it has been reclaimed. `false`: the offer was
+    /// refused (the backend logs why, or has no offer facility); the region
+    /// stays committed and intact, and the caller may use it or offer it again.
     ///
     /// A region must not be offered again until it has been reclaimed; a
     /// second offer could hide a discard. Backends may panic in debug builds
-    /// (the test fake always panics); the OS backends ignore the repeat offer
-    /// and log a warning.
-    fn offer(&self, r: &Region, priority: OfferPriority);
+    /// (the test fake always panics); the OS backends ignore the repeat offer,
+    /// log a warning and return `true` (the region is still offered).
+    fn offer(&self, r: &Region, priority: OfferPriority) -> bool;
     /// Take an offered region back. `true`: contents intact. `false`: they were
     /// discarded and the region is writable again. A region that was never
     /// offered (or whose offer failed) reclaims as `true`.
@@ -135,7 +138,14 @@ mod tests {
         let m = system();
         let r = m.alloc(8 * PAGE).unwrap();
         unsafe { std::ptr::write_bytes(r.ptr().as_ptr(), 0xA5, r.bytes()) };
-        m.offer(&r, OfferPriority::Low);
+        // The OS may refuse an offer under load; a refused offer would make
+        // the round trip vacuous, so retry and then skip loudly.
+        if !(0..5).any(|_| m.offer(&r, OfferPriority::Low)) {
+            eprintln!("SKIPPED: the OS refused 5 offers, so there is no round trip to check (on the fallback backend this is expected)");
+            assert!(m.reclaim(&r));
+            m.free(r);
+            return;
+        }
         assert!(m.reclaim(&r), "offered memory was discarded on an idle machine");
         assert_eq!(unsafe { *r.ptr().as_ptr().add(5 * PAGE + 17) }, 0xA5);
         m.free(r);
@@ -152,9 +162,9 @@ mod tests {
             *b.ptr().as_ptr() = 2;
             *c.ptr().as_ptr() = 3
         };
-        m.offer(&a, OfferPriority::VeryLow);
-        m.offer(&b, OfferPriority::Low);
-        m.offer(&c, OfferPriority::Normal);
+        assert!(m.offer(&a, OfferPriority::VeryLow));
+        assert!(m.offer(&b, OfferPriority::Low));
+        assert!(m.offer(&c, OfferPriority::Normal));
         m.discard_oldest_offered(2);
         assert!(!m.reclaim(&a));
         assert!(!m.reclaim(&b));

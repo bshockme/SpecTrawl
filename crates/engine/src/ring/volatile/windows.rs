@@ -43,18 +43,20 @@ impl VolatileMemory for WindowsVolatile {
         NonNull::new(p.cast::<u8>()).map(|ptr| Region { ptr, bytes })
     }
 
-    fn offer(&self, r: &Region, priority: OfferPriority) {
+    fn offer(&self, r: &Region, priority: OfferPriority) -> bool {
         if self.offered.lock().contains(&r.addr()) {
             log::warn!("region offered again before it was reclaimed; ignoring the repeat offer");
-            return;
+            return true;
         }
         // SAFETY: `r` is a whole committed `VirtualAlloc` range owned by this
         // backend; the caller does not touch it until `reclaim`.
         let rc = unsafe { OfferVirtualMemory(r.ptr.as_ptr().cast::<c_void>(), r.bytes, os_priority(priority)) };
         if rc == 0 {
             self.offered.lock().insert(r.addr());
+            true
         } else {
-            log::warn!("OfferVirtualMemory failed ({rc}); region stays committed");
+            log::warn!("OfferVirtualMemory refused the offer (error {rc}); region stays committed");
+            false
         }
     }
 
@@ -95,15 +97,27 @@ mod tests {
     // `ReclaimVirtualMemory` on a range that is not currently offered returns
     // ERROR_INVALID_PARAMETER (87), not success, so the backend must only call
     // it for ranges whose offer succeeded.
+    //
+    // The OS may refuse an offer, and under load it may discard a `VeryLow`
+    // offer at once (`ReclaimVirtualMemory` then returns ERROR_BUSY, 170), so
+    // neither acceptance nor an intact first reclaim is asserted.
     #[test]
     fn only_successful_offers_are_reclaimed_from_the_os() {
         let m = WindowsVolatile::default();
         let r = m.alloc(2 * PAGE).unwrap();
         assert!(m.reclaim(&r), "never-offered region must reclaim intact");
-        m.offer(&r, OfferPriority::VeryLow);
-        assert!(m.offered.lock().contains(&r.addr()), "OfferVirtualMemory was refused");
-        assert!(m.reclaim(&r));
-        assert!(m.reclaim(&r), "second reclaim must not reach the OS");
+        let accepted = (0..5).any(|_| m.offer(&r, OfferPriority::VeryLow));
+        assert_eq!(m.offered.lock().contains(&r.addr()), accepted, "only an accepted offer is recorded");
+        if accepted {
+            // Goes to the OS once: intact, or discarded under load.
+            let _intact = m.reclaim(&r);
+            assert!(!m.offered.lock().contains(&r.addr()));
+        } else {
+            eprintln!("OfferVirtualMemory refused 5 offers; checking the refusal path");
+        }
+        // Refused, or already reclaimed: the region is not offered, so this
+        // must not reach the OS (which would fail with 87 and report a loss).
+        assert!(m.reclaim(&r), "a reclaim of a region that is not offered must not reach the OS");
         m.free(r);
     }
 }

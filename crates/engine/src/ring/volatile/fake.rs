@@ -56,13 +56,15 @@ impl VolatileMemory for FakeVolatile {
         heap_alloc(bytes)
     }
 
-    fn offer(&self, r: &Region, priority: OfferPriority) {
+    /// Always accepts.
+    fn offer(&self, r: &Region, priority: OfferPriority) -> bool {
         let mut s = self.state.lock();
         let addr = r.addr();
         let pending = s.offered.iter().any(|&(a, _)| a == addr) || s.discarded.contains(&addr);
         assert!(!pending, "region {addr:#x} offered again before it was reclaimed");
         s.log.push((addr, priority));
         s.offered.push_back((addr, r.bytes()));
+        true
     }
 
     fn reclaim(&self, r: &Region) -> bool {

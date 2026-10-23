@@ -53,12 +53,12 @@ impl VolatileMemory for LinuxVolatile {
         NonNull::new(p.cast::<u8>()).map(|ptr| Region { ptr, bytes })
     }
 
-    fn offer(&self, r: &Region, _priority: OfferPriority) {
+    fn offer(&self, r: &Region, _priority: OfferPriority) -> bool {
         if self.hashes.lock().contains_key(&r.addr()) {
             // Re-hashing now could record pages the kernel already dropped and
             // hide the loss, so keep the hashes from the first offer.
             log::warn!("region offered again before it was reclaimed; ignoring the repeat offer");
-            return;
+            return true;
         }
         let base = r.ptr.as_ptr();
         let hashes = (0..r.bytes / PAGE)
@@ -70,8 +70,12 @@ impl VolatileMemory for LinuxVolatile {
         // lets the kernel drop its pages, which then read as zeros.
         let rc = unsafe { libc::madvise(base.cast(), r.bytes, libc::MADV_FREE) };
         if rc != 0 {
-            log::warn!("madvise(MADV_FREE) failed ({}); region stays resident", std::io::Error::last_os_error());
+            // Not offered: forget the hashes so a later offer is a fresh one.
+            log::warn!("madvise(MADV_FREE) refused ({}); region stays resident", std::io::Error::last_os_error());
+            self.hashes.lock().remove(&r.addr());
+            return false;
         }
+        true
     }
 
     fn reclaim(&self, r: &Region) -> bool {
