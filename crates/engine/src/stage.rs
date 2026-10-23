@@ -28,8 +28,6 @@ use crate::source::{ReadError, Source};
 const POLL: Duration = Duration::from_millis(1);
 /// Weight of the newest block in [`StageStats::block_micros`].
 const EMA_ALPHA: f64 = 0.05;
-/// Blocks [`Stage::bins`] keeps after recomputing them.
-const RECOMPUTE_LRU: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct StageConfig {
@@ -97,6 +95,8 @@ pub struct Stage {
     /// Taken only by [`Stage::bins`] callers (bus workers, outside the
     /// scheduler lock); never by the stage thread.
     recompute: Mutex<Recompute>,
+    /// Blocks the recompute LRU keeps.
+    recompute_depth: usize,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -117,7 +117,16 @@ impl Stage {
         let name = format!("fft-{}", shared.source.id().0);
         let worker = Worker { shared: shared.clone(), sink, fft_size, hop, row_period_secs: cfg.row_period_secs };
         let handle = std::thread::Builder::new().name(name).spawn(move || worker.run()).expect("spawn the FFT stage thread");
-        Arc::new(Stage { shared, fft_size, hop, recompute: Mutex::new(Recompute::default()), thread: Mutex::new(Some(handle)) })
+        // The recompute LRU is as deep as the cache: same-priority subscriptions drift up to a cache-depth apart while they recover.
+        let recompute_depth = cfg.cache_blocks.max(1);
+        Arc::new(Stage {
+            shared,
+            fft_size,
+            hop,
+            recompute: Mutex::new(Recompute::default()),
+            recompute_depth,
+            thread: Mutex::new(Some(handle)),
+        })
     }
 
     pub fn source(&self) -> &Arc<Source> {
@@ -151,8 +160,8 @@ impl Stage {
     }
 
     /// Block `block`'s segment and bins (`block ≥ 1`), and whether this call
-    /// recomputed them: from the cache; else from the last
-    /// [`RECOMPUTE_LRU`] blocks recomputed; else read from the ring
+    /// recomputed them: from the cache; else from the last `cache_blocks`
+    /// blocks recomputed (kept only once something fell behind the cache); else read from the ring
     /// (`[(b−1)·L, (b+1)·L)`) and transformed once under the recompute
     /// lock, so subscriptions that miss the cache together wait for one
     /// FFT per block instead of each computing it. A ring error is returned
@@ -176,7 +185,7 @@ impl Stage {
         let mut bins: Arc<[Complex32]> = std::iter::repeat_n(Complex32::default(), n).collect();
         fft.forward(&r.input, Arc::get_mut(&mut bins).expect("a fresh Arc is unique"));
         r.lru.push_back((block, seg.clone(), bins.clone()));
-        while r.lru.len() > RECOMPUTE_LRU {
+        while r.lru.len() > self.recompute_depth {
             r.lru.pop_front();
         }
         // Hand the lock to the callers that waited for this block before

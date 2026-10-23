@@ -43,10 +43,11 @@ fn rows_show_the_carrier_in_the_right_bin_and_blocks_reach_the_sink() {
 #[test]
 fn a_stage_that_falls_behind_skips_to_the_live_edge() {
     // A paced 100 MS/s source outruns the FFT (~1 ms per 32,768-sample hop,
-    // about 33 MS/s) while the keeper still provisions for it, so the ring
-    // holds a full second: a jump to its tail would leave the stage ~1 s
-    // behind; a jump to the live edge leaves it near 0.
-    let keeper = Keeper::start(RingBudget::new(BudgetConfig { guaranteed_secs: 1.0, ceiling_bytes: 512 << 20, sweep_secs: 0.1 }));
+    // about 33 MS/s) while the keeper still provisions for it, so the stage
+    // is overwritten within a fraction of a second and must jump: a jump to
+    // the ring's tail leaves it about the ring's depth (~0.3 s) behind, a
+    // jump to the live edge near 0.
+    let keeper = Keeper::start(RingBudget::new(BudgetConfig { guaranteed_secs: 0.1, ceiling_bytes: 128 << 20, sweep_secs: 0.1 }));
     let (d, _c) = sim(100e6, true);
     let src = Arc::new(Source::start(d, cfg(), Mode::Live, &keeper).unwrap());
     let (_bus, stage) = stage_of(&src);
@@ -54,9 +55,11 @@ fn a_stage_that_falls_behind_skips_to_the_live_edge() {
     let a = stage.stats().latest_block.unwrap();
     wait_until(|| stage.stats().latest_block.unwrap() > a + 20); // still publishing after skipping
     // Within a second of a skip the stage is near the live edge, and still inside the ring.
+    // Well under the ring's ~0.33 s, which a jump to the tail would leave: 0.1 s, not 0.5 s.
+    const MAX_BEHIND: f64 = 0.1;
     let deadline = Instant::now() + Duration::from_secs(1);
     let mut s = stage.stats();
-    while s.behind_secs >= 0.5 && Instant::now() < deadline {
+    while s.behind_secs >= MAX_BEHIND && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
         s = stage.stats();
     }
@@ -69,7 +72,7 @@ fn a_stage_that_falls_behind_skips_to_the_live_edge() {
         s.latest_block.unwrap() * l,
         src.head()
     );
-    assert!(s.behind_secs < 0.5, "{s:?}, {:?}", src.stats());
+    assert!(s.behind_secs < MAX_BEHIND, "{s:?}, {:?}", src.stats());
     assert!(s.latest_block.unwrap() * l >= oldest, "{s:?}, oldest {oldest}");
     stage.stop();
 }

@@ -18,12 +18,7 @@ fn spec(source: SourceId, center_hz: f64) -> ChannelSpec {
 fn two_hundred_channels_recover_from_a_stall_of_every_worker() {
     let engine = Engine::new(EngineConfig {
         budget: BudgetConfig { guaranteed_secs: 1.0, ceiling_bytes: 256 << 20, sweep_secs: 0.2 },
-        // Two workers: with one free-running stall consumer per worker, the
-        // default pool (14 on a 16-thread machine) lets those consumers drift
-        // more than the 8-block recompute LRU apart as they catch up, and
-        // each then recomputes on its own (see BACKLOG); the 200 `Classify`
-        // channels share either way.
-        bus: BusConfig { workers: 2, ..Default::default() },
+        bus: BusConfig::default(),
         source: cfg(),
     });
     let (d, _c) = SimDevice::with_config(SimConfig { paced: true, report_lag_gaps: false, ..Default::default() }); // the default 800 MHz scenario
