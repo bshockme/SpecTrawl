@@ -1,22 +1,42 @@
 //! The spectral identifier on real spectra in testdata/spectra (mean dB per
-//! bin, made with `cargo run -p engine --example trawl`). Each test skips if
-//! its spectrum isn't present.
+//! bin, made with `cargo run -p engine --example trawl`). A missing spectrum
+//! fails the test unless SPECTRAWL_SKIP_CAPTURES=1.
 
 mod common;
 
 use detect::spectral::{Kind, Occupant, Spectrum, floor_estimate, identify};
 
 fn occupants(name: &str) -> Option<Vec<Occupant>> {
-    let meta: serde_json::Value = serde_json::from_str(&common::spectrum(name)?).ok()?;
-    let raw = common::spectrum_file(name, "spec")?;
-    let n = meta["bins"].as_u64()? as usize;
-    let span = meta["span_hz"].as_f64()?;
+    // Only absence may skip; anything present must parse.
+    let json = common::spectrum(name)?;
+    let spec = common::spectrum_file(name, "spec")?;
+    Some(parse_spectrum(name, &json, &spec))
+}
+
+fn parse_spectrum(name: &str, json: &str, spec: &[u8]) -> Vec<Occupant> {
+    let meta: serde_json::Value = serde_json::from_str(json).unwrap_or_else(|e| panic!("{name}.json: {e}"));
+    let n = meta["bins"].as_u64().unwrap_or_else(|| panic!("{name}.json: missing or non-integer `bins`")) as usize;
+    let span = meta["span_hz"].as_f64().unwrap_or_else(|| panic!("{name}.json: missing or non-numeric `span_hz`"));
+    let center = meta["center_hz"].as_f64().unwrap_or_else(|| panic!("{name}.json: missing or non-numeric `center_hz`"));
+    assert!(spec.len() >= 4 * n, "{name}.spec: {} bytes, need {} for {n} bins", spec.len(), 4 * n);
     let bin = span / n as f64;
-    let db: Vec<f32> = raw[..4 * n].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+    let db: Vec<f32> = spec[..4 * n].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
     // As the engine does: floor windows a twentieth of the span, 1-8 MHz.
     let floor = floor_estimate(&db, ((span / 20.0).clamp(1e6, 8e6) / bin) as usize);
-    let f0 = meta["center_hz"].as_f64()? - span / 2.0;
-    Some(identify(&Spectrum { db: &db, floor: &floor, f0_hz: f0, bin_hz: bin }))
+    let f0 = center - span / 2.0;
+    identify(&Spectrum { db: &db, floor: &floor, f0_hz: f0, bin_hz: bin })
+}
+
+#[test]
+#[should_panic(expected = "bad.json")]
+fn malformed_spectrum_json_panics() {
+    parse_spectrum("bad", "{\"bins\": 4,", &[]);
+}
+
+#[test]
+#[should_panic(expected = "bad.spec: 8 bytes, need 16")]
+fn truncated_spectrum_panics() {
+    parse_spectrum("bad", r#"{"bins":4,"span_hz":1e6,"center_hz":1e8}"#, &[0; 8]);
 }
 
 fn has(o: &[Occupant], kind: Kind, mhz: f64, tol_mhz: f64) -> bool {
