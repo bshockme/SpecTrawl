@@ -5,3 +5,4 @@
 /testdata/trawl*/
 /testdata/*.log
 /testdata/audio/
+/.worktrees/
