@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+dsp = { version = "0.1.0", path = "../dsp" }
 num-complex = "0.4.6"
 rustfft = "6.4.1"
 

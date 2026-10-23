@@ -1,10 +1,16 @@
 //! DSP building blocks. For now: a windowed power-spectrum analyzer that
 //! accumulates many FFTs per output frame (linear-power averaging).
 
+pub mod ddc;
+pub mod demod;
+pub mod fir;
+
 use std::sync::Arc;
 
 use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
+
+pub use ddc::Ddc;
 
 /// 4-term Blackman-Harris: ~92 dB sidelobes, good for wide dynamic range.
 pub fn blackman_harris(n: usize) -> Vec<f32> {

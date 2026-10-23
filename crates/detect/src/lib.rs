@@ -7,9 +7,7 @@ pub mod bandplan;
 pub mod carrier;
 pub mod chirp;
 pub mod context;
-pub mod ddc;
 pub mod decode;
-pub mod demod;
 pub mod dmr;
 pub mod features;
 pub mod flex;
@@ -32,7 +30,8 @@ pub mod trunk;
 
 use num_complex::Complex32;
 
-pub use ddc::Ddc;
+pub use dsp::Ddc;
+pub use dsp::{ddc, demod};
 pub use features::Features;
 pub use sync::SyncResult;
 

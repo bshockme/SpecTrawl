@@ -75,20 +75,7 @@ impl Ddc {
         // After the CIC the FIR runs at only ~8x the output rate, so it can
         // afford a long, sharp filter (adjacent channels can be 12.5 kHz away).
         let n = if cic.is_some() { 24 * fir_decim + 1 } else { (8 * fir_decim + 1).max(31) | 1 };
-        let fc = cutoff / fs_fir;
-        let m = (n - 1) as f64;
-        let mut taps: Vec<f32> = (0..n)
-            .map(|i| {
-                let x = i as f64 - m / 2.0;
-                let sinc = if x == 0.0 { 2.0 * fc } else { (2.0 * std::f64::consts::PI * fc * x).sin() / (std::f64::consts::PI * x) };
-                // Blackman window.
-                let w = 0.42 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / m).cos()
-                    + 0.08 * (4.0 * std::f64::consts::PI * i as f64 / m).cos();
-                (sinc * w) as f32
-            })
-            .collect();
-        let sum: f32 = taps.iter().sum();
-        taps.iter_mut().for_each(|t| *t /= sum);
+        let taps = crate::fir::windowed_sinc(n, cutoff, fs_fir);
         let w = -2.0 * std::f64::consts::PI * offset_hz / fs;
         Self {
             taps,
@@ -109,7 +96,7 @@ impl Ddc {
             let m = x * self.osc;
             self.osc *= self.step;
             self.mixed += 1;
-            if self.mixed % 4096 == 0 {
+            if self.mixed.is_multiple_of(4096) {
                 self.osc /= self.osc.norm();
             }
             match &mut self.cic {
