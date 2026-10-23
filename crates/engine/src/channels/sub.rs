@@ -186,6 +186,19 @@ impl Sub {
         self.panicked
     }
 
+    /// The bus shed this subscription: its last turn. Tell the consumer,
+    /// then drop it (a consumer that already ended stays `Ended`).
+    pub fn shed(&mut self) -> Ran {
+        self.panicked = false;
+        self.wait = false;
+        if self.consumer.is_some() {
+            self.deliver(Delivery::Shed);
+            self.finish();
+            self.counters.state = ConsumerState::Shed;
+        }
+        Ran { panicked: self.panicked, wait: true }
+    }
+
     /// Something other than the consumer panicked during a turn: end the
     /// subscription without calling the consumer again.
     pub fn abandon(&mut self) {

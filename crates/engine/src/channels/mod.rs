@@ -178,7 +178,7 @@ pub enum BusError {
 pub struct BusConfig {
     /// Worker threads; default `available_parallelism − 2`, at least 1.
     pub workers: usize,
-    /// Lag beyond which consumers are shed (Task 9).
+    /// Lag beyond which the lowest-priority consumer is shed while the pool is saturated.
     pub max_lag_secs: f64,
     pub stage: StageConfig,
 }
@@ -212,7 +212,7 @@ impl BlockSink for BusSink {
 impl ChannelBus {
     /// Starts threads "bus-worker-<i>".
     pub fn new(cfg: BusConfig) -> Arc<ChannelBus> {
-        let shared = Arc::new(Shared::new());
+        let shared = Arc::new(Shared::new(cfg.workers, cfg.max_lag_secs));
         let workers = sched::spawn_workers(&shared, cfg.workers);
         Arc::new(ChannelBus { cfg, shared, stages: Mutex::new(HashMap::new()), workers: Mutex::new(workers), next_id: AtomicU64::new(1) })
     }
@@ -314,7 +314,7 @@ impl ChannelBus {
             .collect();
         BusStats {
             workers: self.cfg.workers,
-            saturated: false,
+            saturated: snap.saturated,
             shed_total: snap.shed_total,
             panicked_total: snap.panicked_total,
             consumers,
@@ -341,8 +341,11 @@ impl ChannelBus {
 
     fn on_block(&self, source: SourceId, block: u64) {
         // The block's segment, for subscriptions waiting out of span in another.
-        let segment = self.stage(source).and_then(|s| s.cache().get(block)).map(|(seg, _)| seg.id);
-        self.shared.on_block(source, Latest { block, segment });
+        let stage = self.stage(source);
+        let segment = stage.as_ref().and_then(|s| s.cache().get(block)).map(|(seg, _)| seg.id);
+        // The rate stats() uses for lag: the source's current segment's.
+        let rate = stage.map_or(0.0, |s| s.source().segment_at(s.source().head()).sample_rate);
+        self.shared.on_block(source, Latest { block, segment, rate });
     }
 }
 
