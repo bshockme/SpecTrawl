@@ -199,6 +199,17 @@ impl Sub {
         Ran { panicked: self.panicked, wait: true }
     }
 
+    /// The bus detached this subscription's source: its last turn. Tell the
+    /// consumer, then drop it (a consumer that already ended gets nothing).
+    pub fn detached(&mut self) -> Ran {
+        self.panicked = false;
+        self.wait = false;
+        if self.consumer.is_some() {
+            self.end(EndReason::SourceDetached);
+        }
+        Ran { panicked: self.panicked, wait: true }
+    }
+
     /// Something other than the consumer panicked during a turn: end the
     /// subscription without calling the consumer again.
     pub fn abandon(&mut self) {

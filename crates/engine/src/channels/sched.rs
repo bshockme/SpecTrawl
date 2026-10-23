@@ -19,6 +19,15 @@
 //! the highest priority for one last, cheap turn in which the worker
 //! delivers `Delivery::Shed` and drops the consumer.
 //!
+//! Detaching a source uses the same last turn: every subscription of the
+//! source still running (or out of span) is marked and queued at the front
+//! of the highest priority; its last turn delivers `Ended { SourceDetached }`
+//! and drops the consumer. Once a subscription has ended (or been shed) and
+//! has no last turn pending, the scheduler drops it and keeps only its
+//! counters for the stats, so a detached source's stage and ring go with the
+//! last subscription's last turn. After `stop`, workers run the last turns
+//! already queued, then exit.
+//!
 //! Lock order: the scheduler lock and a subscription's lock are never held
 //! together; the scheduler lock is never held while a block runs or a
 //! consumer is called.
@@ -42,6 +51,13 @@ const TOP: usize = PRIORITIES - 1;
 /// The saturation window.
 const WINDOW: Duration = Duration::from_secs(1);
 
+/// What a subscription's last turn delivers before it drops the consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LastTurn {
+    Shed,
+    Detached,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Turn {
     /// Caught up (or ended): waits for the next block.
@@ -53,14 +69,16 @@ enum Turn {
 }
 
 struct Entry {
-    sub: Arc<Mutex<Sub>>,
+    /// `None` once the subscription has ended (or been shed) for good.
+    sub: Option<Arc<Mutex<Sub>>>,
     info: ChannelInfo,
     priority: Priority,
     /// As of the end of its last turn.
     counters: Counters,
     turn: Turn,
-    /// Shed: its next turn delivers `Delivery::Shed` and drops the consumer.
-    last_turn: bool,
+    /// Shed or detached: its next turn delivers `Delivery::Shed` or
+    /// `Ended { SourceDetached }` and drops the consumer.
+    last_turn: Option<LastTurn>,
 }
 
 /// A source's latest cached block, its segment (`None`: not known) and the
@@ -131,21 +149,49 @@ impl Sched {
         }
     }
 
-    /// The highest-priority queued subscription, marked running, and
-    /// whether this is its last turn (it was shed). Ids of subscriptions
-    /// removed while queued are skipped.
-    fn take_next(&mut self) -> Option<(ChannelId, Arc<Mutex<Sub>>, bool)> {
+    /// The highest-priority queued subscription, marked running, and its
+    /// last turn if it was shed or detached. With `last_only` (the bus is
+    /// stopping), only a subscription due a last turn is taken; the rest
+    /// stay queued. Ids of subscriptions removed while queued are skipped.
+    fn take_next(&mut self, last_only: bool) -> Option<(ChannelId, Arc<Mutex<Sub>>, Option<LastTurn>)> {
         let Sched { subs, queues, running, .. } = self;
         for q in queues.iter_mut().rev() {
-            while let Some(id) = q.pop_front() {
-                if let Some(e) = subs.get_mut(&id) {
-                    e.turn = Turn::Running;
-                    *running += 1;
-                    return Some((id, e.sub.clone(), e.last_turn));
+            let mut i = 0;
+            while i < q.len() {
+                let id = q[i];
+                let Some(e) = subs.get_mut(&id) else {
+                    q.remove(i);
+                    continue;
+                };
+                if last_only && e.last_turn.is_none() {
+                    i += 1;
+                    continue;
                 }
+                q.remove(i);
+                let Some(sub) = e.sub.clone() else { continue };
+                e.turn = Turn::Running;
+                *running += 1;
+                return Some((id, sub, e.last_turn));
             }
         }
         None
+    }
+
+    /// Queue `id` at the front of the highest priority for its last turn.
+    fn queue_last_turn(&mut self, id: ChannelId) {
+        let Some(e) = self.subs.get_mut(&id) else { return };
+        match e.turn {
+            Turn::Idle => {
+                e.turn = Turn::Queued;
+                self.queues[TOP].push_front(id);
+            }
+            Turn::Queued => {
+                let priority = e.priority as usize;
+                self.queues[priority].retain(|&q| q != id);
+                self.queues[TOP].push_front(id);
+            }
+            Turn::Running => {} // the worker queues it after the block in progress
+        }
     }
 
     /// Counts this `on_block` call; at the end of each window decides
@@ -176,23 +222,13 @@ impl Sched {
         let candidates = self
             .subs
             .iter()
-            .filter(|(_, e)| !e.last_turn)
+            .filter(|(_, e)| e.last_turn.is_none())
             .map(|(&id, e)| (id, e.priority, e.lag_secs(self.latest.get(&e.info.source).copied())));
         let Some((id, priority, lag)) = choose_victim(candidates, self.max_lag_secs) else { return };
         let e = self.subs.get_mut(&id).expect("just found");
         e.counters.state = ConsumerState::Shed;
-        e.last_turn = true;
-        match e.turn {
-            Turn::Idle => {
-                e.turn = Turn::Queued;
-                self.queues[TOP].push_front(id);
-            }
-            Turn::Queued => {
-                self.queues[priority as usize].retain(|&q| q != id);
-                self.queues[TOP].push_front(id);
-            }
-            Turn::Running => {} // the worker queues it after the block in progress
-        }
+        e.last_turn = Some(LastTurn::Shed);
+        self.queue_last_turn(id);
         self.shed_total += 1;
         let id = id.0;
         log::warn!("channel bus: shed channel {id} ({priority:?}) lagging {lag:.1} s under a saturated pool");
@@ -243,7 +279,7 @@ impl Shared {
         let id = info.id;
         let mut s = self.sched.lock();
         let latest = s.latest.get(&info.source).copied();
-        let entry = Entry { sub: Arc::new(Mutex::new(sub)), info, priority, counters, turn: Turn::Idle, last_turn: false };
+        let entry = Entry { sub: Some(Arc::new(Mutex::new(sub))), info, priority, counters, turn: Turn::Idle, last_turn: None };
         let behind = entry.behind(latest);
         s.subs.insert(id, entry);
         if behind {
@@ -258,6 +294,33 @@ impl Shared {
     pub fn remove(&self, id: ChannelId) -> bool {
         let entry = self.sched.lock().subs.remove(&id);
         entry.is_some()
+    }
+
+    /// `source` is detached: every subscription of it still running (or out
+    /// of span) is queued for a last turn that delivers
+    /// `Ended { SourceDetached }`; one already shed, ended or due a last turn
+    /// gets nothing more. The source's latest block is forgotten.
+    pub fn detach(&self, source: SourceId) {
+        let mut s = self.sched.lock();
+        s.latest.remove(&source);
+        let ids: Vec<ChannelId> = s
+            .subs
+            .iter()
+            .filter(|(_, e)| {
+                e.info.source == source
+                    && e.sub.is_some()
+                    && e.last_turn.is_none()
+                    && matches!(e.counters.state, ConsumerState::Running | ConsumerState::OutOfSpan)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for &id in &ids {
+            s.subs.get_mut(&id).expect("just found").last_turn = Some(LastTurn::Detached);
+            s.queue_last_turn(id);
+        }
+        if !ids.is_empty() {
+            self.ready.notify_all();
+        }
     }
 
     /// Block `latest.block` of `source` is cached: queue every idle
@@ -309,18 +372,24 @@ impl Shared {
             let (id, sub, last) = {
                 let mut s = self.sched.lock();
                 loop {
-                    if s.stop {
-                        return;
-                    }
-                    if let Some(next) = s.take_next() {
+                    let stop = s.stop;
+                    if let Some(next) = s.take_next(stop) {
                         break next;
+                    }
+                    if stop {
+                        return;
                     }
                     self.ready.wait(&mut s);
                 }
             };
             let (counters, ran) = {
                 let mut g = sub.lock();
-                let ran = match catch_unwind(AssertUnwindSafe(|| if last { g.shed() } else { g.run_block() })) {
+                let turn = || match last {
+                    None => g.run_block(),
+                    Some(LastTurn::Shed) => g.shed(),
+                    Some(LastTurn::Detached) => g.detached(),
+                };
+                let ran = match catch_unwind(AssertUnwindSafe(turn)) {
                     Ok(ran) => ran,
                     Err(_) => {
                         log::warn!("channel bus: channel {} panicked outside its consumer; ended", id.0);
@@ -339,20 +408,27 @@ impl Shared {
                 }
                 if let Some(e) = s.subs.get_mut(&id) {
                     e.counters = counters;
-                    // Shed while this ordinary turn ran: its last turn is next, unless it ended meanwhile.
-                    let shed_meanwhile = e.last_turn && !last && counters.state != ConsumerState::Ended;
-                    if e.last_turn && counters.state == ConsumerState::Ended {
+                    // Shed or detached while this ordinary turn ran: its last turn is next, unless it ended meanwhile.
+                    let pending = e.last_turn.filter(|_| last.is_none() && counters.state != ConsumerState::Ended);
+                    if e.last_turn == Some(LastTurn::Shed) && last.is_none() && counters.state == ConsumerState::Ended {
                         // The consumer ended (Stop or panic) before `Shed` could be delivered:
                         // the shed is cancelled, so it no longer counts in `shed_total`.
                         s.shed_total -= 1;
                     }
-                    if last || counters.state == ConsumerState::Ended {
-                        e.last_turn = false;
+                    if last.is_some() || counters.state == ConsumerState::Ended {
+                        e.last_turn = None;
                     }
-                    if shed_meanwhile {
-                        e.counters.state = ConsumerState::Shed;
+                    if let Some(kind) = pending {
+                        if kind == LastTurn::Shed {
+                            e.counters.state = ConsumerState::Shed;
+                        }
                         e.turn = Turn::Queued;
                         s.queues[TOP].push_front(id);
+                    } else if matches!(e.counters.state, ConsumerState::Shed | ConsumerState::Ended) {
+                        // Done for good: only the counters stay, for the stats. The
+                        // subscription (and its stage and source) drops below, outside the lock.
+                        e.sub = None;
+                        e.turn = Turn::Idle;
                     } else if !ran.wait && e.behind(s.latest.get(&e.info.source).copied()) {
                         e.turn = Turn::Queued;
                         s.queues[e.priority as usize].push_back(id);
@@ -361,7 +437,7 @@ impl Shared {
                     }
                 }
             }
-            drop(sub); // unsubscribed meanwhile: the last reference, so the consumer drops here
+            drop(sub); // unsubscribed or done meanwhile: the last reference, so the subscription drops here
         }
     }
 }

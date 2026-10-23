@@ -10,7 +10,7 @@ mod sched;
 mod sub;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 
@@ -196,6 +196,7 @@ pub struct ChannelBus {
     stages: Mutex<HashMap<SourceId, Arc<Stage>>>,
     workers: Mutex<Vec<JoinHandle<()>>>,
     next_id: AtomicU64,
+    stopped: AtomicBool,
 }
 
 /// The stages' sink: a `Weak`, so bus and stage do not keep each other alive.
@@ -214,13 +215,25 @@ impl ChannelBus {
     pub fn new(cfg: BusConfig) -> Arc<ChannelBus> {
         let shared = Arc::new(Shared::new(cfg.workers, cfg.max_lag_secs));
         let workers = sched::spawn_workers(&shared, cfg.workers);
-        Arc::new(ChannelBus { cfg, shared, stages: Mutex::new(HashMap::new()), workers: Mutex::new(workers), next_id: AtomicU64::new(1) })
+        Arc::new(ChannelBus {
+            cfg,
+            shared,
+            stages: Mutex::new(HashMap::new()),
+            workers: Mutex::new(workers),
+            next_id: AtomicU64::new(1),
+            stopped: AtomicBool::new(false),
+        })
     }
 
     /// Starts the source's stage with a `BusSink(Weak<ChannelBus>)` as its
     /// BlockSink (a Weak, so bus and stage do not keep each other alive).
-    /// A source already attached keeps its stage.
+    /// A source already attached keeps its stage. Attaching after
+    /// [`ChannelBus::stop`] is not supported: the stage runs, but no worker
+    /// is left to serve its subscriptions.
     pub fn attach(self: &Arc<Self>, source: Arc<Source>) -> Arc<Stage> {
+        if self.stopped.load(Ordering::SeqCst) {
+            log::warn!("channel bus: source {} attached after the bus stopped; nothing will serve it", source.id().0);
+        }
         let mut stages = self.stages.lock();
         stages
             .entry(source.id())
@@ -228,9 +241,25 @@ impl ChannelBus {
             .clone()
     }
 
-    /// Task 10.
-    pub fn detach(&self, _source: SourceId) -> bool {
-        false
+    /// Ends every subscription of `source` with `Ended { SourceDetached }`
+    /// (delivered by the pool, once each, in a last turn), removes the stage
+    /// and stops it. The ended subscriptions stay in the stats as `Ended`
+    /// until unsubscribed; a later `subscribe` for the source fails with
+    /// `NoSuchSource`. False if the source was not attached.
+    pub fn detach(&self, source: SourceId) -> bool {
+        let stage = {
+            // Under the stages lock, so a concurrent subscribe either sees the
+            // stage and is marked here, or does not see it (see `subscribe`).
+            let mut stages = self.stages.lock();
+            let stage = stages.remove(&source);
+            if stage.is_some() {
+                self.shared.detach(source);
+            }
+            stage
+        };
+        let Some(stage) = stage else { return false };
+        stage.stop(); // outside every lock: it joins the stage thread, which calls `on_block`
+        true
     }
 
     pub fn stage(&self, source: SourceId) -> Option<Arc<Stage>> {
@@ -275,7 +304,16 @@ impl ChannelBus {
             hop: l,
         };
         let sub = Sub::new(info.clone(), spec, usable, stage, seg.id, design, next_block, consumer);
-        self.shared.add(sub, priority);
+        {
+            // Added under the stages lock: a source detached meanwhile is not subscribed to.
+            let stages = self.stages.lock();
+            if !stages.contains_key(&info.source) {
+                drop(stages);
+                drop(sub); // the consumer drops outside the lock
+                return Err(BusError::NoSuchSource);
+            }
+            self.shared.add(sub, priority);
+        }
         Ok(info)
     }
 
@@ -321,11 +359,15 @@ impl ChannelBus {
         }
     }
 
-    /// Stops the stages, then the workers, and joins them. Idempotent; Drop calls it.
+    /// Detaches every source (their subscriptions end with
+    /// `SourceDetached`), then stops the workers once those last turns are
+    /// delivered, and joins them. Afterwards `subscribe` fails with
+    /// `NoSuchSource`. Idempotent; Drop calls it.
     pub fn stop(&self) {
-        let stages: Vec<Arc<Stage>> = self.stages.lock().values().cloned().collect();
-        for s in stages {
-            s.stop();
+        self.stopped.store(true, Ordering::SeqCst);
+        let sources: Vec<SourceId> = self.stages.lock().keys().copied().collect();
+        for source in sources {
+            self.detach(source);
         }
         self.shared.stop();
         let handles: Vec<JoinHandle<()>> = self.workers.lock().drain(..).collect();
@@ -341,10 +383,10 @@ impl ChannelBus {
 
     fn on_block(&self, source: SourceId, block: u64) {
         // The block's segment, for subscriptions waiting out of span in another.
-        let stage = self.stage(source);
-        let segment = stage.as_ref().and_then(|s| s.cache().get(block)).map(|(seg, _)| seg.id);
+        let Some(stage) = self.stage(source) else { return }; // detached
+        let segment = stage.cache().get(block).map(|(seg, _)| seg.id);
         // The rate stats() uses for lag: the source's current segment's.
-        let rate = stage.map_or(0.0, |s| s.source().segment_at(s.source().head()).sample_rate);
+        let rate = stage.source().segment_at(stage.source().head()).sample_rate;
         self.shared.on_block(source, Latest { block, segment, rate });
     }
 }

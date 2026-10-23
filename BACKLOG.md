@@ -3,6 +3,12 @@
 Ideas and known rough edges that aren't scheduled yet. Newest at the top of each section.
 
 ## Rebuild
+- **Second-stage channelizer for narrow modes not built** (2026-10-23): every channel is cut from the source's 65536-point FFT; `ChannelSpec::parent` is carried but refused (`BusError::NestedChannelsNotSupported`). Build it with the first narrow mode that needs it.
+- **Channel output rates are `fs/2^k`** (2026-10-23): the channelizer's output rate is `fs·K/N` with K a power of two, so a consumer gets the smallest such rate at or above what it asked for, not an exact rate. Add a per-channel rational resampler if a consumer needs one.
+- **No channel sharing between subscriptions** (2026-10-23): each subscription computes its own channel, even when two consumers want the same one. Add sharing if profiling shows it matters.
+- **Channel samples carry the filter's group delay** (2026-10-23): a `Samples` delivery's content lags its `first_sample` by N/4 input samples (K/4 output samples); not corrected.
+- **Sample waker declined** (2026-10-23): the stage polls the ring every 1 ms for its next block instead of being woken by the writer.
+- **Ring hole-eviction stat and offer back-off** (done 2026-10-23, step 2): the ring counts the holes it evicts and backs off after refused offers (Task 1 of step 2), closing those step 1 leftovers.
 - **Ring offers are not demoted with age** (2026-10-23): the keeper offers each block once, at `Normal`, as it leaves the guaranteed window, and does not re-offer it at a lower priority as it ages (spec §4.1 "priority falling with age"). Needs a reclaim-and-re-offer (or an OS call that changes priority in place) per band crossing; weigh its cost before step 5.
 - **Ring user cap and per-source pin/weight UI not wired** (2026-10-23): the budget takes a ceiling in bytes and a per-source weight, but the user cap in seconds or bytes ("lower wins", spec §4.1) and the per-source pin/weight setting have no config or UI yet. Step 3 (UI) or later.
 - **No memory-pressure handling on fallback platforms** (2026-10-23): outside Windows and Linux the ring's backend refuses every offer, and the spec's "poll available memory and retire the oldest blocks under a floor" is not built, so the ring there holds its whole ceiling whatever else needs RAM. Not scheduled (no such platform is targeted yet).
@@ -24,7 +30,7 @@ Ideas and known rough edges that aren't scheduled yet. Newest at the top of each
 - DESIGN §1 L33: Voice vocoders are a non-goal — CONTRADICTED — step 9
 - DESIGN §2 L41: CI builds for Windows and Linux from the start — DONE (done 2026-10-23, step 0/1)
 - DESIGN §2 L43: Custom wgpu waterfall with GPU colour map — PARTIAL — step 3
-- DESIGN §4 L101: Usable bandwidth fraction masks band edges — PARTIAL — step 2
+- DESIGN §4 L101: Usable bandwidth fraction masks band edges — DONE (done 2026-10-23, step 2): a channel outside the usable fraction of the span is refused at subscribe and waits out of span after a retune
 - DESIGN §4 L102: IQ ring stores native device format — DONE (done 2026-10-23, step 0/1): DESIGN.md §4.2 and §5.1 amended to say the ring keeps interleaved i16 (rebuild spec §4.1)
 - DESIGN §4 L104: Zero-IF: offset-tune and mask the DC spike — SILENTLY DROPPED — not scheduled
 - DESIGN §4 L105: Native sweep, else retune-and-dwell — PARTIAL — not scheduled
@@ -35,7 +41,7 @@ Ideas and known rough edges that aren't scheduled yet. Newest at the top of each
 - DESIGN §4 L136: Role assigner — SILENTLY DROPPED — not scheduled
 - DESIGN §5 L144: Disk-backed rolling tier for the raw ring — SILENTLY DROPPED — not scheduled
 - DESIGN §5 L145: Ring readers include the user scrubbing — PARTIAL — step 5
-- DESIGN §5 L149: One overlap-save FFT per source, about 64k points — CONTRADICTED — step 2
+- DESIGN §5 L149: One overlap-save FFT per source, about 64k points — DONE (done 2026-10-23, step 2): one 65536-point overlap-save FFT per source (the stage, hop N/2); channels are cut from its cached bins
 - DESIGN §5 L154: Per-bin noise floor plus CFAR threshold — PARTIAL — step 4
 - DESIGN §5 L155: Regions become records with occupied bandwidth and mean power — PARTIAL — step 4
 - DESIGN §6 L170: Record id, source_id and role — PARTIAL — step 4
@@ -69,18 +75,18 @@ Ideas and known rough edges that aren't scheduled yet. Newest at the top of each
 - DESIGN §9 L246: Look-back scrub: select a region, decode or export it — PARTIAL — step 5
 - DESIGN §9 L248: Drag-to-tune, digit-wheel entry, no modal dialogs — PARTIAL — not scheduled
 - DESIGN §9 L248: Dark theme with a few colour maps — PARTIAL — not scheduled
-- DESIGN §10 L252: Per source: one USB thread plus one FFT/channelizer thread — PARTIAL — step 2
+- DESIGN §10 L252: Per source: one USB thread plus one FFT/channelizer thread — DONE (done 2026-10-23, step 2): the device's USB thread plus the stage's FFT thread per source; channels are cut on the bus's worker pool
 - DESIGN §10 L253: Detectors run on a worker pool — CONTRADICTED — step 6
 - DESIGN §10 L254: UI never blocks on the engine — CONTRADICTED — step 3
-- DESIGN §10 L259: Benchmark early — PARTIAL — step 2
-- DESIGN §11 L274: dsp crate holds FFT, filters, channelizer, demodulators — CONTRADICTED — step 2
+- DESIGN §10 L259: Benchmark early — DONE (done 2026-10-23, step 2): first numbers from `channels_200`: `200 channels @ 10 MS/s: max lag 0.000 s, mean lag 0.000 s, stage 1018 µs/block, recomputed 0 blocks, workers 14 (16 logical CPUs)`
+- DESIGN §11 L274: dsp crate holds FFT, filters, channelizer, demodulators — DONE (done 2026-10-23, step 2): `dsp` holds the shared FFT, the windowed-sinc filters, the fast-convolution channelizer and `Ddc`/`Demod`
 - DESIGN §12 L288: Labelled SigMF corpus — DONE (done 2026-10-23, step 0/1)
 - DESIGN §12 L289: Synthetic generators with detection-rate and false-alarm tests — PARTIAL — not scheduled
 - DESIGN §12 L290: Golden-output tests on known captures — DONE (done 2026-10-23, step 0/1)
 - DESIGN §13 L301: Wi-Fi/LTE/BLE labelled by spectral shape only — CONTRADICTED — not scheduled
 - DESIGN §14 L307: Milestone 1: GPU waterfall, scrub 10 s, SigMF export — PARTIAL — step 5
 - DESIGN §14 L309: Milestone 2: records, signal list, boxes, SQLite — PARTIAL — step 4
-- DESIGN §14 L310: Milestone 3: channelizer, symbol engine, synthetic tests — PARTIAL — step 2
+- DESIGN §14 L310: Milestone 3: channelizer, symbol engine, synthetic tests — PARTIAL — channelizer done (done 2026-10-23, step 2); symbol engine and synthetic tests remain (step 6)
 - DESIGN §14 L312: Milestone 5: unknown-signal features, rules, grouping — PARTIAL — step 6
 - DESIGN §14 L313: Milestone 6: HackRF sweep, RTL-SDR Park, role assigner — PARTIAL — not scheduled
 - DESIGN §14 L314: Milestone 7: Soapy, HydraSDR, ISM signatures, TSCM, remote node — PARTIAL — not scheduled

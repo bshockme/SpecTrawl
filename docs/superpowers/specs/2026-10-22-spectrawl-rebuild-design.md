@@ -236,6 +236,8 @@ Burst tracker (carried over): merge inflates mean SNR (sums added, row count max
 
 Ring block size; the exact offer-priority schedule by age; the Linux page-marker scheme; slice file layout under the content directory; FFT size and overlap; channelizer filter design, including the slice rates and FFT size of the second-stage channelizer for narrow modes; pool sizing; snapshot encoding; SQLite schema; the worker protocol's exact framing and the supervisor's restart policy for `onair-rx`; the exact catalogue grouping; the order in which OnAir modes beyond the native hot-path set are wired up; the simulator's new scenarios; colour and typography within the existing theme.
 
+Chosen in step 2 (2026-10-23): FFT size N = 65536, overlap-save with hop N/2; channel FFT size K = the smallest power of two ≥ 64 with `fs·K/N ≥ max(min_rate, 1.6·bandwidth)`, K ≤ N/4, giving an output rate of `fs·K/N`; channel filter = a Blackman-windowed sinc of K/2+1 taps at the output rate, cutoff bandwidth/2; spectrum cache 32 blocks; waterfall rows every 50 ms, history 64 rows; pool = `available_parallelism − 2` workers (at least 1); shedding = when at least 90 % of block arrivals in the last second found every worker busy with work queued and a consumer lags more than 2 s, the lowest-priority laggard is shed, at most one per second; nested (second-stage) channels deferred.
+
 ## 10. Decisions taken with the owner (2026-10-22)
 
 1. **Licence: MIT.** SpecTrawl stays MIT; OnAir is used only as a separate process (§3, §4.6).

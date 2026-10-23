@@ -1,6 +1,7 @@
 pub mod budget;
 pub mod cache;
 pub mod channels;
+pub mod engine;
 pub mod export;
 pub mod ring;
 pub mod rows;
@@ -16,6 +17,7 @@ pub use channels::{
     BusConfig, BusError, BusStats, ChannelBus, ChannelId, ChannelInfo, ChannelSpec, Consumer, ConsumerState, ConsumerStats, Delivery,
     EndReason, Flow, GapReason, Priority, Start,
 };
+pub use engine::{Engine, EngineConfig};
 pub use export::{ExportError, ExportResult};
 pub use ring::keeper::{Housekept, Keeper};
 pub use ring::{RingConfig, RingStats};
