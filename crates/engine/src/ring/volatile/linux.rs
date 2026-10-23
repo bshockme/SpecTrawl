@@ -54,6 +54,12 @@ impl VolatileMemory for LinuxVolatile {
     }
 
     fn offer(&self, r: &Region, _priority: OfferPriority) {
+        if self.hashes.lock().contains_key(&r.addr()) {
+            // Re-hashing now could record pages the kernel already dropped and
+            // hide the loss, so keep the hashes from the first offer.
+            log::warn!("region offered again before it was reclaimed; ignoring the repeat offer");
+            return;
+        }
         let base = r.ptr.as_ptr();
         let hashes = (0..r.bytes / PAGE)
             // SAFETY: each page lies inside the mapping, which is page aligned.

@@ -59,8 +59,9 @@ impl VolatileMemory for FakeVolatile {
     fn offer(&self, r: &Region, priority: OfferPriority) {
         let mut s = self.state.lock();
         let addr = r.addr();
+        let pending = s.offered.iter().any(|&(a, _)| a == addr) || s.discarded.contains(&addr);
+        assert!(!pending, "region {addr:#x} offered again before it was reclaimed");
         s.log.push((addr, priority));
-        Self::forget(&mut s, addr);
         s.offered.push_back((addr, r.bytes()));
     }
 

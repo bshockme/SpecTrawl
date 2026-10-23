@@ -44,6 +44,10 @@ impl VolatileMemory for WindowsVolatile {
     }
 
     fn offer(&self, r: &Region, priority: OfferPriority) {
+        if self.offered.lock().contains(&r.addr()) {
+            log::warn!("region offered again before it was reclaimed; ignoring the repeat offer");
+            return;
+        }
         // SAFETY: `r` is a whole committed `VirtualAlloc` range owned by this
         // backend; the caller does not touch it until `reclaim`.
         let rc = unsafe { OfferVirtualMemory(r.ptr.as_ptr().cast::<c_void>(), r.bytes, os_priority(priority)) };

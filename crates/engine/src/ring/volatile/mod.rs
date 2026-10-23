@@ -78,6 +78,11 @@ pub trait VolatileMemory: Send + Sync {
     fn alloc(&self, bytes: usize) -> Option<Region>;
     /// Let the OS discard `r` under memory pressure. The caller must not touch
     /// the region's memory until it has been reclaimed.
+    ///
+    /// A region must not be offered again until it has been reclaimed; a
+    /// second offer could hide a discard. Backends may panic in debug builds
+    /// (the test fake always panics); the OS backends ignore the repeat offer
+    /// and log a warning.
     fn offer(&self, r: &Region, priority: OfferPriority);
     /// Take an offered region back. `true`: contents intact. `false`: they were
     /// discarded and the region is writable again. A region that was never
@@ -160,5 +165,15 @@ mod tests {
             m.offered().iter().map(|o| o.1).collect::<Vec<_>>(),
             vec![OfferPriority::VeryLow, OfferPriority::Low, OfferPriority::Normal]
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "offered again before it was reclaimed")]
+    fn fake_backend_rejects_a_second_offer_before_reclaim() {
+        let m = FakeVolatile::default();
+        let a = m.alloc(PAGE).unwrap();
+        m.offer(&a, OfferPriority::Low);
+        m.discard_oldest_offered(1);
+        m.offer(&a, OfferPriority::Low);
     }
 }
