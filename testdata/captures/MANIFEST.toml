@@ -1,0 +1,10 @@
+# Large real captures, hosted as GitHub release assets and fetched by
+# tools/fetch_captures.ps1 / tools/fetch_captures.sh. Everything else in this
+# directory is git-ignored.
+release = "captures-v1"
+
+# [[capture]]
+# name = "wideband_20261023_r1_p25_30s"   # stem; assets are <name>.sigmf-data and <name>.sigmf-meta
+# sha256 = "..."                          # of the .sigmf-data
+# bytes = 1200000000
+# used_by = ["engine/tests/..."]

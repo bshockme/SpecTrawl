@@ -1,7 +1,8 @@
 /target
 *.sigmf-data
 /testdata/large/
-/testdata/captures/
+/testdata/captures/*
+!/testdata/captures/MANIFEST.toml
 /testdata/trawl*/
 /testdata/*.log
 /testdata/audio/

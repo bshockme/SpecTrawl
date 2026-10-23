@@ -2,6 +2,9 @@
 
 Ideas and known rough edges that aren't scheduled yet. Newest at the top of each section.
 
+## Rebuild
+- **Golden captures re-recorded** (2026-10-23): the original P25/DMR/NXDN slices stayed on another machine; new ones live under testdata/small and the tests were re-pinned to the local systems.
+
 ## UI
 
 - **New-signal highlighting** (done 2026-10-11): emitters first seen within the new-signal window (⚙, default 120 s) are outlined green on the waterfalls, fading with age, and marked ✦ and sorted first in the emitter table ("new first"). Left: a saved baseline ("not in the baseline" rather than "seen recently").

@@ -2,14 +2,13 @@
 //! bin, made with `cargo run -p engine --example trawl`). Each test skips if
 //! its spectrum isn't present.
 
-use std::path::PathBuf;
+mod common;
 
 use detect::spectral::{Kind, Occupant, Spectrum, floor_estimate, identify};
 
 fn occupants(name: &str) -> Option<Vec<Occupant>> {
-    let stem = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/spectra").join(name);
-    let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(format!("{}.json", stem.display())).ok()?).ok()?;
-    let raw = std::fs::read(format!("{}.spec", stem.display())).ok()?;
+    let meta: serde_json::Value = serde_json::from_str(&common::spectrum(name)?).ok()?;
+    let raw = common::spectrum_file(name, "spec")?;
     let n = meta["bins"].as_u64()? as usize;
     let span = meta["span_hz"].as_f64()?;
     let bin = span / n as f64;
@@ -26,7 +25,7 @@ fn has(o: &[Occupant], kind: Kind, mhz: f64, tol_mhz: f64) -> bool {
 
 #[test]
 fn fm_broadcast_with_hd() {
-    let Some(o) = occupants("live_101.000MHz") else { return eprintln!("skipping: spectrum not present") };
+    let Some(o) = occupants("live_101.000MHz") else { return };
     assert!(has(&o, Kind::FmBroadcast { hd: true }, 102.1, 0.01), "{o:#?}");
     for mhz in [97.5, 103.5, 105.5] {
         assert!(has(&o, Kind::FmBroadcast { hd: false }, mhz, 0.01), "{mhz}: {o:#?}");
@@ -35,7 +34,7 @@ fn fm_broadcast_with_hd() {
 
 #[test]
 fn atsc_tv_by_pilot() {
-    let Some(o) = occupants("sweep_465-615MHz") else { return eprintln!("skipping: spectrum not present") };
+    let Some(o) = occupants("sweep_465-615MHz") else { return };
     for ch in [18, 24, 34, 36] {
         assert!(o.iter().any(|x| x.kind == Kind::Tv { channel: ch, atsc1: true }), "ch {ch}: {o:#?}");
     }
@@ -47,7 +46,7 @@ fn atsc_tv_by_pilot() {
 
 #[test]
 fn lte_downlinks() {
-    let Some(o) = occupants("sweep_610-900MHz") else { return eprintln!("skipping: spectrum not present") };
+    let Some(o) = occupants("sweep_610-900MHz") else { return };
     let cells: Vec<f64> = o.iter().filter(|x| matches!(x.kind, Kind::Cellular { .. })).map(|x| x.center_hz / 1e6).collect();
     for mhz in [632.0, 731.5, 739.0, 751.0, 763.0, 879.0] {
         assert!(cells.iter().any(|c| (c - mhz).abs() < 1.5), "{mhz}: {cells:?}");
