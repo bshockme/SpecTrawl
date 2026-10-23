@@ -32,7 +32,7 @@ pub mod keeper;
 pub mod volatile;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use arc_swap::ArcSwapOption;
 use sdr_core::{Complex32, Samples};
@@ -105,6 +105,8 @@ pub struct RingStats {
     pub blocks_offered: u32,
     pub blocks_lost_total: u64,
     pub starved_total: u64,
+    /// Holes dropped from the hole table because newer ones replaced them.
+    pub holes_evicted: u64,
 }
 
 /// What one [`IqRing::housekeep`] pass did.
@@ -139,6 +141,14 @@ pub struct IqRing {
     holes: Box<[Hole]>,
     /// Holes recorded so far. Stored by the writer only.
     holes_recorded: AtomicU64,
+    /// Holes evicted from the table (the `k >= HOLES` case of `record_hole`).
+    holes_evicted: AtomicU64,
+    /// Housekeeping ticks to skip between offer passes after refusals.
+    offer_backoff: AtomicU32,
+    /// Ticks skipped so far in the current back-off.
+    offer_skip: AtomicU32,
+    /// Whether a refusal run has already been logged at `warn`.
+    offer_refusal_logged: AtomicBool,
 }
 
 /// The ring's only writer. Not `Clone`; [`IqRing::new`] makes exactly one.
@@ -188,6 +198,10 @@ impl IqRing {
             starved_total: AtomicU64::new(0),
             holes: (0..HOLES).map(|_| Hole::default()).collect::<Vec<_>>().into_boxed_slice(),
             holes_recorded: AtomicU64::new(0),
+            holes_evicted: AtomicU64::new(0),
+            offer_backoff: AtomicU32::new(0),
+            offer_skip: AtomicU32::new(0),
+            offer_refusal_logged: AtomicBool::new(false),
         });
         (ring.clone(), RingWriter { ring })
     }
@@ -283,7 +297,10 @@ impl IqRing {
         let k = self.holes_recorded.load(Ordering::Relaxed);
         let h = &self.holes[(k % HOLES as u64) as usize];
         if k >= HOLES as u64 {
-            self.oldest.fetch_max(h.end.load(Ordering::Relaxed), Ordering::SeqCst);
+            let (es, ee) = (h.start.load(Ordering::Relaxed), h.end.load(Ordering::Relaxed));
+            self.oldest.fetch_max(ee, Ordering::SeqCst);
+            self.holes_evicted.fetch_add(1, Ordering::Relaxed);
+            log::debug!("ring: hole table full, evicted hole {es}..{ee}");
         }
         h.start.store(start, Ordering::SeqCst);
         h.end.store(end, Ordering::SeqCst);
@@ -574,9 +591,18 @@ impl IqRing {
     /// a block a reader reclaimed is `Live` again and is offered at its
     /// current band. Returns the number offered.
     fn offer_aged(&self, protected_from: u64) -> u32 {
+        /// 3000 ticks of 20 ms: back off for at most a minute.
+        const MAX_BACKOFF_TICKS: u32 = 3000;
+        let backoff = self.offer_backoff.load(Ordering::Relaxed);
+        let skipped = self.offer_skip.load(Ordering::Relaxed);
+        if skipped < backoff {
+            self.offer_skip.store(skipped + 1, Ordering::Relaxed);
+            return 0;
+        }
         let first = self.oldest() / self.block_samples;
         let n = protected_from.saturating_sub(first);
         let mut offered = 0;
+        let mut attempts = 0u32;
         for b in first..protected_from {
             let Some(block) = self.slot(b).load_full().filter(|blk| blk.index == b) else { continue };
             if BlockState::from_u8(block.state.load(Ordering::SeqCst)) != BlockState::Live {
@@ -591,8 +617,23 @@ impl IqRing {
                 2 => OfferPriority::Low,
                 _ => OfferPriority::VeryLow,
             };
+            attempts += 1;
             if self.try_offer(&block, priority) {
                 offered += 1;
+            }
+        }
+        if offered > 0 {
+            self.offer_backoff.store(0, Ordering::Relaxed);
+            self.offer_skip.store(0, Ordering::Relaxed);
+            self.offer_refusal_logged.store(false, Ordering::Relaxed);
+        } else if attempts > 0 {
+            let next = backoff.saturating_mul(2).clamp(1, MAX_BACKOFF_TICKS);
+            self.offer_backoff.store(next, Ordering::Relaxed);
+            self.offer_skip.store(0, Ordering::Relaxed);
+            if self.offer_refusal_logged.swap(true, Ordering::Relaxed) {
+                log::debug!("ring: OS refused {attempts} offers again; backing off {next} ticks");
+            } else {
+                log::warn!("ring: OS refused {attempts} offers; backing off {next} ticks");
             }
         }
         offered
@@ -643,7 +684,14 @@ impl IqRing {
             blocks_offered: offered,
             blocks_lost_total: self.blocks_lost_total.load(Ordering::Relaxed),
             starved_total: self.starved_total.load(Ordering::Relaxed),
+            holes_evicted: self.holes_evicted.load(Ordering::Relaxed),
         }
+    }
+
+    /// Ticks currently skipped between offer passes (0 when offers succeed).
+    #[cfg(test)]
+    pub(crate) fn offer_backoff_ticks(&self) -> u32 {
+        self.offer_backoff.load(Ordering::Relaxed)
     }
 }
 
@@ -795,6 +843,21 @@ mod tests {
     }
 
     #[test]
+    fn evicting_a_hole_is_counted() {
+        let (r, mut w) = IqRing::with_slots(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()), 512);
+        // HOLES + 2 writes each starting 10 samples past the head make HOLES + 1 holes.
+        r.provision(300);
+        let mut s = 0u64;
+        for _ in 0..=HOLES {
+            s += 10;
+            w.write(s, Samples::Ci16(&ramp(s, 100)));
+            s += 100;
+        }
+        assert_eq!(r.stats().holes_evicted, 1);
+        assert_eq!(r.oldest(), 10, "oldest moved past the evicted hole [0, 10)");
+    }
+
+    #[test]
     fn an_evicted_hole_moves_oldest_past_it() {
         let (r, mut w) = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()));
         r.provision(200);
@@ -866,6 +929,13 @@ mod tests {
 
     #[test]
     fn concurrent_reader_sees_ramp_or_overwritten() {
+        // Correctness (no torn read) is asserted inside every attempt; the race
+        // itself is only likely per attempt, so coverage gets eight tries.
+        assert!((0..8).any(|_| concurrent_reader_once()), "no read was overwritten in 8 attempts");
+    }
+
+    /// One attempt; returns whether a read was observed overwritten.
+    fn concurrent_reader_once() -> bool {
         // Eight slots so provisioning wraps and overwrites blocks while the reader runs.
         const BLOCKS: u64 = 200;
         const READS: u64 = 2000;
@@ -946,8 +1016,8 @@ mod tests {
         writer.join().unwrap();
         let (ok, over) = reader.join().unwrap();
         assert!(ok > 0, "no read succeeded");
-        assert!(over > 0, "no read was overwritten ({ok} ok)");
         assert_eq!(r.head(), BLOCKS * bs);
+        over > 0
     }
 
     fn state(b: &Block) -> BlockState {
@@ -1028,6 +1098,13 @@ mod tests {
 
     #[test]
     fn concurrent_offers_and_reads_never_copy_offered_memory() {
+        // Correctness is asserted inside every attempt; coverage (more than one
+        // offer) is only likely per attempt, so it gets eight tries.
+        assert!((0..8).any(|_| concurrent_offers_once()), "the keeper never offered more than once in 8 attempts");
+    }
+
+    /// One attempt; returns whether the keeper offered more than once.
+    fn concurrent_offers_once() -> bool {
         const CYCLES: u64 = 5000;
         let mem = Arc::new(FakeVolatile::default());
         let (r, mut w) = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(SlowOffer(mem.clone(), Default::default())));
@@ -1080,7 +1157,7 @@ mod tests {
         keeper.join().expect("keeper panicked (double offer?)");
         let (ok, _lost) = reader.join().expect("reader panicked (copied offered memory?)");
         assert!(ok > 0, "no read succeeded");
-        assert!(mem.offered().len() > 1, "the keeper never offered more than once");
+        mem.offered().len() > 1
     }
 
     /// The fake, with a `reclaim` that panics.
@@ -1138,6 +1215,54 @@ mod tests {
         }
     }
 
+    /// Refuses every offer and counts the attempts.
+    struct AlwaysRefusing(FakeVolatile, AtomicU64);
+
+    impl VolatileMemory for AlwaysRefusing {
+        fn alloc(&self, bytes: usize) -> Option<volatile::Region> {
+            self.0.alloc(bytes)
+        }
+        fn offer(&self, _: &volatile::Region, _: OfferPriority) -> bool {
+            self.1.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+        fn reclaim(&self, r: &volatile::Region) -> bool {
+            self.0.reclaim(r)
+        }
+        fn free(&self, r: volatile::Region) {
+            self.0.free(r)
+        }
+    }
+
+    #[test]
+    fn a_refused_offer_backs_off_exponentially_and_an_accepted_one_resets() {
+        let mem = Arc::new(AlwaysRefusing(FakeVolatile::default(), AtomicU64::new(0)));
+        let (r, mut w) = IqRing::new(RingConfig { block_bytes: 4096 }, mem.clone());
+        r.set_guaranteed_samples(3072); // only block 0 is past the window
+        r.provision(3);
+        w.write(0, Samples::Ci16(&ramp(0, 4096))); // blocks 0..3 written (1024 samples each)
+        r.housekeep(); // pass 1: one refused offer attempt
+        assert_eq!(mem.1.load(Ordering::Relaxed), 1);
+        assert_eq!(r.offer_backoff_ticks(), 1);
+        r.housekeep(); // pass 2: skipped, backing off
+        assert_eq!(mem.1.load(Ordering::Relaxed), 1);
+        r.housekeep(); // pass 3: retried, refused again, back-off doubles
+        assert_eq!(mem.1.load(Ordering::Relaxed), 2);
+        assert_eq!(r.offer_backoff_ticks(), 2);
+        for _ in 0..20 {
+            r.housekeep(); // retries at passes 6, 11 and 20
+        }
+        assert_eq!(mem.1.load(Ordering::Relaxed), 5);
+        assert_eq!(r.offer_backoff_ticks(), 16);
+
+        let (r, mut w) = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(FakeVolatile::default()));
+        r.set_guaranteed_samples(3072);
+        r.provision(3);
+        w.write(0, Samples::Ci16(&ramp(0, 4096)));
+        r.housekeep();
+        assert_eq!(r.offer_backoff_ticks(), 0);
+    }
+
     #[test]
     fn a_refused_offer_leaves_the_block_live_and_the_next_pass_retries() {
         let mem = Arc::new(Refusing(FakeVolatile::default(), AtomicU64::new(1)));
@@ -1155,6 +1280,9 @@ mod tests {
         let mut out = vec![[0i16; 2]; 4];
         r.read_raw(10, &mut out).unwrap(); // live block: read straight through
         assert_eq!(out[0], [10, 7]);
+        // Block 1's offer was accepted in that pass, so no back-off started
+        // and the very next pass retries block 0.
+        assert_eq!(r.offer_backoff_ticks(), 0);
         assert_eq!(r.housekeep().offered, 1); // retried, now accepted
         assert_eq!(state(&r.block_at(0).unwrap()), BlockState::Offered);
         assert_eq!(mem.0.offered().len(), 2);

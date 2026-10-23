@@ -66,6 +66,8 @@ pub struct SourceStats {
     /// Samples the ring skipped because their block was not provisioned in
     /// time (the keeper fell behind); each starvation is also a gap segment.
     pub starved_samples: u64,
+    /// Holes the ring forgot because its hole table was full.
+    pub holes_evicted: u64,
     pub overloads: u64,
     pub device_lost: bool,
     pub segments: usize,
@@ -395,6 +397,7 @@ impl Source {
             device_gaps: inner.device_gaps.load(Ordering::Relaxed),
             device_lost_samples: inner.device_lost_samples.load(Ordering::Relaxed),
             starved_samples: r.starved_total,
+            holes_evicted: r.holes_evicted,
             overloads: inner.overloads.load(Ordering::Relaxed),
             device_lost: inner.device_lost.load(Ordering::SeqCst),
             segments: inner.segments.len(),
