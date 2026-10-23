@@ -5,7 +5,6 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use dsp::channelizer::{ChannelDesign, DesignError, Extractor, design_channel};
-use dsp::spectrum::SharedFft;
 use sdr_core::Complex32;
 
 use super::{ChannelInfo, ChannelSpec, Consumer, ConsumerState, Delivery, EndReason, Flow, GapReason};
@@ -45,14 +44,6 @@ struct PendingGap {
     reason: GapReason,
 }
 
-/// The scratch for recomputing a block from the ring after a cache miss;
-/// dropped again on the next cache hit.
-struct Recompute {
-    fft: SharedFft,
-    input: Vec<Complex32>,
-    bins: Vec<Complex32>,
-}
-
 pub(crate) struct Sub {
     info: ChannelInfo,
     spec: ChannelSpec,
@@ -61,7 +52,6 @@ pub(crate) struct Sub {
     /// `None` once the subscription has ended.
     consumer: Option<Box<dyn Consumer>>,
     extractor: Option<Extractor>,
-    recompute: Option<Recompute>,
     out: Vec<Complex32>,
     /// Gaps to deliver before the next `Samples`, coalesced by reason.
     pending: Vec<PendingGap>,
@@ -92,7 +82,6 @@ impl Sub {
             stage,
             consumer: Some(consumer),
             extractor: Some(Extractor::new(design)),
-            recompute: None,
             out,
             pending: Vec::new(),
             panicked: false,
@@ -129,32 +118,30 @@ impl Sub {
         }
         let b = self.counters.next_block;
         let l = self.stage.hop();
-        let cached = self.stage.cache().get(b);
-        let (seg, cached_bins) = match cached {
-            Some((seg, bins)) => {
-                self.recompute = None;
-                (seg, Some(bins))
+        let (seg, bins) = match self.stage.bins(b) {
+            Ok((seg, bins, recomputed)) => {
+                if recomputed {
+                    self.counters.recomputed += 1;
+                }
+                (seg, bins)
             }
-            None => match self.recompute_block(b) {
-                Ok(seg) => (seg, None),
-                Err(ReadError::Future) => {
-                    // Unreachable while `b ≤ latest` (the stage only caches a block
-                    // once all its input is written), but must not hot-spin: wait
-                    // for the next block.
-                    self.wait = true;
-                    return false;
+            Err(ReadError::Future) => {
+                // Unreachable while `b ≤ latest` (the stage only caches a block
+                // once all its input is written), but must not hot-spin: wait
+                // for the next block.
+                self.wait = true;
+                return false;
+            }
+            Err(e) => {
+                let mut next = b + 1;
+                if matches!(e, ReadError::Overwritten | ReadError::Lost) {
+                    // To the live edge, never backwards; the gap runs to where samples resume.
+                    next = next.max(self.stage.source().oldest() / l + 2);
                 }
-                Err(e) => {
-                    let mut next = b + 1;
-                    if matches!(e, ReadError::Overwritten | ReadError::Lost) {
-                        // To the live edge, never backwards; the gap runs to where samples resume.
-                        next = next.max(self.stage.source().oldest() / l + 2);
-                    }
-                    self.add_gap(b * l, next * l, GapReason::Unreadable(e));
-                    self.counters.next_block = next;
-                    return false;
-                }
-            },
+                self.add_gap(b * l, next * l, GapReason::Unreadable(e));
+                self.counters.next_block = next;
+                return false;
+            }
         };
         if seg.id != self.counters.segment {
             self.redesign(&seg);
@@ -168,11 +155,7 @@ impl Sub {
             self.counters.next_block = b + 1;
             return false;
         };
-        let bins: &[Complex32] = match &cached_bins {
-            Some(bins) => bins,
-            None => &self.recompute.as_ref().expect("recomputed just now").bins,
-        };
-        extractor.extract(bins, (b - 1) * l, &mut self.out);
+        extractor.extract(&bins, (b - 1) * l, &mut self.out);
         for g in std::mem::take(&mut self.pending) {
             self.counters.gaps += 1;
             if !self.deliver(Delivery::Gap { from_sample: g.from, to_sample: g.to, reason: g.reason }) {
@@ -241,20 +224,6 @@ impl Sub {
         lo <= latest
     }
 
-    /// Block `b`'s bins from the ring, into the recompute scratch.
-    fn recompute_block(&mut self, b: u64) -> Result<Segment, ReadError> {
-        let (n, l) = (self.stage.fft_size(), self.stage.hop());
-        let r = self.recompute.get_or_insert_with(|| Recompute {
-            fft: SharedFft::new(n),
-            input: vec![Complex32::default(); n],
-            bins: vec![Complex32::default(); n],
-        });
-        let seg = self.stage.source().read((b - 1) * l, &mut r.input)?;
-        r.fft.forward(&r.input, &mut r.bins);
-        self.counters.recomputed += 1;
-        Ok(seg)
-    }
-
     /// A new segment: design the channel for its tuning and rate.
     fn redesign(&mut self, seg: &Segment) {
         self.counters.segment = seg.id;
@@ -315,7 +284,7 @@ impl Sub {
         self.finish(None);
     }
 
-    /// Drop the consumer and the scratch; the counters stay for the stats.
+    /// Drop the consumer and the buffers; the counters stay for the stats.
     /// `reason` becomes the end reason unless one is already set.
     fn finish(&mut self, reason: Option<EndReason>) {
         if self.counters.end_reason.is_none() {
@@ -327,7 +296,6 @@ impl Sub {
         }
         self.counters.state = ConsumerState::Ended;
         self.extractor = None;
-        self.recompute = None;
         self.pending = Vec::new();
         self.out = Vec::new();
     }

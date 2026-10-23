@@ -81,6 +81,10 @@ struct Collected {
     limit: Option<usize>,
     /// Sleep this long in each delivery.
     sleep: Option<Duration>,
+    /// Sleep this long in the first delivery only.
+    sleep_once: Option<Duration>,
+    /// Deliveries finished.
+    deliveries: u64,
     stored: Vec<Complex32>,
     samples: usize,
     first_samples: Vec<u64>,
@@ -114,6 +118,16 @@ impl Collector {
     /// Stores samples and sleeps `d` in every delivery.
     pub fn sleeping(d: Duration) -> Collector {
         Collector::with(Collected { store: true, sleep: Some(d), ..Default::default() })
+    }
+
+    /// Counts samples and sleeps `d` in its first delivery only.
+    pub fn sleeping_once(d: Duration) -> Collector {
+        Collector::with(Collected { sleep_once: Some(d), ..Default::default() })
+    }
+
+    /// Deliveries that have returned.
+    pub fn deliveries(&self) -> u64 {
+        self.0.lock().unwrap().deliveries
     }
 
     /// Samples received.
@@ -161,11 +175,15 @@ impl Collector {
 
 impl Consumer for Collector {
     fn deliver(&mut self, d: Delivery<'_>) -> Flow {
-        let sleep = self.0.lock().unwrap().sleep;
+        let sleep = {
+            let mut c = self.0.lock().unwrap();
+            c.sleep.or(c.sleep_once.take())
+        };
         if let Some(t) = sleep {
             std::thread::sleep(t); // outside the lock, so the test can read meanwhile
         }
         let mut c = self.0.lock().unwrap();
+        c.deliveries += 1;
         match d {
             Delivery::Samples { first_sample, samples, .. } => {
                 c.first_samples.push(first_sample);

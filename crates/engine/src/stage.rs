@@ -7,6 +7,7 @@
 //! head with a 1 ms park: it is the ring's only poller, a block takes about
 //! 3.3 ms at 10 MS/s, and the write path stays free of any waker.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -14,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use dsp::channelizer::{FFT_SIZE, HOP};
 use dsp::spectrum::{SharedFft, bh_power};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use sdr_core::Complex32;
 
 use crate::budget::SourceId;
@@ -27,6 +28,8 @@ use crate::source::{ReadError, Source};
 const POLL: Duration = Duration::from_millis(1);
 /// Weight of the newest block in [`StageStats::block_micros`].
 const EMA_ALPHA: f64 = 0.05;
+/// Blocks [`Stage::bins`] keeps after recomputing them.
+const RECOMPUTE_LRU: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct StageConfig {
@@ -76,10 +79,24 @@ struct Shared {
     stop: AtomicBool,
 }
 
+/// [`Stage::bins`]' path for blocks that have left the cache: one FFT plan,
+/// one input buffer (both made on first use and kept) and the last few
+/// recomputed blocks, shared by every subscription of the source.
+#[derive(Default)]
+struct Recompute {
+    fft: Option<SharedFft>,
+    input: Vec<Complex32>,
+    /// Oldest first.
+    lru: VecDeque<(u64, Segment, Arc<[Complex32]>)>,
+}
+
 pub struct Stage {
     shared: Arc<Shared>,
     fft_size: usize,
     hop: u64,
+    /// Taken only by [`Stage::bins`] callers (bus workers, outside the
+    /// scheduler lock); never by the stage thread.
+    recompute: Mutex<Recompute>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -100,7 +117,7 @@ impl Stage {
         let name = format!("fft-{}", shared.source.id().0);
         let worker = Worker { shared: shared.clone(), sink, fft_size, hop, row_period_secs: cfg.row_period_secs };
         let handle = std::thread::Builder::new().name(name).spawn(move || worker.run()).expect("spawn the FFT stage thread");
-        Arc::new(Stage { shared, fft_size, hop, thread: Mutex::new(Some(handle)) })
+        Arc::new(Stage { shared, fft_size, hop, recompute: Mutex::new(Recompute::default()), thread: Mutex::new(Some(handle)) })
     }
 
     pub fn source(&self) -> &Arc<Source> {
@@ -131,6 +148,42 @@ impl Stage {
 
     pub fn stats(&self) -> StageStats {
         self.shared.stats.lock().clone()
+    }
+
+    /// Block `block`'s segment and bins (`block ≥ 1`), and whether this call
+    /// recomputed them: from the cache; else from the last
+    /// [`RECOMPUTE_LRU`] blocks recomputed; else read from the ring
+    /// (`[(b−1)·L, (b+1)·L)`) and transformed once under the recompute
+    /// lock, so subscriptions that miss the cache together wait for one
+    /// FFT per block instead of each computing it. A ring error is returned
+    /// as is and nothing is kept.
+    pub fn bins(&self, block: u64) -> Result<(Segment, Arc<[Complex32]>, bool), ReadError> {
+        assert!(block >= 1, "block 0 starts before sample 0");
+        if let Some((seg, bins)) = self.shared.cache.get(block) {
+            return Ok((seg, bins, false));
+        }
+        let mut guard = self.recompute.lock();
+        let r = &mut *guard;
+        if let Some((_, seg, bins)) = r.lru.iter().rev().find(|c| c.0 == block) {
+            return Ok((seg.clone(), bins.clone(), false));
+        }
+        let n = self.fft_size;
+        if r.input.len() != n {
+            r.input = vec![Complex32::default(); n];
+        }
+        let seg = self.shared.source.read((block - 1) * self.hop, &mut r.input)?;
+        let fft = r.fft.get_or_insert_with(|| SharedFft::new(n));
+        let mut bins: Arc<[Complex32]> = std::iter::repeat_n(Complex32::default(), n).collect();
+        fft.forward(&r.input, Arc::get_mut(&mut bins).expect("a fresh Arc is unique"));
+        r.lru.push_back((block, seg.clone(), bins.clone()));
+        while r.lru.len() > RECOMPUTE_LRU {
+            r.lru.pop_front();
+        }
+        // Hand the lock to the callers that waited for this block before
+        // this one can come back for the next: a barging caller would run
+        // ahead of the rest by more than the LRU and make them recompute.
+        MutexGuard::unlock_fair(guard);
+        Ok((seg, bins, true))
     }
 
     /// Stop the thread and join it (unless called on the thread itself). Idempotent.

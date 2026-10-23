@@ -1,7 +1,8 @@
 //! The channel bus (spec §4.3): consumers subscribe to a channel of a
 //! source with a start point, a priority and a callback; a pool of workers
-//! cuts each channel from the stage's cached bins (or recomputes a block from
-//! the ring on a cache miss) and delivers blocks in order with gap markers.
+//! cuts each channel from the stage's cached bins (on a cache miss, from the
+//! stage's shared recompute path, [`Stage::bins`]) and delivers blocks in
+//! order with gap markers.
 //!
 //! Scheduling is by priority, then round-robin one block per turn
 //! (`sched.rs`); each subscription's lag behind the stage is in [`BusStats`].
@@ -147,7 +148,9 @@ pub struct ConsumerStats {
     pub lag_secs: f64,
     /// `Samples` deliveries.
     pub blocks: u64,
-    /// Blocks recomputed from the ring after a cache miss.
+    /// Blocks this subscription's turns recomputed from the ring after a
+    /// cache miss ([`Stage::bins`] returned `true`); a block another
+    /// subscription recomputed first is not counted again.
     pub recomputed: u64,
     /// `Gap` deliveries.
     pub gaps: u64,
