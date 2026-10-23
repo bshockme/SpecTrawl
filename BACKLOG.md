@@ -3,6 +3,9 @@
 Ideas and known rough edges that aren't scheduled yet. Newest at the top of each section.
 
 ## Rebuild
+- **NXDN golden capture** (2026-10-23): `nxdn_control_channel` stays ignored, not on air in the owner's area (two 40 s runs at 460.6 MHz found only DMR). Re-record if an NXDN control channel turns up.
+- **P25 Phase 2 golden captures** (2026-10-23): the local site (WACN 0xBEE00, system 0x348) has Phase 2 channels near 855.78 and 859.08 MHz, but their FACCH/SACCH decode nothing on the recorded slices, even with every NAC the Phase 1 channels show (0x340/0x343/0x344/0x34D) registered or a brute force over all NACs. `p25_phase2_talkgroups_after_learning_the_nac` and `p25_phase2_voice_and_encryption_sync` stay ignored until that is understood and slices are recorded. The 770.3 MHz site of the old tests is not on air here.
+- **ADP golden slice** (2026-10-23): `p25_phase1_voice_frames_and_encryption` now covers only a clear call; record a slice with an encrypted Phase 1 call to pin ADP (0xAA) again.
 - **Golden captures re-recorded** (2026-10-23): the original P25/DMR/NXDN slices stayed on another machine; new ones live under testdata/small and the tests were re-pinned to the local systems.
 
 ## UI

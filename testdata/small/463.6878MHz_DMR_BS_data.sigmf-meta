@@ -1,0 +1,18 @@
+{
+  "annotations": [],
+  "captures": [
+    {
+      "core:datetime": "2026-10-23T12:38:42.343Z",
+      "core:frequency": 463687813.09605414,
+      "core:sample_start": 0
+    }
+  ],
+  "global": {
+    "core:datatype": "cf32_le",
+    "core:description": "DMR BS data via SpecTrawl capture_identified",
+    "core:hw": "Airspy R2 735863DC2F650AE3",
+    "core:recorder": "SpecTrawl",
+    "core:sample_rate": 48076.92307692308,
+    "core:version": "1.2.0"
+  }
+}

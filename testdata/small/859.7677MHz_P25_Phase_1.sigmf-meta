@@ -1,0 +1,18 @@
+{
+  "annotations": [],
+  "captures": [
+    {
+      "core:datetime": "2026-10-23T12:41:59.282Z",
+      "core:frequency": 859767675.78125,
+      "core:sample_start": 0
+    }
+  ],
+  "global": {
+    "core:datatype": "cf32_le",
+    "core:description": "P25 Phase 1 via SpecTrawl capture_identified",
+    "core:hw": "Airspy R2 735863DC2D8F33E3",
+    "core:recorder": "SpecTrawl",
+    "core:sample_rate": 52083.333333333336,
+    "core:version": "1.2.0"
+  }
+}

@@ -1,5 +1,7 @@
 /target
 *.sigmf-data
+!/testdata/small/
+!/testdata/small/*.sigmf-data
 /testdata/large/
 /testdata/captures/*
 !/testdata/captures/MANIFEST.toml
