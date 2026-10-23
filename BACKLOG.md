@@ -7,6 +7,83 @@ Ideas and known rough edges that aren't scheduled yet. Newest at the top of each
 - **P25 Phase 2 golden captures** (2026-10-23): the local site (WACN 0xBEE00, system 0x348) has Phase 2 channels near 855.78 and 859.08 MHz, but their FACCH/SACCH decode nothing on the recorded slices, even with every NAC the Phase 1 channels show (0x340/0x343/0x344/0x34D) registered or a brute force over all NACs. `p25_phase2_talkgroups_after_learning_the_nac` and `p25_phase2_voice_and_encryption_sync` stay ignored until that is understood and slices are recorded. The 770.3 MHz site of the old tests is not on air here.
 - **ADP golden slice** (2026-10-23): `p25_phase1_voice_frames_and_encryption` now covers only a clear call; record a slice with an encrypted Phase 1 call to pin ADP (0xAA) again.
 - **Golden captures re-recorded** (2026-10-23): the original P25/DMR/NXDN slices stayed on another machine; new ones live under testdata/small and the tests were re-pinned to the local systems.
+- DESIGN §1 L11: Find every emission, then classify and decode it — PARTIAL — step 6
+- DESIGN §1 L12: Browse, search, filter and sort records — PARTIAL — step 4
+- DESIGN §1 L13: Tag records and add notes — SILENTLY DROPPED — step 4
+- DESIGN §1 L14: Rewind to, replay and export records — PARTIAL — step 5
+- DESIGN §1 L17: Baseline comparison and TSCM baselines — MISSING — not scheduled
+- DESIGN §1 L23: Any SDR fills any role, matched on capabilities — PARTIAL — not scheduled
+- DESIGN §1 L25: Reliable detection across many channels at once — PARTIAL — step 6
+- DESIGN §1 L26: Unknown signals get bandwidth, modulation family, symbol rate, timing — PARTIAL — step 6
+- DESIGN §1 L28: Windows and Linux support — PARTIAL — step 0
+- DESIGN §1 L33: Voice vocoders are a non-goal — CONTRADICTED — step 9
+- DESIGN §2 L41: CI builds for Windows and Linux from the start — SILENTLY DROPPED — step 0
+- DESIGN §2 L43: Custom wgpu waterfall with GPU colour map — PARTIAL — step 3
+- DESIGN §4 L101: Usable bandwidth fraction masks band edges — PARTIAL — step 2
+- DESIGN §4 L102: IQ ring stores native device format — CONTRADICTED — step 1
+- DESIGN §4 L104: Zero-IF: offset-tune and mask the DC spike — SILENTLY DROPPED — not scheduled
+- DESIGN §4 L105: Native sweep, else retune-and-dwell — PARTIAL — not scheduled
+- DESIGN §4 L108: Per-serial config: ppm, gain to dBm, preferred roles — PARTIAL — not scheduled
+- DESIGN §4 L121: GainChange, Overload, DeviceLost events — MISSING — step 1
+- DESIGN §4 L123: USB callback only copies into lock-free ring — CONTRADICTED — step 1
+- DESIGN §4 L127: Roles: Survey, Focus, Park, Follow — PARTIAL — not scheduled
+- DESIGN §4 L136: Role assigner — SILENTLY DROPPED — not scheduled
+- DESIGN §5 L144: Disk-backed rolling tier for the raw ring — SILENTLY DROPPED — not scheduled
+- DESIGN §5 L145: Ring readers include the user scrubbing — PARTIAL — step 5
+- DESIGN §5 L149: One overlap-save FFT per source, about 64k points — CONTRADICTED — step 2
+- DESIGN §5 L154: Per-bin noise floor plus CFAR threshold — PARTIAL — step 4
+- DESIGN §5 L155: Regions become records with occupied bandwidth and mean power — PARTIAL — step 4
+- DESIGN §6 L170: Record id, source_id and role — PARTIAL — step 4
+- DESIGN §6 L171: Record times on the shared TimeAnchor timeline — CONTRADICTED — step 1
+- DESIGN §6 L173: Power: peak and mean dBFS, dBm if calibrated — PARTIAL — step 4
+- DESIGN §6 L174: Features on each record — PARTIAL — step 6
+- DESIGN §6 L178: Classification as list of label, confidence, by — PARTIAL — step 4
+- DESIGN §6 L180: iq_clip link to a SigMF file — PARTIAL — step 4
+- DESIGN §6 L182: group_id from frequency, features and IDs — PARTIAL — step 4
+- DESIGN §7 L192: One reusable symbol engine, all state per channel — CONTRADICTED — step 6
+- DESIGN §7 L194: Normalize to 10 samples per symbol — PARTIAL — not scheduled
+- DESIGN §7 L195: Lookahead delay ring — SILENTLY DROPPED — not scheduled
+- DESIGN §7 L197: Masked sync tables with frame_period and tolerance — PARTIAL — step 6
+- DESIGN §7 L198: Rate-class gate: zero crossings plus hysteresis — SILENTLY DROPPED — step 6
+- DESIGN §7 L198: Amplitude-consistency gate — PARTIAL — not scheduled
+- DESIGN §7 L198: Two-sync confirmation within one frame period plus 3% — CONTRADICTED — step 6
+- DESIGN §7 L199: Timing and drift from sync spacing — PARTIAL — not scheduled
+- DESIGN §7 L200: Adaptive slicer and re-slicing — PARTIAL — not scheduled
+- DESIGN §7 L205: dPMR, D-STAR, YSF, ProVoice, ISM pulse timing — PARTIAL — not scheduled
+- DESIGN §7 L209: Occupied bandwidth and spectral shape — PARTIAL — step 6
+- DESIGN §7 L212: Symbol rate by zero crossings, envelope, cyclostationary features — PARTIAL — not scheduled
+- DESIGN §7 L213: PSK-on-FM test — SILENTLY DROPPED — not scheduled
+- DESIGN §7 L214: Burst timing: duration, period, duty, hop pattern — PARTIAL — not scheduled
+- DESIGN §7 L219: Rule-based classification on features — PARTIAL — step 6
+- DESIGN §7 L220: Small ML modulation classifier — SILENTLY DROPPED — not scheduled
+- DESIGN §8 L224: In-tree decoder modules behind cargo features — SILENTLY DROPPED — not scheduled
+- DESIGN §8 L225: External-process decoders over stdin/JSON — SILENTLY DROPPED — step 7
+- DESIGN §9 L238: Timeline pane — SILENTLY DROPPED — not scheduled
+- DESIGN §9 L240: Map pane — SILENTLY DROPPED — not scheduled
+- DESIGN §9 L245: Linear power averaging, peak-hold decay, max per pixel — PARTIAL — not scheduled
+- DESIGN §9 L246: Look-back scrub: select a region, decode or export it — PARTIAL — step 5
+- DESIGN §9 L248: Drag-to-tune, digit-wheel entry, no modal dialogs — PARTIAL — not scheduled
+- DESIGN §9 L248: Dark theme with a few colour maps — PARTIAL — not scheduled
+- DESIGN §10 L252: Per source: one USB thread plus one FFT/channelizer thread — PARTIAL — step 2
+- DESIGN §10 L253: Detectors run on a worker pool — CONTRADICTED — step 6
+- DESIGN §10 L254: UI never blocks on the engine — CONTRADICTED — step 3
+- DESIGN §10 L259: Benchmark early — PARTIAL — step 2
+- DESIGN §11 L274: dsp crate holds FFT, filters, channelizer, demodulators — CONTRADICTED — step 2
+- DESIGN §12 L288: Labelled SigMF corpus — PARTIAL — step 0
+- DESIGN §12 L289: Synthetic generators with detection-rate and false-alarm tests — PARTIAL — not scheduled
+- DESIGN §12 L290: Golden-output tests on known captures — PARTIAL — step 0
+- DESIGN §13 L301: Wi-Fi/LTE/BLE labelled by spectral shape only — CONTRADICTED — not scheduled
+- DESIGN §14 L307: Milestone 1: GPU waterfall, scrub 10 s, SigMF export — PARTIAL — step 5
+- DESIGN §14 L309: Milestone 2: records, signal list, boxes, SQLite — PARTIAL — step 4
+- DESIGN §14 L310: Milestone 3: channelizer, symbol engine, synthetic tests — PARTIAL — step 2
+- DESIGN §14 L312: Milestone 5: unknown-signal features, rules, grouping — PARTIAL — step 6
+- DESIGN §14 L313: Milestone 6: HackRF sweep, RTL-SDR Park, role assigner — PARTIAL — not scheduled
+- DESIGN §14 L314: Milestone 7: Soapy, HydraSDR, ISM signatures, TSCM, remote node — PARTIAL — not scheduled
+- DESIGN §16 L328: Make it easy to log metadata without content — SILENTLY DROPPED — not scheduled
+- docs/ui-design.md §2.3: TrunkSystem for any protocol — PARTIAL — step 9
+- docs/auto-explore.md §4: Explore orders by new since baseline — PARTIAL — step 9
+- docs/auto-explore.md §3/§7: Explore verdicts and in-view determination — PARTIAL — step 9
+- docs/auto-explore.md §8: Explore patrol revisits and thumbnails — MISSING — not scheduled
 
 ## UI
 

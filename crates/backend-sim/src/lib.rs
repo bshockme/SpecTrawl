@@ -405,7 +405,7 @@ impl Generator {
                     s.sym_left -= 1.0;
                     s.z *= s.step;
                     let slot_on = match slot_s {
-                        Some(sl) => ((t_block + i as f64 / fs) / sl) as u64 % 2 == 0,
+                        Some(sl) => (((t_block + i as f64 / fs) / sl) as u64).is_multiple_of(2),
                         None => true,
                     };
                     if slot_on {
