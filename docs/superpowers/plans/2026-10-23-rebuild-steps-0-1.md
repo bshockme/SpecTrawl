@@ -962,7 +962,8 @@ fn live_sources_get_equal_seconds_not_equal_bytes() {
     let a: std::collections::HashMap<_, _> = b.allowances().into_iter().collect();
     let secs = |id, rate: f64| a[&id].ceiling_blocks as f64 * MB as f64 / (rate * 4.0);
     assert!((secs(SourceId(1), 10e6) - secs(SourceId(2), 2.5e6)).abs() < 0.2, "{a:?}");   // within one block of each other
-    assert!((secs(SourceId(1), 10e6) - 20.0).abs() < 0.5);                               // 1000 MB / 50 MB/s = 20 s each
+    let expect = 1000.0 * 1048576.0 / 50e6;   // 1000 MiB shared at 50 MB/s combined: 20.97 s each
+    assert!((secs(SourceId(1), 10e6) - expect).abs() < 0.5);
     assert_eq!(a[&SourceId(1)].guaranteed_samples, 10_000_000);
 }
 
