@@ -1,0 +1,262 @@
+//! The one FFT thread per source: it walks the ring a hop at a time, caches
+//! each block's bins for the channelizer and averages Blackman-Harris power
+//! derived from those same bins into waterfall rows.
+//!
+//! Block `b` is the `N`-sample window starting at `(b − 1)·L` (`L = N/2`), so
+//! it is complete once the head reaches `(b + 1)·L`. The thread polls the
+//! head with a 1 ms park: it is the ring's only poller, a block takes about
+//! 3.3 ms at 10 MS/s, and the write path stays free of any waker.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use dsp::channelizer::{FFT_SIZE, HOP};
+use dsp::spectrum::{SharedFft, bh_power};
+use parking_lot::Mutex;
+use sdr_core::Complex32;
+
+use crate::budget::SourceId;
+use crate::cache::SpectrumCache;
+use crate::rows::{Row, RowHistory};
+use crate::segments::Segment;
+use crate::source::{ReadError, Source};
+
+/// How long the thread parks when the next block is not complete yet.
+const POLL: Duration = Duration::from_millis(1);
+/// Weight of the newest block in [`StageStats::block_micros`].
+const EMA_ALPHA: f64 = 0.05;
+
+#[derive(Debug, Clone)]
+pub struct StageConfig {
+    pub fft_size: usize,
+    /// Blocks of bins the [`SpectrumCache`] keeps.
+    pub cache_blocks: usize,
+    /// Seconds of blocks averaged into one waterfall row.
+    pub row_period_secs: f64,
+    /// Rows the [`RowHistory`] keeps.
+    pub row_history: usize,
+}
+
+impl Default for StageConfig {
+    fn default() -> Self {
+        StageConfig { fft_size: FFT_SIZE, cache_blocks: 32, row_period_secs: 0.05, row_history: 64 }
+    }
+}
+
+/// Told about each block once it is in the cache.
+pub trait BlockSink: Send + Sync {
+    fn on_block(&self, source: SourceId, block: u64);
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StageStats {
+    /// Blocks transformed and cached.
+    pub blocks: u64,
+    /// Ring refusals: one per jump to the live edge, one per block skipped
+    /// over a gap or a segment boundary.
+    pub skipped_blocks: u64,
+    /// EMA (α = 0.05) of the FFT + rows time per block.
+    pub block_micros: f64,
+    /// The last block inserted into the cache.
+    pub latest_block: Option<u64>,
+}
+
+/// What the stage and its thread share.
+struct Shared {
+    source: Arc<Source>,
+    cache: Arc<SpectrumCache>,
+    rows: Arc<RowHistory>,
+    stats: Mutex<StageStats>,
+    stop: AtomicBool,
+}
+
+pub struct Stage {
+    shared: Arc<Shared>,
+    fft_size: usize,
+    hop: u64,
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Stage {
+    /// Starts thread "fft-<source id>". `sink.on_block` is called after each block is cached.
+    pub fn start(source: Arc<Source>, cfg: StageConfig, sink: Arc<dyn BlockSink>) -> Arc<Stage> {
+        let fft_size = cfg.fft_size;
+        let hop = if fft_size == FFT_SIZE { HOP as u64 } else { (fft_size / 2) as u64 };
+        let shared = Arc::new(Shared {
+            cache: Arc::new(SpectrumCache::new(cfg.cache_blocks)),
+            rows: Arc::new(RowHistory::new(cfg.row_history)),
+            stats: Mutex::new(StageStats::default()),
+            stop: AtomicBool::new(false),
+            source,
+        });
+        let name = format!("fft-{}", shared.source.id().0);
+        let worker = Worker { shared: shared.clone(), sink, fft_size, hop, row_period_secs: cfg.row_period_secs };
+        let handle = std::thread::Builder::new().name(name).spawn(move || worker.run()).expect("spawn the FFT stage thread");
+        Arc::new(Stage { shared, fft_size, hop, thread: Mutex::new(Some(handle)) })
+    }
+
+    pub fn source(&self) -> &Arc<Source> {
+        &self.shared.source
+    }
+
+    pub fn cache(&self) -> &Arc<SpectrumCache> {
+        &self.shared.cache
+    }
+
+    pub fn rows(&self) -> &Arc<RowHistory> {
+        &self.shared.rows
+    }
+
+    /// Samples between consecutive blocks (`L`).
+    pub fn hop(&self) -> u64 {
+        self.hop
+    }
+
+    pub fn fft_size(&self) -> usize {
+        self.fft_size
+    }
+
+    /// The last block inserted into the cache.
+    pub fn latest_block(&self) -> Option<u64> {
+        self.shared.stats.lock().latest_block
+    }
+
+    pub fn stats(&self) -> StageStats {
+        self.shared.stats.lock().clone()
+    }
+
+    /// Stop the thread and join it (unless called on the thread itself). Idempotent.
+    pub fn stop(&self) {
+        self.shared.stop.store(true, Ordering::SeqCst);
+        let handle = self.thread.lock().take();
+        if let Some(h) = handle {
+            if h.thread().id() == std::thread::current().id() {
+                return;
+            }
+            h.thread().unpark();
+            if h.join().is_err() {
+                log::warn!("fft stage: the stage thread panicked");
+            }
+        }
+    }
+}
+
+impl Drop for Stage {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// A row being accumulated: the sum of its blocks' power.
+struct RowAcc {
+    first_sample: u64,
+    end_sample: u64,
+    blocks: u32,
+    segment: Segment,
+    sum: Vec<f32>,
+}
+
+/// The stage thread's state.
+struct Worker {
+    shared: Arc<Shared>,
+    sink: Arc<dyn BlockSink>,
+    fft_size: usize,
+    hop: u64,
+    row_period_secs: f64,
+}
+
+impl Worker {
+    fn run(self) {
+        let (n, l) = (self.fft_size, self.hop);
+        let source = &self.shared.source;
+        let id = source.id();
+        let mut fft = SharedFft::new(n);
+        let mut buf = vec![Complex32::default(); n];
+        let mut power = vec![0.0f32; n];
+        let mut row: Option<RowAcc> = None;
+        let mut b = (source.oldest() / l + 1).max(1);
+        while !self.shared.stop.load(Ordering::SeqCst) {
+            if source.head() < (b + 1) * l {
+                std::thread::park_timeout(POLL);
+                continue;
+            }
+            let first = (b - 1) * l;
+            match source.read(first, &mut buf) {
+                Ok(seg) => {
+                    let t0 = Instant::now();
+                    let mut bins: Arc<[Complex32]> = std::iter::repeat_n(Complex32::default(), n).collect();
+                    fft.forward(&buf, Arc::get_mut(&mut bins).expect("a fresh Arc is unique"));
+                    bh_power(&bins, &mut power);
+                    self.accumulate(&mut row, first, first + n as u64, &seg, &power);
+                    let micros = t0.elapsed().as_secs_f64() * 1e6;
+                    self.shared.cache.insert(b, seg, bins);
+                    {
+                        let mut s = self.shared.stats.lock();
+                        s.block_micros = if s.blocks == 0 { micros } else { s.block_micros + EMA_ALPHA * (micros - s.block_micros) };
+                        s.blocks += 1;
+                        s.latest_block = Some(b);
+                    }
+                    self.sink.on_block(id, b);
+                    b += 1;
+                }
+                Err(ReadError::Future) => std::thread::park_timeout(POLL),
+                Err(ReadError::Overwritten | ReadError::Lost) => {
+                    b = source.oldest() / l + 2;
+                    self.shared.stats.lock().skipped_blocks += 1;
+                }
+                Err(ReadError::Gap | ReadError::SpansSegments) => {
+                    b += 1;
+                    self.shared.stats.lock().skipped_blocks += 1;
+                }
+            }
+        }
+    }
+
+    /// Add one block's power to the row in progress, publishing the partial
+    /// row first if the block belongs to another segment, and the row itself
+    /// once it holds `ceil(row_period·fs/L)` blocks.
+    fn accumulate(&self, row: &mut Option<RowAcc>, first: u64, end: u64, seg: &Segment, power: &[f32]) {
+        if let Some(r) = row.take_if(|r| r.segment.id != seg.id) {
+            self.publish(r);
+        }
+        let want = self.blocks_per_row(seg.sample_rate);
+        let acc = row.get_or_insert_with(|| RowAcc {
+            first_sample: first,
+            end_sample: end,
+            blocks: 0,
+            segment: seg.clone(),
+            sum: vec![0.0; power.len()],
+        });
+        for (s, p) in acc.sum.iter_mut().zip(power) {
+            *s += p;
+        }
+        acc.blocks += 1;
+        acc.end_sample = end;
+        if acc.blocks >= want
+            && let Some(r) = row.take()
+        {
+            self.publish(r);
+        }
+    }
+
+    /// `ceil(row_period·fs/L)`, at least 1.
+    fn blocks_per_row(&self, rate: f64) -> u32 {
+        let blocks = (self.row_period_secs * rate / self.hop as f64).ceil();
+        if blocks.is_finite() && blocks >= 1.0 { blocks as u32 } else { 1 }
+    }
+
+    /// Push the row's average power.
+    fn publish(&self, acc: RowAcc) {
+        let k = 1.0 / acc.blocks as f32;
+        let power = acc.sum.into_iter().map(|s| s * k).collect();
+        self.shared.rows.push(Row {
+            first_sample: acc.first_sample,
+            end_sample: acc.end_sample,
+            blocks: acc.blocks,
+            segment: acc.segment,
+            power,
+        });
+    }
+}

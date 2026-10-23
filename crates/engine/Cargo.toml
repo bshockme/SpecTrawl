@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 arc-swap = "1.7"
+dsp = { version = "0.1.0", path = "../dsp" }
 log = "0.4"
 parking_lot = "0.12"
 sdr-core = { version = "0.1.0", path = "../sdr-core" }

@@ -839,6 +839,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "backend-sim",
+ "dsp",
  "libc",
  "log",
  "parking_lot",
