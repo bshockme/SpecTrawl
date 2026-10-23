@@ -1,13 +1,13 @@
 //! The spectral identifier on real spectra in testdata/spectra (mean dB per
 //! bin, made with `cargo run -p engine --example trawl`). A missing spectrum
-//! fails the test unless SPECTRAWL_SKIP_CAPTURES=1.
+//! fails the test unless SPECTRAWL_SKIP_CAPTURES is set (then it is skipped).
 
 mod common;
 
 use detect::spectral::{Kind, Occupant, Spectrum, floor_estimate, identify};
 
 fn occupants(name: &str) -> Option<Vec<Occupant>> {
-    // Only absence may skip; anything present must parse.
+    // Absence panics (or skips when SPECTRAWL_SKIP_CAPTURES is set); anything present must parse.
     let json = common::spectrum(name)?;
     let spec = common::spectrum_file(name, "spec")?;
     Some(parse_spectrum(name, &json, &spec))

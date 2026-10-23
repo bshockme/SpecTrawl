@@ -134,14 +134,21 @@ pub struct DeviceInfo {
 /// In-band events, positioned on the sample counter of the stream.
 ///
 /// Contract every backend honours:
-/// - `TimeAnchor`: sent at stream start and at least once per second of
-///   samples; `at_sample` is the sample that `host_time` corresponds to.
+/// - `TimeAnchor`: sent at stream start and then at least once per second of
+///   samples plus up to one transfer (a backend anchors at a block boundary,
+///   so the gap between anchors can exceed a second by one block); `at_sample`
+///   is the sample that `host_time` corresponds to.
 /// - `Retune`: stamped at the first sample that carries the new tuning, as
-///   closely as the backend can determine.
+///   closely as the backend can determine. Its `at_sample` may equal the end
+///   of the block it is sent before (the new tuning starts with the next
+///   block), so it is never below the stream's current sample count.
 /// - `Gap`: `at_sample` is the index of the first lost sample; the next
 ///   `on_samples` starts at `at_sample + lost_samples`.
 /// - `Overload`: at most once per second while the input clips.
-/// - `DeviceLost`: sent once, after which no more samples arrive.
+/// - `DeviceLost`: sent once, in band, by backends that can detect the loss
+///   (the simulator), after which no more samples arrive. Backends that
+///   cannot (Airspy) never send it; the engine's watchdog raises it instead
+///   when no samples have arrived for 2 s and `Device::is_streaming()` is false.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     /// The centre frequency or sample rate changed.

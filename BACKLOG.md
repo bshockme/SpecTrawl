@@ -3,6 +3,11 @@
 Ideas and known rough edges that aren't scheduled yet. Newest at the top of each section.
 
 ## Rebuild
+- **Ring offers are not demoted with age** (2026-10-23): the keeper offers each block once, at `Normal`, as it leaves the guaranteed window, and does not re-offer it at a lower priority as it ages (spec §4.1 "priority falling with age"). Needs a reclaim-and-re-offer (or an OS call that changes priority in place) per band crossing; weigh its cost before step 5.
+- **Ring user cap and per-source pin/weight UI not wired** (2026-10-23): the budget takes a ceiling in bytes and a per-source weight, but the user cap in seconds or bytes ("lower wins", spec §4.1) and the per-source pin/weight setting have no config or UI yet. Step 3 (UI) or later.
+- **No memory-pressure handling on fallback platforms** (2026-10-23): outside Windows and Linux the ring's backend refuses every offer, and the spec's "poll available memory and retire the oldest blocks under a floor" is not built, so the ring there holds its whole ceiling whatever else needs RAM. Not scheduled (no such platform is targeted yet).
+- **A Lost block in the middle of the ring is retired only at the front** (2026-10-23): reads of it fail with `Lost` at once, but the keeper drops it (and frees its slot) only once it is the oldest held block, so its memory is held until then. Step 5, if the replay scrubber makes it visible.
+- **backend-airspy does not emit DeviceLost itself** (2026-10-23): spec §8 asks the Airspy backend to emit `DeviceLost`; instead the engine's watchdog raises it for any backend (no samples for 2 s and `is_streaming() == false`, see the `sdr-core` stream contract). An in-band event from libairspy's transfer status remains possible later.
 - **NXDN golden capture** (2026-10-23): `nxdn_control_channel` stays ignored, not on air in the owner's area (two 40 s runs at 460.6 MHz found only DMR). Re-record if an NXDN control channel turns up.
 - **P25 Phase 2 golden captures** (2026-10-23): the local site (WACN 0xBEE00, system 0x348) has Phase 2 channels near 855.78 and 859.08 MHz, but their FACCH/SACCH decode nothing on the recorded slices, even with every NAC the Phase 1 channels show (0x340/0x343/0x344/0x34D) registered or a brute force over all NACs. `p25_phase2_talkgroups_after_learning_the_nac` and `p25_phase2_voice_and_encryption_sync` stay ignored until that is understood and slices are recorded. The 770.3 MHz site of the old tests is not on air here.
 - **ADP golden slice** (2026-10-23): `p25_phase1_voice_frames_and_encryption` now covers only a clear call; record a slice with an encrypted Phase 1 call to pin ADP (0xAA) again.
@@ -15,17 +20,17 @@ Ideas and known rough edges that aren't scheduled yet. Newest at the top of each
 - DESIGN §1 L23: Any SDR fills any role, matched on capabilities — PARTIAL — not scheduled
 - DESIGN §1 L25: Reliable detection across many channels at once — PARTIAL — step 6
 - DESIGN §1 L26: Unknown signals get bandwidth, modulation family, symbol rate, timing — PARTIAL — step 6
-- DESIGN §1 L28: Windows and Linux support — PARTIAL — step 0
+- DESIGN §1 L28: Windows and Linux support — DONE (done 2026-10-23, step 0/1)
 - DESIGN §1 L33: Voice vocoders are a non-goal — CONTRADICTED — step 9
-- DESIGN §2 L41: CI builds for Windows and Linux from the start — SILENTLY DROPPED — step 0
+- DESIGN §2 L41: CI builds for Windows and Linux from the start — DONE (done 2026-10-23, step 0/1)
 - DESIGN §2 L43: Custom wgpu waterfall with GPU colour map — PARTIAL — step 3
 - DESIGN §4 L101: Usable bandwidth fraction masks band edges — PARTIAL — step 2
-- DESIGN §4 L102: IQ ring stores native device format — CONTRADICTED — step 1
+- DESIGN §4 L102: IQ ring stores native device format — DONE (done 2026-10-23, step 0/1): DESIGN.md §4.2 and §5.1 amended to say the ring keeps interleaved i16 (rebuild spec §4.1)
 - DESIGN §4 L104: Zero-IF: offset-tune and mask the DC spike — SILENTLY DROPPED — not scheduled
 - DESIGN §4 L105: Native sweep, else retune-and-dwell — PARTIAL — not scheduled
 - DESIGN §4 L108: Per-serial config: ppm, gain to dBm, preferred roles — PARTIAL — not scheduled
-- DESIGN §4 L121: GainChange, Overload, DeviceLost events — MISSING — step 1
-- DESIGN §4 L123: USB callback only copies into lock-free ring — CONTRADICTED — step 1
+- DESIGN §4 L121: GainChange, Overload, DeviceLost events — DONE (done 2026-10-23, step 0/1): Overload from the backends; DeviceLost in-band from the simulator and from the engine's watchdog for the rest
+- DESIGN §4 L123: USB callback only copies into lock-free ring — DONE (done 2026-10-23, step 0/1): the callback writes the block ring without a mutex (the segment table's lock only on Retune/Gap/starvation)
 - DESIGN §4 L127: Roles: Survey, Focus, Park, Follow — PARTIAL — not scheduled
 - DESIGN §4 L136: Role assigner — SILENTLY DROPPED — not scheduled
 - DESIGN §5 L144: Disk-backed rolling tier for the raw ring — SILENTLY DROPPED — not scheduled
@@ -34,7 +39,7 @@ Ideas and known rough edges that aren't scheduled yet. Newest at the top of each
 - DESIGN §5 L154: Per-bin noise floor plus CFAR threshold — PARTIAL — step 4
 - DESIGN §5 L155: Regions become records with occupied bandwidth and mean power — PARTIAL — step 4
 - DESIGN §6 L170: Record id, source_id and role — PARTIAL — step 4
-- DESIGN §6 L171: Record times on the shared TimeAnchor timeline — CONTRADICTED — step 1
+- DESIGN §6 L171: Record times on the shared TimeAnchor timeline — PARTIAL — step 4 (the sample timeline exists since step 1, 2026-10-23; records are timed on it in step 4)
 - DESIGN §6 L173: Power: peak and mean dBFS, dBm if calibrated — PARTIAL — step 4
 - DESIGN §6 L174: Features on each record — PARTIAL — step 6
 - DESIGN §6 L178: Classification as list of label, confidence, by — PARTIAL — step 4
@@ -69,9 +74,9 @@ Ideas and known rough edges that aren't scheduled yet. Newest at the top of each
 - DESIGN §10 L254: UI never blocks on the engine — CONTRADICTED — step 3
 - DESIGN §10 L259: Benchmark early — PARTIAL — step 2
 - DESIGN §11 L274: dsp crate holds FFT, filters, channelizer, demodulators — CONTRADICTED — step 2
-- DESIGN §12 L288: Labelled SigMF corpus — PARTIAL — step 0
+- DESIGN §12 L288: Labelled SigMF corpus — DONE (done 2026-10-23, step 0/1)
 - DESIGN §12 L289: Synthetic generators with detection-rate and false-alarm tests — PARTIAL — not scheduled
-- DESIGN §12 L290: Golden-output tests on known captures — PARTIAL — step 0
+- DESIGN §12 L290: Golden-output tests on known captures — DONE (done 2026-10-23, step 0/1)
 - DESIGN §13 L301: Wi-Fi/LTE/BLE labelled by spectral shape only — CONTRADICTED — not scheduled
 - DESIGN §14 L307: Milestone 1: GPU waterfall, scrub 10 s, SigMF export — PARTIAL — step 5
 - DESIGN §14 L309: Milestone 2: records, signal list, boxes, SQLite — PARTIAL — step 4

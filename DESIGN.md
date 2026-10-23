@@ -99,7 +99,7 @@ An open device exposes a common `Device` interface: tune, set the sample rate, s
 |---|---|
 | Frequency range(s), tuning step, retune latency | Role fit, sweep speed |
 | Sample rates, **usable bandwidth fraction** | The channelizer masks band edges where filters roll off and images appear. Example: the Airspy at 10 MSPS is about 9 MHz clean. |
-| Native sample format (packed 12-bit / i16 / i8 / f32) | The IQ ring stores the native format |
+| Native sample format (packed 12-bit / i16 / i8 / f32) | Converted once in the callback; the IQ ring stores interleaved i16 (§5.1) |
 | Gain model: named stages plus linearity/sensitivity presets | One gain control in the UI for every device |
 | IF architecture: real-IF / zero-IF | On zero-IF devices, offset-tune and mask the DC spike |
 | Native sweep support | Use the hardware sweep, otherwise fall back to generic retune-and-dwell |
@@ -139,7 +139,7 @@ The **role assigner** scores each attached device against each role's needs and 
 
 ### 5.1 IQ ring (look-back)
 
-- Holds the last *N* seconds of wideband IQ **in the device's native format**. At 10 MS/s int16 that's 40 MB/s, half the size of f32. Samples are converted to complex float only when read.
+- Holds the last *N* seconds of wideband IQ **as interleaved i16** (amended 2026-10-23 per the rebuild spec §4.1; this said "in the device's native format"). At 10 MS/s that's 40 MB/s, half the size of f32; a device's float or 8-bit output is converted once in the callback. Samples are converted to complex float only when read.
 - RAM tier by default, configurable. 10 s ≈ 400 MB at 10 MS/s.
 - An optional **disk-backed rolling tier**: 40 MB/s is trivial for an NVMe drive. That gives hours of look-back and SCEPTRE-style unattended capture.
 - Readers: the FFT (live edge), the channelizer (live edge or rewound), detectors that confirmed late (rewound to the start of the burst), the user (scrubbing the waterfall), and export ("save this region as SigMF").
