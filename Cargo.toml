@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "UNLICENSED"
+license = "MIT"
 
 [profile.dev]
 # DSP is unusably slow unoptimized; keep debug info but optimize our deps.
