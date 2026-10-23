@@ -119,3 +119,22 @@ fn silent_driver_death_is_detected_by_the_watchdog() {
     assert!(t0.elapsed() >= Duration::from_secs(2) - block, "{:?}", t0.elapsed());
     assert_eq!(c.starts(), 1);
 }
+
+#[test]
+fn a_source_keeps_its_keeper_alive() {
+    let keeper = Keeper::start(RingBudget::new(BudgetConfig { guaranteed_secs: 0.5, ceiling_bytes: 64 << 20, sweep_secs: 0.2 }));
+    let (d, _c) = sim(2.5e6, true);
+    let src = Source::start(d, cfg(), Mode::Live, &keeper).unwrap();
+    drop(keeper); // the caller lets go; the source still has one
+    wait_until(|| src.stats().held_secs >= 0.5); // still housekept (blocks keep being provisioned)
+    assert_eq!(src.stats().starved_samples, 0);
+    assert_eq!(src.keeper().tick_panics(), 0);
+}
+
+#[test]
+fn export_error_is_a_std_error() {
+    fn is_error<E: std::error::Error + Send + Sync + 'static>() {}
+    is_error::<ExportError>();
+    let e = ExportError::Ring(engine::ring::ReadError::Gap);
+    assert_eq!(e.to_string(), "the range touches a gap: samples the device never delivered");
+}

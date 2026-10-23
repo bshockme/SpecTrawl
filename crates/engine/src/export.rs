@@ -19,6 +19,28 @@ pub enum ExportError {
     Io(std::io::Error),
 }
 
+impl std::fmt::Display for ExportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExportError::Spans(s) => write!(f, "the range spans segments {} to {}", s.first.0, s.last.0),
+            ExportError::Ring(ring::ReadError::Gap) => f.write_str("the range touches a gap: samples the device never delivered"),
+            ExportError::Ring(ring::ReadError::Overwritten) => f.write_str("the range is no longer held"),
+            ExportError::Ring(ring::ReadError::Lost) => f.write_str("the range was discarded by the OS under memory pressure"),
+            ExportError::Ring(ring::ReadError::Future) => f.write_str("the range has not been written yet"),
+            ExportError::Io(e) => write!(f, "writing the export failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ExportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ExportError::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
 impl From<std::io::Error> for ExportError {
     fn from(e: std::io::Error) -> Self {
         ExportError::Io(e)

@@ -33,6 +33,11 @@ pub struct Segment {
 impl Segment {
     /// The samples at the start of a `Gap` segment that the device never
     /// delivered: `from_sample .. from_sample + lost_samples`. `None` otherwise.
+    ///
+    /// A hint for consumers that want to skip a hole in one step. Reads are the
+    /// authority: a range that intersects a hole is refused by `Source::read`
+    /// whether or not it is visible here (the ring remembers the newest 64
+    /// holes itself).
     pub fn hole(&self) -> Option<Range<u64>> {
         match self.boundary {
             Boundary::Gap { lost_samples } if lost_samples > 0 => Some(self.from_sample..self.from_sample + lost_samples),

@@ -255,9 +255,16 @@ pub struct Source {
     inner: Arc<SourceInner>,
     device: SharedDevice,
     id: SourceId,
+    keeper: Arc<Keeper>,
 }
 
 impl Source {
+    /// The keeper housekeeping this source's ring; the source holds its own
+    /// handle, so the caller dropping theirs does not stop housekeeping.
+    pub fn keeper(&self) -> &Arc<Keeper> {
+        &self.keeper
+    }
+
     /// Build the ring, segment table and timeline, join the budget, register
     /// with the keeper and start the device streaming into the ring.
     pub fn start(device: Box<dyn Device>, cfg: SourceConfig, mode: Mode, keeper: &Arc<Keeper>) -> sdr_core::Result<Source> {
@@ -295,7 +302,7 @@ impl Source {
             budget.leave(id);
             return Err(e);
         }
-        Ok(Source { inner, device, id })
+        Ok(Source { inner, device, id, keeper: keeper.clone() })
     }
 
     pub fn id(&self) -> SourceId {

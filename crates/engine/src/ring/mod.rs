@@ -170,7 +170,7 @@ impl RingWriter {
 
 impl IqRing {
     /// A ring and its only writer.
-    pub fn new(cfg: RingConfig, mem: Arc<dyn VolatileMemory>) -> (Arc<IqRing>, RingWriter) {
+    pub(crate) fn new(cfg: RingConfig, mem: Arc<dyn VolatileMemory>) -> (Arc<IqRing>, RingWriter) {
         IqRing::with_slots(cfg, mem, MAX_SLOTS)
     }
 
