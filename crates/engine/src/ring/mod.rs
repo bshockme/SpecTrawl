@@ -24,7 +24,7 @@ use arc_swap::ArcSwapOption;
 use sdr_core::{Complex32, Samples};
 
 use self::block::{Block, BlockState};
-use self::volatile::{PAGE, VolatileMemory};
+use self::volatile::{OfferPriority, PAGE, VolatileMemory};
 
 /// Default block size: 64 MiB, 16 Mi samples.
 pub const DEFAULT_BLOCK_BYTES: usize = 64 << 20;
@@ -254,12 +254,21 @@ impl IqRing {
     /// Bring an offered block back before copying from it. The caller holds a
     /// [`ReaderGuard`] on `block`.
     fn make_live(&self, block: &Block) -> Result<(), ReadError> {
+        let mut waited = 0u32;
         loop {
             match BlockState::from_u8(block.state.load(Ordering::SeqCst)) {
                 BlockState::Live => return Ok(()),
                 BlockState::Lost => return Err(ReadError::Lost),
-                // Another reader is reclaiming it; the result is moments away.
-                BlockState::Reclaiming => std::hint::spin_loop(),
+                // Another thread is inside `offer` or `reclaim`; wait for the
+                // outcome (bounded spin, then yield so a descheduled winner runs).
+                BlockState::Reclaiming | BlockState::Offering => {
+                    waited += 1;
+                    if waited < SPINS_BEFORE_YIELD {
+                        std::hint::spin_loop();
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
                 BlockState::Offered => {
                     let won = block.state.compare_exchange(
                         BlockState::Offered as u8,
@@ -268,7 +277,13 @@ impl IqRing {
                         Ordering::SeqCst,
                     );
                     if won.is_ok() {
-                        if block.mem().reclaim(block.region()) {
+                        // If `reclaim` unwinds, nobody knows whether the
+                        // contents survived: settle the block as Lost so
+                        // waiters do not spin on `Reclaiming` forever.
+                        let settle = StateOnUnwind(block, BlockState::Lost);
+                        let intact = block.mem().reclaim(block.region());
+                        std::mem::forget(settle);
+                        if intact {
                             block.state.store(BlockState::Live as u8, Ordering::SeqCst);
                             return Ok(());
                         }
@@ -279,6 +294,43 @@ impl IqRing {
                 }
             }
         }
+    }
+
+    /// Keeper side: offer `block`'s memory to the OS if no reader is in it.
+    /// Returns `true` if the block is now `Offered`.
+    ///
+    /// Protocol (pairs with the reader's `readers += 1` then state load, all
+    /// `SeqCst`): CAS `Live → Offering`; if `readers != 0`, revert to `Live`
+    /// and give up; otherwise `mem.offer()` and store `Offered`. A reader
+    /// that arrives after the CAS sees `Offering` or `Offered` and waits or
+    /// reclaims; a reader that arrived before it is seen in `readers`. So no
+    /// reader copies from memory that is offered, and a block is offered at
+    /// most once per reclaim (only a `Live` block can be offered, and an
+    /// offered block becomes `Live` again only through `reclaim`).
+    ///
+    /// The keeper must never offer the block holding `head`: the writer does
+    /// not look at the state.
+    #[cfg_attr(not(test), allow(dead_code))] // the keeper (Task 11) calls it
+    pub(crate) fn try_offer(&self, block: &Block, priority: OfferPriority) -> bool {
+        if block.state.compare_exchange(BlockState::Live as u8, BlockState::Offering as u8, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            return false;
+        }
+        if block.readers.load(Ordering::SeqCst) != 0 {
+            block.state.store(BlockState::Live as u8, Ordering::SeqCst);
+            return false;
+        }
+        // If `offer` unwinds, treat the offer as not made: back to `Live`.
+        let settle = StateOnUnwind(block, BlockState::Live);
+        block.mem().offer(block.region(), priority);
+        std::mem::forget(settle);
+        block.state.store(BlockState::Offered as u8, Ordering::SeqCst);
+        true
+    }
+
+    /// The block in `b`'s slot, if it is block `b`.
+    #[cfg(test)]
+    fn block_at(&self, b: u64) -> Option<Arc<Block>> {
+        self.slot(b).load_full().filter(|blk| blk.index == b)
     }
 
     /// Keeper side: make sure blocks `wanted_block ..= wanted_block + ahead`
@@ -334,7 +386,7 @@ impl IqRing {
                 && block.index < written_blocks
             {
                 match BlockState::from_u8(block.state.load(Ordering::Relaxed)) {
-                    BlockState::Live | BlockState::Reclaiming => live += 1,
+                    BlockState::Live | BlockState::Reclaiming | BlockState::Offering => live += 1,
                     BlockState::Offered => offered += 1,
                     BlockState::Lost => {}
                 }
@@ -360,9 +412,9 @@ struct ReaderGuard<'a>(&'a Block);
 
 impl<'a> ReaderGuard<'a> {
     fn enter(block: &'a Block) -> ReaderGuard<'a> {
-        // SeqCst with the state load that follows: the keeper (Task 11) must
-        // mark a block Offered before checking `readers`, so either it sees
-        // this reader or this reader sees `Offered` and reclaims.
+        // SeqCst with the state load that follows, against `try_offer`'s
+        // `Live → Offering` CAS then `readers` load: either the keeper sees
+        // this reader and backs off, or this reader sees `Offering`/`Offered`.
         block.readers.fetch_add(1, Ordering::SeqCst);
         ReaderGuard(block)
     }
@@ -373,6 +425,20 @@ impl Drop for ReaderGuard<'_> {
         self.0.readers.fetch_sub(1, Ordering::SeqCst);
     }
 }
+
+/// While a transient state's owner is inside `offer`/`reclaim`: if that call
+/// unwinds, store the settling state so waiters are released. Forgotten on
+/// the normal path.
+struct StateOnUnwind<'a>(&'a Block, BlockState);
+
+impl Drop for StateOnUnwind<'_> {
+    fn drop(&mut self) {
+        self.0.state.store(self.1 as u8, Ordering::SeqCst);
+    }
+}
+
+/// Spins in `make_live` before it starts yielding the thread.
+const SPINS_BEFORE_YIELD: u32 = 64;
 
 /// Convert `src[from..from + dst.len()]` to stored i16 IQ, as the old ring did:
 /// Ci16 copied, Ci8 shifted left by 8, Cf32 scaled by 32767 and clamped.
@@ -405,7 +471,8 @@ mod tests {
 
     use sdr_core::{Complex32, Samples};
 
-    use super::volatile::FakeVolatile;
+    use super::block::BlockState;
+    use super::volatile::{FakeVolatile, OfferPriority};
     use super::*;
 
     fn ramp(start: u64, n: usize) -> Vec<[i16; 2]> {
@@ -589,5 +656,170 @@ mod tests {
         assert!(ok > 0, "no read succeeded");
         assert!(over > 0, "no read was overwritten ({ok} ok)");
         assert_eq!(r.head(), BLOCKS * bs);
+    }
+
+    fn state(b: &Block) -> BlockState {
+        BlockState::from_u8(b.state.load(Ordering::SeqCst))
+    }
+
+    /// A ring with blocks 0 and 1 full of ramp; returns its fake memory too.
+    fn two_full_blocks() -> (Arc<IqRing>, Arc<FakeVolatile>) {
+        let mem = Arc::new(FakeVolatile::default());
+        let r = IqRing::new(RingConfig { block_bytes: 4096 }, mem.clone());
+        r.provision(1);
+        r.write(0, Samples::Ci16(&ramp(0, 2048)));
+        (r, mem)
+    }
+
+    #[test]
+    fn try_offer_backs_off_while_a_reader_is_in_the_block() {
+        let (r, mem) = two_full_blocks();
+        let b0 = r.block_at(0).unwrap();
+        let reading = ReaderGuard::enter(&b0);
+        assert!(!r.try_offer(&b0, OfferPriority::Low));
+        assert_eq!(state(&b0), BlockState::Live);
+        assert!(mem.offered().is_empty());
+        drop(reading);
+        assert!(r.try_offer(&b0, OfferPriority::Low));
+        assert!(!r.try_offer(&b0, OfferPriority::Low), "an offered block is not offered twice");
+    }
+
+    #[test]
+    fn offered_block_is_reclaimed_by_a_read_or_reported_lost() {
+        let (r, mem) = two_full_blocks();
+        let b0 = r.block_at(0).unwrap();
+        assert!(r.try_offer(&b0, OfferPriority::Low));
+        assert_eq!(state(&b0), BlockState::Offered);
+        assert_eq!(mem.offered().len(), 1);
+        let mut out = vec![[0i16; 2]; 4];
+        r.read_raw(10, &mut out).unwrap(); // reclaims intact
+        assert_eq!(out[0], [10, 7]);
+        assert_eq!(state(&b0), BlockState::Live);
+
+        assert!(r.try_offer(&b0, OfferPriority::Low));
+        mem.discard_oldest_offered(1);
+        assert_eq!(r.read_raw(10, &mut out), Err(ReadError::Lost));
+        assert_eq!(state(&b0), BlockState::Lost);
+        assert_eq!(r.read_raw(10, &mut out), Err(ReadError::Lost));
+        assert!(!r.try_offer(&b0, OfferPriority::Low));
+        assert_eq!(r.stats().blocks_lost_total, 1);
+        r.read_raw(1100, &mut out).unwrap(); // block 1 untouched
+    }
+
+    /// The fake for a single offered block, with `offer` delayed on entry
+    /// (widening the window between the keeper deciding to offer and the
+    /// offer taking effect) and a check that `reclaim` only ever sees a region
+    /// whose offer has completed.
+    struct SlowOffer(Arc<FakeVolatile>, std::sync::atomic::AtomicBool);
+
+    impl VolatileMemory for SlowOffer {
+        fn alloc(&self, bytes: usize) -> Option<volatile::Region> {
+            self.0.alloc(bytes)
+        }
+        fn offer(&self, r: &volatile::Region, priority: OfferPriority) {
+            let t = std::time::Instant::now();
+            while t.elapsed() < std::time::Duration::from_micros(2) {
+                std::hint::spin_loop();
+            }
+            self.0.offer(r, priority);
+            self.1.store(true, Ordering::SeqCst);
+        }
+        fn reclaim(&self, r: &volatile::Region) -> bool {
+            assert!(self.1.swap(false, Ordering::SeqCst), "reclaim of a region whose offer had not completed");
+            self.0.reclaim(r)
+        }
+        fn free(&self, r: volatile::Region) {
+            self.0.free(r)
+        }
+    }
+
+    #[test]
+    fn concurrent_offers_and_reads_never_copy_offered_memory() {
+        const CYCLES: u64 = 5000;
+        let mem = Arc::new(FakeVolatile::default());
+        let r = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(SlowOffer(mem.clone(), Default::default())));
+        r.provision(1);
+        r.write(0, Samples::Ci16(&ramp(0, 2048)));
+        let go = Arc::new(Barrier::new(2));
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let keeper = {
+            let (r, mem, go, done) = (r.clone(), mem.clone(), go.clone(), done.clone());
+            std::thread::spawn(move || {
+                let b0 = r.block_at(0).unwrap();
+                let mut out = vec![[0i16; 2]; 64];
+                go.wait();
+                for i in 0..CYCLES {
+                    r.try_offer(&b0, OfferPriority::Low);
+                    if i == CYCLES * 4 / 5 {
+                        // Zero-fill whatever is offered: a reader copying offered
+                        // memory now would see zeros in an `Ok` read.
+                        mem.discard_oldest_offered(1);
+                    }
+                    let _ = r.read_raw(i % 900, &mut out);
+                }
+                done.store(true, Ordering::Release);
+            })
+        };
+        let reader = {
+            let (r, go, done) = (r.clone(), go.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut rng = 0x2545_F491_4F6C_DD1Du64;
+                let mut out = vec![[0i16; 2]; 512];
+                let (mut ok, mut lost) = (0u64, 0u64);
+                go.wait();
+                // Read for as long as the keeper runs.
+                while !done.load(Ordering::Acquire) {
+                    let start = xorshift(&mut rng) % (1024 - 512 + 1);
+                    match r.read_raw(start, &mut out) {
+                        Ok(()) => {
+                            for (i, s) in out.iter().enumerate() {
+                                assert_eq!(*s, [(start + i as u64) as i16, 7], "read offered memory at {start}+{i}");
+                            }
+                            ok += 1;
+                        }
+                        Err(ReadError::Lost) => lost += 1,
+                        Err(e) => panic!("unexpected {e:?}"),
+                    }
+                }
+                (ok, lost)
+            })
+        };
+        keeper.join().expect("keeper panicked (double offer?)");
+        let (ok, _lost) = reader.join().expect("reader panicked (copied offered memory?)");
+        assert!(ok > 0, "no read succeeded");
+        assert!(mem.offered().len() > 1, "the keeper never offered more than once");
+    }
+
+    /// The fake, with a `reclaim` that panics.
+    struct PanickyReclaim(FakeVolatile);
+
+    impl VolatileMemory for PanickyReclaim {
+        fn alloc(&self, bytes: usize) -> Option<volatile::Region> {
+            self.0.alloc(bytes)
+        }
+        fn offer(&self, r: &volatile::Region, priority: OfferPriority) {
+            self.0.offer(r, priority)
+        }
+        fn reclaim(&self, _: &volatile::Region) -> bool {
+            panic!("reclaim failed")
+        }
+        fn free(&self, r: volatile::Region) {
+            self.0.free(r)
+        }
+    }
+
+    #[test]
+    fn a_reclaim_that_unwinds_leaves_the_block_lost_not_stuck() {
+        let r = IqRing::new(RingConfig { block_bytes: 4096 }, Arc::new(PanickyReclaim(FakeVolatile::default())));
+        r.provision(1);
+        r.write(0, Samples::Ci16(&ramp(0, 2048)));
+        let b0 = r.block_at(0).unwrap();
+        assert!(r.try_offer(&b0, OfferPriority::Low));
+        let mut out = vec![[0i16; 2]; 4];
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.read_raw(0, &mut out)));
+        assert!(unwound.is_err());
+        assert_eq!(state(&b0), BlockState::Lost);
+        assert_eq!(b0.readers.load(Ordering::SeqCst), 0);
+        assert_eq!(r.read_raw(0, &mut out), Err(ReadError::Lost)); // returns, does not spin
     }
 }

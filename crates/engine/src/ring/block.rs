@@ -18,9 +18,12 @@ pub enum BlockState {
     /// The OS discarded the contents; the samples are gone for good.
     Lost = 2,
     /// A reader won the `Offered → Reclaiming` race and is reclaiming it; other
-    /// readers wait for `Live` or `Lost`. Transient, never seen by the keeper
-    /// as offerable.
+    /// readers wait for `Live` or `Lost`. Transient; the keeper cannot offer it.
     Reclaiming = 3,
+    /// The keeper won `Live → Offering` and is offering it (see
+    /// `IqRing::try_offer`); readers wait for `Live` (offer abandoned) or
+    /// `Offered` (then reclaim it). Transient.
+    Offering = 4,
 }
 
 impl BlockState {
@@ -29,7 +32,9 @@ impl BlockState {
             0 => BlockState::Live,
             1 => BlockState::Offered,
             2 => BlockState::Lost,
-            _ => BlockState::Reclaiming,
+            3 => BlockState::Reclaiming,
+            4 => BlockState::Offering,
+            _ => unreachable!("invalid block state {v}"),
         }
     }
 }
