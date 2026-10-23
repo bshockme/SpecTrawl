@@ -83,6 +83,7 @@ fn a_panicking_consumer_is_ended_and_the_others_continue() {
     let src = Arc::new(Source::start(d, cfg(), Mode::Live, &keeper()).unwrap());
     // One worker: deliveries after the panic prove the worker that caught it survived.
     let bus = ChannelBus::new(BusConfig { workers: 1, ..Default::default() });
+    assert_eq!(bus.stats().workers, 1);
     bus.attach(src.clone());
     let mut seen = 0;
     let bad = move |d: Delivery<'_>| {

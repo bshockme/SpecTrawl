@@ -490,6 +490,10 @@ impl Generator {
             let c = f64::from_bits(self.center.load(Ordering::Relaxed));
             if c != center {
                 center = c;
+                // Every emitter's step was computed against the old centre.
+                for s in st.iter_mut() {
+                    s.sym_left = 0.0;
+                }
                 sink.on_event(StreamEvent::Retune { at_sample: n, center_hz: center, sample_rate: fs });
             }
             for a in acc.iter_mut() {
@@ -701,6 +705,54 @@ mod tests {
         let retunes = log.events(|e| matches!(e, StreamEvent::Retune { center_hz, .. } if *center_hz == 860e6));
         assert_eq!(retunes.len(), 1);
         assert_eq!(at_sample(&retunes[0]) % 65_536, 0);
+    }
+
+    /// Keeps every block's samples, and the events, for spectral checks.
+    #[derive(Default)]
+    struct Captured {
+        blocks: Vec<(u64, Vec<[i16; 2]>)>,
+        events: Vec<StreamEvent>,
+    }
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Captured>>);
+
+    impl StreamSink for Capture {
+        fn on_samples(&mut self, first_sample: u64, samples: Samples<'_>) {
+            let Samples::Ci16(s) = samples else { panic!("sim is Ci16") };
+            self.0.lock().unwrap().blocks.push((first_sample, s.to_vec()));
+        }
+
+        fn on_event(&mut self, event: StreamEvent) {
+            self.0.lock().unwrap().events.push(event);
+        }
+    }
+
+    #[test]
+    fn a_cw_emitter_stays_at_its_absolute_frequency_across_a_retune() {
+        let cw = Emitter { freq_hz: 855.0e6, level_dbfs: -20.0, modulation: Modulation::Cw, keying: Keying::Continuous };
+        let (mut d, _c) = SimDevice::with_config(SimConfig { emitters: vec![cw], center_hz: 855.25e6, paced: false, ..Default::default() });
+        let cap = Capture::default();
+        d.start(Box::new(cap.clone())).unwrap();
+        wait_until(|| cap.0.lock().unwrap().blocks.len() >= 3);
+        // 859 MHz, not 860: a -5 MHz offset is exactly Nyquist (step = -1), where the phase-difference estimator is ambiguous.
+        d.set_center(859e6).unwrap();
+        let retune_at = || {
+            cap.0.lock().unwrap().events.iter().find_map(|e| match e {
+                StreamEvent::Retune { at_sample, center_hz, .. } if *center_hz == 859e6 => Some(*at_sample),
+                _ => None,
+            })
+        };
+        wait_until(|| retune_at().is_some_and(|at| cap.0.lock().unwrap().blocks.iter().filter(|b| b.0 >= at).count() >= 2));
+        d.stop().unwrap();
+        let at = retune_at().unwrap();
+        let g = cap.0.lock().unwrap();
+        let x: Vec<Complex32> =
+            g.blocks.iter().filter(|b| b.0 >= at).flat_map(|b| b.1.iter().map(|v| Complex32::new(v[0] as f32, v[1] as f32))).collect();
+        let fs = 10e6;
+        let sum: f64 = x.windows(2).map(|w| (w[1] * w[0].conj()).arg() as f64).sum();
+        let hz = sum / (x.len() - 1) as f64 * fs / std::f64::consts::TAU;
+        assert!((hz - -4.0e6).abs() < 100.0, "tone at {hz} Hz, expected -4 MHz");
     }
 
     /// A recorder that blocks for 400 ms on its third block, like a descheduled runner.

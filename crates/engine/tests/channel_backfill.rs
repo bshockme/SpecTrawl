@@ -3,7 +3,6 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use backend_sim::{Emitter, Keying, Modulation, SimConfig, SimControl, SimDevice};
 use common::{Collector, Event, cfg, cw_sim, keeper, two_tone_sim, wait_until};
 use dsp::Ddc;
 use engine::{
@@ -28,23 +27,6 @@ fn freq(x: &[Complex32]) -> f32 {
 fn ripple(x: &[Complex32]) -> f32 {
     let m = x.iter().sum::<Complex32>() / x.len() as f32;
     x.iter().map(|v| (v - m).norm()).fold(0.0f32, f32::max) / m.norm()
-}
-
-/// Like `cw_sim`, but the carrier follows retunes: the sim computes a `Cw`
-/// emitter's phase step once and keeps it across a retune, while an `FmTone`
-/// recomputes it from the current centre every few hundred samples (with no
-/// deviation it is a plain carrier).
-fn retunable_cw_sim(freq_hz: f64, level_dbfs: f64) -> (SimDevice, SimControl) {
-    let carrier =
-        Emitter { freq_hz, level_dbfs, modulation: Modulation::FmTone { tone_hz: 1_000.0, dev_hz: 0.0 }, keying: Keying::Continuous };
-    SimDevice::with_config(SimConfig {
-        emitters: vec![carrier],
-        rate: 10e6,
-        center_hz: 855.25e6,
-        paced: true,
-        report_lag_gaps: false,
-        ..Default::default()
-    })
 }
 
 /// Samples delivered after the last `Gap`.
@@ -82,16 +64,6 @@ fn a_channel_backfilled_from_five_seconds_ago_matches_a_direct_ddc() {
     assert!(got.first_delivery_first_sample() == start);
     let (a, b) = (got.tail(want / 2), reference[reference.len() / 2..reference.len() / 2 + want / 2].to_vec());
     let s = bus.stats().consumers[0].clone();
-    eprintln!(
-        "power {:.3} vs {:.3} dB, freq {:.3} / {:.3} Hz, ripple {:.5} / {:.5}, recomputed {}",
-        power(&a),
-        power(&b),
-        freq(&a),
-        freq(&b),
-        ripple(&a),
-        ripple(&b),
-        s.recomputed
-    );
     assert!((power(&a) - power(&b)).abs() < 0.5, "power {} vs {} dB", power(&a), power(&b));
     assert!(freq(&a).abs() < 1.0 && freq(&b).abs() < 1.0, "tone not at DC: {} / {} Hz", freq(&a), freq(&b));
     assert!(ripple(&a) < 0.02 && ripple(&b) < 0.02, "neighbour leaks: {} / {}", ripple(&a), ripple(&b));
@@ -142,8 +114,8 @@ fn backfill_over_retired_history_reports_one_gap_and_continues() {
 #[test]
 fn a_retune_delivers_a_gap_then_continues_on_the_new_tuning() {
     let tone = 855.25e6 + TONE_OFFSET;
-    let (d, _c) = retunable_cw_sim(tone, -20.0);
-    let src = Arc::new(Source::start(Box::new(d), cfg(), Mode::Live, &keeper()).unwrap());
+    let (d, _c) = cw_sim(10e6, tone, -20.0);
+    let src = Arc::new(Source::start(d, cfg(), Mode::Live, &keeper()).unwrap());
     let bus = ChannelBus::new(BusConfig { workers: 2, ..Default::default() });
     bus.attach(src.clone());
     let got = Collector::new();
@@ -162,7 +134,6 @@ fn a_retune_delivers_a_gap_then_continues_on_the_new_tuning() {
     assert_eq!(gaps.len(), 1, "{:?}", gaps.iter().map(|&i| events[i]).collect::<Vec<_>>());
     let i = gaps[0];
     let Event::Gap { from_sample, to_sample, reason } = events[i] else { unreachable!() };
-    eprintln!("retune gap {from_sample}..{to_sample}: {reason:?}");
     assert!(matches!(reason, GapReason::Unreadable(ReadError::SpansSegments | ReadError::Gap)), "reason {reason:?}");
     let (Event::Samples { first_sample: prev, .. }, Event::Samples { first_sample: next, .. }) = (events[i - 1], events[i + 1]) else {
         panic!("the gap is not between two Samples: {:?}", &events[i - 1..=i + 1]);
@@ -170,7 +141,6 @@ fn a_retune_delivers_a_gap_then_continues_on_the_new_tuning() {
     assert_eq!((from_sample, to_sample), (prev + L, next), "the gap does not tile the deliveries around it");
     assert_eq!(src.segment_at(next - L).center_hz, 860e6);
     let level = |x: &[Complex32]| 20.0 * (x.iter().sum::<Complex32>() / x.len() as f32).norm().log10();
-    eprintln!("level {:.3} -> {:.3} dBFS, freq {:.3} -> {:.3} Hz", level(&before), level(&after), freq(&before), freq(&after));
     assert!((level(&after) - level(&before)).abs() < 0.5, "level {} -> {} dBFS", level(&before), level(&after));
     assert!(freq(&before).abs() < 1.0 && freq(&after).abs() < 1.0, "tone not at DC: {} / {} Hz", freq(&before), freq(&after));
 
@@ -196,7 +166,6 @@ fn a_retune_delivers_a_gap_then_continues_on_the_new_tuning() {
     let k = events.iter().position(|e| matches!(e, Event::Samples { first_sample, .. } if *first_sample == last_before)).unwrap();
     let first_after = events[k + 1..].iter().position(|e| matches!(e, Event::Samples { .. })).unwrap() + k + 1;
     let between = &events[k + 1..first_after];
-    eprintln!("out of span: {between:?}");
     let oos: Vec<&Event> = between.iter().filter(|e| matches!(e, Event::Gap { reason: GapReason::OutOfSpan, .. })).collect();
     assert_eq!(oos.len(), 1, "{between:?}");
     for e in between {

@@ -63,7 +63,8 @@ impl Entry {
         let c = &self.counters;
         match c.state {
             ConsumerState::Running => c.next_block <= latest.block,
-            ConsumerState::OutOfSpan => c.next_block <= latest.block && latest.segment != Some(c.segment),
+            // An unknown segment (cache miss) counts as the same one: waking on every block would spin.
+            ConsumerState::OutOfSpan => c.next_block <= latest.block && latest.segment.is_some_and(|s| s != c.segment),
             ConsumerState::Shed | ConsumerState::Ended => false,
         }
     }
