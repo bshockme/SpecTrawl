@@ -8,9 +8,11 @@ use backend_sim::{SimConfig, SimControl, SimDevice};
 use engine::{RingConfig, SourceConfig};
 use sdr_core::Device;
 
-/// A simulated device with no emitters (noise only) at `rate`.
+/// A simulated device with no emitters (noise only) at `rate`. It never
+/// reports a lag gap (a paced sim that falls behind on a loaded runner just
+/// restarts its clock), so only injected gaps reach the tests.
 pub fn sim(rate: f64, paced: bool) -> (Box<dyn Device>, SimControl) {
-    let (d, c) = SimDevice::with_config(SimConfig { emitters: vec![], rate, paced, ..Default::default() });
+    let (d, c) = SimDevice::with_config(SimConfig { emitters: vec![], rate, paced, report_lag_gaps: false, ..Default::default() });
     (Box::new(d), c)
 }
 

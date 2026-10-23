@@ -199,13 +199,25 @@ pub struct SimConfig {
     /// Pace generation to real time. When false the generator runs as fast as
     /// the CPU allows and never reports a `Gap` for falling behind.
     pub paced: bool,
+    /// When paced and more than 250 ms behind, report the skipped span as a
+    /// `Gap` (true, like a device dropping transfers) or just restart the
+    /// pacing clock without losing samples (false, for tests that must not
+    /// depend on the machine's scheduling).
+    pub report_lag_gaps: bool,
     pub serial: String,
 }
 
 impl Default for SimConfig {
     fn default() -> Self {
         // The centre keeps every default-scenario emitter inside the 90% usable band.
-        Self { emitters: default_scenario(), rate: 10e6, center_hz: 855.25e6, paced: true, serial: "SIM-0001".into() }
+        Self {
+            emitters: default_scenario(),
+            rate: 10e6,
+            center_hz: 855.25e6,
+            paced: true,
+            report_lag_gaps: true,
+            serial: "SIM-0001".into(),
+        }
     }
 }
 
@@ -281,6 +293,7 @@ pub struct SimDevice {
     running: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     paced: bool,
+    report_lag_gaps: bool,
     shared: Arc<SimShared>,
 }
 
@@ -319,6 +332,7 @@ impl SimDevice {
             running: Arc::new(AtomicBool::new(false)),
             worker: None,
             paced: cfg.paced,
+            report_lag_gaps: cfg.report_lag_gaps,
             shared: shared.clone(),
         };
         (dev, SimControl(shared))
@@ -380,6 +394,7 @@ impl Device for SimDevice {
             noise_amp: 10f64.powf(self.noise_dbfs / 20.0) as f32,
             running: self.running.clone(),
             paced: self.paced,
+            report_lag_gaps: self.report_lag_gaps,
             shared: self.shared.clone(),
         };
         self.worker = Some(std::thread::Builder::new().name("sim-sdr".into()).spawn(move || generator.run(sink)).unwrap());
@@ -412,6 +427,7 @@ struct Generator {
     noise_amp: f32,
     running: Arc<AtomicBool>,
     paced: bool,
+    report_lag_gaps: bool,
     shared: Arc<SimShared>,
 }
 
@@ -555,15 +571,20 @@ impl Generator {
                 continue;
             }
 
-            // Pace to real time; if we fall behind, report the skipped span as a gap.
+            // Pace to real time; if we fall behind, report the skipped span as
+            // a gap, or (without lag gaps) restart the clock from now.
             let due = t0 + Duration::from_secs_f64(n as f64 / fs);
             let now = Instant::now();
             if due > now {
                 std::thread::sleep(due - now);
             } else if now - due > Duration::from_millis(250) {
-                let lost = ((now - due).as_secs_f64() * fs) as u64;
-                sink.on_event(StreamEvent::Gap { at_sample: n, lost_samples: lost });
-                n += lost;
+                if self.report_lag_gaps {
+                    let lost = ((now - due).as_secs_f64() * fs) as u64;
+                    sink.on_event(StreamEvent::Gap { at_sample: n, lost_samples: lost });
+                    n += lost;
+                } else {
+                    t0 += now - due;
+                }
             }
         }
     }
@@ -680,6 +701,40 @@ mod tests {
         let retunes = log.events(|e| matches!(e, StreamEvent::Retune { center_hz, .. } if *center_hz == 860e6));
         assert_eq!(retunes.len(), 1);
         assert_eq!(at_sample(&retunes[0]) % 65_536, 0);
+    }
+
+    /// A recorder that blocks for 400 ms on its third block, like a descheduled runner.
+    struct Stalling(Recorder, usize);
+
+    impl StreamSink for Stalling {
+        fn on_samples(&mut self, first_sample: u64, samples: Samples<'_>) {
+            self.1 += 1;
+            if self.1 == 3 {
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            self.0.on_samples(first_sample, samples);
+        }
+
+        fn on_event(&mut self, event: StreamEvent) {
+            self.0.on_event(event);
+        }
+    }
+
+    #[test]
+    fn falling_behind_reports_a_gap_only_when_lag_gaps_are_on() {
+        for report_lag_gaps in [true, false] {
+            let (mut d, _c) = SimDevice::with_config(SimConfig { emitters: vec![], rate: 2.5e6, report_lag_gaps, ..Default::default() });
+            let log = Recorder::new();
+            d.start(Box::new(Stalling(log.clone(), 0))).unwrap();
+            wait_until(|| log.samples() >= 10 * 65_536);
+            d.stop().unwrap();
+            let gaps = log.events(|e| matches!(e, StreamEvent::Gap { .. }));
+            assert_eq!(gaps.is_empty(), !report_lag_gaps, "report_lag_gaps = {report_lag_gaps}: {gaps:?}");
+            if !report_lag_gaps {
+                let blocks = log.0.lock().unwrap().blocks.clone();
+                assert!(blocks.windows(2).all(|w| w[1].0 == w[0].0 + w[0].1 as u64), "samples are continuous");
+            }
+        }
     }
 
     #[test]

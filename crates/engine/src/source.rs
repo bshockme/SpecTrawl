@@ -60,8 +60,12 @@ pub struct SourceStats {
     pub held_secs: f64,
     pub guaranteed_secs: f64,
     pub ceiling_secs: f64,
-    pub gaps: u64,
-    pub lost_samples: u64,
+    /// `Gap` events the device reported, and the samples they lost.
+    pub device_gaps: u64,
+    pub device_lost_samples: u64,
+    /// Samples the ring skipped because their block was not provisioned in
+    /// time (the keeper fell behind); each starvation is also a gap segment.
+    pub starved_samples: u64,
     pub overloads: u64,
     pub device_lost: bool,
     pub segments: usize,
@@ -118,8 +122,8 @@ struct SourceInner {
     segments: SegmentTable,
     timeline: Timeline,
     mode: AtomicU8,
-    gaps: AtomicU64,
-    lost_samples: AtomicU64,
+    device_gaps: AtomicU64,
+    device_lost_samples: AtomicU64,
     overloads: AtomicU64,
     device_lost: AtomicBool,
     /// Nanoseconds since `EPOCH` of the last `on_samples`.
@@ -147,8 +151,7 @@ impl SourceInner {
             // sample to that head and what follows is a new run. (The ring
             // refuses the range before this push lands, so a reader that
             // resolves its segment in between still gets no samples.)
-            self.lost_samples.fetch_add(out.starved, Ordering::Relaxed);
-            self.gaps.fetch_add(1, Ordering::Relaxed);
+            // Counted by the ring (`starved_total`), not as a device gap.
             let cur = self.segments.current();
             let head = self.ring.head();
             let from = out.first_starved.max(cur.from_sample);
@@ -177,8 +180,8 @@ impl SourceInner {
                 // `at_sample .. at_sample + lost_samples` and is never readable.
                 let cur = self.segments.current();
                 self.segments.push(at_sample, cur.center_hz, cur.sample_rate, Boundary::Gap { lost_samples });
-                self.gaps.fetch_add(1, Ordering::Relaxed);
-                self.lost_samples.fetch_add(lost_samples, Ordering::Relaxed);
+                self.device_gaps.fetch_add(1, Ordering::Relaxed);
+                self.device_lost_samples.fetch_add(lost_samples, Ordering::Relaxed);
             }
             StreamEvent::TimeAnchor { at_sample, host_time } => self.timeline.anchor(at_sample, host_time),
             StreamEvent::Overload { .. } => {
@@ -267,8 +270,8 @@ impl Source {
             segments: SegmentTable::new(0, center, rate),
             timeline: Timeline::new(rate),
             mode: AtomicU8::new(mode_to_u8(mode)),
-            gaps: AtomicU64::new(0),
-            lost_samples: AtomicU64::new(0),
+            device_gaps: AtomicU64::new(0),
+            device_lost_samples: AtomicU64::new(0),
             overloads: AtomicU64::new(0),
             device_lost: AtomicBool::new(false),
             last_samples_at: AtomicU64::new(nanos_at(Instant::now())),
@@ -389,8 +392,9 @@ impl Source {
             held_secs: secs(r.held_samples as f64),
             guaranteed_secs: secs(r.guaranteed_samples as f64),
             ceiling_secs: secs(f64::from(r.ceiling_blocks) * r.block_samples as f64),
-            gaps: inner.gaps.load(Ordering::Relaxed),
-            lost_samples: inner.lost_samples.load(Ordering::Relaxed),
+            device_gaps: inner.device_gaps.load(Ordering::Relaxed),
+            device_lost_samples: inner.device_lost_samples.load(Ordering::Relaxed),
+            starved_samples: r.starved_total,
             overloads: inner.overloads.load(Ordering::Relaxed),
             device_lost: inner.device_lost.load(Ordering::SeqCst),
             segments: inner.segments.len(),

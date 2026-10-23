@@ -24,5 +24,7 @@ fn two_live_sources_hold_equal_seconds_and_a_mode_change_redistributes_without_r
     wait_until(|| (a.stats().ceiling_secs - b.stats().ceiling_secs).abs() < 0.15);
     assert_eq!(c1.starts(), 1);
     assert_eq!(c2.starts(), 1);
-    assert_eq!(a.stats().gaps + b.stats().gaps, 0);
+    // Ring starvation is not the point of this test (source_sim checks it);
+    // the sim reports no lag gaps, so any device gap here is a real fault.
+    assert_eq!(a.stats().device_gaps + b.stats().device_gaps, 0);
 }

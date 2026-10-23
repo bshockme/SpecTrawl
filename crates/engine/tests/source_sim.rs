@@ -17,7 +17,10 @@ fn streams_into_the_ring_and_reports_seconds() {
     assert!(s.held_secs <= 64.0 * 1048576.0 / 40e6 + 0.1, "{s:?}"); // never above the ceiling (1.6 s)
     assert!((s.guaranteed_secs - 0.5).abs() < 1e-9);
     assert!(s.ceiling_secs > 1.0);
-    assert_eq!(s.gaps, 0);
+    // The ring is the point here: the keeper kept it provisioned. (The sim
+    // reports no lag gaps, so device gaps are zero too.)
+    assert_eq!(s.starved_samples, 0, "{s:?}");
+    assert_eq!(s.device_gaps, 0);
     let mut out = vec![Complex32::default(); 1000];
     let seg = src.read(src.head() - 2000, &mut out).unwrap();
     assert_eq!(seg.center_hz, 855.25e6);
@@ -42,8 +45,8 @@ fn retune_and_gap_make_segments_and_reads_across_them_are_refused() {
     wait_until(|| matches!(src.segment_at(src.head() - 1).boundary, Boundary::Gap { .. }));
     let g = src.segment_at(src.head() - 1);
     assert_eq!(g.boundary, Boundary::Gap { lost_samples: 70_000 });
-    assert_eq!(src.stats().gaps, 1);
-    assert_eq!(src.stats().lost_samples, 70_000);
+    assert_eq!(src.stats().device_gaps, 1);
+    assert_eq!(src.stats().device_lost_samples, 70_000);
     assert_eq!(src.stats().segments, 3);
 }
 
