@@ -215,6 +215,7 @@ pub struct SimShared {
     pending_gap: AtomicU64,
     pending_overload: AtomicBool,
     pending_drop: AtomicBool,
+    pending_stall: AtomicBool,
     starts: AtomicU32,
     samples_sent: AtomicU64,
     /// True from `start` until the generator thread exits.
@@ -241,6 +242,13 @@ impl SimControl {
     /// Next block: `DeviceLost`, then the generator exits and `is_streaming()` becomes false.
     pub fn drop_device(&self) {
         self.0.pending_drop.store(true, Ordering::Relaxed);
+    }
+
+    /// Next block: the generator exits without sending `DeviceLost`, so
+    /// `is_streaming()` turns false and samples stop. Simulates a driver that
+    /// dies silently, for watchdog tests.
+    pub fn stall(&self) {
+        self.0.pending_stall.store(true, Ordering::Relaxed);
     }
 
     /// How many times `Device::start` ran.
@@ -443,6 +451,10 @@ impl Generator {
         let mut last_anchor: Option<u64> = None;
 
         while self.running.load(Ordering::Relaxed) {
+            if self.shared.pending_stall.swap(false, Ordering::Relaxed) {
+                // Silent death: no event; `_alive` clears `alive` on return.
+                return;
+            }
             // Pending injections, in order: gap, overload, (samples), device loss.
             let lost = self.shared.pending_gap.swap(0, Ordering::Relaxed);
             if lost > 0 {

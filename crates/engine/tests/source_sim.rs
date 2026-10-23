@@ -2,6 +2,8 @@ mod common;
 
 use common::{cfg, sim, wait_until};
 use engine::{Boundary, BudgetConfig, Keeper, Mode, ReadError, RingBudget, Source};
+use std::time::{Duration, Instant};
+
 use sdr_core::Complex32;
 
 #[test]
@@ -55,5 +57,21 @@ fn device_loss_is_flagged_without_a_restart() {
     c.drop_device();
     wait_until(|| src.stats().device_lost);
     assert_eq!(src.stats().overloads, 1);
+    assert_eq!(c.starts(), 1);
+}
+
+#[test]
+fn silent_driver_death_is_detected_by_the_watchdog() {
+    let keeper = Keeper::start(RingBudget::new(BudgetConfig { guaranteed_secs: 0.5, ceiling_bytes: 64 << 20, sweep_secs: 0.2 }));
+    let (d, c) = sim(2.5e6, true);
+    let src = Source::start(d, cfg(), Mode::Live, &keeper).unwrap();
+    wait_until(|| src.head() > 100_000);
+    c.stall();
+    let t0 = Instant::now();
+    wait_until(|| src.stats().device_lost);
+    // The watchdog counts 2 s from the last sample, which can precede `t0` by up to one
+    // 65,536-sample sim block (26 ms at 2.5 MS/s).
+    let block = Duration::from_secs_f64(65_536.0 / 2.5e6);
+    assert!(t0.elapsed() >= Duration::from_secs(2) - block, "{:?}", t0.elapsed());
     assert_eq!(c.starts(), 1);
 }
