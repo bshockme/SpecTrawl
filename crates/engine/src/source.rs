@@ -338,6 +338,15 @@ impl Source {
         self.inner.segments.covering(start, start + len as u64).map_err(|_| ReadError::SpansSegments)
     }
 
+    /// The segment holding `start .. end`, or the segments it spans.
+    pub(crate) fn segment_covering(&self, start: u64, end: u64) -> Result<Segment, crate::segments::SpansSegments> {
+        self.inner.segments.covering(start, end)
+    }
+
+    pub(crate) fn ring(&self) -> &IqRing {
+        &self.inner.ring
+    }
+
     pub fn time_of(&self, sample: u64) -> Option<SystemTime> {
         self.inner.timeline.time_of(sample)
     }

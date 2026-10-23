@@ -1230,7 +1230,7 @@ fn export_after_a_retune_carries_the_new_centre() {
 #[test]
 fn export_errors_before_writing() {
     let keeper = Keeper::start(RingBudget::new(BudgetConfig { guaranteed_secs: 0.5, ceiling_bytes: 16 << 20, sweep_secs: 0.2 }));
-    let (d, _c) = sim(10e6, false);
+    let (d, _c) = sim(10e6, true);
     let src = Source::start(d, cfg(), Mode::Live, &keeper).unwrap();
     wait_until(|| src.oldest() > 1_000_000);
     let dir = std::env::temp_dir().join(format!("spectrawl-export-err-{}", std::process::id()));
