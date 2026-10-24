@@ -55,8 +55,8 @@ fn nothing_in_the_engine_constructs_a_down_converter_or_reads_the_wall_clock() {
 }
 
 #[test]
-fn threads_are_created_only_by_the_keeper_the_stage_and_the_pool() {
-    let allowed = ["ring/keeper.rs", "stage.rs", "channels/sched.rs"];
+fn threads_are_created_only_by_the_keeper_the_stage_the_pool_and_the_publisher() {
+    let allowed = ["ring/keeper.rs", "stage.rs", "channels/sched.rs", "snapshot/mod.rs"];
     for (p, s) in sources() {
         let spawns = s.contains("thread::spawn(") || s.contains("thread::Builder::new(");
         let ok = allowed.iter().any(|a| p.to_string_lossy().replace('\\', "/").ends_with(a));
