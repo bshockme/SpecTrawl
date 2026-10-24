@@ -76,7 +76,7 @@ impl App {
         egui::Panel::top("top_bar").frame(theme::bar_frame()).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("SpecTrawl").strong());
-                ui.menu_button("View ▾", |ui| {
+                ui.menu_button("View ⏷", |ui| {
                     for tab in [Tab::Devices, Tab::Log] {
                         let shown = self.dock.find_tab(&tab).is_some();
                         if ui.add_enabled(!shown, egui::Button::new(tab.name())).clicked() {
@@ -134,10 +134,7 @@ impl App {
         }
         let alive = |id: &SourceId| snap.receivers.iter().any(|r| r.id == *id);
         self.panes.retain(|id, _| alive(id));
-        self.dock.retain_tabs(|t| match t {
-            Tab::Receiver(id) => alive(id),
-            _ => true,
-        });
+        remove_tabs(&mut self.dock, |t| matches!(t, Tab::Receiver(id) if !alive(id)));
         self.seen_version = Some(snap.version);
     }
 
@@ -202,7 +199,7 @@ impl egui_dock::TabViewer for App {
         }
     }
 
-    /// Receivers are closed from their `⋯` menu, which closes the device.
+    /// Receivers are closed from their `…` menu, which closes the device.
     fn is_closeable(&self, tab: &Tab) -> bool {
         !matches!(tab, Tab::Receiver(_))
     }
@@ -214,6 +211,14 @@ impl egui_dock::TabViewer for App {
     /// The panes scroll themselves where they need to.
     fn scroll_bars(&self, _tab: &Tab) -> [bool; 2] {
         [false, false]
+    }
+}
+
+/// Removes every tab matching `gone`, one at a time: `remove_tab` moves a promoted sibling's whole
+/// subtree, where `retain_tabs` moves only its top node and can orphan the tabs below it.
+fn remove_tabs(dock: &mut DockState<Tab>, gone: impl Fn(&Tab) -> bool) {
+    while let Some(path) = dock.find_tab_from(&gone) {
+        dock.remove_tab(path);
     }
 }
 
@@ -249,5 +254,42 @@ fn reopen(dock: &mut DockState<Tab>, tab: Tab) {
         _ => {
             tree.split_left(NodeIndex::root(), DEVICES_SHARE, vec![tab]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every non-empty node below the root hangs from a split, and the tree's tabs are the ones given.
+    fn assert_whole(dock: &DockState<Tab>, tabs: &[Tab]) {
+        let nodes: Vec<_> = dock.main_surface().iter().collect();
+        for (i, n) in nodes.iter().enumerate().skip(1) {
+            if !n.is_empty() {
+                assert!(nodes[(i - 1) / 2].is_parent(), "node {i} is orphaned");
+            }
+        }
+        for t in tabs {
+            assert!(dock.find_tab(t).is_some(), "{t:?} is gone");
+        }
+        let leaf_tabs: usize = nodes.iter().filter_map(|n| n.tabs()).map(|t| t.len()).sum();
+        assert_eq!(leaf_tabs, tabs.len());
+    }
+
+    #[test]
+    fn closing_the_last_receiver_keeps_devices_under_log() {
+        let rx = Tab::Receiver(SourceId(0));
+        let mut dock = DockState::new(vec![Tab::Devices]);
+        dock.main_surface_mut().split_right(NodeIndex::root(), DEVICES_SHARE, vec![Tab::Log]);
+        place_receiver(dock.main_surface_mut(), rx.clone());
+        // The user drags Devices into a split under the Log: receiver over (Log over Devices).
+        let path = dock.find_tab(&Tab::Devices).unwrap();
+        dock.remove_tab(path);
+        let (log, _) = dock.main_surface().find_tab(&Tab::Log).unwrap();
+        dock.main_surface_mut().split_below(log, 0.5, vec![Tab::Devices]);
+        assert_whole(&dock, &[rx.clone(), Tab::Log, Tab::Devices]);
+
+        remove_tabs(&mut dock, |t| *t == rx);
+        assert_whole(&dock, &[Tab::Log, Tab::Devices]);
     }
 }

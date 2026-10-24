@@ -12,7 +12,7 @@ pub enum Tab {
 }
 
 impl Tab {
-    /// The tab's name for the `View ▾` menu and the tab strip (receivers are titled by the app).
+    /// The tab's name for the `View ⏷` menu and the tab strip (receivers are titled by the app).
     pub fn name(&self) -> &'static str {
         match self {
             Tab::Receiver(_) => "Receiver",

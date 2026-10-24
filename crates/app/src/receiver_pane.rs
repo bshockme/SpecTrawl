@@ -23,7 +23,7 @@ pub struct ReceiverPane {
     gain_open: bool,
 }
 
-/// The `Gain ▾` popover's controls, synced from the snapshot while the popover is closed.
+/// The `Gain ⏷` popover's controls, synced from the snapshot while the popover is closed.
 #[derive(Debug, Clone, Copy)]
 struct GainDraft {
     linearity: f32,
@@ -123,7 +123,7 @@ impl ReceiverPane {
             self.gain_menu(ui, r, out);
             self.db_menu(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.menu_button("⋯", |ui| {
+                ui.menu_button("…", |ui| {
                     if ui.button("Close device").clicked() {
                         out.push(Command::Close(r.id));
                         ui.close();
@@ -159,7 +159,7 @@ impl ReceiverPane {
             self.gain.sync(r.gain);
         }
         let g = &mut self.gain;
-        let (_, inner) = popover("Gain ▾").ui(ui, |ui| {
+        let (_, inner) = popover("Gain ⏷").ui(ui, |ui| {
             let mut set = None;
             if ui.add(egui::Slider::new(&mut g.linearity, 0.0..=1.0).text("Linearity")).changed() {
                 set = Some(GainSetting::Linearity(g.linearity));
@@ -193,7 +193,7 @@ impl ReceiverPane {
 
     fn db_menu(&mut self, ui: &mut egui::Ui) {
         let (floor, top) = &mut self.db_range;
-        popover("dB range ▾").ui(ui, |ui| {
+        popover("dB range ⏷").ui(ui, |ui| {
             egui::Grid::new("db_range").num_columns(2).show(ui, |ui| {
                 let lo = *floor + 1.0;
                 ui.label("Top");
@@ -222,7 +222,7 @@ fn mode_name(m: Mode) -> &'static str {
     }
 }
 
-/// The status sentence coloured by health, then the ring's hold in seconds.
+/// The status sentence coloured by health, then a muted clipping count when the input has clipped.
 fn status_lines(ui: &mut egui::Ui, r: &Receiver) {
     let colour = match r.status.health {
         Health::Ok => theme::TEXT2,
@@ -235,10 +235,7 @@ fn status_lines(ui: &mut egui::Ui, r: &Receiver) {
             ui.label(egui::RichText::new(format!("· {reason}")).color(theme::MUTED));
         }
     });
-    let ring = &r.ring;
-    let mut hold = format!("holding {}, guaranteed {}", api::fmt::secs(ring.held_secs), api::fmt::secs(ring.guaranteed_secs));
-    if ring.overloads > 0 {
-        hold.push_str(&format!(" · clipping ({})", ring.overloads));
+    if r.ring.overloads > 0 {
+        ui.label(egui::RichText::new(format!("clipping ({})", r.ring.overloads)).small().color(theme::MUTED));
     }
-    ui.label(egui::RichText::new(hold).small().color(theme::MUTED));
 }
