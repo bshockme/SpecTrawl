@@ -18,8 +18,34 @@ fn engine() -> Engine {
     })
 }
 
+/// The simulator's backend (name `sim`, `SIM-0001`, "Simulated SDR"), but its devices never report a lag gap: a loaded
+/// runner falling 250 ms behind must not break the rows' contiguity.
+struct GapFreeSim;
+
+impl sdr_core::Backend for GapFreeSim {
+    fn name(&self) -> &str {
+        "sim"
+    }
+
+    fn enumerate(&self) -> sdr_core::Result<Vec<sdr_core::DeviceInfo>> {
+        sdr_core::Backend::enumerate(&backend_sim::SimBackend)
+    }
+
+    fn open(&self, serial: &str) -> sdr_core::Result<Box<dyn sdr_core::Device>> {
+        gap_free_open(serial)
+    }
+}
+
+fn gap_free_open(serial: &str) -> sdr_core::Result<Box<dyn sdr_core::Device>> {
+    if serial != "SIM-0001" {
+        return Err(sdr_core::Error::NotFound(serial.into()));
+    }
+    let (d, _) = backend_sim::SimDevice::with_config(SimConfig { paced: true, report_lag_gaps: false, ..Default::default() });
+    Ok(Box::new(d))
+}
+
 fn spawn_sim() -> Handle {
-    engine::snapshot::spawn(engine(), vec![Box::new(backend_sim::SimBackend)], PublisherConfig::default())
+    engine::snapshot::spawn(engine(), vec![Box::new(GapFreeSim)], PublisherConfig::default())
 }
 
 /// Poll `latest()` every 2 ms until `f` holds; panic with the last snapshot on timeout.
@@ -64,6 +90,7 @@ fn snapshots_arrive_at_twenty_hertz_with_contiguous_rows() {
         }
         std::thread::sleep(Duration::from_millis(2));
     }
+    println!("{} snapshots and {} rows in 2 s", versions.len(), rows.len());
     assert!(versions.windows(2).all(|w| w[1] > w[0]));
     assert!((34..=46).contains(&versions.len()), "{} snapshots in 2 s", versions.len());
     assert!(rows.len() >= 30, "{} rows", rows.len());
@@ -140,13 +167,47 @@ fn dropping_the_handle_stops_the_engine() {
     let engine = engine();
     let (d, control) = backend_sim::SimDevice::with_config(SimConfig { paced: true, report_lag_gaps: false, ..Default::default() });
     engine.add_source(Box::new(d), Mode::Live).unwrap();
-    let h = engine::snapshot::spawn(engine, vec![], PublisherConfig::default());
+    let (h, guard) = engine::snapshot::spawn_with_guard(engine, vec![], PublisherConfig::default());
     wait_for(&h, Duration::from_secs(1), |s| !s.receivers.is_empty());
+    let t = Instant::now();
     drop(h);
-    std::thread::sleep(Duration::from_millis(300));
+    // The thread notices the last handle at once (not at its next tick) and stops the device before it exits.
+    assert!(guard.join(Duration::from_millis(500)), "the snapshot thread did not exit within 500 ms of the last handle");
+    assert!(t.elapsed() < Duration::from_millis(500), "the join took {:?}", t.elapsed());
     let sent = control.samples_sent();
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(control.samples_sent(), sent, "the device is still streaming after the handle was dropped");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(control.samples_sent(), sent, "the device is still streaming after the publisher was joined");
+}
+
+/// The simulator's listing, but opening panics (as a misbehaving driver's FFI might).
+struct PanickyOpen;
+
+impl sdr_core::Backend for PanickyOpen {
+    fn name(&self) -> &str {
+        "sim"
+    }
+
+    fn enumerate(&self) -> sdr_core::Result<Vec<sdr_core::DeviceInfo>> {
+        sdr_core::Backend::enumerate(&backend_sim::SimBackend)
+    }
+
+    fn open(&self, _serial: &str) -> sdr_core::Result<Box<dyn sdr_core::Device>> {
+        panic!("driver exploded")
+    }
+}
+
+#[test]
+fn a_panicking_command_is_acknowledged_as_an_error_and_publishing_goes_on() {
+    let h = engine::snapshot::spawn(engine(), vec![Box::new(PanickyOpen)], PublisherConfig::default());
+    let seq = h.send(Command::Open { backend: "sim".into(), serial: "SIM-0001".into() });
+    let a = ack(&h, seq);
+    let err = a.result.expect_err("a panicking open is an error");
+    assert!(err.contains("panicked") && err.contains("driver exploded"), "{err}");
+    let v = h.latest().version;
+    wait_for(&h, Duration::from_secs(2), |s| s.version >= v + 5);
+    assert!(h.latest().log.iter().any(|l| l.text.contains("panicked")), "{:?}", h.latest().log);
+    // Commands are still applied.
+    assert!(matches!(ack(&h, h.send(Command::Enumerate)).result, Ok(Outcome::Done)));
 }
 
 /// The simulator, but labelled like an Airspy that is in use when enumerated.
@@ -162,7 +223,7 @@ impl sdr_core::Backend for InUseLabel {
     }
 
     fn open(&self, serial: &str) -> sdr_core::Result<Box<dyn sdr_core::Device>> {
-        sdr_core::Backend::open(&backend_sim::SimBackend, serial)
+        gap_free_open(serial)
     }
 }
 

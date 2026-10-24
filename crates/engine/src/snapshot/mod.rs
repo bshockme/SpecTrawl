@@ -4,8 +4,11 @@ mod build;
 mod devices;
 pub mod status;
 
+use std::any::Any;
 use std::collections::VecDeque;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -68,42 +71,94 @@ struct Publisher {
 /// Starts thread "snapshot"; the engine lives on it and is dropped when the last `Handle` is.
 ///
 /// The first snapshot (version 1, devices enumerated, sources already in the engine adopted) is stored before this returns.
+/// The thread is detached; [`spawn_with_guard`] also returns a guard to wait for it.
 pub fn spawn(engine: Engine, backends: Vec<Box<dyn Backend>>, cfg: PublisherConfig) -> Handle {
+    spawn_with_guard(engine, backends, cfg).0
+}
+
+/// [`spawn`], plus a guard that waits for the thread to finish once every `Handle` is gone.
+pub fn spawn_with_guard(engine: Engine, backends: Vec<Box<dyn Backend>>, cfg: PublisherConfig) -> (Handle, PublisherGuard) {
     let (tx, rx) = command_channel();
     let swap = Arc::new(ArcSwap::from_pointee(Snapshot::empty()));
     let mut log = Log { lines: VecDeque::new(), kept: cfg.log_kept, n: 0 };
     let registry = Registry::new(&engine, backends, &mut log);
     let mut p = Publisher { engine, registry, cfg, acks: VecDeque::new(), log, watch: Watch::default(), version: 0, swap: swap.clone() };
     p.publish();
-    thread::Builder::new().name("snapshot".into()).spawn(move || p.run(rx)).expect("start the snapshot thread");
-    Handle::new(swap, tx)
+    let (done_tx, done) = mpsc::channel::<()>();
+    let thread = thread::Builder::new()
+        .name("snapshot".into())
+        .spawn(move || {
+            // Dropped last, after `run` has stopped the sources and dropped the engine (or unwound): that ends the guard's wait.
+            let _done = done_tx;
+            p.run(rx);
+        })
+        .expect("start the snapshot thread");
+    (Handle::new(swap, tx), PublisherGuard { thread, done })
+}
+
+/// Waits for the snapshot thread, which ends promptly once the last `Handle` is dropped.
+#[derive(Debug)]
+pub struct PublisherGuard {
+    thread: thread::JoinHandle<()>,
+    done: mpsc::Receiver<()>,
+}
+
+impl PublisherGuard {
+    /// Waits up to `timeout` for the thread to stop the open sources, drop the engine and exit; `true` if it did.
+    /// On `false` the thread is left running, detached. Call it after every `Handle` is dropped, or it waits out `timeout`.
+    pub fn join(self, timeout: Duration) -> bool {
+        if let Err(RecvTimeoutError::Timeout) = self.done.recv_timeout(timeout) {
+            return false;
+        }
+        if self.thread.join().is_err() {
+            log::error!("the snapshot thread panicked");
+        }
+        true
+    }
 }
 
 impl Publisher {
-    /// Until every handle is gone: drain, apply, publish, wait out the period.
-    fn run(mut self, rx: CommandReceiver) {
-        loop {
-            let next = Instant::now() + self.cfg.period;
-            let Some(commands) = rx.drain() else { break };
+    /// Until every handle is gone: drain, apply, publish, wait for the next deadline (on a fixed grid, so the rate holds
+    /// whatever each tick costs). The last handle dropping ends the wait at once.
+    fn run(mut self, mut rx: CommandReceiver) {
+        let period = self.cfg.period;
+        let mut next = Instant::now() + period;
+        'run: while let Some(commands) = rx.drain() {
             for (seq, c) in commands {
-                let target = command_source(&c).and_then(|id| self.registry.letter(id));
-                let result = self.registry.apply(&self.engine, c, &mut self.log);
-                if let Err(e) = &result {
-                    self.log.push(target, format!("command {seq} failed: {e}"));
-                }
-                self.acks.push_back(Ack { seq, result });
-                while self.acks.len() > self.cfg.acks_kept {
-                    self.acks.pop_front();
-                }
+                self.apply(seq, c);
             }
             self.publish();
             while let Some(left) = next.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) {
-                thread::park_timeout(left);
+                if !rx.wait(left) {
+                    break 'run;
+                }
+            }
+            next += period;
+            // More than a period behind (a slow command): start the grid again rather than publish a burst.
+            let now = Instant::now();
+            if next < now {
+                next = now + period;
             }
         }
         // Stop the open sources; the engine drops with this thread's stack.
         for id in self.registry.ids() {
             self.engine.remove_source(id);
+        }
+    }
+
+    /// Applies one command and records its acknowledgement; a panic (a driver's, say) is acknowledged as an error.
+    fn apply(&mut self, seq: u64, c: Command) {
+        let target = command_source(&c).and_then(|id| self.registry.letter(id));
+        let name = command_name(&c);
+        let (registry, engine, log) = (&mut self.registry, &self.engine, &mut self.log);
+        let result = panic::catch_unwind(AssertUnwindSafe(|| registry.apply(engine, c, log)))
+            .unwrap_or_else(|payload| Err(format!("{name} panicked: {}", panic_text(payload.as_ref()))));
+        if let Err(e) = &result {
+            self.log.push(target, format!("command {seq} failed: {e}"));
+        }
+        self.acks.push_back(Ack { seq, result });
+        while self.acks.len() > self.cfg.acks_kept {
+            self.acks.pop_front();
         }
     }
 
@@ -119,6 +174,24 @@ impl Publisher {
             log: self.log.lines.iter().cloned().collect(),
         }));
     }
+}
+
+/// What a command is, for an error message.
+fn command_name(c: &Command) -> &'static str {
+    match c {
+        Command::Enumerate => "enumerate",
+        Command::Open { .. } => "open",
+        Command::Close(_) => "close",
+        Command::Tune { .. } => "tune",
+        Command::SetGain { .. } => "set gain",
+        Command::SetMode { .. } => "set mode",
+        Command::SetBudget { .. } => "set budget",
+    }
+}
+
+/// A panic's message, when it has one.
+fn panic_text(payload: &(dyn Any + Send)) -> &str {
+    payload.downcast_ref::<&str>().copied().or_else(|| payload.downcast_ref::<String>().map(String::as_str)).unwrap_or("(no message)")
 }
 
 /// The receiver a command targets, if any.
