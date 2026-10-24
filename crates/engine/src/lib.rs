@@ -7,6 +7,7 @@ pub mod ring;
 pub mod rows;
 pub mod segments;
 pub mod sigmf;
+pub mod snapshot;
 pub mod source;
 pub mod stage;
 pub mod timeline;
