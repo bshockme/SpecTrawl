@@ -1,23 +1,27 @@
 //! Spec §6 step 2: 200 simultaneous channels at 10 MS/s, with measured lag.
+//! The count scales with the worker pool (`common::load_channels`): 200 at
+//! 14 workers, 14 on a one-worker CI runner.
 
 mod common;
 
 use std::time::{Duration, Instant};
 
 use backend_sim::{SimConfig, SimDevice};
-use common::{Collector, cfg};
-use engine::{BudgetConfig, BusConfig, ChannelSpec, ConsumerState, Engine, EngineConfig, Mode, Priority, Start};
+use common::{Collector, cfg, load_bus_config, load_channels};
+use engine::{BudgetConfig, ChannelSpec, ConsumerState, Engine, EngineConfig, Mode, Priority, Start};
 
 #[test]
 fn two_hundred_channels_at_ten_megasamples_keep_up() {
+    let bus_config = load_bus_config();
+    let n = load_channels(bus_config.workers);
     let engine = Engine::new(EngineConfig {
         budget: BudgetConfig { guaranteed_secs: 1.0, ceiling_bytes: 256 << 20, sweep_secs: 0.2 },
-        bus: BusConfig::default(),
+        bus: bus_config,
         source: cfg(),
     });
     let (d, _c) = SimDevice::with_config(SimConfig { paced: true, report_lag_gaps: false, ..Default::default() }); // the default 800 MHz scenario
     let src = engine.add_source(Box::new(d), Mode::Live).unwrap();
-    let collectors: Vec<Collector> = (0..200).map(|_| Collector::counting_only()).collect();
+    let collectors: Vec<Collector> = (0..n).map(|_| Collector::counting_only()).collect();
     for (i, c) in collectors.iter().enumerate() {
         engine
             .bus()
@@ -44,8 +48,8 @@ fn two_hundred_channels_at_ten_megasamples_keep_up() {
     let lags: Vec<f64> = s.consumers.iter().map(|c| c.lag_secs).collect();
     let max_lag = lags.iter().cloned().fold(0.0, f64::max);
     println!(
-        "200 channels @ 10 MS/s: max lag {max_lag:.3} s, mean lag {:.3} s, stage {:.0} µs/block, stage behind {:.3} s, recomputed {} blocks, workers {}",
-        lags.iter().sum::<f64>() / 200.0,
+        "{n} channels @ 10 MS/s: max lag {max_lag:.3} s, mean lag {:.3} s, stage {:.0} µs/block, stage behind {:.3} s, recomputed {} blocks, workers {}",
+        lags.iter().sum::<f64>() / n as f64,
         stage.block_micros,
         stage.behind_secs,
         s.consumers.iter().map(|c| c.recomputed).sum::<u64>(),

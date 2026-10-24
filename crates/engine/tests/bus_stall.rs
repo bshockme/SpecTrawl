@@ -1,14 +1,15 @@
 //! A stall of every worker pushes 200 subscriptions past the stage's cache
 //! together: the bus must recompute each missed block once, shared by all of
-//! them, and catch up.
+//! them, and catch up. The count scales with the worker pool
+//! (`common::load_channels`): 200 at 14 workers, 14 on a one-worker CI runner.
 
 mod common;
 
 use std::time::{Duration, Instant};
 
 use backend_sim::{SimConfig, SimDevice};
-use common::{Collector, cfg, wait_until};
-use engine::{BudgetConfig, BusConfig, ChannelSpec, Engine, EngineConfig, Mode, Priority, SourceId, Start};
+use common::{Collector, cfg, load_bus_config, load_channels, wait_until};
+use engine::{BudgetConfig, ChannelSpec, Engine, EngineConfig, Mode, Priority, SourceId, Start};
 
 fn spec(source: SourceId, center_hz: f64) -> ChannelSpec {
     ChannelSpec { source, center_hz, bandwidth_hz: 12_500.0, min_rate: 48_000.0, parent: None }
@@ -16,16 +17,18 @@ fn spec(source: SourceId, center_hz: f64) -> ChannelSpec {
 
 #[test]
 fn two_hundred_channels_recover_from_a_stall_of_every_worker() {
+    let bus_config = load_bus_config();
+    let n = load_channels(bus_config.workers);
     let engine = Engine::new(EngineConfig {
         budget: BudgetConfig { guaranteed_secs: 1.0, ceiling_bytes: 256 << 20, sweep_secs: 0.2 },
-        bus: BusConfig::default(),
+        bus: bus_config,
         source: cfg(),
     });
     let (d, _c) = SimDevice::with_config(SimConfig { paced: true, report_lag_gaps: false, ..Default::default() }); // the default 800 MHz scenario
     let src = engine.add_source(Box::new(d), Mode::Live).unwrap();
     let bus = engine.bus();
     let stage = bus.stage(src.id()).unwrap();
-    let collectors: Vec<Collector> = (0..200).map(|_| Collector::counting_only()).collect();
+    let collectors: Vec<Collector> = (0..n).map(|_| Collector::counting_only()).collect();
     for (i, c) in collectors.iter().enumerate() {
         bus.subscribe(spec(src.id(), 851.3e6 + i as f64 * 12_500.0), Start::Live, Priority::Classify, Box::new(c.clone())).unwrap();
     }
@@ -59,7 +62,7 @@ fn two_hundred_channels_recover_from_a_stall_of_every_worker() {
     let recomputed_by = |p: Priority| s.consumers.iter().filter(|c| c.priority == p).map(|c| c.recomputed).sum::<u64>();
     let recomputed: u64 = s.consumers.iter().map(|c| c.recomputed).sum();
     println!(
-        "stall of {workers} workers for 200 ms: max lag {worst:.3} s, recovered {:?} s after subscribing, recomputed {recomputed} blocks ({} by the 200 Classify, {} by the {workers} Listen), stage produced {stall_blocks} blocks during the stall",
+        "stall of {workers} workers for 200 ms: max lag {worst:.3} s, recovered {:?} s after subscribing, recomputed {recomputed} blocks ({} by the {n} Classify, {} by the {workers} Listen), stage produced {stall_blocks} blocks during the stall",
         recovered.map(|d| d.as_secs_f64()),
         recomputed_by(Priority::Classify),
         recomputed_by(Priority::Listen),

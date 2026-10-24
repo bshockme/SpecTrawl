@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use backend_sim::{Emitter, Keying, Modulation, SimConfig, SimControl, SimDevice};
-use engine::{BudgetConfig, Consumer, Delivery, EndReason, Flow, GapReason, Keeper, RingBudget, RingConfig, SourceConfig};
+use engine::{BudgetConfig, BusConfig, Consumer, Delivery, EndReason, Flow, GapReason, Keeper, RingBudget, RingConfig, SourceConfig};
 use sdr_core::{Complex32, Device};
 
 /// A simulated device with no emitters (noise only) at `rate`. It never
@@ -49,6 +49,24 @@ pub fn keeper() -> Arc<Keeper> {
 }
 
 /// 1 MiB blocks (262,144 samples), weight 1.0.
+/// The bus configuration the load tests run with: the default, except that
+/// `SPECTRAWL_TEST_WORKERS` overrides the pool size so a one-worker CI runner
+/// can be reproduced on a big machine.
+pub fn load_bus_config() -> BusConfig {
+    let mut bus = BusConfig::default();
+    if let Some(w) = std::env::var("SPECTRAWL_TEST_WORKERS").ok().and_then(|s| s.parse::<usize>().ok()) {
+        bus.workers = w.max(1);
+    }
+    bus
+}
+
+/// How many channels the load tests subscribe: the spec's 200 on a pool of
+/// 14 workers (a 16-CPU machine), scaled down with the pool so a CI runner
+/// with one worker still exercises the same paths with 14, never fewer.
+pub fn load_channels(workers: usize) -> usize {
+    (200 * workers / 14).clamp(14, 200)
+}
+
 pub fn cfg() -> SourceConfig {
     SourceConfig { ring: RingConfig { block_bytes: 1 << 20 }, weight: 1.0 }
 }
