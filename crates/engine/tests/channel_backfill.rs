@@ -187,3 +187,30 @@ fn a_retune_delivers_a_gap_then_continues_on_the_new_tuning() {
     assert_eq!(src.segment_at(from_sample - L).center_hz, 870e6, "the OutOfSpan gap does not start with the 870 MHz stretch");
     assert_eq!(src.segment_at(to_sample - L).center_hz, 855.25e6, "the OutOfSpan gap does not end where the 855.25 MHz stretch starts");
 }
+
+/// 859.0 MHz is inside the usable span at 855.25 MHz and outside it at 851.25 MHz: a back-fill that
+/// starts before the retune is designed for the segment it starts in, not the head's.
+#[test]
+fn a_backfill_started_before_a_retune_is_designed_for_its_own_segment() {
+    let (d, _c) = cw_sim(10e6, 859.0e6, -20.0);
+    let src = Arc::new(Source::start(d, cfg(), Mode::Live, &keeper()).unwrap());
+    let bus = ChannelBus::new(BusConfig { workers: 2, ..Default::default() });
+    bus.attach(src.clone());
+    wait_until(|| src.head() >= 10_000_000);
+    let before = src.head();
+    src.set_center(851.25e6).unwrap();
+    wait_until(|| src.head() >= before + 5_000_000);
+
+    let c = Collector::new();
+    let spec = ChannelSpec { source: src.id(), center_hz: 859.0e6, bandwidth_hz: 12_500.0, min_rate: 48_000.0, parent: None };
+    // 0.6 s before the retune: about 183 old-segment blocks of 256 output samples (78125 S/s).
+    let id = bus.subscribe(spec, Start::At(before - 6_000_000), Priority::Classify, Box::new(c.clone())).unwrap().id;
+    let stats = || bus.stats().consumers.into_iter().find(|s| s.channel.id == id).unwrap();
+    wait_until(|| stats().state == ConsumerState::OutOfSpan);
+    assert!(c.samples() >= 40_000, "old-segment blocks were delivered: {}", c.samples());
+    // The OutOfSpan gap stays pending while the channel waits; it is delivered once the tuning comes back in span.
+    assert_eq!(c.gaps(), 0);
+    src.set_center(855.25e6).unwrap();
+    wait_until(|| c.gaps() > 0);
+    assert!(c.gap_reasons().contains(&GapReason::OutOfSpan), "{:?}", c.gap_reasons());
+}

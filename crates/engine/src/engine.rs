@@ -49,9 +49,15 @@ impl Engine {
     /// `SourceDetached`), then drops the engine's handle on it. False if no
     /// such source was added.
     pub fn remove_source(&self, id: SourceId) -> bool {
+        if self.sources.lock().remove(&id).is_none() {
+            return false;
+        }
         self.bus.detach(id);
-        let removed = self.sources.lock().remove(&id);
-        removed.is_some()
+        true
+    }
+
+    pub fn config(&self) -> &EngineConfig {
+        &self.cfg
     }
 
     pub fn source(&self, id: SourceId) -> Option<Arc<Source>> {

@@ -51,7 +51,7 @@ pub fn design_channel(
     bandwidth_hz: f64,
     min_rate: f64,
 ) -> Result<ChannelDesign, DesignError> {
-    if bandwidth_hz <= 0.0 || min_rate <= 0.0 || !n.is_power_of_two() {
+    if bandwidth_hz <= 0.0 || min_rate <= 0.0 || !n.is_power_of_two() || !(fs > 0.0 && usable_fraction > 0.0 && usable_fraction <= 1.0) {
         return Err(DesignError::BadSpec);
     }
     let need = min_rate.max(1.6 * bandwidth_hz);
@@ -151,6 +151,14 @@ mod tests {
         assert_eq!(design_channel(65_536, 10e6, 0.9, 0.0, 3.0e6, 48e3), Err(DesignError::TooWide));
         assert_eq!(design_channel(65_536, 10e6, 0.9, 4.49e6, 12_500.0, 48e3), Err(DesignError::OutsideSpan));
         assert_eq!(design_channel(65_536, 10e6, 0.9, 0.0, 0.0, 48e3), Err(DesignError::BadSpec));
+    }
+
+    #[test]
+    fn a_nan_or_zero_rate_is_a_bad_spec() {
+        assert_eq!(design_channel(65_536, f64::NAN, 0.9, 0.0, 12_500.0, 48e3), Err(DesignError::BadSpec));
+        assert_eq!(design_channel(65_536, 0.0, 0.9, 0.0, 12_500.0, 48e3), Err(DesignError::BadSpec));
+        assert_eq!(design_channel(65_536, 10e6, 0.0, 0.0, 12_500.0, 48e3), Err(DesignError::BadSpec));
+        assert_eq!(design_channel(65_536, 10e6, 1.5, 0.0, 12_500.0, 48e3), Err(DesignError::BadSpec));
     }
 
     /// Twelve consecutive hops of a tone exactly on the channel centre, plus a

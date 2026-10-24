@@ -66,6 +66,8 @@ pub struct StageStats {
     /// How far the stage trails the source: `(head − (latest_block + 1)·L) / fs`
     /// seconds at the block's sample rate, 0 when caught up. Updated per block.
     pub behind_secs: f64,
+    /// Blocks the recompute LRU holds ([`Stage::bins`] fills it, [`Stage::trim_recompute`] empties it).
+    pub recompute_held: usize,
 }
 
 /// What the stage and its thread share.
@@ -74,27 +76,44 @@ struct Shared {
     cache: Arc<SpectrumCache>,
     rows: Arc<RowHistory>,
     stats: Mutex<StageStats>,
+    /// Taken by [`Stage::bins`] and [`Stage::trim_recompute`] callers (bus
+    /// workers, outside the scheduler lock); the stage thread only
+    /// `try_lock`s it, to trim.
+    recompute: Mutex<Recompute>,
     stop: AtomicBool,
 }
 
 /// [`Stage::bins`]' path for blocks that have left the cache: one FFT plan,
 /// one input buffer (both made on first use and kept) and the last few
-/// recomputed blocks, shared by every subscription of the source.
+/// recomputed blocks, shared by every subscription of the source. An entry
+/// idle for a second is dropped when the stage publishes a row.
 #[derive(Default)]
 struct Recompute {
     fft: Option<SharedFft>,
     input: Vec<Complex32>,
-    /// Oldest first.
-    lru: VecDeque<(u64, Segment, Arc<[Complex32]>)>,
+    /// Oldest first; each entry carries when it was last used.
+    lru: VecDeque<(u64, Segment, Arc<[Complex32]>, Instant)>,
+}
+
+/// How long a recomputed block may sit unused before the stage thread drops it.
+const RECOMPUTE_IDLE: Duration = Duration::from_secs(1);
+
+impl Shared {
+    /// Drops the LRU entries unused for `idle`; `r` is the locked recompute state.
+    fn trim(&self, r: &mut Recompute, idle: Duration) {
+        let now = Instant::now();
+        let before = r.lru.len();
+        r.lru.retain(|e| now.duration_since(e.3) < idle);
+        if r.lru.len() != before {
+            self.stats.lock().recompute_held = r.lru.len();
+        }
+    }
 }
 
 pub struct Stage {
     shared: Arc<Shared>,
     fft_size: usize,
     hop: u64,
-    /// Taken only by [`Stage::bins`] callers (bus workers, outside the
-    /// scheduler lock); never by the stage thread.
-    recompute: Mutex<Recompute>,
     /// Blocks the recompute LRU keeps.
     recompute_depth: usize,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -111,6 +130,7 @@ impl Stage {
             cache: Arc::new(SpectrumCache::new(cfg.cache_blocks)),
             rows: Arc::new(RowHistory::new(cfg.row_history)),
             stats: Mutex::new(StageStats::default()),
+            recompute: Mutex::new(Recompute::default()),
             stop: AtomicBool::new(false),
             source,
         });
@@ -119,14 +139,7 @@ impl Stage {
         let handle = std::thread::Builder::new().name(name).spawn(move || worker.run()).expect("spawn the FFT stage thread");
         // The recompute LRU is as deep as the cache: same-priority subscriptions drift up to a cache-depth apart while they recover.
         let recompute_depth = cfg.cache_blocks.max(1);
-        Arc::new(Stage {
-            shared,
-            fft_size,
-            hop,
-            recompute: Mutex::new(Recompute::default()),
-            recompute_depth,
-            thread: Mutex::new(Some(handle)),
-        })
+        Arc::new(Stage { shared, fft_size, hop, recompute_depth, thread: Mutex::new(Some(handle)) })
     }
 
     pub fn source(&self) -> &Arc<Source> {
@@ -165,15 +178,19 @@ impl Stage {
     /// (`[(b−1)·L, (b+1)·L)`) and transformed once under the recompute
     /// lock, so subscriptions that miss the cache together wait for one
     /// FFT per block instead of each computing it. A ring error is returned
-    /// as is and nothing is kept.
+    /// as is and nothing is kept. Block 0's window would start before sample
+    /// 0, so it is always `Err(Overwritten)`.
     pub fn bins(&self, block: u64) -> Result<(Segment, Arc<[Complex32]>, bool), ReadError> {
-        assert!(block >= 1, "block 0 starts before sample 0");
+        if block == 0 {
+            return Err(ReadError::Overwritten);
+        }
         if let Some((seg, bins)) = self.shared.cache.get(block) {
             return Ok((seg, bins, false));
         }
-        let mut guard = self.recompute.lock();
+        let mut guard = self.shared.recompute.lock();
         let r = &mut *guard;
-        if let Some((_, seg, bins)) = r.lru.iter().rev().find(|c| c.0 == block) {
+        if let Some((_, seg, bins, used)) = r.lru.iter_mut().rev().find(|c| c.0 == block) {
+            *used = Instant::now();
             return Ok((seg.clone(), bins.clone(), false));
         }
         let n = self.fft_size;
@@ -184,15 +201,23 @@ impl Stage {
         let fft = r.fft.get_or_insert_with(|| SharedFft::new(n));
         let mut bins: Arc<[Complex32]> = std::iter::repeat_n(Complex32::default(), n).collect();
         fft.forward(&r.input, Arc::get_mut(&mut bins).expect("a fresh Arc is unique"));
-        r.lru.push_back((block, seg.clone(), bins.clone()));
+        r.lru.push_back((block, seg.clone(), bins.clone(), Instant::now()));
         while r.lru.len() > self.recompute_depth {
             r.lru.pop_front();
         }
+        self.shared.stats.lock().recompute_held = r.lru.len();
         // Hand the lock to the callers that waited for this block before
         // this one can come back for the next: a barging caller would run
         // ahead of the rest by more than the LRU and make them recompute.
         MutexGuard::unlock_fair(guard);
         Ok((seg, bins, true))
+    }
+
+    /// Drops the recomputed blocks unused for `idle`. The stage thread calls
+    /// it with one second each time it publishes a row.
+    pub fn trim_recompute(&self, idle: Duration) {
+        let mut guard = self.shared.recompute.lock();
+        self.shared.trim(&mut guard, idle);
     }
 
     /// Stop the thread and join it (unless called on the thread itself). Idempotent.
@@ -323,6 +348,10 @@ impl Worker {
 
     /// Push the row's average power.
     fn publish(&self, acc: RowAcc) {
+        // Never wait for a `bins` caller's FFT: the next row trims instead.
+        if let Some(mut r) = self.shared.recompute.try_lock() {
+            self.shared.trim(&mut r, RECOMPUTE_IDLE);
+        }
         let k = 1.0 / acc.blocks as f32;
         let power = acc.sum.into_iter().map(|s| s * k).collect();
         self.shared.rows.push(Row {
@@ -347,7 +376,68 @@ fn next_block_after_jump(b: u64, oldest: u64, head: u64, hop: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::next_block_after_jump;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use backend_sim::{SimConfig, SimDevice};
+
+    use super::{BlockSink, Stage, StageConfig, next_block_after_jump};
+    use crate::budget::{BudgetConfig, Mode, RingBudget, SourceId};
+    use crate::ring::keeper::Keeper;
+    use crate::source::{ReadError, Source, SourceConfig};
+
+    struct NoSink;
+    impl BlockSink for NoSink {
+        fn on_block(&self, _: SourceId, _: u64) {}
+    }
+
+    /// A stage on an unpaced noise sim with a one-block cache, so any older block misses it.
+    fn stage() -> (Arc<Stage>, Arc<Source>) {
+        let keeper = Keeper::start(RingBudget::new(BudgetConfig { guaranteed_secs: 2.0, ceiling_bytes: 256 << 20, sweep_secs: 0.2 }));
+        let (d, _c) =
+            SimDevice::with_config(SimConfig { emitters: vec![], rate: 2e6, paced: false, report_lag_gaps: false, ..Default::default() });
+        let src = Arc::new(Source::start(Box::new(d), SourceConfig::default(), Mode::Live, &keeper).unwrap());
+        let cfg = StageConfig { cache_blocks: 1, row_period_secs: 0.01, ..Default::default() };
+        (Stage::start(src.clone(), cfg, Arc::new(NoSink)), src)
+    }
+
+    fn wait(what: &str, f: impl Fn() -> bool) {
+        let t0 = Instant::now();
+        while !f() {
+            assert!(t0.elapsed() < Duration::from_secs(20), "{what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn bins_of_block_zero_is_an_error() {
+        let (st, _src) = stage();
+        assert!(matches!(st.bins(0), Err(ReadError::Overwritten)));
+    }
+
+    #[test]
+    fn a_recomputed_block_is_dropped_once_idle() {
+        let (st, _src) = stage();
+        wait("the stage never produced blocks", || st.latest_block().is_some_and(|b| b > 8));
+        // A block just behind the one-block cache misses it and is recomputed from the ring.
+        let (_, _, recomputed) = st.bins(st.latest_block().unwrap() - 4).unwrap();
+        assert!(recomputed);
+        assert_eq!(st.stats().recompute_held, 1);
+        // Rows keep being published; the first one after the entry has idled for a second trims it.
+        std::thread::sleep(Duration::from_millis(1200));
+        wait("the idle entry was never trimmed", || st.stats().recompute_held == 0);
+    }
+
+    #[test]
+    fn trim_recompute_keeps_entries_used_within_the_idle_time() {
+        let (st, _src) = stage();
+        wait("the stage never produced blocks", || st.latest_block().is_some_and(|b| b > 8));
+        st.bins(st.latest_block().unwrap() - 4).unwrap();
+        st.trim_recompute(Duration::from_secs(60));
+        assert_eq!(st.stats().recompute_held, 1);
+        st.trim_recompute(Duration::ZERO);
+        assert_eq!(st.stats().recompute_held, 0);
+    }
 
     #[test]
     fn a_jump_lands_at_the_live_edge_and_never_goes_backwards() {

@@ -157,7 +157,8 @@ pub struct ConsumerStats {
     pub state: ConsumerState,
     /// Why the subscription ended: `Panicked` when its consumer (or its turn)
     /// panicked, `RateChanged` or `SourceDetached` for those ends; `None`
-    /// while it runs, after `Flow::Stop` and when it was shed.
+    /// while it runs, after `Flow::Stop` and when it was shed (`Some(Panicked)`
+    /// with state `Shed` when the consumer panicked in its `Shed` delivery).
     pub end_reason: Option<EndReason>,
 }
 
@@ -258,7 +259,7 @@ impl ChannelBus {
     /// and stops it. The ended subscriptions stay in the stats as `Ended`
     /// until unsubscribed; a later `subscribe` for the source fails with
     /// `NoSuchSource`. False if the source was not attached.
-    pub fn detach(&self, source: SourceId) -> bool {
+    pub(crate) fn detach(&self, source: SourceId) -> bool {
         let stage = {
             // Under the stages lock, so a concurrent subscribe either sees the
             // stage and is marked here, or does not see it (see `subscribe`).
@@ -291,7 +292,11 @@ impl ChannelBus {
         let stage = self.stage(spec.source).ok_or(BusError::NoSuchSource)?;
         let source = stage.source().clone();
         let (l, n) = (stage.hop(), stage.fft_size());
-        let seg = source.segment_at(source.head());
+        // A back-fill is designed for the segment it starts in; the subscription redesigns when the segment changes.
+        let seg = match start {
+            Start::Live => source.segment_at(source.head()),
+            Start::At(s) => source.segment_at(s),
+        };
         let usable = source.snapshot().caps.usable_bandwidth_fraction;
         let design = design_channel(n, seg.sample_rate, usable, spec.center_hz - seg.center_hz, spec.bandwidth_hz, spec.min_rate)
             .map_err(BusError::Design)?;

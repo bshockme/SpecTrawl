@@ -168,7 +168,10 @@ impl Sched {
                     continue;
                 }
                 q.remove(i);
-                let Some(sub) = e.sub.clone() else { continue };
+                let Some(sub) = e.sub.clone() else {
+                    e.turn = Turn::Idle;
+                    continue;
+                };
                 e.turn = Turn::Running;
                 *running += 1;
                 return Some((id, sub, e.last_turn));

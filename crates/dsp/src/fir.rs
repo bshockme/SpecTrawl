@@ -4,6 +4,7 @@
 /// `taps` should be odd so the filter is symmetric about a centre tap;
 /// `cutoff_hz` is the one-sided cutoff at sample rate `fs`.
 pub fn windowed_sinc(taps: usize, cutoff_hz: f64, fs: f64) -> Vec<f32> {
+    debug_assert!(taps >= 3 && taps % 2 == 1, "windowed_sinc needs an odd tap count of at least 3, got {taps}");
     let fc = cutoff_hz / fs;
     let m = (taps - 1) as f64;
     let mut h: Vec<f32> = (0..taps)

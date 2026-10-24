@@ -42,11 +42,10 @@ fn rows_show_the_carrier_in_the_right_bin_and_blocks_reach_the_sink() {
 
 #[test]
 fn a_stage_that_falls_behind_skips_to_the_live_edge() {
-    // A paced 100 MS/s source outruns the FFT (~1 ms per 32,768-sample hop,
-    // about 33 MS/s) while the keeper still provisions for it, so the stage
-    // is overwritten within a fraction of a second and must jump: a jump to
-    // the ring's tail leaves it about the ring's depth (~0.3 s) behind, a
-    // jump to the live edge near 0.
+    // The stage falls a few blocks behind on a 100 MS/s source (the FFT does
+    // about 33 MS/s) and is overwritten within a fraction of a second. The
+    // jump must land within 0.1 s of the head, not further: a jump to the
+    // ring's tail would leave it about the ring's depth (~0.3 s) behind.
     let keeper = Keeper::start(RingBudget::new(BudgetConfig { guaranteed_secs: 0.1, ceiling_bytes: 128 << 20, sweep_secs: 0.1 }));
     let (d, _c) = sim(100e6, true);
     let src = Arc::new(Source::start(d, cfg(), Mode::Live, &keeper).unwrap());

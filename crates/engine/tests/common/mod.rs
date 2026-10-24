@@ -184,6 +184,11 @@ impl Collector {
         self.0.lock().unwrap().events.clone()
     }
 
+    /// The reason of every `Gap` delivery so far, in order.
+    pub fn gap_reasons(&self) -> Vec<GapReason> {
+        self.0.lock().unwrap().events.iter().filter_map(|e| if let Event::Gap { reason, .. } = e { Some(*reason) } else { None }).collect()
+    }
+
     /// The last `n` stored samples (fewer if fewer were stored).
     pub fn tail(&self, n: usize) -> Vec<Complex32> {
         let c = self.0.lock().unwrap();
