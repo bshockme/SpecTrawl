@@ -3109,6 +3109,7 @@ dependencies = [
  "engine",
  "env_logger",
  "log",
+ "sdr-core",
  "serde",
  "serde_json",
 ]

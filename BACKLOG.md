@@ -3,6 +3,13 @@
 Ideas and known rough edges that aren't scheduled yet. Newest at the top of each section.
 
 ## Rebuild
+- **Sample-rate command not in `Command`** (2026-10-23): `Source` has no `set_rate`; the Airspy's 2.5 MS/s is unreachable from the new app.
+- **Waterfall zoom resolution is 4096 columns** (2026-10-23): zooming past 24 columns is blocked; native-bin zoom like the old survey view is step 8.
+- **Opening an Airspy blocks the snapshot thread** (2026-10-23): for the duration of `open` there is no new snapshot (~0.5 s); move opens to a helper thread if it shows.
+- **A retune clears the waterfall history** (2026-10-23): re-mapping rows that overlap the new span is not done.
+- **Dock layout, pop-outs, workspaces and the command palette** (2026-10-23): not in the new app yet; step 8 carries them over.
+- **Menu glyphs** (2026-10-23): `▾`/`⋯` from docs/ui-design.md render as `⏷`/`…` because egui's default fonts lack them; a fallback font (step 8) restores the design glyphs.
+- **Waterfall rebuilds the whole texture on every frame of a pan, zoom or dB-range drag** (2026-10-23): pan by uv during the drag and rebuild on release.
 - **Second-stage channelizer for narrow modes not built** (2026-10-23): every channel is cut from the source's 65536-point FFT; `ChannelSpec::parent` is carried but refused (`BusError::NestedChannelsNotSupported`). Build it with the first narrow mode that needs it.
 - **Channel output rates are `fs/2^k`** (2026-10-23): the channelizer's output rate is `fs·K/N` with K a power of two, so a consumer gets the smallest such rate at or above what it asked for, not an exact rate. Add a per-channel rational resampler if a consumer needs one.
 - **No channel sharing between subscriptions** (2026-10-23): each subscription computes its own channel, even when two consumers want the same one. Add sharing if profiling shows it matters.
@@ -10,7 +17,7 @@ Ideas and known rough edges that aren't scheduled yet. Newest at the top of each
 - **Sample waker declined** (2026-10-23): the stage polls the ring every 1 ms for its next block instead of being woken by the writer.
 - **Ring hole-eviction stat and offer back-off** (done 2026-10-23, step 2): the ring counts the holes it evicts and backs off after refused offers (Task 1 of step 2), closing those step 1 leftovers.
 - **Ring offers are not demoted with age** (2026-10-23): the keeper offers each block once, at `Normal`, as it leaves the guaranteed window, and does not re-offer it at a lower priority as it ages (spec §4.1 "priority falling with age"). Needs a reclaim-and-re-offer (or an OS call that changes priority in place) per band crossing; weigh its cost before step 5.
-- **Ring user cap and per-source pin/weight UI not wired** (2026-10-23): the budget takes a ceiling in bytes and a per-source weight, but the user cap in seconds or bytes ("lower wins", spec §4.1) and the per-source pin/weight setting have no config or UI yet. Step 3 (UI) or later.
+- **Ring user cap in seconds ("lower wins") not wired** (2026-10-23): `SetBudget` takes bytes only; the ceiling in bytes and the guaranteed seconds are wired in the Devices pane, but the user cap in seconds (spec §4.1 "lower wins") and the per-source pin/weight setting have no command or UI yet.
 - **No memory-pressure handling on fallback platforms** (2026-10-23): outside Windows and Linux the ring's backend refuses every offer, and the spec's "poll available memory and retire the oldest blocks under a floor" is not built, so the ring there holds its whole ceiling whatever else needs RAM. Not scheduled (no such platform is targeted yet).
 - **A Lost block in the middle of the ring is retired only at the front** (2026-10-23): reads of it fail with `Lost` at once, but the keeper drops it (and frees its slot) only once it is the oldest held block, so its memory is held until then. Step 5, if the replay scrubber makes it visible.
 - **backend-airspy does not emit DeviceLost itself** (2026-10-23): spec §8 asks the Airspy backend to emit `DeviceLost`; instead the engine's watchdog raises it for any backend (no samples for 2 s and `is_streaming() == false`, see the `sdr-core` stream contract). An in-band event from libairspy's transfer status remains possible later.
@@ -32,7 +39,7 @@ Ideas and known rough edges that aren't scheduled yet. Newest at the top of each
 - DESIGN §1 L28: Windows and Linux support — DONE (done 2026-10-23, step 0/1)
 - DESIGN §1 L33: Voice vocoders are a non-goal — CONTRADICTED — step 9
 - DESIGN §2 L41: CI builds for Windows and Linux from the start — DONE (done 2026-10-23, step 0/1)
-- DESIGN §2 L43: Custom wgpu waterfall with GPU colour map — PARTIAL — step 3
+- DESIGN §2 L43: Custom wgpu waterfall with GPU colour map — PARTIAL — the ring texture is a GPU texture updated one row per FFT row; the colour map is applied on the CPU when a row is uploaded (step 8 or later for a shader map)
 - DESIGN §4 L101: Usable bandwidth fraction masks band edges — DONE (done 2026-10-23, step 2): a channel outside the usable fraction of the span is refused at subscribe and waits out of span after a retune
 - DESIGN §4 L102: IQ ring stores native device format — DONE (done 2026-10-23, step 0/1): DESIGN.md §4.2 and §5.1 amended to say the ring keeps interleaved i16 (rebuild spec §4.1)
 - DESIGN §4 L104: Zero-IF: offset-tune and mask the DC spike — SILENTLY DROPPED — not scheduled
@@ -80,7 +87,7 @@ Ideas and known rough edges that aren't scheduled yet. Newest at the top of each
 - DESIGN §9 L248: Dark theme with a few colour maps — PARTIAL — not scheduled
 - DESIGN §10 L252: Per source: one USB thread plus one FFT/channelizer thread — DONE (done 2026-10-23, step 2): the device's USB thread plus the stage's FFT thread per source; channels are cut on the bus's worker pool
 - DESIGN §10 L253: Detectors run on a worker pool — CONTRADICTED — step 6
-- DESIGN §10 L254: UI never blocks on the engine — CONTRADICTED — step 3
+- DESIGN §10 L254: UI never blocks on the engine — DONE (done 2026-10-23, step 3): the app holds one Arc<Snapshot> per frame from an ArcSwap and sends commands over a channel
 - DESIGN §10 L259: Benchmark early — DONE (done 2026-10-23, step 2): numbers from `channels_200` (16 logical CPUs): `200 channels @ 10 MS/s: max lag 0.000 s, mean lag 0.000 s, stage 1050 µs/block, stage behind 0.000 s, recomputed 0 blocks, workers 14`
 - DESIGN §11 L274: dsp crate holds FFT, filters, channelizer, demodulators — DONE (done 2026-10-23, step 2): `dsp` holds the shared FFT, the windowed-sinc filters, the fast-convolution channelizer and `Ddc`/`Demod`
 - DESIGN §12 L288: Labelled SigMF corpus — DONE (done 2026-10-23, step 0/1)

@@ -238,6 +238,8 @@ Ring block size; the exact offer-priority schedule by age; the Linux page-marker
 
 Chosen in step 2 (2026-10-23): FFT size N = 65536, overlap-save with hop N/2; channel FFT size K = the smallest power of two ≥ 64 with `fs·K/N ≥ max(min_rate, 1.6·bandwidth)`, K ≤ N/4, giving an output rate of `fs·K/N`; channel filter = a Blackman-windowed sinc of K/2+1 taps at the output rate, cutoff bandwidth/2; spectrum cache 32 blocks; waterfall rows every 50 ms, history 64 rows; pool = `available_parallelism − 2` workers (at least 1); shedding = when at least 90 % of block arrivals in the last second found every worker busy with work queued and a consumer lags more than 2 s, the lowest-priority laggard is shed, at most one per second; nested (second-stage) channels deferred.
 
+Chosen in step 3 (2026-10-23): snapshot cadence 20 Hz (50 ms); a snapshot carries each receiver's newest 16 finished rows, the last 64 acks and the last 200 log lines; waterfall history 1024 rows of 4096 max-reduced columns, texture 1024 rows by the displayed width, zoom no narrower than 24 history columns; receivers take letters `A`, `B`, … in order of opening, lowest free letter first (`S` is reserved for the sweep, step 4a); default budget 30 s guaranteed, ceiling half of physical RAM.
+
 ## 10. Decisions taken with the owner (2026-10-22)
 
 1. **Licence: MIT.** SpecTrawl stays MIT; OnAir is used only as a separate process (§3, §4.6).
