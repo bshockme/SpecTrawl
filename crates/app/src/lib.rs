@@ -8,6 +8,8 @@ pub mod log_pane;
 pub mod receiver_pane;
 pub mod tabs;
 pub mod theme;
+pub mod trace;
+pub mod waterfall;
 
 use engine::snapshot::PublisherConfig;
 use engine::{BudgetConfig, BusConfig, Engine, EngineConfig, RingBudget, SourceConfig};

@@ -1,10 +1,12 @@
-//! One receiver: its header toolbar (ui-design §3.1), its status line and, from Task 6, its waterfall.
+//! One receiver: its header toolbar (ui-design §3.1), its status line, then its spectrum and waterfall ([`body`]).
+
+mod body;
 
 use api::{Command, GainSetting, Health, Mode, Receiver, Status};
 use egui::PopupCloseBehavior;
 use egui::containers::menu::{MenuButton, MenuConfig};
 
-use crate::theme;
+use crate::{theme, trace};
 
 /// The display range a new pane starts with when nothing was saved for its device, in dB.
 pub const DEFAULT_DB_RANGE: (f32, f32) = (-110.0, -45.0);
@@ -21,6 +23,7 @@ pub struct ReceiverPane {
     centre_editing: bool,
     gain: GainDraft,
     gain_open: bool,
+    body: body::Body,
 }
 
 /// The `Gain ⏷` popover's controls, synced from the snapshot while the popover is closed.
@@ -59,26 +62,22 @@ impl ReceiverPane {
             centre_editing: false,
             gain: GainDraft { linearity: 0.5, sensitivity: 0.5, manual: [8, 8, 8] },
             gain_open: false,
+            body: body::Body::new(),
         }
     }
 
-    /// Takes in a new snapshot's view of this receiver. Task 6 adds the rows to the history here.
+    /// Takes in a new snapshot's view of this receiver, its rows into the waterfall's history.
     pub fn ingest(&mut self, r: &Receiver) {
         self.last_status = r.status.clone();
         self.last_tuning = Some((r.center_hz, r.sample_rate));
+        self.body.ingest(&r.rows, self.paused);
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, r: &Receiver, out: &mut Vec<Command>) {
         self.header(ui, r, out);
         status_lines(ui, r);
         ui.add_space(4.0);
-        // Task 6 replaces this with the trace and the waterfall.
-        egui::Frame::new().fill(theme::PLOT_BG).stroke(egui::Stroke::new(1.0, theme::BORDER)).corner_radius(4).show(ui, |ui| {
-            let size = ui.available_size();
-            ui.allocate_ui_with_layout(size, egui::Layout::centered_and_justified(egui::Direction::TopDown), |ui| {
-                ui.label(egui::RichText::new("waterfall (Task 6)").color(theme::MUTED));
-            });
-        });
+        self.body.show(ui, r, self.db_range, &mut self.paused, out);
     }
 
     pub fn last_status(&self) -> &Status {
@@ -90,9 +89,9 @@ impl ReceiverPane {
         self.last_tuning
     }
 
-    /// Waterfall rows held (Task 6 keeps them).
+    /// Waterfall rows held.
     pub fn history_len(&self) -> usize {
-        0
+        self.body.history.len()
     }
 
     pub fn paused(&self) -> bool {
@@ -122,6 +121,12 @@ impl ReceiverPane {
             self.centre(ui, r, out);
             self.gain_menu(ui, r, out);
             self.db_menu(ui);
+            if ui.add(egui::Button::new("Pause").selected(self.paused)).on_hover_text("Freeze the waterfall (Space)").clicked() {
+                self.paused = !self.paused;
+                if !self.paused {
+                    self.body.resume();
+                }
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.menu_button("…", |ui| {
                     if ui.button("Close device").clicked() {
@@ -192,6 +197,7 @@ impl ReceiverPane {
     }
 
     fn db_menu(&mut self, ui: &mut egui::Ui) {
+        let newest = self.body.newest_db();
         let (floor, top) = &mut self.db_range;
         popover("dB range ⏷").ui(ui, |ui| {
             egui::Grid::new("db_range").num_columns(2).show(ui, |ui| {
@@ -204,8 +210,9 @@ impl ReceiverPane {
                 ui.add(egui::DragValue::new(floor).range(-200.0..=hi).speed(0.5).suffix(" dB"));
                 ui.end_row();
             });
-            // Task 6 makes this fit the range to the trace (`trace::auto_range`).
-            let _ = ui.button("Auto");
+            if ui.button("Auto").on_hover_text("Fit the range to the newest row").clicked() {
+                (*floor, *top) = trace::auto_range(newest);
+            }
         });
     }
 }
