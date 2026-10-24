@@ -3,12 +3,29 @@
 use std::time::{Duration, Instant};
 
 use api::{Command, SourceId};
-use backend_sim::{SimBackend, SimDevice};
+use backend_sim::{SimBackend, SimConfig, SimDevice};
 use egui::{Pos2, Rect, vec2};
 use engine::snapshot::PublisherConfig;
 use engine::{BudgetConfig, BusConfig, Engine, EngineConfig, SourceConfig};
 use sdr_core::{Backend, Device, DeviceInfo};
 use spectrawl_app::app::App;
+
+/// The simulator's backend, but its device never reports a lag gap: a loaded runner must not put a hole in the history.
+struct GapFreeSim;
+impl Backend for GapFreeSim {
+    fn name(&self) -> &str {
+        "sim"
+    }
+    fn enumerate(&self) -> sdr_core::Result<Vec<DeviceInfo>> {
+        SimBackend.enumerate()
+    }
+    fn open(&self, serial: &str) -> sdr_core::Result<Box<dyn Device>> {
+        if serial != "SIM-0001" {
+            return Err(sdr_core::Error::NotFound(serial.into()));
+        }
+        Ok(Box::new(SimDevice::with_config(SimConfig { paced: true, report_lag_gaps: false, ..Default::default() }).0))
+    }
+}
 
 /// A backend whose `open` takes 700 ms: the snapshot thread stalls, the UI must not.
 struct SlowBackend;
@@ -32,7 +49,7 @@ fn the_app_shows_the_simulator_and_never_blocks_on_the_engine() {
         bus: BusConfig::default(),
         source: SourceConfig::default(),
     });
-    let handle = engine::snapshot::spawn(engine, vec![Box::new(SimBackend), Box::new(SlowBackend)], PublisherConfig::default());
+    let handle = engine::snapshot::spawn(engine, vec![Box::new(GapFreeSim), Box::new(SlowBackend)], PublisherConfig::default());
     let ctx = egui::Context::default();
     let mut app = App::new(handle.clone());
     let mut frame_ms: Vec<f64> = Vec::new();
@@ -64,6 +81,8 @@ fn the_app_shows_the_simulator_and_never_blocks_on_the_engine() {
             let id = opened.expect("the simulator opened as A");
             let pane = app.pane(id).expect("a pane for A");
             assert!(pane.history_len() >= 40, "{} rows after ~3.7 s", pane.history_len());
+            // Engine rows overlap by one hop; the history must take that seam as contiguous, not as a hole.
+            assert_eq!(pane.history_holes(), 0, "hole rows in a gap-free stream");
             assert!(pane.last_status().text.starts_with("Live at 855.250 MHz, 10 MS/s: holding "), "{}", pane.last_status().text);
             assert!(handle.latest().receivers.iter().any(|r| r.letter == 'B'), "the slow device opened as B");
         }

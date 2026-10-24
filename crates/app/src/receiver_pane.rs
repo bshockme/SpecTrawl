@@ -94,6 +94,11 @@ impl ReceiverPane {
         self.body.history.len()
     }
 
+    /// All-NaN rows the history holds, one per discontinuity between snapshot rows.
+    pub fn history_holes(&self) -> usize {
+        self.body.history.iter().filter(|r| r.db.iter().all(|v| v.is_nan())).count()
+    }
+
     pub fn paused(&self) -> bool {
         self.paused
     }
@@ -166,10 +171,11 @@ impl ReceiverPane {
         let g = &mut self.gain;
         let (_, inner) = popover("Gain ⏷").ui(ui, |ui| {
             let mut set = None;
-            if ui.add(egui::Slider::new(&mut g.linearity, 0.0..=1.0).text("Linearity")).changed() {
+            // Each `SetGain` logs a line: send a drag's value once, when it ends.
+            if settled(&ui.add(egui::Slider::new(&mut g.linearity, 0.0..=1.0).text("Linearity"))) {
                 set = Some(GainSetting::Linearity(g.linearity));
             }
-            if ui.add(egui::Slider::new(&mut g.sensitivity, 0.0..=1.0).text("Sensitivity")).changed() {
+            if settled(&ui.add(egui::Slider::new(&mut g.sensitivity, 0.0..=1.0).text("Sensitivity"))) {
                 set = Some(GainSetting::Sensitivity(g.sensitivity));
             }
             if ui.button("Auto").clicked() {
@@ -182,7 +188,7 @@ impl ReceiverPane {
             }
             for (i, stage) in r.caps.gain_stages.iter().take(3).enumerate() {
                 ui.horizontal(|ui| {
-                    if ui.add(egui::DragValue::new(&mut g.manual[i]).range(0..=15)).changed() {
+                    if settled(&ui.add(egui::DragValue::new(&mut g.manual[i]).range(0..=15))) {
                         let [lna, mixer, vga] = g.manual;
                         set = Some(GainSetting::Manual { lna, mixer, vga });
                     }
@@ -218,6 +224,15 @@ impl ReceiverPane {
 }
 
 /// A header popover that stays open while its controls are used.
+/// Whether an edit is finished: a drag when it stops (not every frame of it), a click or a typed value at once.
+fn settled(r: &egui::Response) -> bool {
+    edit_settled(r.changed(), r.dragged(), r.drag_stopped())
+}
+
+fn edit_settled(changed: bool, dragged: bool, drag_stopped: bool) -> bool {
+    drag_stopped || (changed && !dragged)
+}
+
 fn popover(text: &str) -> MenuButton<'_> {
     MenuButton::new(text).config(MenuConfig::new().close_behavior(PopupCloseBehavior::CloseOnClickOutside))
 }
@@ -244,5 +259,21 @@ fn status_lines(ui: &mut egui::Ui, r: &Receiver) {
     });
     if r.ring.overloads > 0 {
         ui.label(egui::RichText::new(format!("clipping ({})", r.ring.overloads)).small().color(theme::MUTED));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::edit_settled;
+
+    #[test]
+    fn a_drag_settles_once_when_it_stops_and_a_click_at_once() {
+        // Frames of a drag: changing, then the release.
+        assert!(!edit_settled(true, true, false));
+        assert!(!edit_settled(false, true, false));
+        assert!(edit_settled(false, false, true));
+        // A click on the track, or a typed value.
+        assert!(edit_settled(true, false, false));
+        assert!(!edit_settled(false, false, false));
     }
 }
