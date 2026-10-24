@@ -148,3 +148,35 @@ fn dropping_the_handle_stops_the_engine() {
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(control.samples_sent(), sent, "the device is still streaming after the handle was dropped");
 }
+
+/// The simulator, but labelled like an Airspy that is in use when enumerated.
+struct InUseLabel;
+
+impl sdr_core::Backend for InUseLabel {
+    fn name(&self) -> &str {
+        "sim"
+    }
+
+    fn enumerate(&self) -> sdr_core::Result<Vec<sdr_core::DeviceInfo>> {
+        Ok(vec![sdr_core::DeviceInfo { backend: "sim".into(), serial: "SIM-0001".into(), label: "Simulated SDR (in use)".into() }])
+    }
+
+    fn open(&self, serial: &str) -> sdr_core::Result<Box<dyn sdr_core::Device>> {
+        sdr_core::Backend::open(&backend_sim::SimBackend, serial)
+    }
+}
+
+#[test]
+fn an_open_device_is_listed_once_whatever_its_enumerated_label() {
+    let h = engine::snapshot::spawn(engine(), vec![Box::new(InUseLabel)], PublisherConfig::default());
+    let Ok(Outcome::Opened(id)) = ack(&h, h.send(Command::Open { backend: "sim".into(), serial: "SIM-0001".into() })).result else {
+        panic!()
+    };
+    let seq = h.send(Command::Enumerate);
+    assert!(matches!(ack(&h, seq).result, Ok(Outcome::Done)));
+    let s = h.latest();
+    let listed: Vec<_> = s.devices.iter().filter(|d| d.info.serial == "SIM-0001").collect();
+    assert_eq!(listed.len(), 1, "{:?}", s.devices);
+    assert_eq!(listed[0].open_as, Some(id));
+    assert_eq!(s.receivers[0].device.label, "Simulated SDR");
+}

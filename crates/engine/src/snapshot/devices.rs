@@ -80,10 +80,10 @@ impl Registry {
     /// Sets each entry's `open_as` and lists open devices no backend enumerated.
     fn sync(&mut self) {
         for e in &mut self.entries {
-            e.open_as = self.open.iter().find(|(_, o)| o.info == e.info).map(|(&id, _)| id);
+            e.open_as = self.open.iter().find(|(_, o)| same_device(&o.info, &e.info.backend, &e.info.serial)).map(|(&id, _)| id);
         }
         for (&id, o) in &self.open {
-            if !self.entries.iter().any(|e| e.info == o.info) {
+            if !self.entries.iter().any(|e| same_device(&o.info, &e.info.backend, &e.info.serial)) {
                 self.entries.push(DeviceEntry { info: o.info.clone(), open_as: Some(id) });
             }
         }
@@ -144,7 +144,7 @@ impl Registry {
 
     fn open(&mut self, engine: &Engine, backend: &str, serial: &str, log: &mut Log) -> Result<Outcome, String> {
         let b = self.backends.iter().find(|b| b.name() == backend).ok_or_else(|| format!("no backend named {backend}"))?;
-        if let Some(o) = self.open.values().find(|o| o.info.backend == backend && o.info.serial == serial) {
+        if let Some(o) = self.open.values().find(|o| same_device(&o.info, backend, serial)) {
             return Err(format!("already open as {}", o.letter));
         }
         let letter = self.free_letter().ok_or_else(|| "every receiver letter is in use".to_string())?;
@@ -163,6 +163,12 @@ impl Registry {
         let src = engine.source(id).ok_or_else(|| no_receiver(id))?;
         Ok((letter, src))
     }
+}
+
+/// Whether `info` names the device `backend`/`serial`. The label is not compared: a backend may label a device
+/// differently when it enumerates it (for instance "in use") than when it opens it.
+fn same_device(info: &DeviceInfo, backend: &str, serial: &str) -> bool {
+    info.backend == backend && info.serial == serial
 }
 
 fn no_receiver(id: SourceId) -> String {
