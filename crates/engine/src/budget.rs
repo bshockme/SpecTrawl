@@ -16,16 +16,7 @@ use parking_lot::Mutex;
 /// Bytes per complex sample (two f16/i16 components).
 const BYTES_PER_SAMPLE: f64 = 4.0;
 
-/// Identifies a source within the budget.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SourceId(pub u32);
-
-/// How a source is being used.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    Live,
-    Sweep,
-}
+pub use api::{Mode, SourceId};
 
 /// User-tunable budget parameters.
 #[derive(Debug, Clone)]

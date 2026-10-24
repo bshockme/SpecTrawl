@@ -26,20 +26,7 @@ use crate::stage::{BlockSink, Stage, StageConfig};
 use sched::{Latest, Shared};
 use sub::Sub;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ChannelId(pub u64);
-
-/// Lowest first (the spec's §4.3 list reversed): a worker always takes the
-/// highest-priority subscription that has a block ready.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Priority {
-    Recorder,
-    PagerMonitor,
-    Classify,
-    EmitterDecoder,
-    TrunkControl,
-    Listen,
-}
+pub use api::{ChannelId, Priority};
 
 #[derive(Debug, Clone)]
 pub struct ChannelSpec {
@@ -128,13 +115,7 @@ pub struct ChannelInfo {
     pub hop: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConsumerState {
-    Running,
-    OutOfSpan,
-    Shed,
-    Ended,
-}
+pub use api::ConsumerState;
 
 #[derive(Debug, Clone)]
 pub struct ConsumerStats {

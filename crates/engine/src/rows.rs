@@ -5,19 +5,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::segments::Segment;
-
-/// Linear power averaged over `blocks` FFT blocks covering
-/// `first_sample .. end_sample`, all inside `segment`.
-#[derive(Debug, Clone)]
-pub struct Row {
-    pub first_sample: u64,
-    pub end_sample: u64,
-    pub blocks: u32,
-    pub segment: Segment,
-    /// DC-centred (negative frequencies first) linear power, 1.0 = 0 dBFS.
-    pub power: Vec<f32>,
-}
+pub use api::Row;
 
 /// The most recent `depth` rows of one source.
 pub struct RowHistory {
@@ -37,6 +25,12 @@ impl RowHistory {
     /// Rows with `end_sample > end_sample_after`, oldest first.
     pub fn since(&self, end_sample_after: u64) -> Vec<Arc<Row>> {
         self.rows.lock().iter().filter(|r| r.end_sample > end_sample_after).cloned().collect()
+    }
+
+    /// The newest `n` rows (fewer if fewer are held), oldest first.
+    pub fn newest(&self, n: usize) -> Vec<Arc<Row>> {
+        let rows = self.rows.lock();
+        rows.iter().skip(rows.len().saturating_sub(n)).cloned().collect()
     }
 
     pub fn len(&self) -> usize {

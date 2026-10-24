@@ -123,7 +123,7 @@ pub struct Capabilities {
     pub transfer_samples: Option<usize>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
     pub backend: String,
     /// Stable identity used for per-device config and calibration.

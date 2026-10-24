@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+api = { path = "../api" }
 arc-swap = "1.7"
 dsp = { version = "0.1.0", path = "../dsp" }
 log = "0.4"

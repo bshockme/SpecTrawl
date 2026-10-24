@@ -114,6 +114,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "api"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "sdr-core",
+ "serde",
+]
+
+[[package]]
 name = "arboard"
 version = "3.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -837,6 +846,7 @@ dependencies = [
 name = "engine"
 version = "0.1.0"
 dependencies = [
+ "api",
  "arc-swap",
  "backend-sim",
  "dsp",
