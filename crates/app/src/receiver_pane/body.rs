@@ -110,8 +110,8 @@ impl Body {
         };
         let spec = Rect::from_min_size(rect.min, vec2(rect.width(), SPECTRUM_H.min(rect.height())));
         let wf = Rect::from_min_max(pos2(rect.left(), spec.bottom() + 1.0), rect.max);
-        let spec_resp = ui.interact(spec, ui.id().with("spectrum"), Sense::click_and_drag());
-        let wf_resp = ui.interact(wf, ui.id().with("waterfall"), Sense::click_and_drag());
+        let spec_resp = ui.interact(spec, ui.id().with(("spectrum", r.id)), Sense::click_and_drag());
+        let wf_resp = ui.interact(wf, ui.id().with(("waterfall", r.id)), Sense::click_and_drag());
 
         let mut view = View { db_min: db_range.0, db_max: db_range.1, zoom: self.zoom };
         self.interact(ui, &spec_resp, &wf_resp, span, &mut view, r, out);
@@ -157,17 +157,22 @@ impl Body {
             let (lo, hi) = view.window(span);
             view.pan(span, -(wf.drag_delta().x / wf.rect.width()) as f64 * (hi - lo));
         }
-        if spec.dragged_by(egui::PointerButton::Primary) {
-            self.tune_drag += spec.drag_delta().x;
-        }
-        if spec.drag_stopped() && self.tune_drag != 0.0 {
+        let primary = egui::PointerButton::Primary;
+        let (offset, release) = tune_drag_step(
+            self.tune_drag,
+            spec.drag_started_by(primary),
+            spec.dragged_by(primary),
+            spec.drag_stopped_by(primary),
+            spec.drag_delta().x,
+        );
+        self.tune_drag = offset;
+        if let Some(dx) = release {
             let (lo, hi) = view.window(span);
-            let dhz = (self.tune_drag / spec.rect.width()) as f64 * (hi - lo);
+            let dhz = (dx / spec.rect.width()) as f64 * (hi - lo);
             let hz = round_to(r.center_hz - dhz, r.caps.tuning_step_hz);
             if hz != r.center_hz {
                 out.push(Command::Tune { source: r.id, center_hz: hz });
             }
-            self.tune_drag = 0.0;
         }
         if spec.double_clicked() || wf.double_clicked() {
             view.zoom = None;
@@ -325,6 +330,20 @@ fn wheel_notches(events: &[egui::Event]) -> f64 {
         .sum()
 }
 
+/// One frame of the spectrum's tuning drag: the offset (points) to draw the trace shifted by, and the offset to tune by
+/// when the drag ended this frame. A new drag starts from zero, and an offset left over from a drag whose release was
+/// never seen (the pane was not drawn that frame) is dropped as soon as the spectrum is seen not dragging.
+fn tune_drag_step(offset: f32, started: bool, dragged: bool, stopped: bool, dx: f32) -> (f32, Option<f32>) {
+    let mut o = if started { 0.0 } else { offset };
+    if dragged {
+        o += dx;
+    }
+    if stopped {
+        return (0.0, (o != 0.0).then_some(o));
+    }
+    if dragged { (o, None) } else { (0.0, None) }
+}
+
 /// `hz` to the nearest multiple of `step` (unchanged for a step of 0).
 fn round_to(hz: f64, step: f64) -> f64 {
     if step > 0.0 { (hz / step).round() * step } else { hz }
@@ -345,4 +364,28 @@ fn runs(pts: impl Iterator<Item = Option<Pos2>>) -> Vec<Vec<Pos2>> {
         out.push(cur);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tuning_drag_tunes_once_by_its_own_movement() {
+        let (o, t) = tune_drag_step(0.0, true, true, false, 5.0);
+        assert_eq!((o, t), (5.0, None));
+        let (o, t) = tune_drag_step(o, false, true, false, 15.0);
+        assert_eq!((o, t), (20.0, None));
+        assert_eq!(tune_drag_step(o, false, false, true, 0.0), (0.0, Some(20.0)));
+    }
+
+    #[test]
+    fn a_stale_offset_never_tunes() {
+        // The release was never seen: the next frame drawn without a drag drops the offset.
+        assert_eq!(tune_drag_step(20.0, false, false, false, 0.0), (0.0, None));
+        // A new drag starts from zero; a press and release without movement does not tune.
+        let (o, t) = tune_drag_step(20.0, true, true, false, 0.0);
+        assert_eq!((o, t), (0.0, None));
+        assert_eq!(tune_drag_step(o, false, false, true, 0.0), (0.0, None));
+    }
 }
