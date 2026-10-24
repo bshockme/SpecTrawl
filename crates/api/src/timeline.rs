@@ -44,7 +44,7 @@ impl Segment {
 
 /// Linear power averaged over `blocks` FFT blocks covering
 /// `first_sample .. end_sample`, all inside `segment`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Row {
     pub first_sample: u64,
     pub end_sample: u64,
@@ -52,4 +52,31 @@ pub struct Row {
     pub segment: Segment,
     /// DC-centred (negative frequencies first) linear power, 1.0 = 0 dBFS.
     pub power: Vec<f32>,
+}
+
+/// The bins are elided (a snapshot's `Debug`, in a failing test's message say, would print 65 536 of them per row).
+impl std::fmt::Debug for Row {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Row")
+            .field("first_sample", &self.first_sample)
+            .field("end_sample", &self.end_sample)
+            .field("blocks", &self.blocks)
+            .field("segment", &self.segment)
+            .field("power", &format_args!("[{} bins]", self.power.len()))
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_rows_debug_counts_its_bins_instead_of_printing_them() {
+        let segment = Segment { id: SegmentId(1), from_sample: 0, center_hz: 855.25e6, sample_rate: 10e6, boundary: Boundary::Start };
+        let row = Row { first_sample: 0, end_sample: 32_768, blocks: 1, segment, power: vec![0.5; 65_536] };
+        let text = format!("{row:?}");
+        assert!(text.contains("power: [65536 bins]"), "{text}");
+        assert!(!text.contains("0.5"), "{text}");
+    }
 }

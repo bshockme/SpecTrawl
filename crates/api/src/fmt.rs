@@ -21,19 +21,19 @@ fn trim(v: f64) -> String {
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
-/// `2 m 40 s` (60 s and over), `30 s` (10 to 60, rounded), `0.5 s` (under 10, one decimal); negatives read as 0.
+/// `2 m 40 s` (60 s and over), `30 s` (10 to 60, rounded), `0.5 s` (under 10, one decimal), `0 s` (under 0.05);
+/// negatives read as 0. The value is rounded before the form is chosen, so `59.6` reads `1 m 0 s` and `9.96` reads `10 s`.
 pub fn secs(s: f64) -> String {
     let s = if s.is_nan() { 0.0 } else { s.max(0.0) };
-    if s >= 60.0 {
-        let total = s.round() as u64;
-        format!("{} m {} s", total / 60, total % 60)
-    } else if s >= 10.0 {
-        format!("{} s", s.round() as u64)
-    } else if s == 0.0 {
-        "0 s".to_string()
-    } else {
-        format!("{s:.1} s")
+    let tenths = (s * 10.0).round();
+    if tenths == 0.0 {
+        return "0 s".to_string();
     }
+    if tenths < 100.0 {
+        return format!("{:.1} s", tenths / 10.0);
+    }
+    let total = s.round() as u64;
+    if total >= 60 { format!("{} m {} s", total / 60, total % 60) } else { format!("{total} s") }
 }
 
 /// `1 channel`, `3 channels`.
@@ -56,6 +56,13 @@ mod tests {
         assert_eq!(secs(30.0), "30 s");
         assert_eq!(secs(0.5), "0.5 s");
         assert_eq!(secs(-1.0), "0 s");
+        // Rounded first, then formatted: no "60 s" and no "10.0 s".
+        assert_eq!(secs(59.6), "1 m 0 s");
+        assert_eq!(secs(59.4), "59 s");
+        assert_eq!(secs(9.96), "10 s");
+        assert_eq!(secs(9.94), "9.9 s");
+        assert_eq!(secs(0.04), "0 s");
+        assert_eq!(secs(0.05), "0.1 s");
         assert_eq!(count(1, "channel"), "1 channel");
         assert_eq!(count(3, "channel"), "3 channels");
     }

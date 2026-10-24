@@ -213,8 +213,8 @@ impl Stage {
         Ok((seg, bins, true))
     }
 
-    /// Drops the recomputed blocks unused for `idle`. The stage thread calls
-    /// it with one second each time it publishes a row.
+    /// Drops the recomputed blocks unused for `idle`, waiting for the lock. The stage thread does not call this: each time
+    /// it publishes a row it calls `Shared::trim` itself with one second, and only if `try_lock` gets the lock.
     pub fn trim_recompute(&self, idle: Duration) {
         let mut guard = self.shared.recompute.lock();
         self.shared.trim(&mut guard, idle);

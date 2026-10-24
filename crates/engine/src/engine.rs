@@ -56,6 +56,7 @@ impl Engine {
         true
     }
 
+    /// The configuration the engine was built with; a later budget change (`keeper().budget().set_config`) is not shown here.
     pub fn config(&self) -> &EngineConfig {
         &self.cfg
     }
