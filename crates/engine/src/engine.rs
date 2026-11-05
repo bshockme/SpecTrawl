@@ -137,7 +137,12 @@ impl Engine {
     }
 
     /// Starts a replay (spec §4.7); `Err` says why it can't be heard.
+    /// A relative WAV path is under [`audio::default_dir`](crate::audio::default_dir).
     pub fn play(&self, target: PlayTarget, mode: Option<AudioMode>, gain: f32, to: PlayTo) -> Result<PlayId, String> {
+        let to = match to {
+            PlayTo::Wav(p) if p.is_relative() => PlayTo::Wav(crate::audio::default_dir().join(p)),
+            to => to,
+        };
         let what = match &target {
             PlayTarget::Record(id) => {
                 let record = self

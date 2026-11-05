@@ -41,7 +41,8 @@ pub enum PlayTarget {
 pub enum PlayTo {
     /// The audio output, mixed with anything else playing.
     Speaker,
-    /// A 16-bit mono WAV at 48 kHz, written once the replay has been demodulated.
+    /// A 16-bit mono WAV at 48 kHz, written once the replay has been demodulated. A relative path is under the
+    /// engine's audio directory (`<Documents>/SpecTrawl/audio`).
     Wav(PathBuf),
 }
 

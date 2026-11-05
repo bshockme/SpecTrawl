@@ -40,6 +40,7 @@ fn new_row() -> Vec<f32> {
         source: SourceConfig::default(),
         store: None,
         slices: None,
+        audio: engine::audio::AudioConfig::Manual,
     });
     let src = e.add_source(device(), engine::Mode::Live).unwrap();
     src.set_sweep_plan(SweepPlan { start_hz: 845e6, stop_hz: 875e6, spur_grid_hz: Some(5e6), ..Default::default() });

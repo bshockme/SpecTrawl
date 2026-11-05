@@ -4,7 +4,9 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use api::{Claim, Command, Evidence, RecordId, RecordQuery, SignalRecord, Snapshot, fmt};
+use api::{
+    AudioMode, Claim, Command, Evidence, PlayState, PlayTarget, PlayTo, PlayView, RecordId, RecordQuery, SignalRecord, Snapshot, fmt,
+};
 use egui::{RichText, Sense, vec2};
 
 use crate::theme;
@@ -47,6 +49,8 @@ pub struct RecordsPane {
     pub showing_history: bool,
     tag_draft: String,
     note_draft: String,
+    /// The mode Play asks for; `None` lets the engine choose from the frequency.
+    pub play_mode: Option<AudioMode>,
 }
 
 impl Default for RecordsPane {
@@ -82,6 +86,7 @@ impl RecordsPane {
             showing_history: false,
             tag_draft: String::new(),
             note_draft: String::new(),
+            play_mode: None,
         }
     }
 
@@ -178,7 +183,7 @@ impl RecordsPane {
                 }
             }
         });
-        let detail_h = if selected.is_some() { 170.0 } else { 0.0 };
+        let detail_h = if selected.is_some() { 200.0 } else { 0.0 };
         let list_h = (ui.available_height() - detail_h).max(ROW_H * 3.0);
         let letter = |r: &SignalRecord| snap.receivers.iter().find(|x| x.id == r.source).map_or('–', |x| x.letter);
         egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, false]).show_rows(ui, ROW_H, rows.len(), |ui, range| {
@@ -224,10 +229,90 @@ impl RecordsPane {
             return;
         };
         ui.separator();
-        self.detail(ui, &r, out);
+        self.detail(ui, snap, &r, out);
     }
 
-    fn detail(&mut self, ui: &mut egui::Ui, r: &SignalRecord, out: &mut Vec<Command>) {
+    /// What Play sends for a record.
+    pub fn play_command(&self, id: RecordId) -> Command {
+        Command::Play { target: PlayTarget::Record(id), mode: self.play_mode, gain: 1.0, to: PlayTo::Speaker }
+    }
+
+    /// What Save audio sends: a WAV named after the record, under the engine's audio directory.
+    pub fn save_command(&self, id: RecordId) -> Command {
+        let to = PlayTo::Wav(format!("record-{}.wav", id.0).into());
+        Command::Play { target: PlayTarget::Record(id), mode: self.play_mode, gain: 1.0, to }
+    }
+
+    /// The record's newest replay: running ones first, else the latest that ended.
+    pub fn play_of(snap: &Snapshot, id: RecordId) -> Option<&PlayView> {
+        let mine = || snap.audio.plays.iter().filter(move |p| p.target == PlayTarget::Record(id));
+        mine().rev().find(|p| !p.state.is_over()).or_else(|| mine().next_back())
+    }
+
+    /// The line the detail shows for a replay.
+    pub fn play_line(p: &PlayView) -> String {
+        let mode = format!("{}{}", p.mode.name(), if p.mode_guessed { " (by band)" } else { "" });
+        let from = match p.from {
+            api::PlayFrom::Ring => "ring",
+            api::PlayFrom::Slice => "slice",
+        };
+        let what = match (&p.to, &p.state) {
+            (PlayTo::Wav(path), PlayState::Finished) => format!("saved {}", path.display()),
+            (PlayTo::Wav(_), s) if !s.is_over() => "saving".into(),
+            (_, PlayState::Preparing) => "starting".into(),
+            (_, PlayState::Playing) => "playing".into(),
+            (_, PlayState::Finished) => "played".into(),
+            (_, PlayState::Stopped) => "stopped".into(),
+            (_, PlayState::EndedEarly(why)) => format!("ended early: {why}"),
+        };
+        let length = if p.complete { fmt::secs(p.length_s) } else { format!("{}…", fmt::secs(p.length_s)) };
+        format!("{what} · {} of {length} · {mode} from the {from}", fmt::secs(p.position_s))
+    }
+
+    fn listen(&mut self, ui: &mut egui::Ui, snap: &Snapshot, r: &SignalRecord, out: &mut Vec<Command>) {
+        ui.horizontal(|ui| {
+            let modes = [(None, "Auto"), (Some(AudioMode::Am), "AM"), (Some(AudioMode::Nfm), "NFM"), (Some(AudioMode::Wfm), "WFM")];
+            let current = modes.iter().find(|m| m.0 == self.play_mode).map_or("Auto", |m| m.1);
+            egui::ComboBox::from_id_salt("play-mode").selected_text(current).width(64.0).show_ui(ui, |ui| {
+                for (m, name) in modes {
+                    ui.selectable_value(&mut self.play_mode, m, name);
+                }
+            });
+            let running = Self::play_of(snap, r.id).filter(|p| !p.state.is_over());
+            match running {
+                Some(p) if p.to == PlayTo::Speaker => {
+                    if ui.button("■ Stop").clicked() {
+                        out.push(Command::StopPlay(p.id));
+                    }
+                }
+                _ => {
+                    if ui.button("▶ Play").on_hover_text("Hear it (from the ring, or its slice)").clicked() {
+                        out.push(self.play_command(r.id));
+                    }
+                }
+            }
+            if ui.button("Save audio").on_hover_text("Write it out as a WAV").clicked() {
+                out.push(self.save_command(r.id));
+            }
+            if let Some(p) = Self::play_of(snap, r.id) {
+                let colour = if matches!(p.state, PlayState::EndedEarly(_)) { theme::ALERT } else { theme::TEXT };
+                ui.label(RichText::new(Self::play_line(p)).small().color(colour));
+            }
+            if let Err(e) = &snap.audio.output {
+                ui.label(RichText::new(format!("no sound: {e}")).small().color(theme::MUTED));
+            }
+        });
+        // A refused play is answered with the reason.
+        let refused = snap.acks.iter().rev().find_map(|a| match &a.result {
+            Err(e) if e.contains(&format!("record {} ", r.id.0)) && e.contains("can't be heard") => Some(e.clone()),
+            _ => None,
+        });
+        if let Some(e) = refused {
+            ui.label(RichText::new(e).small().color(theme::ALERT));
+        }
+    }
+
+    fn detail(&mut self, ui: &mut egui::Ui, snap: &Snapshot, r: &SignalRecord, out: &mut Vec<Command>) {
         ui.label(
             RichText::new(format!(
                 "Record {} · {} · {:.1} kHz · {} · samples {}..{}",
@@ -240,6 +325,7 @@ impl RecordsPane {
             ))
             .strong(),
         );
+        self.listen(ui, snap, r, out);
         if r.claims.is_empty() {
             ui.label(RichText::new("unknown: no claims yet").italics().color(theme::MUTED));
         }

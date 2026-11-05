@@ -20,6 +20,11 @@ pub const JITTER: Duration = Duration::from_millis(100);
 /// The longest replay: 120 s (about 23 MB).
 pub const MAX_SECS: f64 = 120.0;
 
+/// `<Documents>/SpecTrawl/audio`: where a replay's WAV goes when its path is relative.
+pub fn default_dir() -> std::path::PathBuf {
+    crate::store::default_path().with_file_name("audio")
+}
+
 fn jitter_samples() -> usize {
     (JITTER.as_secs_f64() * RATE) as usize
 }
