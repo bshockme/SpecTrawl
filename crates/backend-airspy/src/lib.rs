@@ -125,6 +125,8 @@ struct Api {
     set_samplerate: unsafe extern "C" fn(*mut AirspyDev, u32) -> c_int,
     set_sample_type: unsafe extern "C" fn(*mut AirspyDev, c_int) -> c_int,
     set_packing: unsafe extern "C" fn(*mut AirspyDev, u8) -> c_int,
+    /// libhydrasdr only: the RFOne's input (0 = ANT, 1/2 = CABLE1/CABLE2).
+    set_rf_port: Option<unsafe extern "C" fn(*mut AirspyDev, c_int) -> c_int>,
     start_rx: unsafe extern "C" fn(*mut AirspyDev, RxCb, *mut c_void) -> c_int,
     stop_rx: unsafe extern "C" fn(*mut AirspyDev) -> c_int,
     is_streaming: unsafe extern "C" fn(*mut AirspyDev) -> c_int,
@@ -175,6 +177,7 @@ impl Api {
                 set_samplerate: sym!("set_samplerate"),
                 set_sample_type: sym!("set_sample_type"),
                 set_packing: sym!("set_packing"),
+                set_rf_port: if hydra { Some(sym!("set_rf_port")) } else { None },
                 start_rx: sym!("start_rx"),
                 stop_rx: sym!("stop_rx"),
                 is_streaming: sym!("is_streaming"),
@@ -522,6 +525,12 @@ impl AirspyBackend {
         };
         d.api.check("set_sample_type", unsafe { (d.api.set_sample_type)(dev, SAMPLE_FLOAT32_IQ) })?;
         d.api.check("set_samplerate", unsafe { (d.api.set_samplerate)(dev, rate as u32) })?;
+        // The RFOne keeps its input selection between opens: another program
+        // that left it on CABLE1 (trunk-recorder-pro's device test, eddie
+        // 2026-11-04) made every later session here hear nothing. Always ANT.
+        if let Some(f) = d.api.set_rf_port {
+            d.api.check("set_rf_port", unsafe { f(dev, 0) })?;
+        }
         d.set_center(100e6)?;
         d.set_gain(GainSetting::Linearity(0.6))?;
         Ok(d)
