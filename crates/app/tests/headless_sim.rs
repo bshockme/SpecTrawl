@@ -50,6 +50,7 @@ fn the_app_shows_the_simulator_and_never_blocks_on_the_engine() {
         source: SourceConfig::default(),
         store: None,
         slices: None,
+        audio: engine::audio::AudioConfig::Manual,
     });
     let handle = engine::snapshot::spawn(engine, vec![Box::new(GapFreeSim), Box::new(SlowBackend)], PublisherConfig::default());
     let ctx = egui::Context::default();
@@ -107,6 +108,7 @@ fn records_list_and_box_with_one_snapshot_in_five() {
         source: SourceConfig::default(),
         store: None,
         slices: None,
+        audio: engine::audio::AudioConfig::Manual,
     });
     let handle = engine::snapshot::spawn(engine, vec![Box::new(GapFreeSim)], PublisherConfig::default());
     let ctx = egui::Context::default();
@@ -166,6 +168,7 @@ fn a_sweeping_receiver_shows_its_passes_over_the_span() {
         source: SourceConfig::default(),
         store: None,
         slices: None,
+        audio: engine::audio::AudioConfig::Manual,
     });
     let handle = engine::snapshot::spawn(engine, vec![Box::new(GapFreeSim)], PublisherConfig::default());
     let ctx = egui::Context::default();

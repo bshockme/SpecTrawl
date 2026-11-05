@@ -11,6 +11,7 @@
 //! An interface takes one `Arc<Snapshot>` per frame and draws from it, sends commands, and holds no engine type, lock,
 //! thread or clock. This crate itself creates no threads and reads no clocks.
 
+pub mod audio;
 pub mod command;
 pub mod fmt;
 pub mod handle;
@@ -18,6 +19,7 @@ pub mod records;
 pub mod snapshot;
 pub mod timeline;
 
+pub use audio::{AudioMode, AudioView, PlayFrom, PlayId, PlayState, PlayTarget, PlayTo, PlayView};
 pub use command::{Ack, Command, CommandReceiver, CommandSender, Outcome, command_channel};
 pub use handle::Handle;
 pub use records::{

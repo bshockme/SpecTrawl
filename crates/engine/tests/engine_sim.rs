@@ -16,6 +16,7 @@ fn removing_a_source_ends_its_consumers_once_and_stops_its_stage() {
         source: cfg(),
         store: None,
         slices: None,
+        audio: engine::audio::AudioConfig::Manual,
     });
     let (d, _c) = sim(10e6, true);
     let src = engine.add_source(d, Mode::Live).unwrap();

@@ -5,6 +5,7 @@ use std::time::SystemTime;
 
 use sdr_core::{Capabilities, DeviceInfo, GainSetting};
 
+use crate::audio::AudioView;
 use crate::command::Ack;
 use crate::records::{QueryResult, RecordsView, StoreView};
 use crate::timeline::{Row, SegmentId};
@@ -24,6 +25,8 @@ pub struct Snapshot {
     pub store: Option<StoreView>,
     /// The latest history search's answer.
     pub query: Option<Arc<QueryResult>>,
+    /// The audio output and the replays.
+    pub audio: Arc<AudioView>,
 }
 
 impl Snapshot {
@@ -39,6 +42,7 @@ impl Snapshot {
             records: Arc::new(RecordsView::default()),
             store: None,
             query: None,
+            audio: Arc::new(AudioView::default()),
         }
     }
 }

@@ -26,6 +26,8 @@ pub enum Modulation {
     Fsk { levels: u8, sym_rate: f64, dev_hz: f64, sync: Option<SyncInsert> },
     /// FM with a single audio tone.
     FmTone { tone_hz: f64, dev_hz: f64 },
+    /// AM (double sideband, full carrier) with a single audio tone: the envelope is `1 + depth·sin(2π·tone·t)`.
+    AmTone { tone_hz: f64, depth: f64 },
 }
 
 /// A sync word sent every `period` symbols. 4-level patterns are dibits
@@ -573,7 +575,6 @@ impl Generator {
                 for (i, a) in acc.iter_mut().enumerate() {
                     if s.sym_left <= 0.0 {
                         let dev = match e.modulation {
-                            Modulation::Cw => 0.0,
                             Modulation::Fsk { levels, sym_rate, dev_hz, sync } => {
                                 s.sym_left += fs / sym_rate;
                                 let i = s.sym_index;
@@ -589,6 +590,7 @@ impl Generator {
                                     }
                                 }
                             }
+                            Modulation::Cw | Modulation::AmTone { .. } => 0.0,
                             Modulation::FmTone { tone_hz, dev_hz } => {
                                 // Update the tone ~32 times per cycle.
                                 let per = fs / tone_hz / 32.0;
@@ -597,7 +599,7 @@ impl Generator {
                                 s.tone_phase.sin() * dev_hz
                             }
                         };
-                        if matches!(e.modulation, Modulation::Cw) {
+                        if matches!(e.modulation, Modulation::Cw | Modulation::AmTone { .. }) {
                             s.sym_left = f64::INFINITY;
                         }
                         let w = std::f64::consts::TAU * (off + dev) / fs;
@@ -609,12 +611,20 @@ impl Generator {
                         Some(sl) => (((t_block + i as f64 / fs) / sl) as u64).is_multiple_of(2),
                         None => true,
                     };
+                    let env = match e.modulation {
+                        Modulation::AmTone { tone_hz, depth } => {
+                            s.tone_phase += std::f64::consts::TAU * tone_hz / fs;
+                            (1.0 + depth * s.tone_phase.sin()) as f32
+                        }
+                        _ => 1.0,
+                    };
                     if slot_on {
-                        *a += s.z * s.amp;
+                        *a += s.z * (s.amp * env);
                     }
                 }
-                // Keep the phasor on the unit circle.
+                // Keep the phasor on the unit circle, and the tone's phase small.
                 s.z /= s.z.norm();
+                s.tone_phase %= std::f64::consts::TAU;
             }
             for (o, a) in out.iter_mut().zip(acc.iter()) {
                 *o = [(a.re * 32767.0).clamp(-32768.0, 32767.0) as i16, (a.im * 32767.0).clamp(-32768.0, 32767.0) as i16];
@@ -811,6 +821,34 @@ mod tests {
         let sum: f64 = x.windows(2).map(|w| (w[1] * w[0].conj()).arg() as f64).sum();
         let hz = sum / (x.len() - 1) as f64 * fs / std::f64::consts::TAU;
         assert!((hz - -4.0e6).abs() < 100.0, "tone at {hz} Hz, expected -4 MHz");
+    }
+
+    #[test]
+    fn an_am_emitter_carries_its_tone_on_the_envelope_at_its_depth() {
+        let am = Emitter {
+            freq_hz: 855.25e6,
+            level_dbfs: -20.0,
+            modulation: Modulation::AmTone { tone_hz: 1000.0, depth: 0.5 },
+            keying: Keying::Continuous,
+        };
+        let (mut d, _c) = SimDevice::with_config(SimConfig { emitters: vec![am], center_hz: 855.25e6, paced: false, ..Default::default() });
+        let cap = Capture::default();
+        d.start(Box::new(cap.clone())).unwrap();
+        wait_until(|| cap.0.lock().unwrap().blocks.len() >= 2);
+        d.stop().unwrap();
+        let g = cap.0.lock().unwrap();
+        // Six whole cycles of the tone (10 000 samples each at 10 MS/s).
+        let env: Vec<f64> = g.blocks[1].1[..60_000].iter().map(|v| f64::from(v[0]).hypot(f64::from(v[1]))).collect();
+        let mean = env.iter().sum::<f64>() / env.len() as f64;
+        let at = |hz: f64| {
+            let w = std::f64::consts::TAU * hz / 10e6;
+            let (re, im) =
+                env.iter().enumerate().fold((0.0, 0.0), |(re, im), (n, &v)| (re + v * (w * n as f64).cos(), im - v * (w * n as f64).sin()));
+            2.0 * re.hypot(im) / env.len() as f64
+        };
+        let depth = at(1000.0) / mean;
+        assert!((depth - 0.5).abs() < 0.02, "depth {depth}");
+        assert!(at(1500.0) / mean < 0.02, "the envelope has energy off the tone");
     }
 
     /// A recorder that blocks for 400 ms on its third block, like a descheduled runner.

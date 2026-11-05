@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 api = { path = "../api", features = ["serde"] }
 arc-swap = "1.7"
+cpal = "0.15.3"
 dsp = { version = "0.1.0", path = "../dsp" }
 log = "0.4"
 parking_lot = "0.12"

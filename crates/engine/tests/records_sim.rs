@@ -44,6 +44,7 @@ fn engine() -> Engine {
         source: SourceConfig::default(),
         store: None,
         slices: None,
+        audio: engine::audio::AudioConfig::Manual,
     })
 }
 

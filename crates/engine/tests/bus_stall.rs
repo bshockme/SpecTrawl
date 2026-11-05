@@ -25,6 +25,7 @@ fn two_hundred_channels_recover_from_a_stall_of_every_worker() {
         source: cfg(),
         store: None,
         slices: None,
+        audio: engine::audio::AudioConfig::Manual,
     });
     let (d, _c) = SimDevice::with_config(SimConfig { paced: true, report_lag_gaps: false, ..Default::default() }); // the default 800 MHz scenario
     let src = engine.add_source(Box::new(d), Mode::Live).unwrap();

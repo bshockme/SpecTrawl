@@ -158,6 +158,14 @@ impl Publisher {
                 Some(s) => s.query(seq, q).map(|()| api::Outcome::Queried),
                 None => Err("history search needs the record store".into()),
             },
+            Command::Play { target, mode, gain, to } => engine.play(target, mode, gain, to).map(api::Outcome::Playing),
+            Command::StopPlay(id) => {
+                if engine.stop_play(id) {
+                    Ok(api::Outcome::Done)
+                } else {
+                    Err(format!("replay {} is not playing", id.0))
+                }
+            }
             c => registry.apply(engine, c, log),
         }))
         .unwrap_or_else(|payload| Err(format!("{name} panicked: {}", panic_text(payload.as_ref()))));
@@ -191,6 +199,7 @@ impl Publisher {
                 })
             }),
             query: self.engine.store().and_then(|s| s.query_result()),
+            audio: Arc::new(self.engine.audio_view()),
         }));
     }
 }
@@ -210,6 +219,8 @@ fn command_name(c: &Command) -> &'static str {
         Command::Untag { .. } => "untag",
         Command::Note { .. } => "note",
         Command::QueryRecords(_) => "query records",
+        Command::Play { .. } => "play",
+        Command::StopPlay(_) => "stop play",
     }
 }
 
@@ -232,6 +243,9 @@ fn command_source(c: &Command) -> Option<SourceId> {
         | Command::Tag { .. }
         | Command::Untag { .. }
         | Command::Note { .. }
-        | Command::QueryRecords(_) => None,
+        | Command::QueryRecords(_)
+        | Command::StopPlay(_) => None,
+        Command::Play { target: api::PlayTarget::Region { source, .. }, .. } => Some(*source),
+        Command::Play { .. } => None,
     }
 }

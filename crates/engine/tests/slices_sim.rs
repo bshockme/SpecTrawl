@@ -31,6 +31,7 @@ fn engine(slices: SliceConfig) -> Engine {
         source: SourceConfig::default(),
         store: None,
         slices: Some(slices),
+        audio: engine::audio::AudioConfig::Manual,
     })
 }
 

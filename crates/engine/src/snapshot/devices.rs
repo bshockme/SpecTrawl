@@ -133,7 +133,7 @@ impl Registry {
             Command::Untag { record, tag } => found(engine.records().tag(record, tag.trim(), false) || engine.store().is_some(), record),
             Command::Note { record, text } => found(engine.records().note(record, &text) || engine.store().is_some(), record),
             // The publisher answers it (it needs the command's number).
-            Command::QueryRecords(_) => Err("history search is the publisher's".into()),
+            Command::QueryRecords(_) | Command::Play { .. } | Command::StopPlay(_) => Err("the publisher's to apply".into()),
             Command::SetMode { source, mode } => {
                 let (letter, src) = self.target(engine, source)?;
                 src.set_mode(mode);

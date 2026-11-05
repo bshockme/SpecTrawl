@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use sdr_core::GainSetting;
 
+use crate::audio::{AudioMode, PlayId, PlayTarget, PlayTo};
 use crate::records::{RecordId, RecordQuery};
 use crate::{Mode, SourceId};
 
@@ -56,6 +57,15 @@ pub enum Command {
     },
     /// Answered as [`Snapshot::query`](crate::Snapshot::query) with this command's sequence number.
     QueryRecords(RecordQuery),
+    /// Replay a record or a region (spec §4.7). `mode: None` lets the engine choose from the frequency; `gain` scales
+    /// the sound (1 = as demodulated). Acknowledged with [`Outcome::Playing`], or an error saying why it can't be heard.
+    Play {
+        target: PlayTarget,
+        mode: Option<AudioMode>,
+        gain: f32,
+        to: PlayTo,
+    },
+    StopPlay(PlayId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -64,6 +74,8 @@ pub enum Outcome {
     Opened(SourceId),
     /// The query is running; its answer appears in a later snapshot.
     Queried,
+    /// The replay is under way; it shows in [`Snapshot::audio`](crate::Snapshot::audio).
+    Playing(PlayId),
 }
 
 #[derive(Debug, Clone, PartialEq)]
