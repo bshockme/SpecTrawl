@@ -219,6 +219,29 @@ fn count_levels(disc: &[f32], centre: f32, dev: f32) -> u8 {
 
 const STANDARD_RATES: [f64; 10] = [512.0, 1200.0, 1600.0, 2400.0, 3200.0, 3600.0, 4800.0, 6000.0, 6400.0, 9600.0];
 
+/// A rate line must stand this far (in power) over the floor its own
+/// skirts rise from: the mean of the nearest local minima either side
+/// (suscan's nonlinear baud detector asks for 10 dB the same way, and
+/// prefers to give no rate rather than a doubtful one).
+const LINE_SIGNIFICANCE_DB: f32 = 10.0;
+
+/// Is the peak at bin `k` of the magnitude spectrum `mag` significant
+/// (see `LINE_SIGNIFICANCE_DB`)? A broad hump has local minima far down
+/// its sides but not much below its top; a line drops to the floor
+/// within a few bins.
+fn significant(mag: &[f32], k: usize) -> bool {
+    let mut lo = k;
+    while lo > 0 && mag[lo - 1] <= mag[lo] {
+        lo -= 1;
+    }
+    let mut hi = k;
+    while hi + 1 < mag.len() && mag[hi + 1] <= mag[hi] {
+        hi += 1;
+    }
+    let floor = (mag[lo] + mag[hi]) / 2.0;
+    floor <= 0.0 || 20.0 * (mag[k] / floor).log10() >= LINE_SIGNIFICANCE_DB
+}
+
 /// Symbol rate from the spectral line of the squared frequency derivative.
 fn symbol_rate(disc: &[f32], fs: f64) -> (Option<f64>, Option<f64>) {
     let avail = disc.len().min(1 << 17);
@@ -246,7 +269,7 @@ fn symbol_rate(disc: &[f32], fs: f64) -> (Option<f64>, Option<f64>) {
     let mut near: Vec<f32> = mag[k.saturating_sub(60)..(k + 60).min(mag.len())].to_vec();
     let mid = near.len() / 2;
     let around = *near.select_nth_unstable_by(mid, f32::total_cmp).1;
-    if pk < 5.0 * around {
+    if pk < 5.0 * around || !significant(&mag, k) {
         return (None, None);
     }
     // Sharp transitions put lines at every multiple of the rate: prefer the

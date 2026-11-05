@@ -4,6 +4,7 @@
 pub mod ambe;
 mod ambe_tables;
 pub mod bandplan;
+pub mod blind;
 pub mod carrier;
 pub mod chirp;
 pub mod context;
@@ -447,8 +448,23 @@ pub fn classify_with(x: &[Complex32], fs: f64, bandwidth_hz: f64, hints: Hints) 
             return c;
         }
     }
-    let (label, conf) = if bandwidth_hz > 150e3 {
-        (if f.envelope_cv < 0.25 { "Wideband FM".to_string() } else { "Wideband".to_string() }, 0.5)
+    // A broadcast station's pilot and RDS subcarrier are as decisive as a
+    // sync word. The detector often cuts a station into fragments of
+    // 70–150 kHz (its centre, a sideband), whose discriminator still holds
+    // the pilot but whose squared derivative also holds lines the FSK
+    // rules took for "2FSK 2400 Bd"; so this goes first, for anything wide
+    // enough to carry a 19 kHz subcarrier.
+    let pilot = (bandwidth_hz >= 30e3).then(|| blind::fm_pilot(&disc, fs)).flatten();
+    let (label, conf) = if let Some(p) = pilot {
+        (if p.rds { "FM broadcast (stereo, RDS)".to_string() } else { "FM broadcast (stereo)".to_string() }, 0.9)
+    } else if bandwidth_hz > 150e3 {
+        if let Some(o) = blind::ofdm(x, fs, OFDM_USEFUL_S.0, OFDM_USEFUL_S.1) {
+            (ofdm_label(&o), 0.7)
+        } else if f.envelope_cv < 0.25 {
+            ("Wideband FM".to_string(), 0.5)
+        } else {
+            ("Wideband".to_string(), 0.5)
+        }
     } else if bandwidth_hz < 4.5e3 && f.fsk_levels == 0 {
         // Too narrow for voice or common FSK: a carrier or very slow data.
         ("Carrier".to_string(), 0.6)
@@ -467,17 +483,36 @@ pub fn classify_with(x: &[Complex32], fs: f64, bandwidth_hz: f64, hints: Hints) 
         // A timing line without clear levels is FSK only if the envelope is
         // steady: AM and pulses put a line at their modulation rate too.
         (format!("FSK {:.0} Bd", r), 0.5)
+    } else if let Some(p) = (f.envelope_cv < 0.6).then(|| blind::psk_order(x, fs, bandwidth_hz * 0.25)).flatten() {
+        // Phase modulation: the M-th power leaves a carrier line. The
+        // rate is the cyclic line of the envelope (shaped PSK has one).
+        let name = match p.order {
+            2 => "BPSK",
+            4 => "QPSK",
+            _ => "8PSK",
+        };
+        match blind::envelope_rate(x, fs, 200.0, bandwidth_hz) {
+            Some(r) => (format!("{name} {:.0} Bd", r.hz), 0.6),
+            None => (name.to_string(), 0.5),
+        }
+    } else if let Some(o) = blind::ofdm(x, fs, OFDM_USEFUL_S.0, OFDM_USEFUL_S.1) {
+        (ofdm_label(&o), 0.6)
     } else if f.envelope_cv > 0.35 {
         // The envelope varies. Amplitude
         // modulation shows one of two shapes: a carrier line standing clear
         // of its sidebands with voice-band envelope content (AM), or the
         // signal switching between two levels (OOK, pulses). A varying
         // envelope with neither is noise, a neighbour's skirt or a hump of
-        // floor: not a modulation.
+        // floor: not a modulation... unless it repeats: a slotted or
+        // framed emission (TDMA whose sync the bank doesn't know, a beacon)
+        // shows its period in the envelope.
         match am_evidence(raw, fs) {
             Some(AmKind::Voice) => ("AM".to_string(), 0.6),
             Some(AmKind::Keyed) => ("OOK".to_string(), 0.6),
-            None => ("Unknown".to_string(), 0.2),
+            None => match (analysed_s >= PERIOD_WINDOW_S).then(|| blind::burst_period(x, fs, 0.005, 0.5)).flatten() {
+                Some(p) if p.strength >= 0.5 => (format!("Bursts every {:.0} ms", p.period_s * 1e3), 0.4),
+                _ => ("Unknown".to_string(), 0.2),
+            },
         }
     } else if (1000.0..7000.0).contains(&f.deviation_hz) {
         ("Analog FM".to_string(), 0.5)
@@ -506,6 +541,23 @@ fn longest_on_run<'a>(disc: &'a [f32], gate: &[bool]) -> &'a [f32] {
         }
     }
     &disc[best.0..best.1.min(disc.len())]
+}
+
+/// Least window for a burst period to be read: a single 90 ms hop burst in
+/// a 0.1 s window showed "periods" of 6–8 ms from its own envelope
+/// structure; slots and frames (30 ms and up) need a few repeats.
+const PERIOD_WINDOW_S: f64 = 0.3;
+
+/// Useful OFDM symbol lengths looked for, s: from LTE/NR's 66.7 µs (and
+/// shorter numerologies) up to the few ms of HD Radio and DAB-like systems.
+const OFDM_USEFUL_S: (f64, f64) = (20e-6, 6e-3);
+
+fn ofdm_label(o: &blind::Ofdm) -> String {
+    if o.subcarrier_hz >= 1e3 {
+        format!("OFDM {:.1} kHz subcarriers", o.subcarrier_hz / 1e3)
+    } else {
+        format!("OFDM {:.0} Hz subcarriers", o.subcarrier_hz)
+    }
 }
 
 /// Window SNR below which no feature label is given (see `classify_with`).
@@ -559,12 +611,59 @@ fn am_evidence(x: &[Complex32], fs: f64) -> Option<AmKind> {
         }
     }
     // Voice: a carrier at least 10 dB over the noise beside it, modulated
-    // in the voice band (a bare carrier's ratio is about -40 dB).
+    // in the voice band (a bare carrier's ratio is about -40 dB), and
+    // the carrier is what the channel is: near its centre, and holding
+    // its frequency while the envelope is up. A keyed or FSK data
+    // transmitter near the edge of the channel also has a line and
+    // envelope content (on air, idle pager channels read as "AM").
     let m = carrier::measure(x, fs);
-    if m.seconds > 0.0 && m.line_snr_db >= 10.0 && m.am_voice_db > -25.0 {
+    if m.seconds > 0.0
+        && m.line_snr_db >= 10.0
+        && m.purity >= AM_CARRIER_SHARE
+        && m.am_voice_db > -25.0
+        && m.line_hz.abs() <= AM_CARRIER_OFFSET * fs
+        && steady_frequency(x, fs) < AM_MAX_FREQUENCY_SWING_HZ
+    {
         return Some(AmKind::Voice);
     }
     None
+}
+
+/// Least share of the on-signal power an AM carrier holds (two thirds for
+/// a sine at full modulation, more for voice; a keyed or FSK data
+/// transmitter's strongest line holds a fifth or so).
+const AM_CARRIER_SHARE: f32 = 0.5;
+/// Where an AM carrier may sit in its channel, as a fraction of the
+/// channel sample rate (2.5 × the record width): within a fifth of the
+/// width of the centre.
+const AM_CARRIER_OFFSET: f64 = 0.08;
+/// How far the instantaneous frequency of an AM channel may swing (90th
+/// percentile of its smoothed deviation from the median) while the
+/// envelope is up: an AM carrier holds still; FSK, FM and keyed data
+/// move by kilohertz.
+const AM_MAX_FREQUENCY_SWING_HZ: f32 = 400.0;
+
+/// The 90th percentile of the smoothed instantaneous frequency's distance
+/// from its median, over the samples where the envelope is above its
+/// median (an AM trough is all noise), Hz.
+fn steady_frequency(x: &[Complex32], fs: f64) -> f32 {
+    let mut mags: Vec<f32> = x.iter().map(|c| c.norm()).collect();
+    let n = mags.len();
+    let med = *mags.select_nth_unstable_by(n / 2, f32::total_cmp).1;
+    let k = (fs / (2.0 * std::f64::consts::PI)) as f32;
+    let inst: Vec<f32> =
+        x.windows(2).filter(|w| w[0].norm() >= med && w[1].norm() >= med).map(|w| (w[1] * w[0].conj()).arg() * k).collect();
+    let mut smooth: Vec<f32> = inst.windows(8).map(|w| w.iter().sum::<f32>() / 8.0).collect();
+    if smooth.len() < 64 {
+        return f32::MAX;
+    }
+    let m = smooth.len() / 2;
+    let centre = *smooth.clone().select_nth_unstable_by(m, f32::total_cmp).1;
+    for v in smooth.iter_mut() {
+        *v = (*v - centre).abs();
+    }
+    let i90 = smooth.len() * 9 / 10;
+    *smooth.select_nth_unstable_by(i90, f32::total_cmp).1
 }
 
 #[cfg(test)]
