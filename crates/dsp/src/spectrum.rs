@@ -51,14 +51,20 @@ pub fn bh_power(bins: &[Complex32], out: &mut [f32]) {
     let (h1, h2, h3) = (-a1 / 2.0, a2 / 2.0, -a3 / 2.0);
     let norm = 1.0 / (n as f32 * a0).powi(2);
     let half = n / 2;
-    for (i, o) in out.iter_mut().enumerate() {
-        let k = (i + half) % n;
-        // Offsets are reduced mod n so tiny n still wraps correctly.
-        let at = |d: usize, sign: bool| {
-            let d = d % n;
-            bins[if sign { (k + d) % n } else { (k + n - d) % n }]
-        };
-        let xw = bins[k] * a0 + (at(1, false) + at(1, true)) * h1 + (at(2, false) + at(2, true)) * h2 + (at(3, false) + at(3, true)) * h3;
+    // The 7 taps around bin k, in the order they are summed, wrapping mod n (only the 3 bins at each end wrap).
+    let taps = |k: usize| -> [Complex32; 7] {
+        if (3..n.saturating_sub(3)).contains(&k) {
+            bins[k - 3..k + 4].try_into().expect("7 taps")
+        } else {
+            // Offsets are reduced mod n so tiny n still wraps correctly.
+            std::array::from_fn(|j| bins[(k + 3 * n - 3 + j) % n])
+        }
+    };
+    let (lower, upper) = out.split_at_mut(n - half);
+    // DC-centred: out[i] is bin (i + n/2) mod n, so the upper bins come first.
+    for (o, k) in lower.iter_mut().zip(half..n).chain(upper.iter_mut().zip(0..half)) {
+        let [m3, m2, m1, c, p1, p2, p3] = taps(k);
+        let xw = c * a0 + (m1 + p1) * h1 + (m2 + p2) * h2 + (m3 + p3) * h3;
         *o = xw.norm_sqr() * norm;
     }
 }
@@ -104,5 +110,41 @@ mod tests {
             }
         }
         assert!((got[n / 2 + 100] - 0.25).abs() < 0.01, "0.5 amplitude tone reads 0.25 power");
+    }
+
+    /// The convolution as first written, with every index reduced mod n.
+    fn bh_power_by_modulo(bins: &[Complex32], out: &mut [f32]) {
+        let n = bins.len();
+        let [a0, a1, a2, a3] = BH.map(|a| a as f32);
+        let (h1, h2, h3) = (-a1 / 2.0, a2 / 2.0, -a3 / 2.0);
+        let norm = 1.0 / (n as f32 * a0).powi(2);
+        for (i, o) in out.iter_mut().enumerate() {
+            let k = (i + n / 2) % n;
+            let at = |d: usize, sign: bool| bins[if sign { (k + d % n) % n } else { (k + n - d % n) % n }];
+            let xw =
+                bins[k] * a0 + (at(1, false) + at(1, true)) * h1 + (at(2, false) + at(2, true)) * h2 + (at(3, false) + at(3, true)) * h3;
+            *o = xw.norm_sqr() * norm;
+        }
+    }
+
+    #[test]
+    fn bh_power_is_the_modulo_convolution_bit_for_bit_at_every_size() {
+        let mut x = 0.37f32;
+        for n in (1..=17).chain([64, 4096, 4097]) {
+            let bins: Vec<Complex32> = (0..n)
+                .map(|_| {
+                    x = (x * 3.9 * (1.0 - x)).clamp(0.01, 0.99);
+                    Complex32::new(x - 0.5, (x * 7.0).fract() - 0.5)
+                })
+                .collect();
+            let (mut got, mut want) = (vec![0.0f32; n], vec![0.0f32; n]);
+            bh_power(&bins, &mut got);
+            bh_power_by_modulo(&bins, &mut want);
+            assert_eq!(
+                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "n = {n}"
+            );
+        }
     }
 }
