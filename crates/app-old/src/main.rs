@@ -232,6 +232,12 @@ fn db_ui(ui: &mut egui::Ui, p: &mut Receiver) {
 struct App {
     backends: Vec<Box<dyn Backend>>,
     devices: Vec<DeviceInfo>,
+    /// Open receivers losing samples (percent over the last check), with
+    /// whether another open Airspy shares their USB bus; rechecked every
+    /// few seconds from each source's (lost, total) sample counts.
+    usb_loss: std::collections::BTreeMap<String, (u32, bool)>,
+    usb_counts: std::collections::HashMap<String, (u64, u64)>,
+    usb_checked: Option<std::time::Instant>,
     /// The record store (`Documents/SpecTrawl/spectrawl.db`), when it opened.
     store: Option<engine_old::Store>,
     panes: Vec<Receiver>,
@@ -585,7 +591,54 @@ fn same_device(a: &DeviceInfo, b: &DeviceInfo) -> bool {
     a.backend == b.backend && a.serial == b.serial
 }
 
+/// The pane-title note for a receiver that is losing samples.
+fn usb_note(loss: &std::collections::BTreeMap<String, (u32, bool)>, serial: &str) -> String {
+    match loss.get(serial) {
+        Some(&(pct, true)) => format!(" · LOSING {pct}% OF SAMPLES: shares a USB controller with another radio, move one to another controller"),
+        Some(&(pct, false)) => format!(" · LOSING {pct}% OF SAMPLES (USB link)"),
+        None => String::new(),
+    }
+}
+
 impl App {
+    /// Flags open receivers losing samples. Two radios at 10 MS/s through
+    /// one USB 2 hub lose nearly half (the board's FIFO overflows unseen;
+    /// the backend counts the shortfall as gaps), which wrecks every
+    /// record: no protocol decodes, smeared strong signals.
+    fn check_usb_sharing(&mut self) {
+        if self.usb_checked.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(5)) {
+            return;
+        }
+        self.usb_checked = Some(std::time::Instant::now());
+        let infos: Vec<(String, bool, u64, u64)> = self
+            .panes
+            .iter()
+            .map(|p| {
+                let (i, st) = (p.source.info(), p.source.stats());
+                (i.serial.clone(), i.backend == "airspy", st.lost_samples, st.total_samples)
+            })
+            .collect();
+        let buses: Vec<(&str, u32)> =
+            infos.iter().filter(|i| i.1).filter_map(|i| backend_airspy::usb_bus(&i.0).map(|b| (i.0.as_str(), b))).collect();
+        let mut loss = std::collections::BTreeMap::new();
+        for (serial, _, lost, total) in &infos {
+            let (lost0, total0) = self.usb_counts.insert(serial.clone(), (*lost, *total)).unwrap_or((*lost, *total));
+            let (dl, dt) = (lost.saturating_sub(lost0), total.saturating_sub(total0));
+            if dt > 0 && dl * 50 > dt {
+                let shared = buses.iter().any(|(s, b)| s == serial && buses.iter().any(|(s2, b2)| s2 != s && b2 == b));
+                loss.insert(serial.clone(), ((dl * 100).div_ceil(dt) as u32, shared));
+            }
+        }
+        if loss.keys().ne(self.usb_loss.keys()) && !loss.is_empty() {
+            log::warn!(
+                "losing samples on the USB link: {}",
+                loss.iter().map(|(s, (p, sh))| format!("{s} {p}%{}", if *sh { " (shares a USB controller)" } else { "" })).collect::<Vec<_>>().join(", ")
+            );
+        }
+        self.usb_counts.retain(|s, _| infos.iter().any(|i| &i.0 == s));
+        self.usb_loss = loss;
+    }
+
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply(&cc.egui_ctx);
         let args = parse_args();
@@ -600,6 +653,9 @@ impl App {
         let mut app = Self {
             backends: vec![Box::new(backend_airspy::AirspyBackend::new()), Box::new(backend_sim::SimBackend)],
             devices: Vec::new(),
+            usb_loss: Default::default(),
+            usb_counts: Default::default(),
+            usb_checked: None,
             store,
             panes: Vec::new(),
             paused: false,
@@ -664,11 +720,12 @@ impl App {
         };
         app.rescan();
 
-        // Until the role assigner exists: R2s first (wideband antennas), the
+        // Until the role assigner exists: R2s (and the R2-compatible
+        // HydraSDR) first (wideband antennas), the
         // simulator last. One device → Focus; two → Survey + Focus.
         let rank = |d: &DeviceInfo| match (d.backend.as_str(), d.label.as_str()) {
             ("sim", _) => 9,
-            (_, "Airspy R2") => 0,
+            (_, "Airspy R2" | "HydraSDR RFOne") => 0,
             (_, "Airspy Mini") => 5, // on the 1090 MHz antenna here
             _ => 1,
         };
@@ -2726,7 +2783,7 @@ impl App {
         let scan_rule_name = self.settings.scan.rule.name();
         let scan_aviation = self.settings.scan.aviation;
         {
-            let App { panes, sweep_lo_mhz, sweep_hi_mhz, frame, .. } = &mut *self;
+            let App { panes, sweep_lo_mhz, sweep_hi_mhz, frame, usb_loss, .. } = &mut *self;
             let Some(p) = panes.iter_mut().find(|p| p.id == id) else { return };
             let records = if id.is_sweep() { survey_outside_focus(pane_records(p), &frame.spans) } else { pane_records(p) };
             // Highlight the selected record, and its emitter (or the
@@ -2764,6 +2821,7 @@ impl App {
                     ),
                     None => format!("S · {}", info.label),
                 };
+                let title = title + &usb_note(usb_loss, &info.serial);
                 let res = p.view.show(ui, r, &title, st.as_ref(), &records, sel_record, sel_emitter);
                 for (rx, (lo, hi)) in &frame.live_spans {
                     p.view.bracket(ui, r, *lo, *hi, &rx.to_string());
@@ -2789,11 +2847,12 @@ impl App {
                 let snap = p.source.snapshot();
                 let lost = p.source.stats().device_lost;
                 let title = format!(
-                    "{id} · {} · {:.3} MHz · {:.1} MS/s{}",
+                    "{id} · {} · {:.3} MHz · {:.1} MS/s{}{}",
                     info.label,
                     snap.center_hz / 1e6,
                     snap.sample_rate / 1e6,
-                    if lost { " · DEVICE LOST, waiting for it to return" } else { "" }
+                    if lost { " · DEVICE LOST, waiting for it to return" } else { "" },
+                    usb_note(usb_loss, &info.serial)
                 );
                 let res = p.view.show(ui, r, &title, None, &records, sel_record, sel_emitter);
                 if p.mode == RxMode::Scan {
@@ -4676,6 +4735,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.tick_playback(&ctx);
+        self.check_usb_sharing();
         // Ctrl+K: the command palette, from anywhere.
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) {
             self.palette_open = !self.palette_open;

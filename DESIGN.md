@@ -82,7 +82,7 @@ A backend knows how to enumerate and open one family of devices.
 | Backend | Library | Notes |
 |---|---|---|
 | `airspy` | libairspy | Owned: Airspy R2. Packed 12-bit samples. Real-IF, so no DC spike. |
-| `hydrasdr` | libhydrasdr | HydraSDR RFOne: Airspy R2-derived, R828D tuner, 12-bit, 10 MHz. Not owned yet. If its API is close to libairspy's, it may share a module with `airspy`. Check against the real headers. |
+| `airspy` | libhydrasdr | HydraSDR RFOne: Airspy R2-derived, R828D tuner (ports ANT/CABLE1/CABLE2), 12-bit, 10 MHz. Owned since 2026-11-04. libhydrasdr is libairspy's API under a `hydrasdr_` prefix (u64 `set_freq`, `r82x_read`), so the `airspy` backend loads both and opens each board through whichever lists it; without libhydrasdr it opens the board through libairspy, which can't list it (serial string "HYDRASDR SN:"). |
 | `hackrf` | libhackrf | Native **sweep mode** for fast surveys. 8-bit, zero-IF. |
 | `rtlsdr` | librtlsdr | Includes direct sampling. 8-bit, zero-IF. |
 | `soapy` | SoapySDR | Catch-all for SDRplay, LimeSDR, USRP, PlutoSDR and others. Loses device-specific extras. |
@@ -318,7 +318,6 @@ Start with fewer crates and split them when the boundaries prove themselves. `sd
 Resolve each one when the work actually needs it, not before.
 
 - Project licence (GPL vs MIT/Apache). Check the driver libraries' licences first; dynamic loading helps.
-- Does the HydraSDR API match libairspy's closely enough to share a backend?
 - Exact `api` transport for remote nodes (QUIC? plain TCP + a binary protocol?).
 - Disk-tier format for the IQ ring (raw segments + index vs SigMF segments).
 
