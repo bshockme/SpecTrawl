@@ -6,7 +6,7 @@ use api::Row;
 use egui::{Color32, Rect, pos2};
 
 /// History depth and texture height.
-pub const ROWS: usize = 1024;
+pub const ROWS: usize = 2048;
 /// History columns.
 pub const HIST_W: usize = 4096;
 /// The narrowest zoom, in history columns.
@@ -290,7 +290,7 @@ mod tests {
 
     #[test]
     fn feeding_every_third_snapshot_loses_no_rows() {
-        // 16 rows per snapshot, 1 new row per snapshot: skipping two of every three snapshots still gives a contiguous history.
+        // Many rows per snapshot, 1 new row per snapshot: skipping two of every three snapshots still gives a contiguous history.
         let rows: Vec<Row> = (0..60u64).map(|k| row(k * 32_768, (k + 1) * 32_768, 855.25e6, 0)).collect();
         let mut h = History::new();
         for v in (0..60usize).step_by(3) {
@@ -367,10 +367,10 @@ mod tests {
         let [a, b] = quads(0);
         assert!(b.is_none());
         assert_eq!(a.unwrap().1, (0.0, 1.0));
-        let [a, b] = quads(256);
+        let [a, b] = quads(ROWS / 4);
         let (ua, fa) = a.unwrap();
         let (ub, fb) = b.unwrap();
-        assert_eq!((fa, fb), ((0.0, 0.75), (0.75, 1.0))); // rows 256..1024 on top, then rows 0..256
+        assert_eq!((fa, fb), ((0.0, 0.75), (0.75, 1.0))); // rows ROWS/4..ROWS on top, then rows 0..ROWS/4
         assert_eq!((ua.min.y, ua.max.y, ub.min.y, ub.max.y), (0.25, 1.0, 0.0, 0.25));
     }
 }

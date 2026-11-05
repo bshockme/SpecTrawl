@@ -21,7 +21,7 @@ use sdr_core::Complex32;
 
 use crate::budget::SourceId;
 use crate::source::{ReadError, Source};
-use crate::stage::{BlockSink, Stage, StageConfig};
+use crate::stage::{BlockSink, RowSink, Stage, StageConfig};
 
 use sched::{Latest, Shared};
 use sub::Sub;
@@ -166,7 +166,7 @@ pub enum BusError {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BusConfig {
     /// Worker threads; default `available_parallelism − 2`, at least 1.
     /// [`ChannelBus::new`] raises 0 to 1.
@@ -174,12 +174,25 @@ pub struct BusConfig {
     /// Lag beyond which the lowest-priority consumer is shed while the pool is saturated.
     pub max_lag_secs: f64,
     pub stage: StageConfig,
+    /// Given every source's rows by its stage (the engine's record book; `None`: rows only fill the history).
+    pub row_sink: Option<Arc<dyn RowSink>>,
+}
+
+impl std::fmt::Debug for BusConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BusConfig")
+            .field("workers", &self.workers)
+            .field("max_lag_secs", &self.max_lag_secs)
+            .field("stage", &self.stage)
+            .field("row_sink", &self.row_sink.as_ref().map(|_| "set"))
+            .finish()
+    }
 }
 
 impl Default for BusConfig {
     fn default() -> Self {
         let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
-        BusConfig { workers: cpus.saturating_sub(2).max(1), max_lag_secs: 2.0, stage: StageConfig::default() }
+        BusConfig { workers: cpus.saturating_sub(2).max(1), max_lag_secs: 2.0, stage: StageConfig::default(), row_sink: None }
     }
 }
 
@@ -231,7 +244,9 @@ impl ChannelBus {
         let mut stages = self.stages.lock();
         stages
             .entry(source.id())
-            .or_insert_with(|| Stage::start(source, self.cfg.stage.clone(), Arc::new(BusSink(Arc::downgrade(self)))))
+            .or_insert_with(|| {
+                Stage::start(source, self.cfg.stage.clone(), Arc::new(BusSink(Arc::downgrade(self))), self.cfg.row_sink.clone())
+            })
             .clone()
     }
 

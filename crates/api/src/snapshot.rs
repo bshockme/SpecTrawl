@@ -55,7 +55,7 @@ pub struct Receiver {
     pub stage: StageView,
     pub head: u64,
     pub head_time: Option<SystemTime>,
-    /// The newest finished rows, oldest first (16 at most).
+    /// The newest finished rows, oldest first (48 at most: 1.1 s of 22.9 ms rows, so a stalled tick loses none).
     pub rows: Vec<Arc<Row>>,
     pub consumers: Vec<ConsumerView>,
 }

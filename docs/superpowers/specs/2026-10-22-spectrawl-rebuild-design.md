@@ -240,6 +240,8 @@ Chosen in step 2 (2026-10-23): FFT size N = 65536, overlap-save with hop N/2; ch
 
 Chosen in step 3 (2026-10-23): snapshot cadence 20 Hz (50 ms); a snapshot carries each receiver's newest 16 finished rows, the last 64 acks and the last 200 log lines; waterfall history 1024 rows of 4096 max-reduced columns, texture 1024 rows by the displayed width, zoom no narrower than 24 history columns; receivers take letters `A`, `B`, … in order of opening, lowest free letter first (`S` is reserved for the sweep, step 4a); default budget 30 s guaranteed, ceiling half of physical RAM.
 
+Changed in step 4 (2026-11-04): waterfall rows every 20 ms (ceil'd to whole blocks: 7 blocks, 22.9 ms, at 10 MS/s), the burst detector's verified row rate, so it keeps the configuration its on-air results came from; a snapshot carries each receiver's newest 48 rows (1.1 s, so a stalled tick still loses none); the app's waterfall history is 2048 rows (about 47 s).
+
 ## 10. Decisions taken with the owner (2026-10-22)
 
 1. **Licence: MIT.** SpecTrawl stays MIT; OnAir is used only as a separate process (§3, §4.6).

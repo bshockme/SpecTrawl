@@ -25,5 +25,5 @@ pub use ring::{RingConfig, RingStats};
 pub use rows::{Row, RowHistory};
 pub use segments::{Boundary, CoverError, Segment, SegmentId, SegmentTable, SpansSegments};
 pub use source::{DeviceSnapshot, ReadError, Source, SourceConfig, SourceStats};
-pub use stage::{BlockSink, Stage, StageConfig, StageStats};
+pub use stage::{BlockSink, RowSink, Stage, StageConfig, StageStats};
 pub use timeline::Timeline;

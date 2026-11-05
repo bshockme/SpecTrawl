@@ -35,7 +35,7 @@ pub struct PublisherConfig {
 
 impl Default for PublisherConfig {
     fn default() -> Self {
-        PublisherConfig { period: Duration::from_millis(50), rows_per_snapshot: 16, acks_kept: 64, log_kept: 200 }
+        PublisherConfig { period: Duration::from_millis(50), rows_per_snapshot: 48, acks_kept: 64, log_kept: 200 }
     }
 }
 

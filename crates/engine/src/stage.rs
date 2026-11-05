@@ -42,13 +42,20 @@ pub struct StageConfig {
 
 impl Default for StageConfig {
     fn default() -> Self {
-        StageConfig { fft_size: FFT_SIZE, cache_blocks: 32, row_period_secs: 0.05, row_history: 64 }
+        // 20 ms: the burst detector's verified row rate (step 4; ceil'd to 7 blocks, 22.9 ms, at 10 MS/s).
+        StageConfig { fft_size: FFT_SIZE, cache_blocks: 32, row_period_secs: 0.02, row_history: 64 }
     }
 }
 
 /// Told about each block once it is in the cache.
 pub trait BlockSink: Send + Sync {
     fn on_block(&self, source: SourceId, block: u64);
+}
+
+/// Told about each row once it is in the [`RowHistory`], on the stage thread, in order. It must return quickly: the
+/// next block waits for it. A panic is caught and logged (once per stage); the stage carries on.
+pub trait RowSink: Send + Sync {
+    fn on_row(&self, source: SourceId, row: &Arc<Row>);
 }
 
 #[derive(Debug, Clone, Default)]
@@ -123,7 +130,7 @@ impl Stage {
     /// Starts thread "fft-<source id>". `sink.on_block` is called after each
     /// block is cached. The bus is the only creator (`ChannelBus::attach`);
     /// apps reach a stage through `ChannelBus::stage`.
-    pub(crate) fn start(source: Arc<Source>, cfg: StageConfig, sink: Arc<dyn BlockSink>) -> Arc<Stage> {
+    pub(crate) fn start(source: Arc<Source>, cfg: StageConfig, sink: Arc<dyn BlockSink>, row_sink: Option<Arc<dyn RowSink>>) -> Arc<Stage> {
         let fft_size = cfg.fft_size;
         let hop = if fft_size == FFT_SIZE { HOP as u64 } else { (fft_size / 2) as u64 };
         let shared = Arc::new(Shared {
@@ -135,7 +142,15 @@ impl Stage {
             source,
         });
         let name = format!("fft-{}", shared.source.id().0);
-        let worker = Worker { shared: shared.clone(), sink, fft_size, hop, row_period_secs: cfg.row_period_secs };
+        let worker = Worker {
+            shared: shared.clone(),
+            sink,
+            row_sink,
+            row_sink_panicked: AtomicBool::new(false),
+            fft_size,
+            hop,
+            row_period_secs: cfg.row_period_secs,
+        };
         let handle = std::thread::Builder::new().name(name).spawn(move || worker.run()).expect("spawn the FFT stage thread");
         // The recompute LRU is as deep as the cache: same-priority subscriptions drift up to a cache-depth apart while they recover.
         let recompute_depth = cfg.cache_blocks.max(1);
@@ -255,6 +270,9 @@ struct RowAcc {
 struct Worker {
     shared: Arc<Shared>,
     sink: Arc<dyn BlockSink>,
+    row_sink: Option<Arc<dyn RowSink>>,
+    /// Set once the row sink has panicked (logged once).
+    row_sink_panicked: AtomicBool,
     fft_size: usize,
     hop: u64,
     row_period_secs: f64,
@@ -354,13 +372,21 @@ impl Worker {
         }
         let k = 1.0 / acc.blocks as f32;
         let power = acc.sum.into_iter().map(|s| s * k).collect();
-        self.shared.rows.push(Row {
+        let row = self.shared.rows.push(Row {
             first_sample: acc.first_sample,
             end_sample: acc.end_sample,
             blocks: acc.blocks,
             segment: acc.segment,
             power,
         });
+        if let Some(sink) = &self.row_sink {
+            let id = self.shared.source.id();
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.on_row(id, &row))).is_err()
+                && !self.row_sink_panicked.swap(true, Ordering::Relaxed)
+            {
+                log::error!("source {}: the row sink panicked; rows go on (logged once)", id.0);
+            }
+        }
     }
 }
 
@@ -398,7 +424,7 @@ mod tests {
             SimDevice::with_config(SimConfig { emitters: vec![], rate: 2e6, paced: false, report_lag_gaps: false, ..Default::default() });
         let src = Arc::new(Source::start(Box::new(d), SourceConfig::default(), Mode::Live, &keeper).unwrap());
         let cfg = StageConfig { cache_blocks: 1, row_period_secs: 0.01, ..Default::default() };
-        (Stage::start(src.clone(), cfg, Arc::new(NoSink)), src)
+        (Stage::start(src.clone(), cfg, Arc::new(NoSink), None), src)
     }
 
     fn wait(what: &str, f: impl Fn() -> bool) {

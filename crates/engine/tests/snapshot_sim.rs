@@ -102,7 +102,7 @@ fn snapshots_arrive_at_twenty_hertz_with_contiguous_rows() {
     assert_eq!(r.letter, 'A');
     assert_eq!(r.status.health, Health::Ok);
     assert!(r.status.text.starts_with("Live at 855.250 MHz, 10 MS/s: holding "), "{}", r.status.text);
-    assert!(r.rows.len() <= 16);
+    assert!(r.rows.len() <= 48);
 }
 
 #[test]

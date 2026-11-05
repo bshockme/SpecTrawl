@@ -41,12 +41,14 @@ impl RowHistory {
         self.rows.lock().is_empty()
     }
 
-    /// Append `row`, dropping the oldest past `depth`.
-    pub(crate) fn push(&self, row: Row) {
+    /// Append `row`, dropping the oldest past `depth`; returns the row as held.
+    pub(crate) fn push(&self, row: Row) -> Arc<Row> {
+        let row = Arc::new(row);
         let mut rows = self.rows.lock();
-        rows.push_back(Arc::new(row));
+        rows.push_back(row.clone());
         while rows.len() > self.depth {
             rows.pop_front();
         }
+        row
     }
 }
