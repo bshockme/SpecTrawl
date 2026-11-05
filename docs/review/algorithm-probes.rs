@@ -3,7 +3,7 @@ use detect::{
     demod::{Demod, Mode},
     pocsag, sync,
 };
-use engine::{BurstDetector, DetectorConfig, SpectrumRow, Tuning};
+use engine_old::{BurstDetector, DetectorConfig, SpectrumRow, Tuning};
 use sdr_core::Complex32;
 use std::time::{Duration, SystemTime};
 

@@ -4,7 +4,7 @@ Status: 2026-10-12. Why the labels in the emitter table and the exploration
 log were wrong so often, what the record store showed when the classifier
 was run on air with its evidence kept, and what was changed. The numbers
 come from `testdata`-free runs on this machine's two Airspy R2s with
-`cargo run --release -p engine --example trawl_db`; the stores are
+`cargo run --release -p engine-old --example trawl_db`; the stores are
 `run1.db` (before) and `run3.db` (after) in the session scratch directory
 (not kept),
 and the same tables are now written by the app to
@@ -93,7 +93,7 @@ the whole window.
 | 6 | **In-place verdicts were instant and final.** One classification of one record became "classified"; a later, better feature label never replaced it. | A feature label needs ≥ 2 classifications behind it (`Observation::votes`); an occupant counts as many. A verdict is logged again when the label changes at the same kind. | `engine::explore::determined_in_place` |
 | 7 | **The focus emitter chosen for a survey emitter ignored shape.** A 2 kHz spur under a 15.7 MHz survey blob supplied "Internal spur" for the blob, then stuck. | `explore::observe` only takes a focus emitter whose width can account for the survey's (beyond its bin quantisation); otherwise the survey emitter is only "active" and the store records why. | `engine::explore::comparable` |
 | 8 | **GSM was named on FCCH tone bursts alone**, and the emitter believed it after two hits. FM broadcast stations passed the test. | The protocol is named only when an SCH decoded. | `detect::classify_with` |
-| 9 | **Nothing was kept.** Each wrong label could only be argued about from the CSV. | The record store (`engine::store`): records, every classification job with its window, SNR, features, sync count and decoded fields, emitter snapshots with their tallies, verdicts with the evidence they rested on, notes for every retune. SQLite, WAL, one writer thread. The app opens `Documents/SpecTrawl/spectrawl.db` at start; `trawl_db` runs headless into any file; `docs/review/classify_report.sh` summarises one. | `engine::store`, `crates/engine/examples/trawl_db.rs` |
+| 9 | **Nothing was kept.** Each wrong label could only be argued about from the CSV. | The record store (`engine_old::store`): records, every classification job with its window, SNR, features, sync count and decoded fields, emitter snapshots with their tallies, verdicts with the evidence they rested on, notes for every retune. SQLite, WAL, one writer thread. The app opens `Documents/SpecTrawl/spectrawl.db` at start; `trawl_db` runs headless into any file; `docs/review/classify_report.sh` summarises one. | `engine_old::store`, `crates/engine-old/examples/trawl_db.rs` |
 
 ## 4. Before and after on air
 
@@ -218,9 +218,9 @@ Still questionable in the after run, each worth a capture:
 
 ```
 # before/after runs (two Airspys, the second one surveying meanwhile):
-cargo run --release -p engine --example trawl_db -- <serial> run.db \
+cargo run --release -p engine-old --example trawl_db -- <serial> run.db \
   "98.0:60,112.0:45,127.0:45,155.0:60,240.0:60,280.0:45,460.0:60,855.5:90,930.0:60" "note"
-cargo run --release -p engine --example trawl_db -- <serial2> run.db "24-1800:520" "survey"
+cargo run --release -p engine-old --example trawl_db -- <serial2> run.db "24-1800:520" "survey"
 docs/review/classify_report.sh run.db 1
 ```
 

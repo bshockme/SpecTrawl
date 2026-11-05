@@ -54,8 +54,8 @@ it does not justify unbounded floating-point accumulation.
 
 ### 2. P1 — DSP and exports lose the frequency/time boundaries of the IQ
 
-Locations: `crates/engine/src/lib.rs:226`, `:498`, `:660`;
-`crates/engine/src/listen.rs:374`; `crates/engine/src/sigmf.rs:99`.
+Locations: `crates/engine-old/src/lib.rs:226`, `:498`, `:660`;
+`crates/engine-old/src/listen.rs:374`; `crates/engine-old/src/sigmf.rs:99`.
 
 `RingSink::on_event` discards `at_sample` for Retune and Gap events, retaining
 only the newest tuning and aggregate gap counters. The IQ ring retains samples
@@ -87,7 +87,7 @@ Evidence: static source/call-path review, not a hardware reproduction.
 ### 3. P1 — AM noise squelch opens on the filtered noise it actually receives
 
 Locations: `crates/detect/src/demod.rs:38`, `:206`;
-`crates/engine/src/listen.rs:378`.
+`crates/engine-old/src/listen.rs:378`.
 
 The AM channel filter cuts off at 5 kHz. The squelch estimates envelope noise
 above 6 kHz and assumes a noise-only ratio near 0.2, opening below 0.06.
@@ -178,7 +178,7 @@ the missing validation, not a measured false-positive rate on real RF.
 ### 7. P2 — The DC-spur classifier ignores the receiver's IF architecture
 
 Locations: `crates/detect/src/context.rs:40`;
-`crates/engine/src/classify.rs:314`;
+`crates/engine-old/src/classify.rs:314`;
 `crates/backend-airspy/src/lib.rs:249`.
 
 Every unidentified signal narrower than 5 kHz and within 1.5 kHz of the tuner
@@ -199,7 +199,7 @@ Evidence: deterministic source branch and capability propagation review.
 
 ### 8. P2 — Track merging inflates mean SNR
 
-Location: `crates/engine/src/bursts.rs:401`.
+Location: `crates/engine-old/src/bursts.rs:401`.
 
 When overlapping tracks merge, their `snr_sum` values are added but their
 `rows` counts are combined with `max`. The numerator counts observations that

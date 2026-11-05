@@ -74,14 +74,14 @@ def main():
         command = ["rustc", "--edition=2024", "--test", "-O",
                    str(ROOT / "docs/review/algorithm-probes.rs"),
                    "-L", f"dependency={DEPS}", "-o", str(binary)]
-        for name in ("detect", "engine", "sdr_core"):
+        for name in ("detect", "engine_old", "sdr_core"):
             command += ["--extern", f"{name}={libs[name]}"]
         subprocess.run(command, check=True, cwd=ROOT)
         result = subprocess.run([str(binary), "--nocapture"], cwd=ROOT)
         if args.long_ddc:
             # Copy the unmodified implementation, adding only a main function.
             source = tmp / "ddc.rs"
-            source.write_text((ROOT / "crates/detect/src/ddc.rs").read_text() + LONG_DDC)
+            source.write_text((ROOT / "crates/dsp/src/ddc.rs").read_text() + LONG_DDC)
             binary = tmp / "ddc"
             subprocess.run(["rustc", "--edition=2024", "-O", str(source),
                             "-L", f"dependency={DEPS}", "--extern",

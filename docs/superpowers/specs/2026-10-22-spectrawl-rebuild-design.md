@@ -41,8 +41,8 @@ This rebuild keeps the code that was verified on air (the `detect` crate and the
 ## 3. Constraints
 
 - Rust, egui/eframe/wgpu, egui_dock. The existing `detect`, `sdr-core`, `backend-airspy`, `backend-sim` and `catalog` crates are kept as libraries.
-- Airspy R2 remains the first and only native backend until the foundation is done. The simulator is the test harness.
-- The `detect` crate's on-air verification is its value. Changes to it are bug fixes (listed in §8), not rewrites.
+- The `airspy` backend is the only native backend until the foundation is done: the Airspy R2, and the R2-compatible HydraSDR RFOne through libhydrasdr (amended 2026-11-04, when one replaced an R2 here). The simulator is the test harness.
+- The `detect` crate's on-air verification is its value, and it keeps growing: new detectors, decoders and classification rules are welcome alongside fixes (amended 2026-11-04; this used to say bug fixes only). What protects the value is evidence, not a freeze. A change is checked on the air, or on a committed real capture, before and after; a result that was verified right must still come out right; and a change that alters a verified result says why, with a capture that shows it. The regression tests in `detect/tests/real_captures.rs` run on committed slices in `testdata/small`, so a new detector that earns its place gets a slice and a test. §8 lists known defects.
 - **SpecTrawl stays MIT.** OnAir is GPL-3, so its code is never linked into SpecTrawl, in-process or as a static library, and none of it is copied. OnAir's decoders run as separate GPL programs that SpecTrawl talks to over a documented protocol (§4.6). Its presentation model is reproduced from observation, not from its source.
 
 ## 4. Architecture
@@ -230,7 +230,7 @@ Each step ends with a test on the simulator and, where it touches a decoder, on 
 
 `backend-airspy`: emit `DeviceLost` and `Overload`; stamp `Retune` at the sample where it lands; refresh `TimeAnchor`.
 
-Burst tracker (carried over): merge inflates mean SNR (sums added, row count max'd); extents only grow; adjacent channels fuse on overlap.
+Burst tracker (carried over): merge inflates mean SNR (sums added, row count max'd); extents only grow; adjacent channels fuse on overlap. The last two are fixed in `engine-old` (2026-11-04): a record's extent is the span of bins hit in at least a tenth of its rows, and overlapping tracks merge only when close (an FSK tone pair), frequent or touching, otherwise the segment is split between their cores. Carry that over when the tracker is re-homed.
 
 ## 9. Left to the builder
 
