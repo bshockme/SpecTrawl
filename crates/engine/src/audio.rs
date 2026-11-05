@@ -468,6 +468,21 @@ mod tests {
         assert!((secs - el).abs() < 0.1 * el, "{secs:.3} s rendered in {el:.3} s");
     }
 
+    /// Needs a sound card; plays silence (the mixer is empty). `cargo test -p engine --lib audio -- --ignored`.
+    #[test]
+    #[ignore]
+    fn the_default_device_opens_and_pulls_the_mix() {
+        let m = Mixer::new();
+        let out = AudioOutput::start(AudioConfig::Device, m.clone());
+        std::thread::sleep(Duration::from_millis(1500));
+        let status = out.status();
+        let pulled = m.rendered() as f64 / RATE;
+        drop(out);
+        println!("{status:?}; {pulled:.2} s pulled in 1.5 s");
+        assert!(status.is_ok(), "{status:?}");
+        assert!(pulled > 1.0, "{pulled:.2} s pulled in 1.5 s");
+    }
+
     #[test]
     fn the_resampler_keeps_a_tone_at_its_frequency() {
         // A 1 kHz tone at 48 kHz played to a 44.1 kHz device.

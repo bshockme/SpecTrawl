@@ -76,3 +76,12 @@
    - play a real airband record from the ring and from its slice, and write both as WAVs;
    - check their length against the record and their energy in the voice band;
    - record the choices in spec §9, and close or re-tag the BACKLOG lines for step 5.
+
+## Results
+
+- **Acceptance, simulator:**
+  - A 4.02 s AM record plays 4.07 s from the ring and 4.07 s from its slice.
+  - The 1 kHz tone is 53 dB over the rest of the voice band both ways, and is heard for 3.9 s.
+  - Refusal, stop and source loss behave as listed in review focus 4–5.
+- **App, headless:** Play reaches `Playing` under the paced output, and Stop stops it. No frame took 100 ms or more.
+- **On air:** see BACKLOG "Step 5 on air". Ring and slice agree, at 0.95–0.98; the record's span is right. The local air-band traffic is weak at this antenna.
