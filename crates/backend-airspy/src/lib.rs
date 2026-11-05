@@ -699,7 +699,10 @@ struct CbCtx {
 struct RawRx {
     conv: native::RawToIq,
     buf: Vec<Complex32>,
-    /// Steps in the grid (for spotting skipped steps).
+    /// The grid swept: step 0's centre, the spacing, and the steps (for
+    /// spotting skipped steps).
+    first_hz: u32,
+    step_hz: u32,
     steps: u32,
     /// The hop being delivered, and whether its blocks are being left out.
     key: Option<(u32, u16)>,
@@ -719,6 +722,10 @@ struct RawStats {
     lock_timeouts: u64,
     skipped_steps: u64,
     dropped_blocks: u64,
+    /// Blocks whose centre is not their step's on the grid: captured at
+    /// another frequency than the tag's step says (sweep2 firmware, a restart
+    /// racing a retune; fixed in sweep3), or left over from a replaced plan.
+    misfiled: u64,
 }
 
 /// A time anchor at least this often on the device's clock (~25 ms), so a
@@ -726,11 +733,18 @@ struct RawStats {
 const ANCHOR_TICKS: u32 = 61;
 
 impl RawRx {
-    fn new(steps: u32) -> Self {
+    /// Whether a block's centre is the one its step has on the grid.
+    fn on_grid(&self, t: &native::Tag) -> bool {
+        u32::from(t.step) < self.steps && t.center_hz == self.first_hz.wrapping_add(self.step_hz.wrapping_mul(u32::from(t.step)))
+    }
+
+    fn new(p: &native::SweepParams) -> Self {
         Self {
             conv: native::RawToIq::new(),
             buf: Vec::with_capacity(native::BLOCK_SAMPLES),
-            steps,
+            first_hz: p.f_start_hz,
+            step_hz: p.f_step_hz,
+            steps: u32::from(p.n_steps),
             key: None,
             skip: false,
             clock: None,
@@ -773,6 +787,11 @@ impl CbCtx {
                     continue;
                 }
             };
+            if !raw.on_grid(&t) {
+                // Its hop goes too: the next block of it is not its first, so it is skipped below.
+                raw.stats.misfiled += 1;
+                continue;
+            }
             let key = (t.sweep, t.step);
             if raw.key != Some(key) {
                 if let Some((sweep, step)) = raw.key {
@@ -1006,16 +1025,16 @@ impl Device for AirspyDevice {
         let params = native::SweepParams::new(first, step, plan.steps as u16, plan.dwell_blocks);
         match self.native.take() {
             Some(mut n) => {
-                // The callback is running; it only reads the step count, to spot skipped steps.
+                // The callback is running; it only reads the grid, to check each block against it.
                 if let Some(r) = unsafe { self.raw_mut() } {
-                    r.steps = plan.steps;
+                    (r.first_hz, r.step_hz, r.steps) = (first, step, plan.steps);
                 }
                 n.params = params;
                 self.native = Some(n);
                 self.sweep_start(&params)?;
             }
             None => {
-                self.restart_stream(Some(RawRx::new(plan.steps)))?;
+                self.restart_stream(Some(RawRx::new(&params)))?;
                 // As the reference client does: let the stream get going first.
                 std::thread::sleep(Duration::from_millis(50));
                 if let Err(e) = self.sweep_start(&params) {
@@ -1046,13 +1065,14 @@ impl Device for AirspyDevice {
         if let Some(r) = unsafe { self.raw_mut() } {
             let s = r.stats;
             log::info!(
-                "{}: board sweep ended: {} hops; {} torn, {} untagged, {} lock timeouts, {} skipped steps, {} dropped blocks",
+                "{}: board sweep ended: {} hops; {} torn, {} untagged, {} lock timeouts, {} skipped steps, {} misfiled and {} dropped blocks",
                 self.info.serial,
                 s.hops,
                 s.torn,
                 s.untagged,
                 s.lock_timeouts,
                 s.skipped_steps,
+                s.misfiled,
                 s.dropped_blocks
             );
         }
@@ -1135,6 +1155,17 @@ mod tests {
         assert_eq!(landing_sample(1_000_000, 65_536, rate, block_end, t0 - Duration::from_secs(1), Duration::from_millis(2)), 1_000_000);
         // Requested after the block ended: clamps to its last sample.
         assert_eq!(landing_sample(1_000_000, 65_536, rate, block_end, block_end, Duration::from_millis(2)), 1_000_000 + 65_536);
+    }
+
+    #[test]
+    fn a_block_whose_centre_is_not_its_steps_is_off_the_grid() {
+        let raw = RawRx::new(&native::SweepParams::new(28_500_000, 9_000_000, 197, 1));
+        let tag = |step, center_hz| native::Tag { step, block: 0, sweep: 1, dma: 0, center_hz, lock_timed_out: false };
+        assert!(raw.on_grid(&tag(0, 28_500_000)));
+        assert!(raw.on_grid(&tag(196, 28_500_000 + 196 * 9_000_000)));
+        // sweep2's restart race: tagged step 0, captured at the old step's frequency.
+        assert!(!raw.on_grid(&tag(0, 28_500_000 + 40 * 9_000_000)));
+        assert!(!raw.on_grid(&tag(197, 28_500_000 + 197 * 9_000_000)));
     }
 
     #[test]

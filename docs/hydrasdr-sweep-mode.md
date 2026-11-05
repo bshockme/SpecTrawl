@@ -1,6 +1,6 @@
 # HydraSDR RFOne: firmware sweep mode
 
-The RFOne (serial `36B463DC324C16C7`) runs custom firmware `v1.0.2-sweep2` with an on-device sweep.
+The RFOne (serial `36B463DC324C16C7`) runs custom firmware `v1.0.2-sweep3` with an on-device sweep.
 The board retunes itself, waits until the R828D reports PLL lock, and sends only blocks captured after
 that. Each block is tagged with its step and frequency. This is the `native_sweep` path in DESIGN §4.
 Lock-verified, it does about **673 hops/s** on average over 24–1800 MHz in 8 MHz steps, about 5.4 GHz/s
@@ -104,6 +104,15 @@ A block is **valid** only if both magics match and the header's step, block and 
 - Untagged blocks arrive before the sweep starts and after it stops. Ignore them.
 - Sequence gaps (a `(sweep, step)` pair skipped) were never seen in testing. Count them anyway.
 - If lock timed out (bit 15 set), drop or mark that step. It didn't happen in testing.
+- Check each block's centre against `f_start_hz + step × f_step_hz` and drop it if it differs. SpecTrawl
+  does (`misfiled` in the backend's end-of-sweep log line). On `sweep2` a restart (stop, set gain, start)
+  that landed during the previous run's retune let that retune finish afterwards: the next block was
+  tagged step 0 but captured at the old frequency, and since each start reset the sweep number, a
+  restart in the first pass re-sent `(0, 0)` tags. Fixed in `sweep3` (2026-11-05, ~/hydrasdr
+  `experiments/2026-11-05-restart-race/`); the check stays as a guard and also catches blocks left over
+  from a replaced plan.
+- From `sweep3` the sweep number keeps counting across restarts: the first pass is sweep 1, and
+  `(sweep, step)` is unique within a boot.
 
 ## Spectrum
 
