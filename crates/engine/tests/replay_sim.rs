@@ -147,6 +147,9 @@ fn a_4_s_am_burst_is_heard_from_the_ring_and_from_its_slice() {
 
     // From the ring, to the speaker; the engine picks AM for 124.9 MHz.
     let id = e.play(PlayTarget::Record(r.id), None, 1.0, PlayTo::Speaker).expect("playable from the ring");
+    // Pulled only once it is all there: pulling faster than a slow machine fills it would underrun, and the silences
+    // would spread the tone over more 0.1 s windows than it lasts. (The jitter buffer has its own unit test.)
+    wait(20.0, "the ring play's audio", || play_view(&e, id).complete.then_some(()));
     let (ring_audio, v) = pull_until_over(&e, id, 20.0);
     assert_eq!((v.from, v.mode, v.mode_guessed, &v.state), (PlayFrom::Ring, AudioMode::Am, true, &PlayState::Finished));
     let ring_s = v.length_s;
