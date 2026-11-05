@@ -8,6 +8,7 @@ use sdr_core::Device;
 
 use crate::budget::{BudgetConfig, Mode, RingBudget, SourceId};
 use crate::channels::{BusConfig, ChannelBus};
+use crate::records::{Loaded, RecordBook};
 use crate::ring::keeper::Keeper;
 use crate::source::{Source, SourceConfig};
 
@@ -22,6 +23,8 @@ pub struct EngineConfig {
 
 pub struct Engine {
     cfg: EngineConfig,
+    /// Every source's rows go here (the stages' row sink).
+    records: Arc<RecordBook>,
     bus: Arc<ChannelBus>,
     sources: Mutex<HashMap<SourceId, Arc<Source>>>,
     /// The engine's handle; each `Source` holds the keeper too, so it lives
@@ -30,16 +33,21 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Starts the keeper (from `cfg.budget`) and the bus (from `cfg.bus`).
+    /// Starts the keeper (from `cfg.budget`) and the bus (from `cfg.bus`), with a record book on every source's rows
+    /// (unless `cfg.bus` already names a row sink).
     pub fn new(cfg: EngineConfig) -> Engine {
+        let records = Arc::new(RecordBook::new(Loaded::default(), None));
         let keeper = Keeper::start(RingBudget::new(cfg.budget.clone()));
-        let bus = ChannelBus::new(cfg.bus.clone());
-        Engine { cfg, keeper, bus, sources: Mutex::new(HashMap::new()) }
+        let mut bus_cfg = cfg.bus.clone();
+        bus_cfg.row_sink.get_or_insert_with(|| records.clone());
+        let bus = ChannelBus::new(bus_cfg);
+        Engine { cfg, records, keeper, bus, sources: Mutex::new(HashMap::new()) }
     }
 
     /// Starts the device streaming into a new source and attaches the source to the bus.
     pub fn add_source(&self, device: Box<dyn Device>, mode: Mode) -> sdr_core::Result<Arc<Source>> {
         let source = Arc::new(Source::start(device, self.cfg.source.clone(), mode, &self.keeper)?);
+        self.records.add_source(source.clone());
         self.bus.attach(source.clone());
         self.sources.lock().insert(source.id(), source.clone());
         Ok(source)
@@ -53,6 +61,8 @@ impl Engine {
             return false;
         }
         self.bus.detach(id);
+        // The stage has stopped: no row can race the book's closing of the source's records.
+        self.records.remove_source(id);
         true
     }
 
@@ -67,6 +77,11 @@ impl Engine {
 
     pub fn sources(&self) -> Vec<Arc<Source>> {
         self.sources.lock().values().cloned().collect()
+    }
+
+    /// Records and emitters.
+    pub fn records(&self) -> &Arc<RecordBook> {
+        &self.records
     }
 
     pub fn bus(&self) -> &Arc<ChannelBus> {

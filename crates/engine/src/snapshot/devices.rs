@@ -123,10 +123,13 @@ impl Registry {
                 log.push(Some(letter), format!("{letter} gain set"));
                 Ok(Outcome::Done)
             }
-            // Handled by the publisher (the record book and the store), never here.
-            Command::Tag { .. } | Command::Untag { .. } | Command::Note { .. } | Command::QueryRecords(_) => {
-                Err("records are not kept by this engine".into())
+            Command::Tag { record, tag } | Command::Untag { record, tag } if tag.trim().is_empty() => {
+                Err(format!("record {}: an empty tag", record.0))
             }
+            Command::Tag { record, tag } => found(engine.records().tag(record, tag.trim(), true), record),
+            Command::Untag { record, tag } => found(engine.records().tag(record, tag.trim(), false), record),
+            Command::Note { record, text } => found(engine.records().note(record, &text), record),
+            Command::QueryRecords(_) => Err("history search needs the record store".into()),
             Command::SetMode { source, mode } => {
                 let (letter, src) = self.target(engine, source)?;
                 src.set_mode(mode);
@@ -177,4 +180,9 @@ fn same_device(info: &DeviceInfo, backend: &str, serial: &str) -> bool {
 
 fn no_receiver(id: SourceId) -> String {
     format!("no receiver {}", id.0)
+}
+
+/// A record edit's outcome: the book held the record (or, from task 6, the store will apply it).
+fn found(held: bool, record: api::RecordId) -> Result<Outcome, String> {
+    if held { Ok(Outcome::Done) } else { Err(format!("no record {}", record.0)) }
 }
