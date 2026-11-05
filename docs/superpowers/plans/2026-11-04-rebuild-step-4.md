@@ -41,7 +41,7 @@ Failure modes the step 4 tests must pin, each with its task:
 5. **The store stalls the engine.** A store whose writes take 2 s each: rows, records and snapshots keep flowing, the queue fills, drops are counted and shown, nothing deadlocks, shutdown waits at most the configured time. (Task 6.)
 6. **An interface misses records by skipping snapshots.** Read every fifth snapshot for 10 s of simulator time: the app's record list equals the book's. (Tasks 5 and 8.)
 7. **The slice is not the record's signal.** A sliced record's file holds the record's emitter (simulator CW at a known offset: the slice's spectrum peaks there, within one channel bin) and its timing (the slice's first sample is `iq_clip.from_sample`, within one block of `first_sample − pre-roll` when the ring still held it). (Task 7.)
-8. **The disk cap is ignored.** With a 2 MB cap, the slice directory never exceeds 2 MB plus one slice, the oldest go first, and their records say so. (Task 7.)
+8. **The disk cap is ignored.** With a 400 kB cap (a 0.6 s slice of the narrowest channel is ~94 kB at 39 kS/s), the slice directory never exceeds the cap plus two slices, the oldest go first, and their records say so. (Task 7.)
 
 ---
 
@@ -142,8 +142,8 @@ Failure modes the step 4 tests must pin, each with its task:
 - [ ] `SliceConfig { enabled: true, dir, cap_bytes: 4 GB, pre_roll: 50 ms, max: 120 s }` in `EngineConfig`.
 - [ ] When a record is confirmed the book asks the recorder to slice it: a bus subscription (`Priority::Recorder`, `Start::At(first_sample − pre_roll)`, channel `center_hz`, `max(1.25·bw, 12.5 kHz)`) writing i16 interleaved SigMF (`core:sample_start` = the slice's first sample's offset, `spectrawl:record_id`, `spectrawl:source_sample`); ends when the record closes or `max` is reached; the record's `iq_clip` is set on the next view.
 - [ ] A `Start::At` the ring no longer holds starts at the oldest readable block and `IqClip::from_sample` says where (pin it).
-- [ ] The cap: after each finished slice the recorder sums the directory and deletes oldest-first to the cap, sending `SliceEvicted(record)` to the book and the store (review focus 8, 2 MB cap in the test).
-- [ ] `slices_sim.rs` (review focus 7): a CW emitter at +312.5 kHz: its record's slice, read back, has its spectral peak at the emitter (within one channel bin) and its first sample within one block of `first_sample − pre_roll`.
+- [ ] The cap: after each finished slice the recorder sums the directory and deletes oldest-first to the cap, sending `SliceEvicted(record)` to the book and the store (review focus 8, 400 kB cap in the test).
+- [ ] `slices_sim.rs` (review focus 7): a CW emitter at +312.5 kHz: its record's slice, read back, has its spectral peak at the emitter (within one channel bin) and its first sample within one block plus the channel filter's delay (N/4) of `first_sample − pre_roll`; the slice is cut back to the record's end once the record closes (the end is known only a hangover later).
 - [ ] A shed recorder (pool saturated) leaves the record with a partial slice and a log line; nothing else changes.
 
 ### Task 8: Records in the app

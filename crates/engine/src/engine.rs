@@ -8,6 +8,7 @@ use sdr_core::Device;
 
 use crate::budget::{BudgetConfig, Mode, RingBudget, SourceId};
 use crate::channels::{BusConfig, ChannelBus};
+use crate::recorder::{Recorder, SliceConfig};
 use crate::records::{Loaded, RecordBook, RecordSink};
 use crate::ring::keeper::Keeper;
 use crate::source::{Source, SourceConfig};
@@ -22,6 +23,8 @@ pub struct EngineConfig {
     pub source: SourceConfig,
     /// Where records, emitters, tags and notes are kept across restarts; `None`: in memory only.
     pub store: Option<StoreConfig>,
+    /// The slice tier (every record's IQ on disk); `None`: off.
+    pub slices: Option<SliceConfig>,
 }
 
 pub struct Engine {
@@ -56,6 +59,11 @@ impl Engine {
         let mut bus_cfg = cfg.bus.clone();
         bus_cfg.row_sink.get_or_insert_with(|| records.clone());
         let bus = ChannelBus::new(bus_cfg);
+        if let Some(s) = cfg.slices.clone() {
+            let r = Recorder::new(s);
+            r.attach(&bus);
+            records.set_recorder(r);
+        }
         Engine { cfg, records, store, store_error, keeper, bus, sources: Mutex::new(HashMap::new()) }
     }
 

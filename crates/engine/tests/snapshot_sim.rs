@@ -16,6 +16,7 @@ fn engine() -> Engine {
         bus: BusConfig::default(),
         source: SourceConfig::default(),
         store: None,
+        slices: None,
     })
 }
 

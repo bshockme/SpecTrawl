@@ -238,6 +238,15 @@ pub fn note(tx: &rusqlite::Transaction<'_>, record: RecordId, n: &Note) -> rusql
     Ok(())
 }
 
+pub fn evicted(tx: &rusqlite::Transaction<'_>, record: RecordId) -> rusqlite::Result<()> {
+    tx.execute(
+        "UPDATE records SET clip_path = NULL, clip_from = NULL, clip_samples = NULL, clip_rate = NULL, clip_center_hz = NULL,
+           slice_evicted = 1 WHERE id = ?1",
+        [record.0 as i64],
+    )?;
+    Ok(())
+}
+
 pub fn next_ids(tx: &rusqlite::Transaction<'_>, record: u64, emitter: u64) -> rusqlite::Result<()> {
     for (k, v) in [("next_record_id", record), ("next_emitter_id", emitter)] {
         // Never lower a counter: a late batch from before a restart can't hand ids out twice.

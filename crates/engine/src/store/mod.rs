@@ -69,6 +69,7 @@ enum Op {
     Note(RecordId, Note),
     NextIds(u64, u64),
     Query(u64, RecordQuery),
+    Evicted(RecordId),
     /// Write what is queued, then signal.
     Flush(mpsc::Sender<()>),
 }
@@ -214,6 +215,9 @@ impl RecordSink for Store {
     fn next_ids(&self, record: u64, emitter: u64) {
         self.send(Op::NextIds(record, emitter));
     }
+    fn slice_evicted(&self, record: RecordId) {
+        self.send(Op::Evicted(record));
+    }
 }
 
 struct Writer {
@@ -274,6 +278,7 @@ impl Writer {
                     Op::Folded(g, i) => schema::fold_emitter(&tx, g, i)?,
                     Op::Tag(r, t, on) => schema::tag(&tx, r, &t, on)?,
                     Op::Note(r, note) => schema::note(&tx, r, &note)?,
+                    Op::Evicted(r) => schema::evicted(&tx, r)?,
                     Op::NextIds(r, e) => *ids = Some(ids.map_or((r, e), |(a, b)| (a.max(r), b.max(e)))),
                     other @ (Op::Query(..) | Op::Flush(_)) => answers.push(other),
                 }

@@ -34,6 +34,7 @@ fn engine(store: StoreConfig) -> Engine {
         bus: BusConfig::default(),
         source: SourceConfig::default(),
         store: Some(store),
+        slices: None,
     })
 }
 

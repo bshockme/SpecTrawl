@@ -7,7 +7,7 @@
 //! (the store) after the book's lock is released.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 use api::{EmitterId, EmitterView, Note, RecordId, RecordsView, Role, Row, SignalRecord};
@@ -17,6 +17,7 @@ use sdr_core::IfArchitecture;
 use super::detector::{Detected, Detector, DetectorConfig};
 use super::emitters::{EmitterBook, EmitterState};
 use crate::budget::SourceId;
+use crate::recorder::{Recorder, SliceEvent, SliceRequest};
 use crate::source::Source;
 use crate::stage::RowSink;
 
@@ -34,6 +35,8 @@ pub trait RecordSink: Send + Sync {
     fn note(&self, record: RecordId, note: &Note);
     /// The next ids the book will hand out (written with every batch).
     fn next_ids(&self, record: u64, emitter: u64);
+    /// A record no longer in memory lost its slice to the disk cap.
+    fn slice_evicted(&self, record: RecordId);
 }
 
 /// What the book starts from (the store's load at start).
@@ -64,6 +67,10 @@ struct Outbox {
     emitters: Vec<EmitterState>,
     folded: Vec<(EmitterId, EmitterId)>,
     ids: Option<(u64, u64)>,
+    slice_start: Vec<SliceRequest>,
+    slice_end: Vec<(RecordId, u64)>,
+    slice_cancel: Vec<RecordId>,
+    evicted_elsewhere: Vec<RecordId>,
 }
 
 struct Inner {
@@ -83,6 +90,8 @@ struct Inner {
 pub struct RecordBook {
     inner: Mutex<Inner>,
     sink: Option<Arc<dyn RecordSink>>,
+    /// The slice tier, when it is on.
+    recorder: OnceLock<Arc<Recorder>>,
 }
 
 impl RecordBook {
@@ -112,7 +121,13 @@ impl RecordBook {
                 dirty_emitters,
             }),
             sink,
+            recorder: OnceLock::new(),
         }
+    }
+
+    /// Turns the slice tier on (once).
+    pub fn set_recorder(&self, r: Arc<Recorder>) {
+        let _ = self.recorder.set(r);
     }
 
     /// Starts detecting on `source`'s rows (before the source is attached to the bus, so its first row is seen).
@@ -149,6 +164,9 @@ impl RecordBook {
                 for d in closed {
                     inner.close(&mut ps, d, &mut out);
                 }
+            }
+            if let Some(r) = self.recorder.get() {
+                inner.slice_events(r.take_events(), &mut out);
             }
             inner.version += 1;
             out.ids = Some((inner.next_record, inner.next_emitter));
@@ -225,7 +243,21 @@ impl RecordBook {
     }
 
     fn send(&self, out: Outbox) {
+        if let Some(r) = self.recorder.get() {
+            for id in &out.slice_cancel {
+                r.cancel(*id);
+            }
+            for q in out.slice_start.iter().cloned() {
+                r.start(q);
+            }
+            for &(id, end) in &out.slice_end {
+                r.end(id, end);
+            }
+        }
         let Some(s) = &self.sink else { return };
+        for &id in &out.evicted_elsewhere {
+            s.slice_evicted(id);
+        }
         for r in &out.records {
             s.record(r);
         }
@@ -241,6 +273,18 @@ impl RecordBook {
     }
 }
 
+fn slice_request(ps: &PerSource, d: &Detected) -> SliceRequest {
+    SliceRequest {
+        record: d.id,
+        source: ps.source.id(),
+        center_hz: d.center_hz(),
+        bandwidth_hz: d.bandwidth_hz(),
+        first_sample: d.first_sample,
+        t_start: ps.source.time_of(d.first_sample).unwrap_or(SystemTime::UNIX_EPOCH),
+        hw: ps.serial.to_string(),
+    }
+}
+
 fn take_id(next: &mut u64) -> RecordId {
     *next += 1;
     RecordId(*next - 1)
@@ -252,8 +296,11 @@ impl RowSink for RecordBook {
             let mut inner = self.inner.lock();
             let inner = &mut *inner;
             let Some(mut ps) = inner.sources.remove(&source) else { return };
-            let out = inner.row(&mut ps, row);
+            let mut out = inner.row(&mut ps, row, self.recorder.get().is_some());
             inner.sources.insert(source, ps);
+            if let Some(r) = self.recorder.get() {
+                inner.slice_events(r.take_events(), &mut out);
+            }
             out
         };
         self.send(out);
@@ -261,7 +308,7 @@ impl RowSink for RecordBook {
 }
 
 impl Inner {
-    fn row(&mut self, ps: &mut PerSource, row: &Row) -> Outbox {
+    fn row(&mut self, ps: &mut PerSource, row: &Row, slicing: bool) -> Outbox {
         let mut out = Outbox::default();
         let det = ps.det.get_or_insert_with(|| {
             Detector::new(DetectorConfig { usable_fraction: ps.usable_fraction, ..DetectorConfig::live(DetectorConfig::rows_per_sec(row)) })
@@ -276,17 +323,28 @@ impl Inner {
         let before = self.next_record;
         for (gone, into) in result.merged {
             ps.open.remove(&gone);
+            out.slice_cancel.push(gone);
             if let Some(b) = self.emitters.get_mut(&ps.serial) {
                 b.forget_record(gone);
             }
             log::debug!("record {} merged into {}", gone.0, into.0);
         }
         for d in result.closed {
+            if slicing && !ps.open.contains_key(&d.id) {
+                // Reportable and closed on the same row: its whole slice is back-filled.
+                out.slice_start.push(slice_request(ps, &d));
+            }
+            if slicing {
+                out.slice_end.push((d.id, d.end_sample));
+            }
             self.close(ps, d, &mut out);
         }
         let mut still = HashSet::new();
         for d in open {
             still.insert(d.id);
+            if slicing && !ps.open.contains_key(&d.id) {
+                out.slice_start.push(slice_request(ps, &d));
+            }
             let r = self.place(ps, d, &mut out);
             ps.open.insert(r.id, r);
         }
@@ -382,6 +440,29 @@ impl Inner {
         self.window.iter_mut().for_each(fix);
         for s in self.sources.values_mut() {
             s.open.values_mut().for_each(fix);
+        }
+    }
+
+    /// Finished slices set their record's clip; evicted ones clear it. Closed records go back to the store.
+    fn slice_events(&mut self, events: Vec<SliceEvent>, out: &mut Outbox) {
+        for ev in events {
+            let (id, clip, evicted) = match ev {
+                SliceEvent::Done { record, clip } => (record, Some(clip), false),
+                SliceEvent::Evicted(record) => (record, None, true),
+            };
+            let mut updated = None;
+            let held = self.edit(id, |r| {
+                r.iq_clip = clip;
+                r.slice_evicted |= evicted;
+                if !r.open {
+                    updated = Some(r.clone());
+                }
+            });
+            if let Some(r) = updated {
+                out.records.push(Arc::new(r));
+            } else if !held && evicted {
+                out.evicted_elsewhere.push(id);
+            }
         }
     }
 
