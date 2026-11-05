@@ -34,6 +34,14 @@ pub enum Command {
         guaranteed_secs: f64,
         ceiling_bytes: u64,
     },
+    /// What the receiver sweeps in Sweep mode: `start_hz..stop_hz`, measuring only `segments` when there are any.
+    /// Takes effect at the end of the pass in progress.
+    SetSweep {
+        source: SourceId,
+        start_hz: f64,
+        stop_hz: f64,
+        segments: Vec<(f64, f64)>,
+    },
     Tag {
         record: RecordId,
         tag: String,

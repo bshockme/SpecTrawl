@@ -18,11 +18,12 @@ use dsp::spectrum::{SharedFft, bh_power};
 use parking_lot::{Mutex, MutexGuard};
 use sdr_core::Complex32;
 
-use crate::budget::SourceId;
+use crate::budget::{Mode, SourceId};
 use crate::cache::SpectrumCache;
 use crate::rows::{Row, RowHistory};
 use crate::segments::Segment;
 use crate::source::{ReadError, Source};
+use crate::sweep::{self, SweepStatus};
 
 /// How long the thread parks when the next block is not complete yet.
 const POLL: Duration = Duration::from_millis(1);
@@ -38,12 +39,14 @@ pub struct StageConfig {
     pub row_period_secs: f64,
     /// Rows the [`RowHistory`] keeps.
     pub row_history: usize,
+    /// In Sweep mode, load and save hop profiles under `<Documents>/SpecTrawl/profiles` (off for tests).
+    pub sweep_profiles: bool,
 }
 
 impl Default for StageConfig {
     fn default() -> Self {
         // 20 ms: the burst detector's verified row rate (step 4; ceil'd to 7 blocks, 22.9 ms, at 10 MS/s).
-        StageConfig { fft_size: FFT_SIZE, cache_blocks: 32, row_period_secs: 0.02, row_history: 64 }
+        StageConfig { fft_size: FFT_SIZE, cache_blocks: 32, row_period_secs: 0.02, row_history: 64, sweep_profiles: false }
     }
 }
 
@@ -88,6 +91,8 @@ struct Shared {
     /// `try_lock`s it, to trim.
     recompute: Mutex<Recompute>,
     stop: AtomicBool,
+    /// The sweep's progress while the source is in Sweep mode.
+    sweep: Mutex<Option<SweepStatus>>,
 }
 
 /// [`Stage::bins`]' path for blocks that have left the cache: one FFT plan,
@@ -139,6 +144,7 @@ impl Stage {
             stats: Mutex::new(StageStats::default()),
             recompute: Mutex::new(Recompute::default()),
             stop: AtomicBool::new(false),
+            sweep: Mutex::new(None),
             source,
         });
         let name = format!("fft-{}", shared.source.id().0);
@@ -147,6 +153,7 @@ impl Stage {
             sink,
             row_sink,
             row_sink_panicked: AtomicBool::new(false),
+            profiles: cfg.sweep_profiles,
             fft_size,
             hop,
             row_period_secs: cfg.row_period_secs,
@@ -181,6 +188,11 @@ impl Stage {
     /// The last block inserted into the cache.
     pub fn latest_block(&self) -> Option<u64> {
         self.shared.stats.lock().latest_block
+    }
+
+    /// The sweep's progress, while the source is in Sweep mode.
+    pub fn sweep_status(&self) -> Option<SweepStatus> {
+        self.shared.sweep.lock().clone()
     }
 
     pub fn stats(&self) -> StageStats {
@@ -273,6 +285,8 @@ struct Worker {
     row_sink: Option<Arc<dyn RowSink>>,
     /// Set once the row sink has panicked (logged once).
     row_sink_panicked: AtomicBool,
+    /// The sweep loads and saves hop profiles.
+    profiles: bool,
     fft_size: usize,
     hop: u64,
     row_period_secs: f64,
@@ -289,6 +303,28 @@ impl Worker {
         let mut row: Option<RowAcc> = None;
         let mut b = (source.oldest() / l + 1).max(1);
         while !self.shared.stop.load(Ordering::SeqCst) {
+            if source.mode() == Mode::Sweep {
+                // The sweep owns the source until it leaves Sweep mode (spec §4.6a: no FFT blocks, no channels).
+                if let Some(r) = row.take() {
+                    self.publish(r);
+                }
+                let live_center = source.current_segment().center_hz;
+                let ended = sweep::run(sweep::Ctx {
+                    source,
+                    stop: &self.shared.stop,
+                    status: &self.shared.sweep,
+                    publish: &|r| self.emit(r),
+                    profiles: self.profiles,
+                });
+                *self.shared.sweep.lock() = None;
+                if ended == sweep::Ended::ModeChanged
+                    && let Err(e) = source.set_center(live_center)
+                {
+                    log::warn!("source {}: back to {:.3} MHz after sweeping: {e}", id.0, live_center / 1e6);
+                }
+                b = (source.head() / l).max(1);
+                continue;
+            }
             let head = source.head();
             if head < (b + 1) * l {
                 std::thread::park_timeout(POLL);
@@ -372,13 +408,12 @@ impl Worker {
         }
         let k = 1.0 / acc.blocks as f32;
         let power = acc.sum.into_iter().map(|s| s * k).collect();
-        let row = self.shared.rows.push(Row {
-            first_sample: acc.first_sample,
-            end_sample: acc.end_sample,
-            blocks: acc.blocks,
-            segment: acc.segment,
-            power,
-        });
+        self.emit(Row { first_sample: acc.first_sample, end_sample: acc.end_sample, blocks: acc.blocks, segment: acc.segment, power });
+    }
+
+    /// Into the history, then to the row sink.
+    fn emit(&self, row: Row) {
+        let row = self.shared.rows.push(row);
         if let Some(sink) = &self.row_sink {
             let id = self.shared.source.id();
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.on_row(id, &row))).is_err()

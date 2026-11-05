@@ -65,9 +65,32 @@ pub struct Receiver {
     pub stage: StageView,
     pub head: u64,
     pub head_time: Option<SystemTime>,
-    /// The newest finished rows, oldest first (48 at most: 1.1 s of 22.9 ms rows, so a stalled tick loses none).
+    /// The newest finished rows, oldest first (48 at most: 1.1 s of 22.9 ms rows, so a stalled tick loses none). In
+    /// Sweep mode each row is one stitched pass over the span.
     pub rows: Vec<Arc<Row>>,
     pub consumers: Vec<ConsumerView>,
+    /// The sweep's progress, in Sweep mode.
+    pub sweep: Option<SweepView>,
+}
+
+/// A sweep's progress (spec §4.6a).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SweepView {
+    pub start_hz: f64,
+    /// The end of the hop grid (the rows' axis), measured or not.
+    pub stop_hz: f64,
+    pub hop_hz: f64,
+    pub hops: usize,
+    pub measured_hops: usize,
+    pub current_hop: usize,
+    pub passes: u64,
+    pub last_pass_s: f64,
+    pub hops_per_sec: f64,
+    pub redone_hops: u64,
+    pub settle_retries: u64,
+    pub slow_hops: usize,
+    pub lock_waits: u64,
+    pub unseen_retunes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

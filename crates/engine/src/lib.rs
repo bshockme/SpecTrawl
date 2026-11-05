@@ -13,6 +13,7 @@ pub mod snapshot;
 pub mod source;
 pub mod stage;
 pub mod store;
+pub mod sweep;
 pub mod timeline;
 
 pub use budget::{Allowance, BudgetConfig, Mode, RingBudget, SourceId};

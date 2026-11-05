@@ -18,6 +18,8 @@ sdr-core = { version = "0.1.0", path = "../sdr-core" }
 serde_json = "1.0.151"
 
 [dev-dependencies]
+# Only for tests/sweep_parity.rs (spec §6 step 4a: the new sweep makes the same row as this one); goes with this crate in step 8.
+engine = { path = "../engine" }
 backend-airspy = { path = "../backend-airspy" }
 backend-sim = { path = "../backend-sim" }
 serde_json = "1.0.151"

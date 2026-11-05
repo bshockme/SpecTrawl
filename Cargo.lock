@@ -962,6 +962,7 @@ dependencies = [
  "backend-sim",
  "detect",
  "dsp",
+ "engine",
  "log",
  "num-complex",
  "parking_lot",

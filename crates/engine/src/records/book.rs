@@ -53,6 +53,8 @@ struct PerSource {
     source: Arc<Source>,
     serial: Arc<str>,
     det: Option<Detector>,
+    /// The detector is for stitched sweep rows (`DetectorConfig::sweep`).
+    det_survey: bool,
     zero_if: bool,
     spur_grid_hz: Option<f64>,
     usable_fraction: f32,
@@ -142,6 +144,7 @@ impl RecordBook {
                 source,
                 serial,
                 det: None,
+                det_survey: false,
                 zero_if: snap.caps.if_arch == IfArchitecture::ZeroIf,
                 spur_grid_hz: snap.caps.spur_grid_hz,
                 usable_fraction: snap.caps.usable_bandwidth_fraction as f32,
@@ -310,8 +313,33 @@ impl RowSink for RecordBook {
 impl Inner {
     fn row(&mut self, ps: &mut PerSource, row: &Row, slicing: bool) -> Outbox {
         let mut out = Outbox::default();
+        // A sweep's stitched rows (spec §4.6a) go to a detector configured for them; the switch closes what was open
+        // (the segment changes with it anyway).
+        let survey = row.segment.id.0 & crate::sweep::STITCHED != 0;
+        if ps.det.is_some() && ps.det_survey != survey {
+            let closed = {
+                let next = &mut self.next_record;
+                ps.det.as_mut().map(|d| d.close_all(&mut || take_id(next))).unwrap_or_default()
+            };
+            for d in closed {
+                if slicing {
+                    out.slice_end.push((d.id, d.end_sample));
+                }
+                self.close(ps, d, &mut out);
+            }
+            ps.det = None;
+        }
+        ps.det_survey = survey;
+        let slicing = slicing && !survey;
         let det = ps.det.get_or_insert_with(|| {
-            Detector::new(DetectorConfig { usable_fraction: ps.usable_fraction, ..DetectorConfig::live(DetectorConfig::rows_per_sec(row)) })
+            if survey {
+                Detector::new(DetectorConfig::sweep())
+            } else {
+                Detector::new(DetectorConfig {
+                    usable_fraction: ps.usable_fraction,
+                    ..DetectorConfig::live(DetectorConfig::rows_per_sec(row))
+                })
+            }
         });
         let (result, open) = {
             let next = &mut self.next_record;
@@ -366,11 +394,12 @@ impl Inner {
     fn place(&mut self, ps: &PerSource, d: Detected, out: &mut Outbox) -> Arc<SignalRecord> {
         let t = |s: u64| ps.source.time_of(s).unwrap_or(SystemTime::UNIX_EPOCH);
         let prev = ps.open.get(&d.id);
+        let survey = ps.det_survey;
         let mut r = SignalRecord {
             id: d.id,
             source: ps.source.id(),
             serial: ps.serial.clone(),
-            role: Role::Live,
+            role: if survey { Role::Survey } else { Role::Live },
             segment: d.segment.id,
             tuner_hz: d.segment.center_hz,
             first_sample: d.first_sample,
@@ -401,7 +430,9 @@ impl Inner {
                 EmitterId(*next - 1)
             });
             r.emitter = Some(o.emitter);
-            r.claims = b.position_claims(&r, ps.zero_if, ps.spur_grid_hz);
+            // A stitched row's "tuner" is the middle of the span: no position claims there (the sweep blanks the
+            // radio's spur grid itself).
+            r.claims = if survey { Vec::new() } else { b.position_claims(&r, ps.zero_if, ps.spur_grid_hz) };
             b.note_claims(o.emitter, &r.claims);
             self.dirty_emitters.insert(o.emitter);
             if !r.open

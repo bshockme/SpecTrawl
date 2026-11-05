@@ -71,6 +71,22 @@ pub(crate) fn receivers(engine: &Engine, registry: &Registry, rows: usize, watch
             log.push(Some(o.letter), format!("{}: device lost", o.letter));
         }
         let mode = source.mode();
+        let sweep = stage.as_ref().and_then(|s| s.sweep_status()).filter(|_| mode == api::Mode::Sweep).map(|s| api::SweepView {
+            start_hz: s.start_hz,
+            stop_hz: s.stop_hz(),
+            hop_hz: s.hop_hz,
+            hops: s.hops,
+            measured_hops: s.measured_hops,
+            current_hop: s.current_hop,
+            passes: s.passes,
+            last_pass_s: s.last_pass_s,
+            hops_per_sec: s.hops_per_sec,
+            redone_hops: s.redone_hops,
+            settle_retries: s.settle_retries,
+            slow_hops: s.slow_hops,
+            lock_waits: s.lock_waits,
+            unseen_retunes: s.unseen_retunes,
+        });
         let status = status_line(&StatusInput {
             mode,
             center_hz: dev.center_hz,
@@ -83,6 +99,7 @@ pub(crate) fn receivers(engine: &Engine, registry: &Registry, rows: usize, watch
             device_lost: stats.device_lost,
             silent_secs,
             stage_behind_secs: stage_stats.behind_secs,
+            sweep: sweep.clone(),
         });
         out.push(Receiver {
             id,
@@ -114,6 +131,7 @@ pub(crate) fn receivers(engine: &Engine, registry: &Registry, rows: usize, watch
             head_time: source.time_of(head),
             rows: stage.map(|s| s.rows().newest(rows)).unwrap_or_default(),
             consumers,
+            sweep,
         });
     }
     let view = BusView { workers: bus.workers, saturated: bus.saturated, shed_total: bus.shed_total, panicked_total: bus.panicked_total };

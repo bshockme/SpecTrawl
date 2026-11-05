@@ -256,6 +256,10 @@ pub struct Source {
     device: SharedDevice,
     id: SourceId,
     keeper: Arc<Keeper>,
+    /// The last gain set (the hop profile's key).
+    gain: Mutex<Option<GainSetting>>,
+    /// What to sweep in Sweep mode, and the other receivers' LO leaks to blank (spec §4.6a).
+    sweep: Mutex<(crate::sweep::SweepPlan, Vec<(f64, f64)>)>,
 }
 
 impl Source {
@@ -302,7 +306,15 @@ impl Source {
             budget.leave(id);
             return Err(e);
         }
-        Ok(Source { inner, device, id, keeper: keeper.clone() })
+        let plan = {
+            let d = device.lock();
+            let ranges = &d.capabilities().freq_ranges_hz;
+            let lo = ranges.iter().map(|r| r.0).fold(f64::MAX, f64::min).max(24e6);
+            let hi = ranges.iter().map(|r| r.1).fold(f64::MIN, f64::max);
+            let grid = d.capabilities().spur_grid_hz;
+            crate::sweep::SweepPlan { start_hz: lo, stop_hz: hi.max(lo), spur_grid_hz: grid, ..Default::default() }
+        };
+        Ok(Source { inner, device, id, keeper: keeper.clone(), gain: Mutex::new(None), sweep: Mutex::new((plan, Vec::new())) })
     }
 
     pub fn id(&self) -> SourceId {
@@ -325,7 +337,43 @@ impl Source {
     }
 
     pub fn set_gain(&self, g: GainSetting) -> sdr_core::Result<()> {
-        self.device.lock().set_gain(g)
+        self.device.lock().set_gain(g)?;
+        *self.gain.lock() = Some(g);
+        Ok(())
+    }
+
+    /// The last gain set through [`Source::set_gain`] (`None`: the device's default).
+    pub fn gain(&self) -> Option<GainSetting> {
+        *self.gain.lock()
+    }
+
+    /// The tuner's PLL lock, where the device reports it.
+    pub fn tuner_locked(&self) -> Option<bool> {
+        self.device.lock().tuner_locked()
+    }
+
+    /// The newest segment (the current tuning), even before any of its samples arrived.
+    pub fn current_segment(&self) -> Segment {
+        self.inner.segments.current()
+    }
+
+    /// What Sweep mode sweeps (default: the device's whole range from 24 MHz, on its spur grid).
+    pub fn sweep_plan(&self) -> crate::sweep::SweepPlan {
+        self.sweep.lock().0.clone()
+    }
+
+    /// Takes effect at the end of the pass in progress.
+    pub fn set_sweep_plan(&self, plan: crate::sweep::SweepPlan) {
+        self.sweep.lock().0 = plan;
+    }
+
+    /// Ranges a sweep blanks (other receivers' LO leaks).
+    pub fn lo_masks(&self) -> Vec<(f64, f64)> {
+        self.sweep.lock().1.clone()
+    }
+
+    pub fn set_lo_masks(&self, masks: Vec<(f64, f64)>) {
+        self.sweep.lock().1 = masks;
     }
 
     pub fn snapshot(&self) -> DeviceSnapshot {

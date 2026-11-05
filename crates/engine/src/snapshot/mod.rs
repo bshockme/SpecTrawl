@@ -127,6 +127,7 @@ impl Publisher {
             for (seq, c) in commands {
                 self.apply(seq, c);
             }
+            self.registry.update_lo_masks(&self.engine);
             self.publish();
             while let Some(left) = next.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) {
                 if !rx.wait(left) {
@@ -204,6 +205,7 @@ fn command_name(c: &Command) -> &'static str {
         Command::SetGain { .. } => "set gain",
         Command::SetMode { .. } => "set mode",
         Command::SetBudget { .. } => "set budget",
+        Command::SetSweep { .. } => "set sweep",
         Command::Tag { .. } => "tag",
         Command::Untag { .. } => "untag",
         Command::Note { .. } => "note",
@@ -220,7 +222,10 @@ fn panic_text(payload: &(dyn Any + Send)) -> &str {
 fn command_source(c: &Command) -> Option<SourceId> {
     match c {
         Command::Close(id) => Some(*id),
-        Command::Tune { source, .. } | Command::SetGain { source, .. } | Command::SetMode { source, .. } => Some(*source),
+        Command::Tune { source, .. }
+        | Command::SetGain { source, .. }
+        | Command::SetMode { source, .. }
+        | Command::SetSweep { source, .. } => Some(*source),
         Command::Enumerate
         | Command::Open { .. }
         | Command::SetBudget { .. }
