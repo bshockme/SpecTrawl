@@ -36,7 +36,7 @@ Failure modes the step 4 tests must pin, each with its task:
 
 1. **A record spans a retune or a hole.** A segment boundary (retune or gap) closes every open record at the boundary; a record never covers samples from two segments, and `segment` names the one it is in. (Task 3.)
 2. **Smeared rows widen or fuse records.** The 2026-11-03/04 cases: occasional smeared rows don't widen a record; one smeared row doesn't fuse established neighbours 25 kHz apart; FSK tones stay one record; an FM swing keeps its width; pieces of a wide signal become one record. All `engine-old::bursts` tests are carried over. (Task 3.)
-3. **Merging inflates SNR** (spec §8): merging two tracks sums both their SNR sums and their row counts, so the mean is a mean. (Task 3.)
+3. **Merging inflates SNR** (spec §8): two tracks overlapping in time merge into the larger row count with each mean (SNR, level) the row-weighted mean of the two, never above either; `engine-old` already did this (the fix predates the spec's note), and the port keeps it under a test. (Task 3.)
 4. **Records lost or renumbered across a restart.** Close the engine with records, tags and notes; open a new engine on the same store; the same ids, times, extents, claims, tags and notes come back, and new records get ids above all old ones. (Task 6.)
 5. **The store stalls the engine.** A store whose writes take 2 s each: rows, records and snapshots keep flowing, the queue fills, drops are counted and shown, nothing deadlocks, shutdown waits at most the configured time. (Task 6.)
 6. **An interface misses records by skipping snapshots.** Read every fifth snapshot for 10 s of simulator time: the app's record list equals the book's. (Tasks 5 and 8.)
@@ -101,7 +101,7 @@ Failure modes the step 4 tests must pin, each with its task:
 **Files:** `crates/engine/src/records/detector.rs`, `records/mod.rs`.
 
 - [ ] Carry over every test in `engine-old/src/bursts.rs` (including the 2026-11-03/04 ones: smeared rows, neighbours, FSK tones, FM swing, wide-signal pieces), rewritten to feed `api::Row`s (linear power) at 65 536 bins; they fail before the port.
-- [ ] Add: a retune boundary closes every open record at the last row of the old segment, and the next record starts in the new segment (review focus 1); a `Gap` segment does the same; the §8 SNR fix (review focus 3: merge a 30 dB track of 10 rows into a 10 dB track of 10 rows → mean SNR 20 dB, rows 20, not 30 dB mean over max rows); `mean_dbfs` is the mean over rows of the mean power across the record's core bins.
+- [ ] Add: a retune boundary closes every open record at the last row of the old segment, and the next record starts in the new segment (review focus 1); a `Gap` segment does the same; the §8 SNR rule (review focus 3: merging a 30 dB and a 10 dB track of 10 overlapping rows each gives a 20 dB mean over 10 rows); `mean_dbfs` is the mean over rows of the mean power across the record's core bins.
 - [ ] Port `Track` (hits, core, reach, extend/cover/absorb), `associate` (close / frequent / touching bridging, splitting at core midpoints), the floor (block percentile, usable fraction) and `to_record`, onto sample indices: `first_sample` = the first row's `first_sample`, `end_sample` = the last row's `end_sample`; wall times from the book (Task 5).
 - [ ] The 4:1 reduction (sum of linear power over four bins, then dB) lives here, with a test that a tone exactly on a reduced bin edge lands in one of the two neighbours at full power.
 - [ ] Ids are allocated by a closure the book passes (`FnMut() -> RecordId`), not a static counter.

@@ -3,6 +3,7 @@ pub mod cache;
 pub mod channels;
 pub mod engine;
 pub mod export;
+pub mod records;
 pub mod ring;
 pub mod rows;
 pub mod segments;
