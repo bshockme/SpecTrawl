@@ -47,8 +47,23 @@ const PRUNE_EVERY: u32 = 64;
 const STICKY_LABELS: [&str; 3] = ["Internal spur", "Spur comb", "DC offset"];
 
 /// A label fixed by position (see `STICKY_LABELS`).
+/// Share of an emitter's analysed time a modulation-describing label needs
+/// to beat the undescriptive ones (see `Emitter::majority_feature_label`).
+const DESCRIBED_SHARE: f32 = 0.25;
+
+/// Feature labels that say nothing about the modulation: what a look at a
+/// keyed-down, idle or too-short stretch of any transmitter gives.
+fn describes_modulation(label: &str) -> bool {
+    !matches!(label, "Carrier" | "Unknown" | "Wideband") && !label.ends_with(" Carrier") && !label.ends_with(" Unknown")
+}
+
 pub fn is_sticky(label: &str) -> bool {
     STICKY_LABELS.iter().any(|s| label.starts_with(s))
+}
+
+/// Sticky labels that only make sense on a line (see `spur_context`).
+fn is_line_label(label: &str) -> bool {
+    label.starts_with("Internal spur (image)") || label.starts_with("Spur comb")
 }
 
 /// Narrower than this, a signal is a line: a carrier, a spur or a birdie.
@@ -59,9 +74,17 @@ const LINE_TOL_HZ: f64 = 1.5e3;
 /// twenty-odd lines in a 10 MHz span, three at some common spacing is
 /// coincidence about once per line; four is not)...
 const COMB_LINES: usize = 4;
+/// Records a line needs before it can be a comb member (persistent, not
+/// a blip: the radio's own 750 kHz comb lines had 12–40 in a minute, the
+/// false members at a trunked site 1–5).
+const COMB_MEMBER_RECORDS: u32 = 6;
 /// ...with spacings in this range (closer is one wide signal's structure,
 /// further apart is coincidence in a 10 MHz span).
 const COMB_SPACING_HZ: (f64, f64) = (20e3, 2.5e6);
+/// Comb members are on the air at least this share of the time (see
+/// `Emitter::duty`): a trunked site's narrow blips on its channel raster
+/// were 1–39% on air and read as combs at every multiple of 12.5 kHz.
+const COMB_MIN_DUTY: f64 = 0.5;
 /// Closed records whose ring extents an emitter remembers.
 const RECENT_RECORDS: usize = 8;
 
@@ -69,6 +92,9 @@ const RECENT_RECORDS: usize = 8;
 const MIN_PROTOCOL_HITS: u32 = 2;
 /// ...unless one identification alone contained this many syncs.
 const STRONG_SYNCS: usize = 4;
+/// Least analysed time a classification weighs (a look shorter than this
+/// still counts for something).
+const MIN_WEIGHT_S: f32 = 0.05;
 
 #[derive(Debug, Clone)]
 pub struct Emitter {
@@ -80,6 +106,9 @@ pub struct Emitter {
     pub records: u32,
     /// Summed duration of finished records, seconds.
     pub on_time_s: f64,
+    /// Start of the record still open on it (its time isn't in
+    /// `on_time_s` yet).
+    pub(crate) open_start: Option<SystemTime>,
     pub active: bool,
     /// Seen often, long or strongly enough not to be a noise blip.
     pub confirmed: bool,
@@ -87,6 +116,9 @@ pub struct Emitter {
     /// Classification labels seen on this emitter's records (and its own
     /// group classifications), with counts.
     pub tally: BTreeMap<String, u32>,
+    /// Seconds of signal analysed behind each label in `tally`: a label
+    /// from a 1.5 s window weighs ten times one from a 0.15 s look.
+    pub weight: BTreeMap<String, f32>,
     /// Labels in `tally` that named a protocol.
     pub protocols: BTreeMap<String, u32>,
     /// Decoded system identities ("NAC 0x2A5", "CC 9"), weighted by frames.
@@ -98,7 +130,8 @@ pub struct Emitter {
     pub last_talk: Option<String>,
     /// Capacity Plus repeater number this transmitter was seen to be.
     pub capplus_repeater: Option<u8>,
-    /// Protocol labels seen at least once with `STRONG_SYNCS` or more syncs.
+    /// Protocol labels seen at least once with `STRONG_SYNCS` or more syncs,
+    /// or with frames that passed their code.
     pub strong: std::collections::BTreeSet<String>,
     /// Latest group-level classification.
     pub class: Option<Arc<Classification>>,
@@ -128,7 +161,10 @@ impl Emitter {
         // Labels fixed by where the signal sits (the tuner's DC, the radio's
         // own spur grid) beat any feature vote: early looks at a record can
         // see it wider than it is and vote otherwise.
-        if let Some(l) = self.tally.keys().find(|l| is_sticky(l)) {
+        // A label given to a line (an image, a comb member) lapses once
+        // the emitter has shown itself wider than a line: a data channel's
+        // first narrow record is not what it is.
+        if let Some(l) = self.tally.keys().find(|l| is_sticky(l) && (!is_line_label(l) || self.bandwidth_hz < LINE_HZ * 1.5)) {
             return Some(l.clone());
         }
         self.protocol_label().or_else(|| self.majority_feature_label())
@@ -149,8 +185,27 @@ impl Emitter {
         }
     }
 
+    /// The feature label with the most analysed time behind it, except
+    /// that a label describing a modulation beats one that doesn't
+    /// ("Carrier", "Unknown", "Wideband") once it holds `DESCRIBED_SHARE`
+    /// of the time: a voice channel is keyed in short looks that read as
+    /// a bare carrier far more often than it is caught talking, and it
+    /// is the talking that says what it is.
     fn majority_feature_label(&self) -> Option<String> {
-        self.tally.iter().filter(|(l, _)| !self.protocols.contains_key(*l)).max_by_key(|(_, n)| **n).map(|(l, _)| l.clone())
+        let feature = |l: &&String| !self.protocols.contains_key(*l);
+        let w = |l: &String| self.weight.get(l).copied().unwrap_or(0.0);
+        let total: f32 = self.tally.keys().filter(feature).map(w).sum();
+        let best = |describing: bool| {
+            self.tally
+                .keys()
+                .filter(feature)
+                .filter(|l| describes_modulation(l) == describing)
+                .max_by(|a, b| w(a).total_cmp(&w(b)).then_with(|| self.tally[*b].cmp(&self.tally[*a])))
+        };
+        match best(true) {
+            Some(l) if w(l) >= DESCRIBED_SHARE * total => Some(l.clone()),
+            _ => self.tally.keys().filter(feature).max_by(|a, b| w(a).total_cmp(&w(b))).cloned(),
+        }
     }
 
     /// The protocol label seen most, if it was seen at least
@@ -182,10 +237,12 @@ impl Emitter {
         self.bin_hz
     }
 
-    /// Fraction of the time between first and last seen that it was on.
+    /// Fraction of the time between first and last seen that it was on,
+    /// counting a record still open (a steady line has one, all along).
     pub fn duty(&self) -> f64 {
         let span = self.last_seen.duration_since(self.first_seen).map(|d| d.as_secs_f64()).unwrap_or(0.0);
-        if span <= 0.0 { 1.0 } else { (self.on_time_s / span).min(1.0) }
+        let open = self.open_start.and_then(|t| self.last_seen.duration_since(t).ok()).map_or(0.0, |d| d.as_secs_f64());
+        if span <= 0.0 { 1.0 } else { ((self.on_time_s + open) / span).min(1.0) }
     }
 }
 
@@ -199,6 +256,14 @@ pub(crate) struct EmitterBook {
     latest: Option<SystemTime>,
     calls: u32,
 }
+
+/// Widest emitter that takes in narrower records lying inside it (see
+/// `EmitterBook::contains`): a narrowband channel.
+const CONTAIN_MAX_HZ: f64 = 30e3;
+/// Half a broadcast FM channel (200 kHz in the Americas; stations 100 kHz
+/// apart elsewhere stay apart because pieces that are stations themselves
+/// are never folded).
+const STATION_HALF_HZ: f64 = 100e3;
 
 impl EmitterBook {
     /// Frequency tolerance for joining: a quarter of the bandwidth, at least
@@ -222,12 +287,42 @@ impl EmitterBook {
         (e.center_hz - c).abs() <= Self::tolerance(e.bandwidth_hz.max(bw), bin) && (0.33..=3.0).contains(&ratio)
     }
 
-    /// The closest emitter a record fits, other than `except`.
+    /// Does a clearly narrower record lie inside `e`, a confirmed narrowband
+    /// emitter (or have its centre inside a broadcast FM station's)? An FSK channel's records that caught one tone (an idle
+    /// pager: ±4.8 kHz) or part of a burst are that channel, not a new
+    /// "carrier" beside it. Fine rows only; wide emitters (LTE, TV, a
+    /// "Wideband" blob) are left out so narrow signals inside them stay
+    /// their own.
+    fn contains(e: &Emitter, c: f64, bw: f64, bin: f64) -> bool {
+        let bin = bin.max(e.bin_hz);
+        if bin >= COARSE_BIN_HZ || !e.confirmed || bw * 2.0 > e.bandwidth_hz + bin {
+            return false;
+        }
+        // A broadcast FM station owns its channel: a narrow record at its
+        // carrier (quiet programme) or a piece of its swing is the station.
+        if e.best.as_ref().is_some_and(|b| b.label.starts_with("FM broadcast") || b.label == "Wideband FM") {
+            return (e.center_hz - c).abs() <= e.bandwidth_hz / 2.0 + bin;
+        }
+        e.bandwidth_hz <= CONTAIN_MAX_HZ && (e.center_hz - c).abs() + bw / 2.0 <= e.bandwidth_hz / 2.0 + bin
+    }
+
+    /// Is `r` clearly wider than `e` and spanning all of it?
+    fn covers(r: &SignalRecord, e: &Emitter) -> bool {
+        let bin = r.bin_hz.max(e.bin_hz);
+        r.bandwidth_hz() >= 1.5 * e.bandwidth_hz
+            && r.f_lo_hz <= e.center_hz - e.bandwidth_hz / 2.0 + bin
+            && r.f_hi_hz >= e.center_hz + e.bandwidth_hz / 2.0 - bin
+    }
+
+    /// The emitter a record belongs to, other than `except`: a confirmed
+    /// narrowband emitter containing it (the busiest), else the closest it
+    /// fits.
     fn find(&self, c: f64, bw: f64, bin: f64, except: Option<u64>) -> Option<u64> {
-        self.map
-            .values()
-            .filter(|e| Some(e.id) != except && Self::fits(e, c, bw, bin))
-            .min_by(|a, b| (a.center_hz - c).abs().total_cmp(&(b.center_hz - c).abs()))
+        let others = || self.map.values().filter(move |e| Some(e.id) != except);
+        others()
+            .filter(|e| Self::contains(e, c, bw, bin))
+            .max_by_key(|e| e.records)
+            .or_else(|| others().filter(|e| Self::fits(e, c, bw, bin)).min_by(|a, b| (a.center_hz - c).abs().total_cmp(&(b.center_hz - c).abs())))
             .map(|e| e.id)
     }
 
@@ -237,7 +332,11 @@ impl EmitterBook {
         let bw = r.bandwidth_hz().max(1.0);
         let c = r.center_hz();
         let id = match self.by_record.get(&r.id) {
-            Some(&id) if closed && self.map.get(&id).is_some_and(|e| e.records == 1) => self.refit(r, id, c, bw),
+            // A record that closes wider than its emitter and covering it,
+            // on an emitter with only a few records, built that emitter
+            // from its own early fragments (two tracks of a broadcast
+            // station that later merged): the emitter takes its final shape.
+            Some(&id) if closed && self.map.get(&id).is_some_and(|e| e.records == 1 || (e.records <= 3 && Self::covers(r, e))) => self.refit(r, id, c, bw),
             Some(&id) => id,
             None => {
                 let id = self.find(c, bw, r.bin_hz, None).unwrap_or_else(|| {
@@ -245,11 +344,17 @@ impl EmitterBook {
                     self.map.insert(self.next_id, Self::new_emitter(self.next_id, r, c, bw));
                     self.next_id
                 });
+                // A record taken in because it lies inside the emitter (one
+                // tone of a pager, a station's quiet carrier) is a partial
+                // view: it doesn't move the emitter's centre or width.
+                let partial = self.map.get(&id).is_some_and(|e| e.records > 0 && Self::contains(e, c, bw, r.bin_hz));
                 if let Some(e) = self.map.get_mut(&id) {
                     e.records += 1;
-                    // Slow average so one odd record doesn't drag the centre.
-                    e.center_hz += (c - e.center_hz) * 0.1;
-                    e.bandwidth_hz += (bw - e.bandwidth_hz) * 0.1;
+                    if !partial {
+                        // Slow average so one odd record doesn't drag the centre.
+                        e.center_hz += (c - e.center_hz) * 0.1;
+                        e.bandwidth_hz += (bw - e.bandwidth_hz) * 0.1;
+                    }
                 }
                 self.by_record.insert(r.id, id);
                 id
@@ -268,6 +373,7 @@ impl EmitterBook {
             e.peak_snr_db = e.peak_snr_db.max(r.max_snr_db);
             e.last_end_sample = e.last_end_sample.max(r.last_row_end_sample);
             e.tuner_center_hz = r.tuner_center_hz;
+            e.open_start = if closed { None } else { Some(e.open_start.map_or(r.t_start, |t| t.min(r.t_start))) };
             if closed {
                 e.on_time_s += r.duration_s();
                 if r.rows >= 2 || r.max_snr_db >= BLIP_SNR_DB {
@@ -296,13 +402,32 @@ impl EmitterBook {
             }
             return id;
         };
-        let Some(from) = self.map.remove(&id) else { return id };
+        if !self.fold(id, to) {
+            return id;
+        }
         self.by_record.insert(r.id, to);
-        let Some(e) = self.map.get_mut(&to) else { return to };
+        if let Some(e) = self.map.get_mut(&to) {
+            e.center_hz += (c - e.center_hz) * 0.1;
+            e.bandwidth_hz += (bw - e.bandwidth_hz) * 0.1;
+        }
+        to
+    }
+
+    /// Folds emitter `id` into `to`: its records (all of them, not only
+    /// the one being placed), counts and votes. False if either is gone.
+    fn fold(&mut self, id: u64, to: u64) -> bool {
+        if id == to || !self.map.contains_key(&to) {
+            return false;
+        }
+        let Some(from) = self.map.remove(&id) else { return false };
+        for v in self.by_record.values_mut() {
+            if *v == id {
+                *v = to;
+            }
+        }
+        let Some(e) = self.map.get_mut(&to) else { return false };
         e.records += from.records;
         e.solid_records += from.solid_records;
-        e.center_hz += (c - e.center_hz) * 0.1;
-        e.bandwidth_hz += (bw - e.bandwidth_hz) * 0.1;
         e.on_time_s += from.on_time_s;
         e.first_seen = e.first_seen.min(from.first_seen);
         e.last_seen = e.last_seen.max(from.last_seen);
@@ -317,6 +442,9 @@ impl EmitterBook {
         e.recent.extend(recent.into_iter().rev().take(RECENT_RECORDS).rev());
         for (k, n) in from.tally {
             *e.tally.entry(k).or_default() += n;
+        }
+        for (k, n) in from.weight {
+            *e.weight.entry(k).or_default() += n;
         }
         for (k, n) in from.protocols {
             *e.protocols.entry(k).or_default() += n;
@@ -338,7 +466,20 @@ impl EmitterBook {
         if e.best.is_none() {
             e.best = from.best;
         }
-        to
+        true
+    }
+
+    /// A broadcast FM station owns its channel: emitters within
+    /// `STATION_HALF_HZ` of it that aren't stations themselves (pieces
+    /// split off by quiet programme or the swing, seen before it was
+    /// named) fold into it.
+    fn fold_station(&mut self, id: u64) {
+        let Some(c) = self.map.get(&id).map(|e| e.center_hz) else { return };
+        let is_station = |e: &Emitter| e.best.as_ref().is_some_and(|b| b.label.starts_with("FM broadcast"));
+        let pieces: Vec<u64> = self.map.values().filter(|e| e.id != id && (e.center_hz - c).abs() <= STATION_HALF_HZ && !is_station(e)).map(|e| e.id).collect();
+        for p in pieces {
+            self.fold(p, id);
+        }
     }
 
     fn new_emitter(id: u64, r: &SignalRecord, c: f64, bw: f64) -> Emitter {
@@ -351,10 +492,12 @@ impl EmitterBook {
             records: 0,
             solid_records: 0,
             on_time_s: 0.0,
+            open_start: None,
             active: false,
             confirmed: false,
             peak_snr_db: r.max_snr_db,
             tally: BTreeMap::new(),
+            weight: BTreeMap::new(),
             protocols: BTreeMap::new(),
             ids: BTreeMap::new(),
             activity: BTreeMap::new(),
@@ -416,6 +559,7 @@ impl EmitterBook {
     pub(crate) fn adopt(&mut self, id: u64, c: Arc<Classification>) {
         let Some(e) = self.map.get_mut(&id) else { return };
         *e.tally.entry(c.label.clone()).or_default() += MIN_PROTOCOL_HITS;
+        *e.weight.entry(c.label.clone()).or_default() += (c.analysed_s as f32).max(MIN_WEIGHT_S) * MIN_PROTOCOL_HITS as f32;
         if c.protocol.is_some() {
             *e.protocols.entry(c.label.clone()).or_default() += MIN_PROTOCOL_HITS;
             e.strong.insert(c.label.clone());
@@ -443,6 +587,7 @@ impl EmitterBook {
             return;
         }
         *e.tally.entry(c.label.clone()).or_default() += 1;
+        *e.weight.entry(c.label.clone()).or_default() += (c.analysed_s as f32).max(MIN_WEIGHT_S);
         if let Some(id) = c.fields.as_ref().and_then(|f| f.id.clone().map(|id| (id, f.decoded))) {
             *e.ids.entry(id.0).or_default() += id.1;
         }
@@ -460,12 +605,17 @@ impl EmitterBook {
         }
         if c.protocol.is_some() {
             *e.protocols.entry(c.label.clone()).or_default() += 1;
-            if c.sync.as_ref().is_some_and(|s| s.count >= STRONG_SYNCS) {
+            // Strong: enough syncs, or frames that passed their code (a FLEX
+            // frame header's BCH, a P25 NID, a DMR slot type), most of those
+            // tried. A weak pager decodes a header now and then, with no
+            // sync-bank syncs at all, and was left "Unknown".
+            let checked = c.fields.as_ref().is_some_and(|f| f.decoded >= 1 && f.decoded * 2 >= f.tried);
+            if checked || c.sync.as_ref().is_some_and(|s| s.count >= STRONG_SYNCS) {
                 e.strong.insert(c.label.clone());
             }
         }
         let pcount = |l: &str| e.protocols.get(l).copied().unwrap_or(0);
-        let tcount = |l: &str| e.tally.get(l).copied().unwrap_or(0);
+        let tcount = |l: &str| e.weight.get(l).copied().unwrap_or(0.0);
         let trusted =
             |cl: &Classification| cl.protocol.is_some() && (pcount(&cl.label) >= MIN_PROTOCOL_HITS || e.strong.contains(&cl.label));
         // `best` follows `label()`: a trusted protocol if any, else the most
@@ -479,6 +629,9 @@ impl EmitterBook {
         };
         if replace {
             e.best = Some(c.clone());
+        }
+        if replace && c.label.starts_with("FM broadcast") {
+            self.fold_station(id);
         }
     }
 
@@ -497,17 +650,37 @@ impl EmitterBook {
         if bandwidth_hz >= LINE_HZ {
             return None;
         }
-        let lines: Vec<f64> = self
-            .map
-            .values()
-            .filter(|e| e.bandwidth_hz < LINE_HZ && e.records >= 2 && (e.center_hz - center_hz).abs() > LINE_TOL_HZ)
-            .map(|e| e.center_hz)
-            .collect();
+        let others = |min_records: u32| -> Vec<f64> {
+            self.map
+                .values()
+                .filter(|e| e.bandwidth_hz < LINE_HZ && e.records >= min_records && (e.center_hz - center_hz).abs() > LINE_TOL_HZ)
+                .map(|e| e.center_hz)
+                .collect()
+        };
+        let lines = others(2);
         let near = |f: f64| lines.iter().any(|l| (l - f).abs() <= LINE_TOL_HZ);
         let offset = center_hz - tuner_hz;
         if offset.abs() > LINE_TOL_HZ && near(tuner_hz - offset) {
             return Some(SpurContext::ImagePair);
         }
+        // A comb is made of lines that are always there (a clock's
+        // harmonics). The brief narrow blips of a busy trunked site, or a
+        // hopping meter's sidelines, fall on a common spacing by chance
+        // (a 25 kHz channel grid, the hop grid) and must not count.
+        // A clock's harmonic is on the air nearly all the time; a site's
+        // blips (seen often enough over a few minutes to pass the record
+        // count) are on a few tenths of it at most.
+        let lines: Vec<f64> = self
+            .map
+            .values()
+            .filter(|e| {
+                e.bandwidth_hz < LINE_HZ
+                    && e.records >= COMB_MEMBER_RECORDS
+                    && e.duty() >= COMB_MIN_DUTY
+                    && (e.center_hz - center_hz).abs() > LINE_TOL_HZ
+            })
+            .map(|e| e.center_hz)
+            .collect();
         // Each other line proposes a spacing; the spacing most lines fit wins.
         let mut best: Option<(usize, f64)> = None;
         for l in &lines {
@@ -622,17 +795,124 @@ mod tests {
         for i in 0..3 {
             b.observe(&rec(i, 856.3375, 9.0, i), true);
         }
-        // First rows of a key-up: narrow, so it starts an emitter of its own...
+        // First rows of a key-up: narrow, but inside the channel's confirmed
+        // emitter, so it joins it straight away...
         let mut r = rec(10, 856.3380, 1.8, 10);
         b.observe(&r, false);
-        assert_eq!(b.map.len(), 2);
-        // ...and joins the channel's emitter once it closes at full width.
+        assert_eq!(b.map.len(), 1);
+        // ...and stays there once it closes at full width.
         r.f_lo_hz = 856.3375e6 - 4.5e3;
         r.f_hi_hz = 856.3375e6 + 4.5e3;
         let id = b.observe(&r, true);
         assert_eq!(b.map.len(), 1);
         assert_eq!(b.by_record[&10], id);
         assert_eq!(b.get(id).unwrap().records, 4);
+    }
+
+    #[test]
+    fn pieces_of_a_broadcast_station_join_it() {
+        let mut b = EmitterBook::default();
+        let st = b.observe(&rec(1, 93.7, 130.0, 1), true);
+        for i in 2..4 {
+            b.observe(&rec(i, 93.7, 130.0, i), true);
+        }
+        let fm = Arc::new(Classification {
+            label: "FM broadcast (stereo, RDS)".into(),
+            protocol: None,
+            confidence: 0.9,
+            features: Default::default(),
+            sync: None,
+            fields: None,
+            analysed_s: 1.5,
+        });
+        b.set_group_class(st, fm);
+        assert!(b.get(st).unwrap().confirmed);
+        // Its carrier alone (quiet programme), and a piece of its swing.
+        assert_eq!(b.observe(&rec(10, 93.7004, 10.0, 10), true), st);
+        assert_eq!(b.observe(&rec(11, 93.6400, 40.0, 11), true), st);
+        // A station 200 kHz away is not part of it.
+        assert_ne!(b.observe(&rec(12, 93.9, 130.0, 12), true), st);
+    }
+
+    #[test]
+    fn a_station_built_from_its_fragments_takes_its_final_shape() {
+        let mut b = EmitterBook::default();
+        // Two pieces of one station seen while still open...
+        let a = b.observe(&rec(1, 97.64, 47.0, 1), false);
+        assert_eq!(b.observe(&rec(2, 97.645, 45.0, 1), false), a);
+        assert_eq!(b.get(a).unwrap().records, 2);
+        // ...then their tracks merged and the record closes at full width.
+        let mut whole = rec(1, 97.7034, 207.0, 1);
+        whole.t_end = whole.t_start + Duration::from_secs(60);
+        assert_eq!(b.observe(&whole, true), a);
+        let e = b.get(a).unwrap();
+        assert!((e.center_hz - 97.7034e6).abs() < 2e3 && e.bandwidth_hz > 200e3, "{} {}", e.center_hz, e.bandwidth_hz);
+    }
+
+    #[test]
+    fn a_named_station_takes_in_its_pieces() {
+        let mut b = EmitterBook::default();
+        let st = b.observe(&rec(1, 93.6826, 72.0, 1), true);
+        let p1 = b.observe(&rec(2, 93.6195, 11.0, 2), true);
+        let p2 = b.observe(&rec(3, 93.7657, 28.0, 3), true);
+        let other = b.observe(&rec(4, 93.9, 150.0, 4), true);
+        assert_eq!(b.map.len(), 4);
+        let fm = Arc::new(Classification {
+            label: "FM broadcast (stereo, RDS)".into(),
+            protocol: None,
+            confidence: 0.9,
+            features: Default::default(),
+            sync: None,
+            fields: None,
+            analysed_s: 1.5,
+        });
+        b.set_group_class(st, fm);
+        assert!(b.get(p1).is_none() && b.get(p2).is_none());
+        assert_eq!((b.by_record[&2], b.by_record[&3]), (st, st));
+        assert_eq!(b.get(st).unwrap().records, 3);
+        assert!(b.get(other).is_some(), "the next channel up is another station");
+    }
+
+    #[test]
+    fn one_checked_frame_names_the_protocol() {
+        let flex = |decoded, tried| {
+            Arc::new(Classification {
+                label: "FLEX 1600/4".into(),
+                protocol: Some("FLEX".into()),
+                confidence: 0.95,
+                features: Default::default(),
+                sync: None,
+                fields: Some(detect::decode::Fields { decoded, tried, ..Default::default() }),
+                analysed_s: 1.5,
+            })
+        };
+        let mut b = EmitterBook::default();
+        let a = b.observe(&rec(1, 931.3375, 12.0, 1), true);
+        b.set_group_class(a, flex(1, 1));
+        assert_eq!(b.get(a).unwrap().protocol_label().as_deref(), Some("FLEX 1600/4"));
+        // One lucky pass among many failures is not enough.
+        let c = b.observe(&rec(2, 929.1, 12.0, 2), true);
+        b.set_group_class(c, flex(1, 6));
+        assert_eq!(b.get(c).unwrap().protocol_label(), None);
+    }
+
+    #[test]
+    fn one_tone_of_a_pager_joins_its_channel() {
+        let mut b = EmitterBook::default();
+        // A FLEX channel at full width (both tones)...
+        for i in 0..3 {
+            b.observe(&rec(i, 929.6125, 14.0, i), true);
+        }
+        // ...then records that caught one tone each, 4.7 kHz either side.
+        let a = b.observe(&rec(10, 929.6078, 3.0, 10), true);
+        let c = b.observe(&rec(11, 929.6172, 3.0, 11), true);
+        assert_eq!((a, c), (b.by_record[&0], b.by_record[&0]));
+        assert_eq!(b.map.len(), 1);
+        // ...without shrinking it to a tone's width.
+        assert!(b.get(a).unwrap().bandwidth_hz > 13e3, "{}", b.get(a).unwrap().bandwidth_hz);
+        // A narrow line 20 kHz away is not part of it.
+        b.observe(&rec(12, 929.6325, 3.0, 12), true);
+        assert_eq!(b.map.len(), 2);
     }
 
     #[test]
@@ -646,12 +926,17 @@ mod tests {
                 n += 1;
             }
         }
-        // ...and a comb at 750 kHz: 94.4992, 95.2492, 95.9992, 97.4992 MHz.
-        for mhz in [94.4992, 95.2492, 95.9992, 97.4992] {
-            for _ in 0..3 {
-                b.observe(&rec(n, mhz, 1.8, n), true);
+        // ...and a comb at 750 kHz: 94.4992, 95.2492, 95.9992, 97.4992 MHz,
+        // each line seen often enough to be a comb member.
+        for (k, mhz) in [94.4992, 95.2492, 95.9992, 97.4992].into_iter().enumerate() {
+            for i in 0..COMB_MEMBER_RECORDS as u64 {
+                // Steady: each second on the air for most of it.
+                let mut r = rec(n, mhz, 1.8, 100 + i);
+                r.t_end = r.t_start + Duration::from_millis(900);
+                b.observe(&r, true);
                 n += 1;
             }
+            let _ = k;
         }
         // A lone line, and a voice channel.
         b.observe(&rec(n, 241.0, 1.8, n), true);
@@ -668,6 +953,26 @@ mod tests {
         }
         assert_eq!(b.spur_context(241.0e6, 1.8e3, 240e6), None);
         assert_eq!(b.spur_context(240.2e6, 12.5e3, 240e6), None, "not a line");
+        // Four brief blips on a 25 kHz grid (a trunked site's leftovers)
+        // are not a comb: members must be persistent.
+        for mhz in [852.325, 852.35, 852.375, 852.4] {
+            for _ in 0..3 {
+                b.observe(&rec(n, mhz, 3.0, n), true);
+                n += 1;
+            }
+        }
+        assert_eq!(b.spur_context(852.425e6, 3.0e3, 855.5e6), None, "blips on a grid");
+        // Nor are blips seen often enough to pass the record count: on
+        // air a few tenths of the time, as on eddie's P25 site.
+        for (k, mhz) in [853.2, 853.2625, 853.325, 853.3875].into_iter().enumerate() {
+            for i in 0..(COMB_MEMBER_RECORDS as u64 + 4) {
+                let mut r = rec(n, mhz, 3.0, 200 + k as u64 + i * 10);
+                r.t_end = r.t_start + Duration::from_millis(400);
+                b.observe(&r, true);
+                n += 1;
+            }
+        }
+        assert_eq!(b.spur_context(853.45e6, 3.0e3, 855.5e6), None, "frequent blips on a raster");
     }
 
     #[test]
