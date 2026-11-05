@@ -57,6 +57,7 @@ fn the_app_shows_the_simulator_and_never_blocks_on_the_engine() {
     let mut app = App::new(handle.clone());
     let mut frame_ms: Vec<f64> = Vec::new();
     let mut opened: Option<SourceId> = None;
+    let mut stage = None; // A's stage before it closes, for the frame-time message
     let input = |k: usize| egui::RawInput {
         screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 900.0))),
         time: Some(k as f64 / 60.0),
@@ -88,15 +89,18 @@ fn the_app_shows_the_simulator_and_never_blocks_on_the_engine() {
             assert_eq!(pane.history_holes(), 0, "hole rows in a gap-free stream");
             assert!(pane.last_status().text.starts_with("Live at 855.250 MHz, 10 MS/s: holding "), "{}", pane.last_status().text);
             assert!(handle.latest().receivers.iter().any(|r| r.letter == 'B'), "the slow device opened as B");
+            stage = handle.latest().receivers.iter().find(|r| r.id == id).map(|r| r.stage.clone());
         }
         std::thread::sleep(Duration::from_millis(16));
     }
     assert!(app.pane(opened.unwrap()).is_none(), "the closed receiver's pane is gone");
+    let frame_ms_by_k = frame_ms.clone();
     frame_ms.sort_by(|a, b| a.total_cmp(b));
     let (p50, max) = (frame_ms[frame_ms.len() / 2], *frame_ms.last().unwrap());
     println!("headless frames: p50 {p50:.2} ms, max {max:.2} ms");
     // A 700 ms open on the snapshot thread must not reach the UI; 100 ms leaves room for a 2-vCPU CI runner's scheduling.
-    assert!(max < 100.0, "a frame took {max:.1} ms while the engine ran (slow open at frame 60)");
+    let slow: Vec<usize> = (0..frame_ms.len()).filter(|&k| frame_ms_by_k[k] >= 100.0).collect();
+    assert!(max < 100.0, "a frame took {max:.1} ms while the engine ran (slow open at frame 60); frames {slow:?}; stage {stage:?}");
     assert!(p50 < 10.0, "median frame {p50:.1} ms");
 }
 

@@ -95,7 +95,9 @@ fn snapshots_arrive_at_twenty_hertz_with_contiguous_rows() {
     }
     println!("{} snapshots and {} rows in 2 s", versions.len(), rows.len());
     assert!(versions.windows(2).all(|w| w[1] > w[0]));
-    assert!((34..=46).contains(&versions.len()), "{} snapshots in 2 s", versions.len());
+    // A starved runner shows in the stage's cost and lag.
+    let stage = h.latest().receivers.iter().find(|r| r.id == id).map(|r| r.stage.clone());
+    assert!((34..=46).contains(&versions.len()), "{} snapshots in 2 s; stage {stage:?}", versions.len());
     assert!(rows.len() >= 30, "{} rows", rows.len());
     // Block b spans (b - 1)L .. (b + 1)L with L = N/2, so each row's first block is the hop after the previous row's last:
     // the next row starts one hop before the previous one ends.

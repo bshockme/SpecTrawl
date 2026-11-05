@@ -136,10 +136,18 @@ noise floors read the same as in normal streaming.
 
 - USB load is 16 KB per hop per dwell block: about 11 MB/s at 680 hops/s, against a 44.9 MB/s ceiling.
 - Most hops take 3 blocks (1.23 ms).
-- Hops just above VCO divider changes (RF ≈ 50, 106, 216, 438 and 880 MHz) take longer, as does the low
-  band. A 100–124 MHz sweep runs at only ~188 hops/s (about 4.9 ms per hop), so revisit times vary by band.
-- The wrap from the top of the range back to the bottom takes **~7 ms**. The lock check absorbs all of
-  this; the host never has to guess.
+- The low band, 28–60 MHz, takes 2.5–4 ms per hop.
+- Crossing one of the tuner's VCO divider switches (RF ≈ 52, 106, 220, 442 and 885 MHz), in either
+  direction, costs about **10 ms**. A plan pays that once per crossing per pass. No band is slow in itself:
+  a sub-band plan that stays between two switch points runs at about 700–800 hops/s, depending on its own
+  wrap (a 3-step 500–516 MHz plan measured 736; 3-block hops with no wrap would give ~800).
+  - A small plan that straddles a switch point is slow out of proportion. The 4-step 100–124 MHz test plan
+    crossed 106 MHz twice per pass and so measured only ~188 hops/s.
+  - Leaving a band out of the plan doesn't avoid a switch: the hop over the gap still crosses it.
+- The wrap from the top of the range back to the bottom takes **~8 ms**. A back-and-forth order would save
+  only that (about 1.5%).
+- The lock check absorbs all of this; the host never has to guess.
+- Source: per-step hop times on sweep3 over 24–1800 MHz, in `~/hydrasdr/experiments/2026-11-05-sweep-order/`.
 - The stream is **not continuous** in sweep mode. The backend's delivered-vs-clock check
   (`check_delivery`) is off while sweeping; the trailer's DMA counter times each hop instead.
 - Gain is fixed for the whole pass. Linearity preset 10 is a reasonable survey default; the default

@@ -101,7 +101,9 @@ fn records_have_the_right_extent_and_timing_and_never_span_a_retune() {
 
     // Nothing else (no noise records, no edge blobs).
     let stray: Vec<_> = recs.iter().filter(|r| ![CW_HZ, P25_HZ, FM_HZ].iter().any(|&f| near(r, f))).collect();
-    assert!(stray.is_empty(), "records where nothing transmits: {stray:?}");
+    // A stage that fell behind and skipped ahead publishes short, noisier rows; say so if it did.
+    let stage = e.bus().stage(src.id()).map(|s| s.stats());
+    assert!(stray.is_empty(), "records where nothing transmits: {stray:?}; stage {stage:?}");
 
     // Every emitter in the view is one of the three.
     assert_eq!(view.emitters.len(), 3, "{:?}", view.emitters);

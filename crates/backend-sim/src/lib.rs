@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
+use num_complex::Complex;
 use sdr_core::{
     Backend, Capabilities, Complex32, Device, DeviceInfo, Error, GainSetting, IfArchitecture, NativeSweep, Result, SampleFormat, Samples,
     StreamEvent, StreamSink,
@@ -572,7 +573,8 @@ impl Generator {
                 if !on {
                     continue;
                 }
-                for (i, a) in acc.iter_mut().enumerate() {
+                let mut i = 0;
+                while i < acc.len() {
                     if s.sym_left <= 0.0 {
                         let dev = match e.modulation {
                             Modulation::Fsk { levels, sym_rate, dev_hz, sync } => {
@@ -605,22 +607,44 @@ impl Generator {
                         let w = std::f64::consts::TAU * (off + dev) / fs;
                         s.step = Complex32::new(w.cos() as f32, w.sin() as f32);
                     }
-                    s.sym_left -= 1.0;
-                    s.z *= s.step;
-                    let slot_on = match slot_s {
-                        Some(sl) => (((t_block + i as f64 / fs) / sl) as u64).is_multiple_of(2),
-                        None => true,
-                    };
-                    let env = match e.modulation {
-                        Modulation::AmTone { tone_hz, depth } => {
-                            s.tone_phase += std::f64::consts::TAU * tone_hz / fs;
-                            (1.0 + depth * s.tone_phase.sin()) as f32
-                        }
-                        _ => 1.0,
-                    };
-                    if slot_on {
-                        *a += s.z * (s.amp * env);
+                    // The samples up to the next symbol: the check above fires once `sym_left` has been decremented
+                    // to zero or below, ceil(sym_left) samples on (the decrements by 1.0 are exact).
+                    let left = acc.len() - i;
+                    let run = if s.sym_left.is_finite() { (s.sym_left.ceil() as usize).clamp(1, left) } else { left };
+                    if s.sym_left.is_finite() {
+                        s.sym_left -= run as f64;
                     }
+                    let span = &mut acc[i..i + run];
+                    match (e.modulation, slot_s) {
+                        (Modulation::AmTone { tone_hz, depth }, None) => {
+                            // The tone as a phasor too: one sin/cos per run, not per sample.
+                            let dt = std::f64::consts::TAU * tone_hz / fs;
+                            let (mut t, t_step) = (Complex::<f64>::from_polar(1.0, s.tone_phase), Complex::<f64>::from_polar(1.0, dt));
+                            for a in span.iter_mut() {
+                                s.z *= s.step;
+                                t *= t_step;
+                                *a += s.z * (s.amp * (1.0 + depth * t.im) as f32);
+                            }
+                            s.tone_phase += dt * run as f64;
+                        }
+                        (_, None) => rotate_into(span, &mut s.z, s.step, s.amp),
+                        (m, Some(sl)) => {
+                            for (j, a) in span.iter_mut().enumerate() {
+                                s.z *= s.step;
+                                let env = match m {
+                                    Modulation::AmTone { tone_hz, depth } => {
+                                        s.tone_phase += std::f64::consts::TAU * tone_hz / fs;
+                                        (1.0 + depth * s.tone_phase.sin()) as f32
+                                    }
+                                    _ => 1.0,
+                                };
+                                if (((t_block + (i + j) as f64 / fs) / sl) as u64).is_multiple_of(2) {
+                                    *a += s.z * (s.amp * env);
+                                }
+                            }
+                        }
+                    }
+                    i += run;
                 }
                 // Keep the phasor on the unit circle, and the tone's phase small.
                 s.z /= s.z.norm();
@@ -662,6 +686,30 @@ impl Generator {
     }
 }
 
+/// Adds `amp·z·stepᵏ` (k = 1, 2, …) to each of `out`, leaving `z` at the last. Four phasors a step apart advance by
+/// step⁴, so the multiplies don't wait on each other: one chain held the simulator to ~30 MS/s.
+fn rotate_into(out: &mut [Complex32], z: &mut Complex32, step: Complex32, amp: f32) {
+    let s2 = step * step;
+    let s4 = s2 * s2;
+    let mut zs = [*z * step, *z * s2, *z * s2 * step, *z * s4];
+    let mut last = *z;
+    let (quads, rest) = out.as_chunks_mut::<4>();
+    for q in quads {
+        for (a, zk) in q.iter_mut().zip(&zs) {
+            *a += *zk * amp;
+        }
+        last = zs[3];
+        for zk in &mut zs {
+            *zk *= s4;
+        }
+    }
+    for (a, zk) in rest.iter_mut().zip(zs) {
+        *a += zk * amp;
+        last = zk;
+    }
+    *z = last;
+}
+
 fn gate(t: f64, period: f64, duty: f64, phase: f64) -> bool {
     let p = (t / period + phase).fract();
     p < duty
@@ -695,6 +743,29 @@ impl XorShift {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn four_phasors_add_what_one_chain_adds() {
+        // Against the exact f64 rotation, over one block of the stage's size: no further off than one chain.
+        let (w, w0, amp) = (0.013_7f64, 0.4f64, 0.25f32);
+        let step = Complex32::new(w.cos() as f32, w.sin() as f32);
+        for len in [0, 1, 3, 4, 5, 7, 8, 4097, 65_536] {
+            let exact = |k: usize| Complex32::new(0.1, -0.2) + Complex32::from_polar(amp, (w0 + w * k as f64) as f32);
+            let z0 = Complex32::new(w0.cos() as f32, w0.sin() as f32);
+            let (mut chain, mut zc) = (vec![Complex32::new(0.1, -0.2); len], z0);
+            for a in &mut chain {
+                zc *= step;
+                *a += zc * amp;
+            }
+            let (mut got, mut zg) = (vec![Complex32::new(0.1, -0.2); len], z0);
+            rotate_into(&mut got, &mut zg, step, amp);
+            let worst = |v: &[Complex32]| v.iter().enumerate().map(|(k, a)| (a - exact(k + 1)).norm()).fold(0.0f32, f32::max);
+            let (e_chain, e_got) = (worst(&chain), worst(&got));
+            assert!(e_got <= 2.0 * e_chain + 1e-5, "len {len}: off by {e_got:e}, one chain by {e_chain:e}");
+            let z_exact = Complex32::from_polar(1.0, (w0 + w * len as f64) as f32);
+            assert!((zg - z_exact).norm() <= 2.0 * (zc - z_exact).norm() + 1e-5, "len {len}: z {zg}, one chain {zc}, exact {z_exact}");
+        }
+    }
 
     #[derive(Default)]
     struct Log {
