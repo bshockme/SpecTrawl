@@ -3,13 +3,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use api::{AudioMode, AudioView, PlayId, PlayTarget, PlayTo, SignalRecord};
 use parking_lot::Mutex;
 use sdr_core::Device;
 
+use crate::audio::AudioConfig;
 use crate::budget::{BudgetConfig, Mode, RingBudget, SourceId};
 use crate::channels::{BusConfig, ChannelBus};
 use crate::recorder::{Recorder, SliceConfig};
 use crate::records::{Loaded, RecordBook, RecordSink};
+use crate::replay::{Player, Resolved};
 use crate::ring::keeper::Keeper;
 use crate::source::{Source, SourceConfig};
 use crate::store::{Store, StoreConfig};
@@ -25,6 +28,8 @@ pub struct EngineConfig {
     pub store: Option<StoreConfig>,
     /// The slice tier (every record's IQ on disk); `None`: off.
     pub slices: Option<SliceConfig>,
+    /// What plays the replays' audio.
+    pub audio: AudioConfig,
 }
 
 pub struct Engine {
@@ -35,6 +40,7 @@ pub struct Engine {
     /// Why the configured store could not be opened.
     store_error: Option<String>,
     bus: Arc<ChannelBus>,
+    player: Player,
     sources: Mutex<HashMap<SourceId, Arc<Source>>>,
     /// The engine's handle; each `Source` holds the keeper too, so it lives
     /// as long as the last of them whatever the field order.
@@ -64,7 +70,8 @@ impl Engine {
             r.attach(&bus);
             records.set_recorder(r);
         }
-        Engine { cfg, records, store, store_error, keeper, bus, sources: Mutex::new(HashMap::new()) }
+        let player = Player::new(cfg.audio);
+        Engine { cfg, records, store, store_error, keeper, bus, player, sources: Mutex::new(HashMap::new()) }
     }
 
     /// Starts the device streaming into a new source and attaches the source to the bus.
@@ -123,6 +130,60 @@ impl Engine {
 
     pub fn keeper(&self) -> &Arc<Keeper> {
         &self.keeper
+    }
+
+    pub fn player(&self) -> &Player {
+        &self.player
+    }
+
+    /// Starts a replay (spec §4.7); `Err` says why it can't be heard.
+    /// A relative WAV path is under [`audio::default_dir`](crate::audio::default_dir).
+    pub fn play(&self, target: PlayTarget, mode: Option<AudioMode>, gain: f32, to: PlayTo) -> Result<PlayId, String> {
+        let to = match to {
+            PlayTo::Wav(p) if p.is_relative() => PlayTo::Wav(crate::audio::default_dir().join(p)),
+            to => to,
+        };
+        let what = match &target {
+            PlayTarget::Record(id) => {
+                let record = self
+                    .records
+                    .get(*id)
+                    .or_else(|| {
+                        self.store.as_ref().and_then(|s| s.query_result()).and_then(|q| q.records.iter().find(|r| r.id == *id).cloned())
+                    })
+                    .ok_or_else(|| format!("record {} is not in memory or in the last search", id.0))?;
+                let source = self.ring_of(&record);
+                Resolved::Record { record, source }
+            }
+            PlayTarget::Region { source, center_hz, bandwidth_hz, from_sample, to_sample } => Resolved::Region {
+                source: self.source(*source).ok_or("no such receiver")?,
+                center_hz: *center_hz,
+                bandwidth_hz: *bandwidth_hz,
+                from_sample: *from_sample,
+                to_sample: *to_sample,
+            },
+        };
+        self.player.play(&self.bus, what, target, mode, gain, to)
+    }
+
+    pub fn stop_play(&self, id: PlayId) -> bool {
+        self.player.stop(&self.bus, id)
+    }
+
+    pub fn audio_view(&self) -> AudioView {
+        self.player.view(&self.records)
+    }
+
+    /// The source whose ring holds a record's samples: the same device, in this run (source ids are reused across
+    /// runs, so the source's own timeline must put the record's first sample at the record's start time).
+    fn ring_of(&self, r: &SignalRecord) -> Option<Arc<Source>> {
+        let s = self.source(r.source)?;
+        if *s.snapshot().info.serial != *r.serial {
+            return None;
+        }
+        let t = s.time_of(r.first_sample)?;
+        let off = t.duration_since(r.t_start).or_else(|e| Ok::<_, ()>(e.duration())).ok()?;
+        (off < std::time::Duration::from_secs(1)).then_some(s)
     }
 }
 

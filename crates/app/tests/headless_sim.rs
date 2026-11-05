@@ -50,6 +50,7 @@ fn the_app_shows_the_simulator_and_never_blocks_on_the_engine() {
         source: SourceConfig::default(),
         store: None,
         slices: None,
+        audio: engine::audio::AudioConfig::Manual,
     });
     let handle = engine::snapshot::spawn(engine, vec![Box::new(GapFreeSim), Box::new(SlowBackend)], PublisherConfig::default());
     let ctx = egui::Context::default();
@@ -107,6 +108,7 @@ fn records_list_and_box_with_one_snapshot_in_five() {
         source: SourceConfig::default(),
         store: None,
         slices: None,
+        audio: engine::audio::AudioConfig::Manual,
     });
     let handle = engine::snapshot::spawn(engine, vec![Box::new(GapFreeSim)], PublisherConfig::default());
     let ctx = egui::Context::default();
@@ -166,6 +168,7 @@ fn a_sweeping_receiver_shows_its_passes_over_the_span() {
         source: SourceConfig::default(),
         store: None,
         slices: None,
+        audio: engine::audio::AudioConfig::Manual,
     });
     let handle = engine::snapshot::spawn(engine, vec![Box::new(GapFreeSim)], PublisherConfig::default());
     let ctx = egui::Context::default();
@@ -197,4 +200,75 @@ fn a_sweeping_receiver_shows_its_passes_over_the_span() {
     let (lo, hi) = pane.history_span().expect("rows in the waterfall");
     assert!((lo - 845e6).abs() < 1.0 && (hi - 881e6).abs() < 1.0, "the waterfall spans {lo}..{hi}");
     assert!(pane.history_len() > 5);
+}
+
+#[test]
+fn play_on_a_record_plays_it_and_stop_stops_it() {
+    let engine = Engine::new(EngineConfig {
+        budget: BudgetConfig { guaranteed_secs: 2.0, ceiling_bytes: 256 << 20, sweep_secs: 0.2 },
+        bus: BusConfig::default(),
+        source: SourceConfig::default(),
+        store: None,
+        slices: None,
+        // Plays advance at real time with no sound card.
+        audio: engine::audio::AudioConfig::Paced,
+    });
+    let handle = engine::snapshot::spawn(engine, vec![Box::new(GapFreeSim)], PublisherConfig::default());
+    let ctx = egui::Context::default();
+    let mut app = App::new(handle.clone());
+    let input = |k: usize| egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 900.0))),
+        time: Some(k as f64 / 20.0),
+        ..Default::default()
+    };
+    let mut frame_ms: Vec<f64> = Vec::new();
+    let mut frame = |app: &mut App, k: usize| {
+        let t = Instant::now();
+        let mut output = ctx.run_ui(input(k), |ui| app.frame(ui));
+        output.textures_delta.clear();
+        frame_ms.push(t.elapsed().as_secs_f64() * 1e3);
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    handle.send(Command::Open { backend: "sim".into(), serial: "SIM-0001".into() });
+    // The default scenario's continuous CW at 855.000 MHz: an open record, played at the live edge.
+    let mut cw = None;
+    for k in 0..100 {
+        frame(&mut app, k);
+        cw = handle.latest().records.records.iter().find(|r| (r.center_hz() - 855.0e6).abs() < 3e3 && r.open && r.rows > 10).map(|r| r.id);
+        if cw.is_some() {
+            break;
+        }
+    }
+    let cw = cw.expect("an open record at 855.000 MHz");
+    app.select(Some(cw));
+    let play = app.records_pane().play_command(cw);
+    app.push_command(play);
+    let mut playing = None;
+    for k in 100..160 {
+        frame(&mut app, k);
+        let snap = handle.latest();
+        if let Some(p) = spectrawl_app::records_pane::RecordsPane::play_of(&snap, cw)
+            && p.state == api::PlayState::Playing
+        {
+            playing = Some(p.clone());
+            break;
+        }
+    }
+    let p = playing.expect("the play reached Playing");
+    let line = spectrawl_app::records_pane::RecordsPane::play_line(&p);
+    // 855 MHz is not an air band: NFM, chosen by band, from the ring.
+    assert!(line.starts_with("playing") && line.contains("NFM (by band) from the ring"), "{line}");
+    app.push_command(Command::StopPlay(p.id));
+    let mut stopped = false;
+    for k in 160..200 {
+        frame(&mut app, k);
+        if spectrawl_app::records_pane::RecordsPane::play_of(&handle.latest(), cw).is_some_and(|p| p.state == api::PlayState::Stopped) {
+            stopped = true;
+            break;
+        }
+    }
+    assert!(stopped, "Stop did not stop it: {:?}", handle.latest().audio);
+    frame_ms.sort_by(|a, b| a.total_cmp(b));
+    let max = *frame_ms.last().unwrap();
+    assert!(max < 100.0, "a frame took {max:.1} ms");
 }

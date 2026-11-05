@@ -26,7 +26,8 @@ pub fn run() -> eframe::Result {
     let draft = devices_pane::BudgetDraft { guaranteed_secs: budget.guaranteed_secs, ceiling_mb: budget.ceiling_bytes >> 20 };
     let store = Some(engine::store::StoreConfig::new(engine::store::default_path()));
     let slices = Some(engine::recorder::SliceConfig::new(engine::recorder::default_dir()));
-    let engine = Engine::new(EngineConfig { budget, bus: BusConfig::default(), source: SourceConfig::default(), store, slices });
+    let audio = engine::audio::AudioConfig::Device;
+    let engine = Engine::new(EngineConfig { budget, bus: BusConfig::default(), source: SourceConfig::default(), store, slices, audio });
     let backends = vec![Box::new(backend_airspy::AirspyBackend::new()) as _, Box::new(backend_sim::SimBackend) as _];
     let (handle, guard) = engine::snapshot::spawn_with_guard(engine, backends, PublisherConfig::default());
     let viewport = egui::ViewportBuilder::default().with_title("SpecTrawl").with_inner_size([1600.0, 960.0]);

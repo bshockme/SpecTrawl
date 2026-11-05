@@ -30,6 +30,7 @@ fn main() {
         source: SourceConfig::default(),
         store: Some(StoreConfig::new(db)),
         slices: None,
+        audio: engine::audio::AudioConfig::Manual,
     });
     if let Some(err) = e.store_error() {
         panic!("store: {err}");

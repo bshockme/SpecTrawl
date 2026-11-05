@@ -35,6 +35,7 @@ fn engine(store: StoreConfig) -> Engine {
         source: SourceConfig::default(),
         store: Some(store),
         slices: None,
+        audio: engine::audio::AudioConfig::Manual,
     })
 }
 
