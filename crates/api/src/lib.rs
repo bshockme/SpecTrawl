@@ -14,11 +14,16 @@
 pub mod command;
 pub mod fmt;
 pub mod handle;
+pub mod records;
 pub mod snapshot;
 pub mod timeline;
 
 pub use command::{Ack, Command, CommandReceiver, CommandSender, Outcome, command_channel};
 pub use handle::Handle;
+pub use records::{
+    Claim, EmitterId, EmitterView, Evidence, IqClip, Note, PositionKind, QueryResult, RecordId, RecordQuery, RecordsView, Role,
+    SignalRecord, StoreView, headline,
+};
 pub use sdr_core::{Capabilities, DeviceInfo, GainSetting};
 pub use snapshot::{BusView, ConsumerView, DeviceEntry, Health, LogEntry, Receiver, RingView, Snapshot, StageView, Status};
 pub use timeline::{Boundary, Row, Segment, SegmentId};

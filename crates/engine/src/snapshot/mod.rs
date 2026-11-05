@@ -66,6 +66,8 @@ struct Publisher {
     watch: Watch,
     version: u64,
     swap: Arc<ArcSwap<Snapshot>>,
+    /// Empty until the record book exists (step 4 task 5).
+    records: Arc<api::RecordsView>,
 }
 
 /// Starts thread "snapshot"; the engine lives on it and is dropped when the last `Handle` is.
@@ -82,7 +84,17 @@ pub fn spawn_with_guard(engine: Engine, backends: Vec<Box<dyn Backend>>, cfg: Pu
     let swap = Arc::new(ArcSwap::from_pointee(Snapshot::empty()));
     let mut log = Log { lines: VecDeque::new(), kept: cfg.log_kept, n: 0 };
     let registry = Registry::new(&engine, backends, &mut log);
-    let mut p = Publisher { engine, registry, cfg, acks: VecDeque::new(), log, watch: Watch::default(), version: 0, swap: swap.clone() };
+    let mut p = Publisher {
+        engine,
+        registry,
+        cfg,
+        acks: VecDeque::new(),
+        log,
+        watch: Watch::default(),
+        version: 0,
+        swap: swap.clone(),
+        records: Arc::new(api::RecordsView::default()),
+    };
     p.publish();
     let (done_tx, done) = mpsc::channel::<()>();
     let thread = thread::Builder::new()
@@ -172,6 +184,9 @@ impl Publisher {
             bus,
             acks: self.acks.iter().cloned().collect(),
             log: self.log.lines.iter().cloned().collect(),
+            records: self.records.clone(),
+            store: None,
+            query: None,
         }));
     }
 }
@@ -186,6 +201,10 @@ fn command_name(c: &Command) -> &'static str {
         Command::SetGain { .. } => "set gain",
         Command::SetMode { .. } => "set mode",
         Command::SetBudget { .. } => "set budget",
+        Command::Tag { .. } => "tag",
+        Command::Untag { .. } => "untag",
+        Command::Note { .. } => "note",
+        Command::QueryRecords(_) => "query records",
     }
 }
 
@@ -199,6 +218,12 @@ fn command_source(c: &Command) -> Option<SourceId> {
     match c {
         Command::Close(id) => Some(*id),
         Command::Tune { source, .. } | Command::SetGain { source, .. } | Command::SetMode { source, .. } => Some(*source),
-        Command::Enumerate | Command::Open { .. } | Command::SetBudget { .. } => None,
+        Command::Enumerate
+        | Command::Open { .. }
+        | Command::SetBudget { .. }
+        | Command::Tag { .. }
+        | Command::Untag { .. }
+        | Command::Note { .. }
+        | Command::QueryRecords(_) => None,
     }
 }

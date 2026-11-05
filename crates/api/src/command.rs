@@ -7,23 +7,55 @@ use std::time::Duration;
 
 use sdr_core::GainSetting;
 
+use crate::records::{RecordId, RecordQuery};
 use crate::{Mode, SourceId};
 
 #[derive(Debug, Clone)]
 pub enum Command {
     Enumerate,
-    Open { backend: String, serial: String },
+    Open {
+        backend: String,
+        serial: String,
+    },
     Close(SourceId),
-    Tune { source: SourceId, center_hz: f64 },
-    SetGain { source: SourceId, gain: GainSetting },
-    SetMode { source: SourceId, mode: Mode },
-    SetBudget { guaranteed_secs: f64, ceiling_bytes: u64 },
+    Tune {
+        source: SourceId,
+        center_hz: f64,
+    },
+    SetGain {
+        source: SourceId,
+        gain: GainSetting,
+    },
+    SetMode {
+        source: SourceId,
+        mode: Mode,
+    },
+    SetBudget {
+        guaranteed_secs: f64,
+        ceiling_bytes: u64,
+    },
+    Tag {
+        record: RecordId,
+        tag: String,
+    },
+    Untag {
+        record: RecordId,
+        tag: String,
+    },
+    Note {
+        record: RecordId,
+        text: String,
+    },
+    /// Answered as [`Snapshot::query`](crate::Snapshot::query) with this command's sequence number.
+    QueryRecords(RecordQuery),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Outcome {
     Done,
     Opened(SourceId),
+    /// The query is running; its answer appears in a later snapshot.
+    Queried,
 }
 
 #[derive(Debug, Clone, PartialEq)]

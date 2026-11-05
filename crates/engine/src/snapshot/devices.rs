@@ -123,6 +123,10 @@ impl Registry {
                 log.push(Some(letter), format!("{letter} gain set"));
                 Ok(Outcome::Done)
             }
+            // Handled by the publisher (the record book and the store), never here.
+            Command::Tag { .. } | Command::Untag { .. } | Command::Note { .. } | Command::QueryRecords(_) => {
+                Err("records are not kept by this engine".into())
+            }
             Command::SetMode { source, mode } => {
                 let (letter, src) = self.target(engine, source)?;
                 src.set_mode(mode);

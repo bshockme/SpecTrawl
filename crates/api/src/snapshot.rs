@@ -6,6 +6,7 @@ use std::time::SystemTime;
 use sdr_core::{Capabilities, DeviceInfo, GainSetting};
 
 use crate::command::Ack;
+use crate::records::{QueryResult, RecordsView, StoreView};
 use crate::timeline::{Row, SegmentId};
 use crate::{ChannelId, ConsumerState, Mode, Priority, SourceId};
 
@@ -17,6 +18,12 @@ pub struct Snapshot {
     pub bus: BusView,
     pub acks: Vec<Ack>,
     pub log: Vec<Arc<LogEntry>>,
+    /// Open and recent records and emitters (the same `Arc` while nothing changed).
+    pub records: Arc<RecordsView>,
+    /// `None` when the engine runs without a store.
+    pub store: Option<StoreView>,
+    /// The latest history search's answer.
+    pub query: Option<Arc<QueryResult>>,
 }
 
 impl Snapshot {
@@ -29,6 +36,9 @@ impl Snapshot {
             bus: BusView { workers: 0, saturated: false, shed_total: 0, panicked_total: 0 },
             acks: Vec::new(),
             log: Vec::new(),
+            records: Arc::new(RecordsView::default()),
+            store: None,
+            query: None,
         }
     }
 }
