@@ -35,7 +35,8 @@ pub fn status_line(i: &StatusInput) -> Status {
     }
     if i.mode == Mode::Sweep {
         let Some(s) = &i.sweep else { return status(Health::Ok, "Starting the sweep".into(), None) };
-        let span = format!("Sweeping {:.1}–{:.1} MHz", s.start_hz / 1e6, s.stop_hz / 1e6);
+        let board = if s.on_board { " on the board" } else { "" };
+        let span = format!("Sweeping {:.1}–{:.1} MHz{board}", s.start_hz / 1e6, s.stop_hz / 1e6);
         let measured = if s.measured_hops < s.hops { format!(" ({} of {} hops)", s.measured_hops, s.hops) } else { String::new() };
         if s.passes == 0 {
             return status(Health::Ok, format!("{span}{measured}: first pass, hop {} of {}", s.current_hop + 1, s.hops), None);
@@ -46,6 +47,10 @@ pub fn status_line(i: &StatusInput) -> Status {
             s.hops_per_sec,
             s.hops_per_sec * s.hop_hz / 1e6
         );
+        if s.unseen_retunes > 0 && s.on_board {
+            let reason = format!("the board stopped sending hops {} times and was restarted", s.unseen_retunes);
+            return status(Health::Warning, text, Some(reason));
+        }
         if s.unseen_retunes > 0 {
             let reason = format!("{} retunes never showed in the stream; those hops were measured from the head", s.unseen_retunes);
             return status(Health::Warning, text, Some(reason));
@@ -143,6 +148,7 @@ mod tests {
             slow_hops: 0,
             lock_waits: 0,
             unseen_retunes: 0,
+            on_board: false,
         };
         let s = status_line(&StatusInput { mode: Mode::Sweep, sweep: Some(view.clone()), ..base() });
         assert_eq!(s.text, "Sweeping 24.0–1797.0 MHz: first pass, hop 41 of 197");
@@ -151,9 +157,12 @@ mod tests {
         assert_eq!((s.text.as_str(), s.health), ("Sweeping 24.0–1797.0 MHz: pass 1.3 s, 152 hops/s (1368 MHz/s)", Health::Ok));
         let part = api::SweepView { measured_hops: 12, ..done.clone() };
         assert!(status_line(&StatusInput { mode: Mode::Sweep, sweep: Some(part), ..base() }).text.contains("(12 of 197 hops)"));
-        let unseen = api::SweepView { unseen_retunes: 2, ..done };
+        let unseen = api::SweepView { unseen_retunes: 2, ..done.clone() };
         let s = status_line(&StatusInput { mode: Mode::Sweep, sweep: Some(unseen), ..base() });
         assert_eq!(s.health, Health::Warning);
         assert!(s.reason.unwrap().starts_with("2 retunes never showed"));
+        let board = api::SweepView { on_board: true, last_pass_s: 0.3, hops_per_sec: 650.0, ..done };
+        let s = status_line(&StatusInput { mode: Mode::Sweep, sweep: Some(board), ..base() });
+        assert_eq!(s.text, "Sweeping 24.0–1797.0 MHz on the board: pass 0.3 s, 650 hops/s (5850 MHz/s)");
     }
 }

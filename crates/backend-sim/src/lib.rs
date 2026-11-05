@@ -2,15 +2,20 @@
 //! emitters at fixed absolute frequencies, so tuning behaves like hardware.
 //! Used for UI work without a device and as the base of the test suite.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
 use sdr_core::{
-    Backend, Capabilities, Complex32, Device, DeviceInfo, Error, GainSetting, IfArchitecture, Result, SampleFormat, Samples, StreamEvent,
-    StreamSink,
+    Backend, Capabilities, Complex32, Device, DeviceInfo, Error, GainSetting, IfArchitecture, NativeSweep, Result, SampleFormat, Samples,
+    StreamEvent, StreamSink,
 };
+
+/// A simulated board sweep's block (an RFOne's: 8176 real samples at 20 MS/s, as IQ at 10 MS/s).
+pub const NATIVE_BLOCK_SAMPLES: usize = 4088;
+/// Wall time per simulated board hop: lock wait plus a block, ~3 blocks of 409.6 µs as on an RFOne.
+const NATIVE_HOP_S: f64 = 0.00123;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Modulation {
@@ -205,6 +210,8 @@ pub struct SimConfig {
     /// depend on the machine's scheduling).
     pub report_lag_gaps: bool,
     pub serial: String,
+    /// Offer a board sweep (`Capabilities::native_sweep`), simulated the way an RFOne's firmware sends one.
+    pub native_sweep: bool,
 }
 
 impl Default for SimConfig {
@@ -217,6 +224,7 @@ impl Default for SimConfig {
             paced: true,
             report_lag_gaps: true,
             serial: "SIM-0001".into(),
+            native_sweep: false,
         }
     }
 }
@@ -232,6 +240,8 @@ pub struct SimShared {
     samples_sent: AtomicU64,
     /// True from `start` until the generator thread exits.
     alive: AtomicBool,
+    /// The board sweep running, if any.
+    native: Mutex<Option<NativeSweep>>,
 }
 
 /// Test handle for a `SimDevice`: injects faults and observes the stream.
@@ -317,7 +327,7 @@ impl SimDevice {
                 if_arch: IfArchitecture::RealIf,
                 gain_stages: vec![],
                 has_linearity_sensitivity_presets: false,
-                native_sweep: false,
+                native_sweep: cfg.native_sweep,
                 channels: 1,
                 ext_clock: false,
                 bias_tee: false,
@@ -373,6 +383,23 @@ impl Device for SimDevice {
     }
 
     fn set_gain(&mut self, _gain: GainSetting) -> Result<()> {
+        Ok(())
+    }
+
+    fn start_native_sweep(&mut self, plan: NativeSweep) -> Result<NativeSweep> {
+        if !self.caps.native_sweep {
+            return Err(Error::Unsupported("native sweep".into()));
+        }
+        if !self.is_streaming() || plan.steps == 0 || plan.dwell_blocks == 0 {
+            return Err(Error::Unsupported("native sweep: not streaming, or an empty grid".into()));
+        }
+        let granted = NativeSweep { block_samples: NATIVE_BLOCK_SAMPLES, ..plan };
+        *self.shared.native.lock().unwrap() = Some(granted);
+        Ok(granted)
+    }
+
+    fn stop_native_sweep(&mut self) -> Result<()> {
+        self.shared.native.lock().unwrap().take();
         Ok(())
     }
 
@@ -465,6 +492,10 @@ impl Generator {
         let mut n: u64 = 0;
         let mut t0 = Instant::now();
         let mut last_anchor: Option<u64> = None;
+        // Stream time (s): samples / rate live, hops × NATIVE_HOP_S in a board sweep.
+        let mut virt = 0.0f64;
+        let mut last_anchor_t = 0.0f64;
+        let mut board: Option<(NativeSweep, u32)> = None;
 
         while self.running.load(Ordering::Relaxed) {
             if self.shared.pending_stall.swap(false, Ordering::Relaxed) {
@@ -479,15 +510,39 @@ impl Generator {
                 // The lost span did not take real time; keep the pacing clock in step.
                 let skipped = Duration::from_secs_f64(lost as f64 / fs);
                 t0 = t0.checked_sub(skipped).unwrap_or(t0);
+                virt += lost as f64 / fs;
             }
             if self.shared.pending_overload.swap(false, Ordering::Relaxed) {
                 sink.on_event(StreamEvent::Overload { at_sample: n });
             }
-            if last_anchor.is_none_or(|a| (n - a) as f64 >= fs) {
-                sink.on_event(StreamEvent::TimeAnchor { at_sample: n, host_time: SystemTime::now() });
-                last_anchor = Some(n);
+            let plan = *self.shared.native.lock().unwrap();
+            if plan != board.map(|b| b.0) {
+                board = plan.map(|p| (p, 0));
+                if board.is_none() {
+                    // Back to the live tuning.
+                    center = f64::NAN;
+                }
             }
-            let c = f64::from_bits(self.center.load(Ordering::Relaxed));
+            let len = board.map_or(BLOCK, |(p, _)| p.block_samples * usize::from(p.dwell_blocks)).min(BLOCK);
+            if board.is_some() {
+                if virt - last_anchor_t >= 0.025 || last_anchor.is_none() {
+                    sink.on_event(StreamEvent::TimeAnchor { at_sample: n, host_time: SystemTime::now() });
+                    (last_anchor, last_anchor_t) = (Some(n), virt);
+                }
+            } else if last_anchor.is_none_or(|a| (n - a) as f64 >= fs) {
+                sink.on_event(StreamEvent::TimeAnchor { at_sample: n, host_time: SystemTime::now() });
+                (last_anchor, last_anchor_t) = (Some(n), virt);
+            }
+            let c = match board.as_mut() {
+                Some((p, step)) => {
+                    let c = p.first_center_hz + p.step_hz * f64::from(*step);
+                    *step = (*step + 1) % p.steps;
+                    // Every hop is a segment of its own, even one repeating the last centre.
+                    center = f64::NAN;
+                    c
+                }
+                None => f64::from_bits(self.center.load(Ordering::Relaxed)),
+            };
             if c != center {
                 center = c;
                 // Every emitter's step was computed against the old centre.
@@ -496,10 +551,11 @@ impl Generator {
                 }
                 sink.on_event(StreamEvent::Retune { at_sample: n, center_hz: center, sample_rate: fs });
             }
+            let (acc, out) = (&mut acc[..len], &mut out[..len]);
             for a in acc.iter_mut() {
                 *a = Complex32::new(rng.gauss() * self.noise_amp, rng.gauss() * self.noise_amp);
             }
-            let t_block = n as f64 / fs;
+            let t_block = virt;
             for (e, s) in self.emitters.iter().zip(st.iter_mut()) {
                 let off = e.freq_hz - center;
                 if off.abs() > fs * 0.5 {
@@ -560,12 +616,13 @@ impl Generator {
                 // Keep the phasor on the unit circle.
                 s.z /= s.z.norm();
             }
-            for (o, a) in out.iter_mut().zip(&acc) {
+            for (o, a) in out.iter_mut().zip(acc.iter()) {
                 *o = [(a.re * 32767.0).clamp(-32768.0, 32767.0) as i16, (a.im * 32767.0).clamp(-32768.0, 32767.0) as i16];
             }
-            sink.on_samples(n, Samples::Ci16(&out));
-            n += BLOCK as u64;
-            self.shared.samples_sent.fetch_add(BLOCK as u64, Ordering::Relaxed);
+            sink.on_samples(n, Samples::Ci16(out));
+            n += len as u64;
+            virt += if board.is_some() { NATIVE_HOP_S } else { len as f64 / fs };
+            self.shared.samples_sent.fetch_add(len as u64, Ordering::Relaxed);
 
             if self.shared.pending_drop.swap(false, Ordering::Relaxed) {
                 sink.on_event(StreamEvent::DeviceLost);
@@ -577,15 +634,16 @@ impl Generator {
 
             // Pace to real time; if we fall behind, report the skipped span as
             // a gap, or (without lag gaps) restart the clock from now.
-            let due = t0 + Duration::from_secs_f64(n as f64 / fs);
+            let due = t0 + Duration::from_secs_f64(virt);
             let now = Instant::now();
             if due > now {
                 std::thread::sleep(due - now);
             } else if now - due > Duration::from_millis(250) {
-                if self.report_lag_gaps {
+                if self.report_lag_gaps && board.is_none() {
                     let lost = ((now - due).as_secs_f64() * fs) as u64;
                     sink.on_event(StreamEvent::Gap { at_sample: n, lost_samples: lost });
                     n += lost;
+                    virt += lost as f64 / fs;
                 } else {
                     t0 += now - due;
                 }

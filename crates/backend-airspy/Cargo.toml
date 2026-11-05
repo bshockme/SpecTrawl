@@ -11,3 +11,4 @@ sdr-core = { version = "0.1.0", path = "../sdr-core" }
 
 [dev-dependencies]
 parking_lot = "0.12.5"
+rustfft = "6.4.1"

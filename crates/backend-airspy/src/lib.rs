@@ -18,9 +18,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use libloading::Library;
 use sdr_core::{
-    Backend, Capabilities, Complex32, Device, DeviceInfo, Error, GainSetting, GainStage, IfArchitecture, Result, SampleFormat, Samples,
-    StreamEvent, StreamSink,
+    Backend, Capabilities, Complex32, Device, DeviceInfo, Error, GainSetting, GainStage, IfArchitecture, NativeSweep, Result, SampleFormat,
+    Samples, StreamEvent, StreamSink,
 };
+
+pub mod native;
 
 #[repr(C)]
 struct AirspyDev {
@@ -53,6 +55,8 @@ enum SetFreq {
 type RxCb = unsafe extern "C" fn(*mut Transfer) -> c_int;
 
 const SAMPLE_FLOAT32_IQ: c_int = 0;
+/// libhydrasdr: the ADC's words untouched (the firmware sweep's tagged blocks).
+const SAMPLE_RAW: c_int = 5;
 const SUCCESS: c_int = 0;
 const TRUE: c_int = 1;
 
@@ -488,6 +492,13 @@ impl AirspyBackend {
         let sn = u64::from_str_radix(serial, 16).map_err(|_| Error::NotFound(serial.into()))?;
         let (api, dev, rates, model) = probe(&apis, self.scan_unlisted(), sn)?;
         let rate = rates.iter().copied().fold(0.0, f64::max);
+        // Custom RFOne firmware with an on-board sweep ("v1.0.2-sweep2"); stock
+        // firmware STALLs its requests. It needs libhydrasdr's raw stream.
+        let fw = firmware(&api, dev);
+        let native_sweep = api.hydra && fw.contains("sweep");
+        if native_sweep {
+            log::info!("{serial}: firmware {fw} sweeps on the board");
+        }
         let mut d = AirspyDevice {
             api,
             dev,
@@ -510,7 +521,7 @@ impl AirspyBackend {
                     GainStage { name: "VGA".into(), min: 0.0, max: 15.0, step: 1.0 },
                 ],
                 has_linearity_sensitivity_presets: true,
-                native_sweep: false,
+                native_sweep,
                 channels: 1,
                 ext_clock: false,
                 bias_tee: true,
@@ -522,6 +533,8 @@ impl AirspyBackend {
             center_set_at: Arc::new(AtomicU64::new(0)),
             rate,
             ctx: std::ptr::null_mut(),
+            packing: false,
+            native: None,
         };
         d.api.check("set_sample_type", unsafe { (d.api.set_sample_type)(dev, SAMPLE_FLOAT32_IQ) })?;
         d.api.check("set_samplerate", unsafe { (d.api.set_samplerate)(dev, rate as u32) })?;
@@ -541,7 +554,9 @@ impl AirspyDevice {
     /// 12-bit packed USB transfers (15 rather than 20 MB/s at 10 MS/s); the
     /// samples are the same. Takes effect at the next start.
     pub fn set_packing(&mut self, on: bool) -> Result<()> {
-        self.api.check("set_packing", unsafe { (self.api.set_packing)(self.dev, u8::from(on)) })
+        self.api.check("set_packing", unsafe { (self.api.set_packing)(self.dev, u8::from(on)) })?;
+        self.packing = on;
+        Ok(())
     }
 
     /// Reads one R820T tuner register (through the Airspy's firmware).
@@ -549,6 +564,71 @@ impl AirspyDevice {
         let mut v = 0u8;
         self.api.check("r820t_read", unsafe { (self.api.r820t_read)(self.dev, reg, &mut v) })?;
         Ok(v)
+    }
+
+    /// The callback's sweep state. Safe to touch only while the callback is
+    /// stopped, or (as `start_native_sweep` does) for a plain field it only reads.
+    unsafe fn raw_mut(&mut self) -> Option<&mut RawRx> {
+        if self.ctx.is_null() { None } else { unsafe { (*self.ctx).raw.as_mut() } }
+    }
+
+    fn granted(&self, first: u32, step: u32, plan: NativeSweep) -> NativeSweep {
+        NativeSweep {
+            first_center_hz: f64::from(first),
+            step_hz: f64::from(step),
+            steps: plan.steps,
+            dwell_blocks: plan.dwell_blocks,
+            block_samples: native::BLOCK_SAMPLES,
+        }
+    }
+
+    /// Stops the stream and starts it again raw for a firmware sweep (`Some`),
+    /// or back as IQ at the live centre (`None`). The callback's sample count
+    /// carries on; a time anchor and a `Retune` follow the restart.
+    fn restart_stream(&mut self, raw: Option<RawRx>) -> Result<()> {
+        let a = self.api.clone();
+        a.check("stop_rx", unsafe { (a.stop_rx)(self.dev) })?;
+        // stop_rx joined the library's threads: the context is ours until start_rx.
+        let ctx = unsafe { &mut *self.ctx };
+        let sweeping = raw.is_some();
+        ctx.raw = raw;
+        ctx.dropped_total = None;
+        ctx.window = None;
+        ctx.last_anchor = 0;
+        if sweeping {
+            a.check("set_packing", unsafe { (a.set_packing)(self.dev, 0) })?;
+            a.check("set_sample_type", unsafe { (a.set_sample_type)(self.dev, SAMPLE_RAW) })?;
+        } else {
+            a.check("set_sample_type", unsafe { (a.set_sample_type)(self.dev, SAMPLE_FLOAT32_IQ) })?;
+            a.check("set_packing", unsafe { (a.set_packing)(self.dev, u8::from(self.packing)) })?;
+            // The board left the tuner on its last step: back to the live centre,
+            // reported at the first sample after the restart.
+            let c = self.center.load(Ordering::Relaxed);
+            a.check("set_freq", a.set_freq(self.dev, f64::from_bits(c)))?;
+            ctx.reported_center = 0;
+            ctx.center_set_at.store(instant_to_nanos(Instant::now()), Ordering::Release);
+        }
+        a.check("start_rx", unsafe { (a.start_rx)(self.dev, rx_callback, self.ctx as *mut c_void) })
+    }
+
+    fn apply_gain(&mut self, gain: GainSetting) -> Result<()> {
+        let a = &self.api;
+        let step = |v: f32| (v.clamp(0.0, 1.0) * 21.0).round() as u8;
+        match gain {
+            GainSetting::Linearity(v) => a.check("set_linearity_gain", unsafe { (a.set_linearity_gain)(self.dev, step(v)) }),
+            GainSetting::Sensitivity(v) => a.check("set_sensitivity_gain", unsafe { (a.set_sensitivity_gain)(self.dev, step(v)) }),
+            GainSetting::Auto => {
+                a.check("set_lna_agc", unsafe { (a.set_lna_agc)(self.dev, 1) })?;
+                a.check("set_mixer_agc", unsafe { (a.set_mixer_agc)(self.dev, 1) })
+            }
+            GainSetting::Manual { lna, mixer, vga } => {
+                a.check("set_lna_agc", unsafe { (a.set_lna_agc)(self.dev, 0) })?;
+                a.check("set_mixer_agc", unsafe { (a.set_mixer_agc)(self.dev, 0) })?;
+                a.check("set_lna_gain", unsafe { (a.set_lna_gain)(self.dev, lna.min(14)) })?;
+                a.check("set_mixer_gain", unsafe { (a.set_mixer_gain)(self.dev, mixer.min(15)) })?;
+                a.check("set_vga_gain", unsafe { (a.set_vga_gain)(self.dev, vga.min(15)) })
+            }
+        }
     }
 }
 
@@ -568,6 +648,58 @@ struct CbCtx {
     /// whether it is the first (start-up buffering, not judged).
     window: Option<(Instant, u64, bool)>,
     warned: Option<Instant>,
+    hydra: bool,
+    /// libhydrasdr reports dropped samples as a running total (libairspy per
+    /// transfer): the total seen so far, `None` until the first transfer.
+    dropped_total: Option<u64>,
+    /// Running the firmware sweep: the stream is its raw tagged blocks.
+    raw: Option<RawRx>,
+}
+
+/// The callback's side of a firmware sweep.
+struct RawRx {
+    conv: native::RawToIq,
+    buf: Vec<Complex32>,
+    /// Steps in the grid (for spotting skipped steps).
+    steps: u32,
+    /// The hop being delivered, and whether its blocks are being left out.
+    key: Option<(u32, u16)>,
+    skip: bool,
+    /// The device clock's origin on the host clock, and the last anchor's tick.
+    clock: Option<(u32, SystemTime)>,
+    last_anchor: u32,
+    last_overload: Option<u32>,
+    stats: RawStats,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct RawStats {
+    hops: u64,
+    torn: u64,
+    untagged: u64,
+    lock_timeouts: u64,
+    skipped_steps: u64,
+    dropped_blocks: u64,
+}
+
+/// A time anchor at least this often on the device's clock (~25 ms), so a
+/// hop's time is known though the stream is not continuous.
+const ANCHOR_TICKS: u32 = 61;
+
+impl RawRx {
+    fn new(steps: u32) -> Self {
+        Self {
+            conv: native::RawToIq::new(),
+            buf: Vec::with_capacity(native::BLOCK_SAMPLES),
+            steps,
+            key: None,
+            skip: false,
+            clock: None,
+            last_anchor: 0,
+            last_overload: None,
+            stats: RawStats::default(),
+        }
+    }
 }
 
 /// Delivery is judged over windows this long.
@@ -577,6 +709,73 @@ const RATE_WINDOW: Duration = Duration::from_secs(2);
 const RATE_SHORT: f64 = 0.05;
 
 impl CbCtx {
+    /// Samples lost since the last transfer, from the library's count.
+    fn newly_dropped(&mut self, reported: u64, hydra: bool) -> u64 {
+        if !hydra {
+            return reported;
+        }
+        let lost = self.dropped_total.map_or(0, |seen| reported.saturating_sub(seen));
+        self.dropped_total = Some(reported);
+        lost
+    }
+
+    /// One transfer of the firmware sweep: whole tagged blocks, each becoming
+    /// one block of IQ; a new hop starts with its `Retune`.
+    fn on_raw(&mut self, raw: &mut RawRx, words: &[u16]) {
+        for w in words.as_chunks::<{ native::BLOCK_WORDS }>().0 {
+            let t = match native::parse(w) {
+                native::Block::Tagged(t) => t,
+                native::Block::Torn => {
+                    raw.stats.torn += 1;
+                    continue;
+                }
+                native::Block::Untagged => {
+                    raw.stats.untagged += 1;
+                    continue;
+                }
+            };
+            let key = (t.sweep, t.step);
+            if raw.key != Some(key) {
+                if let Some((sweep, step)) = raw.key {
+                    let next = if u32::from(step) + 1 >= raw.steps { (sweep.wrapping_add(1), 0) } else { (sweep, step + 1) };
+                    if key != next && t.step != 0 {
+                        raw.stats.skipped_steps += 1;
+                    }
+                }
+                raw.key = Some(key);
+                // A hop is delivered whole or not at all: from its first block, locked.
+                raw.skip = t.lock_timed_out || t.block != 0;
+                if t.lock_timed_out {
+                    raw.stats.lock_timeouts += 1;
+                }
+                if raw.skip {
+                    continue;
+                }
+                let (tick0, host0) = *raw.clock.get_or_insert((t.dma, SystemTime::now()));
+                let since = t.dma.wrapping_sub(tick0);
+                if raw.stats.hops == 0 || t.dma.wrapping_sub(raw.last_anchor) >= ANCHOR_TICKS {
+                    raw.last_anchor = t.dma;
+                    let host_time = host0 + Duration::from_secs_f64(f64::from(since) * native::TICK_S);
+                    self.sink.on_event(StreamEvent::TimeAnchor { at_sample: self.n, host_time });
+                }
+                self.sink.on_event(StreamEvent::Retune { at_sample: self.n, center_hz: f64::from(t.center_hz), sample_rate: self.rate });
+                raw.stats.hops += 1;
+            } else if raw.skip {
+                continue;
+            }
+            // At most one overload a second of the device's clock.
+            if native::clipped_fraction(w) >= OVERLOAD_FRACTION
+                && raw.last_overload.is_none_or(|o| f64::from(t.dma.wrapping_sub(o)) * native::TICK_S >= 1.0)
+            {
+                raw.last_overload = Some(t.dma);
+                self.sink.on_event(StreamEvent::Overload { at_sample: self.n });
+            }
+            raw.conv.process(&w[8..native::BLOCK_WORDS - 8], &mut raw.buf);
+            self.sink.on_samples(self.n, Samples::Cf32(&raw.buf));
+            self.n += raw.buf.len() as u64;
+        }
+    }
+
     /// The board's FIFO overflows when the host can't drain it fast enough
     /// (two radios at 10 MS/s through one USB 2 hub: each got 5.6 MS/s on
     /// eddie, 2026-11-04) and the samples vanish without either library
@@ -620,9 +819,19 @@ unsafe extern "C" fn rx_callback(t: *mut Transfer) -> c_int {
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         let t = &*t;
         let ctx = &mut *(t.ctx as *mut CbCtx);
-        if t.dropped_samples > 0 {
-            ctx.sink.on_event(StreamEvent::Gap { at_sample: ctx.n, lost_samples: t.dropped_samples });
-            ctx.n += t.dropped_samples;
+        if let Some(mut raw) = ctx.raw.take() {
+            // A dropped raw buffer is lost hops, not a hole in a continuous stream.
+            let lost = ctx.newly_dropped(t.dropped_samples, true);
+            raw.stats.dropped_blocks += lost / native::BLOCK_WORDS as u64;
+            let words = std::slice::from_raw_parts(t.samples as *const u16, t.sample_count.max(0) as usize);
+            ctx.on_raw(&mut raw, words);
+            ctx.raw = Some(raw);
+            return;
+        }
+        let lost = ctx.newly_dropped(t.dropped_samples, ctx.hydra);
+        if lost > 0 {
+            ctx.sink.on_event(StreamEvent::Gap { at_sample: ctx.n, lost_samples: lost });
+            ctx.n += lost;
         }
         let s = std::slice::from_raw_parts(t.samples as *const Complex32, t.sample_count.max(0) as usize);
         // Centre first, then its request time: `set_center` stores them in the
@@ -658,6 +867,15 @@ pub struct AirspyDevice {
     center_set_at: Arc<AtomicU64>,
     rate: f64,
     ctx: *mut CbCtx,
+    /// Set by `set_packing`, restored after a firmware sweep (which needs it off).
+    packing: bool,
+    native: Option<NativeState>,
+}
+
+/// A running firmware sweep.
+struct NativeState {
+    handle: native::VendorHandle,
+    params: [u8; 16],
 }
 
 // The raw handle is only used through libairspy, which is thread-safe for the
@@ -687,6 +905,9 @@ impl Device for AirspyDevice {
         if !(lo..=hi).contains(&hz) {
             return Err(Error::Unsupported(format!("{:.3} MHz out of range", hz / 1e6)));
         }
+        if self.native.is_some() {
+            return Err(Error::Unsupported("tune while the board sweeps".into()));
+        }
         self.api.check("set_freq", self.api.set_freq(self.dev, hz))?;
         // Time first, centre second (Release): the callback reads them in the
         // opposite order, so a new centre is never paired with a stale time.
@@ -711,23 +932,97 @@ impl Device for AirspyDevice {
     }
 
     fn set_gain(&mut self, gain: GainSetting) -> Result<()> {
-        let a = &self.api;
-        let step = |v: f32| (v.clamp(0.0, 1.0) * 21.0).round() as u8;
-        match gain {
-            GainSetting::Linearity(v) => a.check("set_linearity_gain", unsafe { (a.set_linearity_gain)(self.dev, step(v)) }),
-            GainSetting::Sensitivity(v) => a.check("set_sensitivity_gain", unsafe { (a.set_sensitivity_gain)(self.dev, step(v)) }),
-            GainSetting::Auto => {
-                a.check("set_lna_agc", unsafe { (a.set_lna_agc)(self.dev, 1) })?;
-                a.check("set_mixer_agc", unsafe { (a.set_mixer_agc)(self.dev, 1) })
+        // The board refuses gain requests while it sweeps: pause it around them.
+        if let Some(n) = &self.native {
+            n.handle.request(native::SWEEP_STOP, &[])?;
+            let r = self.apply_gain(gain);
+            let n = self.native.as_ref().expect("still sweeping");
+            n.handle.request(native::SWEEP_START, &n.params)?;
+            return r;
+        }
+        self.apply_gain(gain)
+    }
+
+    fn start_native_sweep(&mut self, plan: NativeSweep) -> Result<NativeSweep> {
+        if !self.caps.native_sweep {
+            return Err(Error::Unsupported("native sweep (needs RFOne sweep firmware and libhydrasdr)".into()));
+        }
+        if self.ctx.is_null() {
+            return Err(Error::Unsupported("native sweep before the stream starts".into()));
+        }
+        let (lo, hi) = self.caps.freq_ranges_hz[0];
+        let last = plan.first_center_hz + plan.step_hz * f64::from(plan.steps.max(1) - 1);
+        if plan.steps == 0 || plan.steps > u32::from(u16::MAX) || plan.dwell_blocks == 0 {
+            return Err(Error::Unsupported(format!("native sweep of {} steps, {} blocks each", plan.steps, plan.dwell_blocks)));
+        }
+        // The flat part of the IF is ~±4.65 MHz.
+        if !(1e6..=9.3e6).contains(&plan.step_hz) || plan.first_center_hz < lo || last > hi {
+            return Err(Error::Unsupported(format!(
+                "native sweep {:.3}–{:.3} MHz in {:.2} MHz steps",
+                plan.first_center_hz / 1e6,
+                last / 1e6,
+                plan.step_hz / 1e6
+            )));
+        }
+        let (first, step) = (plan.first_center_hz.round() as u32, plan.step_hz.round() as u32);
+        let params = native::start_params(first, step, plan.steps as u16, plan.dwell_blocks);
+        match self.native.take() {
+            Some(mut n) => {
+                let r = n.handle.request(native::SWEEP_STOP, &[]).and_then(|()| {
+                    // The callback is running; it only reads the step count, to spot skipped steps.
+                    if let Some(r) = unsafe { self.raw_mut() } {
+                        r.steps = plan.steps;
+                    }
+                    n.handle.request(native::SWEEP_START, &params)
+                });
+                n.params = params;
+                self.native = Some(n);
+                r?;
             }
-            GainSetting::Manual { lna, mixer, vga } => {
-                a.check("set_lna_agc", unsafe { (a.set_lna_agc)(self.dev, 0) })?;
-                a.check("set_mixer_agc", unsafe { (a.set_mixer_agc)(self.dev, 0) })?;
-                a.check("set_lna_gain", unsafe { (a.set_lna_gain)(self.dev, lna.min(14)) })?;
-                a.check("set_mixer_gain", unsafe { (a.set_mixer_gain)(self.dev, mixer.min(15)) })?;
-                a.check("set_vga_gain", unsafe { (a.set_vga_gain)(self.dev, vga.min(15)) })
+            None => {
+                let handle = native::VendorHandle::open(&self.info.serial)?;
+                self.restart_stream(Some(RawRx::new(plan.steps)))?;
+                // As the reference client does: let the stream get going first.
+                std::thread::sleep(Duration::from_millis(50));
+                if let Err(e) = handle.request(native::SWEEP_START, &params) {
+                    let _ = self.restart_stream(None);
+                    return Err(e);
+                }
+                log::info!(
+                    "{}: board sweep {:.3}–{:.3} MHz, {} steps of {:.2} MHz, {} block(s) each",
+                    self.info.serial,
+                    f64::from(first) / 1e6,
+                    last / 1e6,
+                    plan.steps,
+                    f64::from(step) / 1e6,
+                    plan.dwell_blocks
+                );
+                self.native = Some(NativeState { handle, params });
+                return Ok(self.granted(first, step, plan));
             }
         }
+        Ok(self.granted(first, step, plan))
+    }
+
+    fn stop_native_sweep(&mut self) -> Result<()> {
+        let Some(n) = self.native.take() else { return Ok(()) };
+        let stopped = n.handle.request(native::SWEEP_STOP, &[]);
+        drop(n);
+        if let Some(r) = unsafe { self.raw_mut() } {
+            let s = r.stats;
+            log::info!(
+                "{}: board sweep ended: {} hops; {} torn, {} untagged, {} lock timeouts, {} skipped steps, {} dropped blocks",
+                self.info.serial,
+                s.hops,
+                s.torn,
+                s.untagged,
+                s.lock_timeouts,
+                s.skipped_steps,
+                s.dropped_blocks
+            );
+        }
+        self.restart_stream(None)?;
+        stopped
     }
 
     fn start(&mut self, mut sink: Box<dyn StreamSink>) -> Result<()> {
@@ -749,6 +1044,9 @@ impl Device for AirspyDevice {
             serial: self.info.serial.clone(),
             window: None,
             warned: None,
+            hydra: self.api.hydra,
+            dropped_total: None,
+            raw: None,
         }));
         let rc = unsafe { (self.api.start_rx)(self.dev, rx_callback, ctx as *mut c_void) };
         if let Err(e) = self.api.check("start_rx", rc) {
@@ -762,6 +1060,10 @@ impl Device for AirspyDevice {
     fn stop(&mut self) -> Result<()> {
         if self.ctx.is_null() {
             return Ok(());
+        }
+        if let Some(n) = self.native.take() {
+            let _ = n.handle.request(native::SWEEP_STOP, &[]);
+            let _ = self.api.check("set_sample_type", unsafe { (self.api.set_sample_type)(self.dev, SAMPLE_FLOAT32_IQ) });
         }
         let rc = unsafe { (self.api.stop_rx)(self.dev) };
         // stop_rx joins libairspy's threads, so the callback can no longer run.

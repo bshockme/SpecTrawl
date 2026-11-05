@@ -90,7 +90,11 @@ pub struct SweepView {
     pub settle_retries: u64,
     pub slow_hops: usize,
     pub lock_waits: u64,
+    /// Retune sweep: retunes that never showed in the stream. Board sweep: times the board went quiet and was started
+    /// again.
     pub unseen_retunes: u64,
+    /// The device steps through the hops itself (an RFOne with sweep firmware).
+    pub on_board: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

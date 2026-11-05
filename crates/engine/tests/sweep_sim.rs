@@ -16,9 +16,19 @@ const A_HZ: f64 = 851.3e6;
 const B_HZ: f64 = 870.5e6;
 
 fn device() -> Box<dyn sdr_core::Device> {
+    sim(false)
+}
+
+/// `native`: the simulated device sweeps by itself, as an RFOne with sweep firmware does.
+fn sim(native: bool) -> Box<dyn sdr_core::Device> {
     let cw = |freq_hz| Emitter { freq_hz, level_dbfs: -50.0, modulation: Modulation::Cw, keying: Keying::Continuous };
-    let (d, _) =
-        SimDevice::with_config(SimConfig { emitters: vec![cw(A_HZ), cw(B_HZ)], paced: true, report_lag_gaps: false, ..Default::default() });
+    let (d, _) = SimDevice::with_config(SimConfig {
+        emitters: vec![cw(A_HZ), cw(B_HZ)],
+        paced: true,
+        report_lag_gaps: false,
+        native_sweep: native,
+        ..Default::default()
+    });
     Box::new(d)
 }
 
@@ -81,6 +91,52 @@ fn a_sweep_publishes_stitched_passes_with_every_hop_a_segment() {
     }
 
     // Back to Live: the earlier centre, live rows again.
+    src.set_mode(engine::Mode::Live);
+    wait_until("the sweep to stop", Duration::from_secs(3), || stage.sweep_status().is_none());
+    wait_until("a live row", Duration::from_secs(3), || {
+        stage.rows().latest().is_some_and(|r| r.segment.id.0 & STITCHED == 0 && r.segment.center_hz == 855.25e6)
+    });
+    assert_eq!(src.current_segment().center_hz, 855.25e6);
+}
+
+#[test]
+fn a_board_sweep_is_read_off_the_segment_table_and_stitched_the_same_way() {
+    let e = engine();
+    let src = e.add_source(sim(true), engine::Mode::Live).unwrap();
+    src.set_sweep_plan(SweepPlan { start_hz: 845e6, stop_hz: 875e6, ..Default::default() });
+    let stage = e.bus().stage(src.id()).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let segments_before = src.stats().segments;
+    src.set_mode(engine::Mode::Sweep);
+    wait_until("twenty passes", Duration::from_secs(10), || stage.sweep_status().is_some_and(|s| s.passes >= 20));
+    let status = stage.sweep_status().unwrap();
+    assert!(status.on_board && status.tuner_lock, "{status:?}");
+    assert_eq!((status.hops, status.measured_hops, status.unseen_retunes), (4, 4, 0), "{status:?}");
+    // No retunes, guards or settle checks from here: just the board's hops.
+    assert_eq!((status.lock_waits, status.settle_retries, status.slow_hops), (0, 0, 0), "{status:?}");
+    assert!(src.stats().segments >= segments_before + 4 * 20, "{} segments after 20 passes of 4 hops", src.stats().segments);
+
+    let rows = stage.rows().since(0);
+    let passes: Vec<_> = rows.iter().filter(|r| r.segment.id.0 & STITCHED != 0).collect();
+    let ids: std::collections::BTreeSet<u64> = passes.iter().map(|r| r.segment.id.0).collect();
+    assert_eq!(ids.len(), 1, "the stitched segment changes between passes: {ids:?}");
+    let r = passes.last().unwrap();
+    assert!((r.segment.center_hz - 863e6).abs() < 1.0 && (r.segment.sample_rate - 36e6).abs() < 1.0, "{:?}", r.segment);
+    assert_eq!(r.power.len(), 4 * 3686);
+    assert!(r.power.iter().all(|p| p.is_finite() && *p > 0.0), "every hop measured");
+    let db: Vec<f32> = r.power.iter().map(|p| 10.0 * p.log10()).collect();
+    let mut sorted = db.clone();
+    sorted.sort_by(f32::total_cmp);
+    let floor = sorted[sorted.len() / 2];
+    let bin_hz = r.segment.sample_rate / db.len() as f64;
+    let bin = |f: f64| ((f - (r.segment.center_hz - r.segment.sample_rate / 2.0)) / bin_hz) as usize;
+    for f in [A_HZ, B_HZ] {
+        let k = bin(f);
+        let peak = db[k.saturating_sub(3)..k + 4].iter().copied().fold(f32::MIN, f32::max);
+        assert!(peak > floor + 30.0, "{f}: {peak:.1} dB over a {floor:.1} dB floor");
+    }
+
+    // Back to Live: the board stops, the earlier centre and live rows return.
     src.set_mode(engine::Mode::Live);
     wait_until("the sweep to stop", Duration::from_secs(3), || stage.sweep_status().is_none());
     wait_until("a live row", Duration::from_secs(3), || {

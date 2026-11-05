@@ -51,6 +51,10 @@ pub struct SweepPlan {
     /// Frequency ranges to measure; empty means the whole span. The hop grid still runs from `start_hz` over the whole
     /// span, so rows keep one axis. Normalised by [`SweepPlan::normalised`].
     pub segments: Vec<(f64, f64)>,
+    /// On a device that sweeps by itself (`Capabilities::native_sweep`), the blocks it sends per hop (one FFT each):
+    /// 1 is fastest, more average the noise down; 0 sweeps by retuning anyway. `ffts_per_hop`, `guard_s` and the settle checks are
+    /// the retune sweep's.
+    pub native_dwell: u8,
 }
 
 impl Default for SweepPlan {
@@ -65,6 +69,9 @@ impl Default for SweepPlan {
             spur_grid_hz: Some(5e6),
             spur_halfwidth_hz: 5e3,
             segments: Vec::new(),
+            // As many FFTs as the retune sweep averages, so the survey detector sees the same statistics (on an RFOne:
+            // 375 hops/s, a 24–1800 MHz pass in 0.54 s; 1 block: 648 hops/s, 0.33 s, but noisier rows).
+            native_dwell: 4,
         }
     }
 }
@@ -144,6 +151,8 @@ pub struct SweepStatus {
     /// Per grid hop, whether it is measured.
     pub measured: Vec<bool>,
     pub measured_hops: usize,
+    /// The device steps through the hops itself (no retunes from here).
+    pub on_board: bool,
 }
 
 impl SweepStatus {
@@ -279,13 +288,19 @@ struct SavedProfile {
     written_at: u32,
 }
 
+/// A profile's gain key; a board sweep's samples come through a different converter, so its passband gets its own.
+fn profile_key(gain: Option<sdr_core::GainSetting>, on_board: bool) -> String {
+    let k = profile::gain_key(gain);
+    if on_board { format!("{k}-board") } else { k }
+}
+
 const SAVE_AFTER_PASSES: u32 = 20;
 const SAVE_EVERY_PASSES: u32 = 100;
 const SAVE_MIN_PASSES: u32 = 5;
 
 impl SavedProfile {
-    fn open(serial: &str, fft: usize, bins: usize, gain: Option<sdr_core::GainSetting>) -> Self {
-        let gain_key = profile::gain_key(gain);
+    fn open(serial: &str, fft: usize, bins: usize, gain: Option<sdr_core::GainSetting>, on_board: bool) -> Self {
+        let gain_key = profile_key(gain, on_board);
         let path = profile::path(serial, fft, bins, &gain_key);
         let initial = profile::load(&path, bins);
         match &initial {
@@ -317,6 +332,154 @@ impl SavedProfile {
         match profile::save(&self.path, p, self.passes) {
             Ok(()) => self.written_at = self.passes,
             Err(e) => log::warn!("sweep: hop profile {}: {e}", self.path.display()),
+        }
+    }
+}
+
+/// The hop grid a plan sweeps on a device.
+struct Grid {
+    fft: usize,
+    hop_hz: f64,
+    hops: usize,
+    bins_per_hop: usize,
+    /// First FFT bin of a hop that is kept (the alias-free middle).
+    first_bin: usize,
+    measured: Vec<bool>,
+    measured_hops: usize,
+}
+
+impl Grid {
+    fn new(plan: &SweepPlan, snap: &crate::source::DeviceSnapshot) -> Self {
+        let (rate, usable) = (snap.sample_rate, snap.caps.usable_bandwidth_fraction);
+        let fmax = snap.caps.freq_ranges_hz.iter().map(|r| r.1).fold(f64::MIN, f64::max);
+        let n = plan.fft_size;
+        let hop_hz = rate * usable;
+        // Enough hops to cover the span, but no hop centre beyond the tuner's range.
+        let max_hops = ((fmax - plan.start_hz) / hop_hz + 0.5).floor().max(1.0) as usize;
+        let hops = (((plan.stop_hz - plan.start_hz) / hop_hz).ceil().max(1.0) as usize).min(max_hops);
+        let bins_per_hop = ((n as f64 * usable).round() as usize).min(n);
+        let measured = hop_mask(plan, hop_hz, hops);
+        let measured_hops = measured.iter().filter(|m| **m).count();
+        Self { fft: n, hop_hz, hops, bins_per_hop, first_bin: (n - bins_per_hop) / 2, measured, measured_hops }
+    }
+
+    fn center(&self, plan: &SweepPlan, h: usize) -> f64 {
+        plan.start_hz + self.hop_hz * (h as f64 + 0.5)
+    }
+
+    fn status(&self, plan: &SweepPlan, on_board: bool) -> SweepStatus {
+        SweepStatus {
+            start_hz: plan.start_hz,
+            hop_hz: self.hop_hz,
+            hops: self.hops,
+            current_hop: 0,
+            passes: 0,
+            last_pass_s: 0.0,
+            hops_per_sec: 0.0,
+            redone_hops: 0,
+            settle_retries: 0,
+            slow_hops: 0,
+            tuner_lock: on_board,
+            lock_waits: 0,
+            unseen_retunes: 0,
+            segments: plan.segments.clone(),
+            measured: self.measured.clone(),
+            measured_hops: self.measured_hops,
+            on_board,
+        }
+    }
+}
+
+/// One FFT's power in dB of a hop at `center`, with the radio's spur grid and the other receivers' LO leaks blanked.
+fn blank_hop(ctx: &Ctx<'_>, plan: &SweepPlan, db: &mut [f32], center: f64, rate: f64) {
+    if let Some(grid) = plan.spur_grid_hz {
+        blank_grid_spurs(db, center, rate, grid, plan.spur_halfwidth_hz);
+    }
+    for (mlo, mhi) in ctx.source.lo_masks() {
+        blank_range(db, center, rate, mlo, mhi);
+    }
+}
+
+/// The hops of a pass pasted into one row, corrected by the hop profile and published.
+struct Stitcher {
+    full: Vec<f32>,
+    corrected: Vec<f32>,
+    out_bins: usize,
+    bins_per_hop: usize,
+    fft: usize,
+    serial: String,
+    on_board: bool,
+    saved: Option<SavedProfile>,
+    prof: Vec<f32>,
+    /// The row's segment, the same from pass to pass.
+    segment: Segment,
+}
+
+impl Stitcher {
+    fn new(ctx: &Ctx<'_>, plan: &SweepPlan, grid: &Grid, serial: &str, generation: u64, on_board: bool) -> Self {
+        let (n, bph) = (grid.fft, grid.bins_per_hop);
+        let full = vec![EMPTY_DB; grid.hops * bph];
+        let mut saved = ctx.profiles.then(|| SavedProfile::open(serial, n, bph, ctx.source.gain(), on_board));
+        let prof = saved.as_mut().and_then(|s| s.initial.take()).unwrap_or_default();
+        let span = grid.hops as f64 * grid.hop_hz;
+        Self {
+            corrected: vec![0.0; full.len()],
+            out_bins: full.len().min(plan.max_bins),
+            full,
+            bins_per_hop: bph,
+            fft: n,
+            serial: serial.to_string(),
+            on_board,
+            saved,
+            prof,
+            segment: Segment {
+                id: SegmentId(STITCHED | generation),
+                from_sample: 0,
+                center_hz: plan.start_hz + span / 2.0,
+                sample_rate: span,
+                boundary: Boundary::Start,
+            },
+        }
+    }
+
+    fn hop(&mut self, h: usize) -> &mut [f32] {
+        &mut self.full[h * self.bins_per_hop..(h + 1) * self.bins_per_hop]
+    }
+
+    /// Publishes the pass from `first_sample` to the head.
+    fn publish(&mut self, ctx: &Ctx<'_>, first_sample: u64, measured_hops: usize) {
+        let bph = self.bins_per_hop;
+        let mut out_db = vec![0.0f32; self.out_bins];
+        if measured_hops >= MIN_HOPS_FOR_PROFILE {
+            // A gain change means a different passband: save what we have under the old key and start from the new.
+            let gain = ctx.source.gain();
+            if let Some(s) = self.saved.as_mut().filter(|s| profile_key(gain, self.on_board) != s.gain_key) {
+                s.finish(&self.prof);
+                *s = SavedProfile::open(&self.serial, self.fft, bph, gain, self.on_board);
+                self.prof = s.initial.take().unwrap_or_default();
+            }
+            update_hop_profile(&self.full, bph, &mut self.prof);
+            if let Some(s) = self.saved.as_mut() {
+                s.refined(&self.prof);
+            }
+            for seg in self.corrected.chunks_mut(bph).zip(self.full.chunks(bph)) {
+                for ((c, &v), &p) in seg.0.iter_mut().zip(seg.1).zip(&self.prof) {
+                    *c = if is_empty_db(v) { EMPTY_DB } else { v - p };
+                }
+            }
+            dsp::decimate_max(&self.corrected, &mut out_db);
+        } else {
+            dsp::decimate_max(&self.full, &mut out_db);
+        }
+        let power = out_db.iter().map(|&v| if is_empty_db(v) { f32::NAN } else { 10f32.powf(v / 10.0) }).collect();
+        let end_sample = ctx.source.head();
+        let segment = Segment { from_sample: first_sample, ..self.segment.clone() };
+        (ctx.publish)(Row { first_sample, end_sample, blocks: measured_hops as u32, segment, power });
+    }
+
+    fn finish(&mut self) {
+        if let Some(s) = self.saved.as_mut() {
+            s.finish(&self.prof);
         }
     }
 }
@@ -446,23 +609,22 @@ pub(crate) fn run(ctx: Ctx<'_>) -> Ended {
 /// Sweeps `plan` pass after pass; returns `None` when the plan changed, else why it ended.
 fn run_plan(ctx: &Ctx<'_>, plan: &SweepPlan, generation: u64) -> Option<Ended> {
     let snap = ctx.source.snapshot();
-    let (rate, usable, latency) = (snap.sample_rate, snap.caps.usable_bandwidth_fraction, snap.caps.retune_latency_s);
-    let fmax = snap.caps.freq_ranges_hz.iter().map(|r| r.1).fold(f64::MIN, f64::max);
+    if snap.caps.native_sweep && plan.native_dwell > 0 {
+        match run_native(ctx, plan, generation, &snap) {
+            Ok(ended) => return ended,
+            Err(e) => log::warn!("sweep: the board's own sweep would not start ({e}); retuning from here instead"),
+        }
+    }
+    let (rate, latency) = (snap.sample_rate, snap.caps.retune_latency_s);
     let serial = snap.info.serial.clone();
-    let n = plan.fft_size;
-    let hop_hz = rate * usable;
-    // Enough hops to cover the span, but no hop centre beyond the tuner's range.
-    let max_hops = ((fmax - plan.start_hz) / hop_hz + 0.5).floor().max(1.0) as usize;
-    let hops = (((plan.stop_hz - plan.start_hz) / hop_hz).ceil().max(1.0) as usize).min(max_hops);
-    let bins_per_hop = ((n as f64 * usable).round() as usize).min(n);
-    let first_bin = (n - bins_per_hop) / 2;
+    let grid = Grid::new(plan, &snap);
+    let (n, hop_hz, hops, bins_per_hop, first_bin) = (grid.fft, grid.hop_hz, grid.hops, grid.bins_per_hop, grid.first_bin);
     // The device's latency is from the request; the landing is known, so only the PLL's settling remains.
     let settle = (plan.guard_s.max(SETTLE_S).max(latency - LANDS_AFTER.as_secs_f64()) * rate).ceil() as u64;
     let dwell = (n * plan.ffts_per_hop) as u64;
     let long_guard = (LONG_GUARD_S * rate).ceil() as u64;
 
-    let measured = hop_mask(plan, hop_hz, hops);
-    let measured_hops = measured.iter().filter(|m| **m).count();
+    let (measured, measured_hops) = (grid.measured.clone(), grid.measured_hops);
     if measured_hops == 0 {
         log::warn!("sweep: no hop of {hops} falls in the segments {:?}; nothing to measure", plan.segments);
     }
@@ -480,38 +642,9 @@ fn run_plan(ctx: &Ctx<'_>, plan: &SweepPlan, generation: u64) -> Option<Ended> {
     let mut sa = SpectrumAnalyzer::new(n);
     let mut block = vec![Complex32::default(); n];
     let mut db = Vec::with_capacity(n);
-    let mut full = vec![EMPTY_DB; hops * bins_per_hop];
-    let out_bins = full.len().min(plan.max_bins);
-    let mut saved = ctx.profiles.then(|| SavedProfile::open(&serial, n, bins_per_hop, ctx.source.gain()));
-    let mut prof: Vec<f32> = saved.as_mut().and_then(|s| s.initial.take()).unwrap_or_default();
-    let mut corrected = vec![0.0f32; full.len()];
+    let mut st = Stitcher::new(ctx, plan, &grid, &serial, generation, false);
     let span = hops as f64 * hop_hz;
-    let stitched = |from_sample: u64| Segment {
-        id: SegmentId(STITCHED | generation),
-        from_sample,
-        center_hz: plan.start_hz + span / 2.0,
-        sample_rate: span,
-        boundary: Boundary::Start,
-    };
-
-    *ctx.status.lock() = Some(SweepStatus {
-        start_hz: plan.start_hz,
-        hop_hz,
-        hops,
-        current_hop: 0,
-        passes: 0,
-        last_pass_s: 0.0,
-        hops_per_sec: 0.0,
-        redone_hops: 0,
-        settle_retries: 0,
-        slow_hops: 0,
-        tuner_lock: false,
-        lock_waits: 0,
-        unseen_retunes: 0,
-        segments: plan.segments.clone(),
-        measured: measured.clone(),
-        measured_hops,
-    });
+    *ctx.status.lock() = Some(grid.status(plan, false));
     let bump = |f: &dyn Fn(&mut SweepStatus)| {
         if let Some(s) = ctx.status.lock().as_mut() {
             f(s);
@@ -540,25 +673,20 @@ fn run_plan(ctx: &Ctx<'_>, plan: &SweepPlan, generation: u64) -> Option<Ended> {
     if measured_hops > 0 && !measured[probe_hop] {
         probe_hop = next_measured(probe_hop);
     }
-    let finish = |saved: &mut Option<SavedProfile>, prof: &[f32]| {
-        if let Some(s) = saved.as_mut() {
-            s.finish(prof);
-        }
-    };
     loop {
         let pass_start = Instant::now();
         let pass_first = ctx.source.head();
         let mut h = 0;
         while h < hops {
             if let Some(e) = ctx.leave() {
-                finish(&mut saved, &prof);
+                st.finish();
                 return Some(e);
             }
             if !measured[h] {
                 h += 1;
                 continue;
             }
-            let center = plan.start_hz + hop_hz * (h as f64 + 0.5);
+            let center = grid.center(plan, h);
             let issued = Instant::now();
             let landing = match ctx.retune(center) {
                 Ok(Landed::At(s)) => s,
@@ -567,7 +695,7 @@ fn run_plan(ctx: &Ctx<'_>, plan: &SweepPlan, generation: u64) -> Option<Ended> {
                     s
                 }
                 Ok(Landed::Leave(e)) => {
-                    finish(&mut saved, &prof);
+                    st.finish();
                     return Some(e);
                 }
                 Err(e) => {
@@ -587,7 +715,7 @@ fn run_plan(ctx: &Ctx<'_>, plan: &SweepPlan, generation: u64) -> Option<Ended> {
             if locked == Some(false) {
                 while ctx.source.tuner_locked() == Some(false) && issued.elapsed() < LOCK_TIMEOUT {
                     if let Some(e) = ctx.leave() {
-                        finish(&mut saved, &prof);
+                        st.finish();
                         return Some(e);
                     }
                     std::thread::park_timeout(POLL);
@@ -613,7 +741,7 @@ fn run_plan(ctx: &Ctx<'_>, plan: &SweepPlan, generation: u64) -> Option<Ended> {
                 let pb = ctx.band_power(&mut sa, &mut block, &mut db, landing + long_guard, plan.ffts_per_hop, first_bin, bins_per_hop);
                 match (pa, pb) {
                     (Err(e), _) | (_, Err(e)) => {
-                        finish(&mut saved, &prof);
+                        st.finish();
                         return Some(e);
                     }
                     (Ok(Some(pa)), Ok(Some(pb))) => {
@@ -645,7 +773,7 @@ fn run_plan(ctx: &Ctx<'_>, plan: &SweepPlan, generation: u64) -> Option<Ended> {
                     Ok(true) => {}
                     Ok(false) => log::warn!("sweep: no samples for hop {h}"),
                     Err(e) => {
-                        finish(&mut saved, &prof);
+                        st.finish();
                         return Some(e);
                     }
                 }
@@ -683,13 +811,8 @@ fn run_plan(ctx: &Ctx<'_>, plan: &SweepPlan, generation: u64) -> Option<Ended> {
                 let k = plan.ffts_per_hop as f32;
                 db.clear();
                 db.extend(lin.iter().map(|l| 10.0 * (l / k + 1e-20).log10()));
-                if let Some(grid) = plan.spur_grid_hz {
-                    blank_grid_spurs(&mut db, center, rate, grid, plan.spur_halfwidth_hz);
-                }
-                for (mlo, mhi) in ctx.source.lo_masks() {
-                    blank_range(&mut db, center, rate, mlo, mhi);
-                }
-                full[h * bins_per_hop..(h + 1) * bins_per_hop].copy_from_slice(&db[first_bin..first_bin + bins_per_hop]);
+                blank_hop(ctx, plan, &mut db, center, rate);
+                st.hop(h).copy_from_slice(&db[first_bin..first_bin + bins_per_hop]);
                 break;
             }
             if redo {
@@ -716,31 +839,7 @@ fn run_plan(ctx: &Ctx<'_>, plan: &SweepPlan, generation: u64) -> Option<Ended> {
             // Nothing to measure: idle rather than spin, but keep the row flowing so the view shows the (empty) span.
             std::thread::sleep(Duration::from_millis(250));
         }
-        let mut out_db = vec![0.0f32; out_bins];
-        if measured_hops >= MIN_HOPS_FOR_PROFILE {
-            // A gain change means a different passband: save what we have under the old key and start from the new.
-            let gain = ctx.source.gain();
-            if let Some(s) = saved.as_mut().filter(|s| profile::gain_key(gain) != s.gain_key) {
-                s.finish(&prof);
-                *s = SavedProfile::open(&serial, n, bins_per_hop, gain);
-                prof = s.initial.take().unwrap_or_default();
-            }
-            update_hop_profile(&full, bins_per_hop, &mut prof);
-            if let Some(s) = saved.as_mut() {
-                s.refined(&prof);
-            }
-            for seg in corrected.chunks_mut(bins_per_hop).zip(full.chunks(bins_per_hop)) {
-                for ((c, &v), &p) in seg.0.iter_mut().zip(seg.1).zip(&prof) {
-                    *c = if is_empty_db(v) { EMPTY_DB } else { v - p };
-                }
-            }
-            dsp::decimate_max(&corrected, &mut out_db);
-        } else {
-            dsp::decimate_max(&full, &mut out_db);
-        }
-        let power = out_db.iter().map(|&v| if is_empty_db(v) { f32::NAN } else { 10f32.powf(v / 10.0) }).collect();
-        let end_sample = ctx.source.head();
-        (ctx.publish)(Row { first_sample: pass_first, end_sample, blocks: measured_hops as u32, segment: stitched(pass_first), power });
+        st.publish(ctx, pass_first, measured_hops);
         let took = pass_start.elapsed().as_secs_f64();
         bump(&|s| {
             s.passes += 1;
@@ -748,8 +847,180 @@ fn run_plan(ctx: &Ctx<'_>, plan: &SweepPlan, generation: u64) -> Option<Ended> {
         });
         // A new plan is picked up between passes.
         if ctx.source.sweep_plan().normalised() != *plan {
-            finish(&mut saved, &prof);
+            st.finish();
             return None;
+        }
+    }
+}
+
+/// How long the board may go without sending a hop before its sweep is started again.
+const BOARD_SILENCE: Duration = Duration::from_millis(500);
+/// A segment whose centre is this far off the grid is not one of the board's hops (the tuning before it started).
+const OFF_GRID_HZ: f64 = 1e3;
+
+/// The device sweeps by itself (an RFOne with sweep firmware): it retunes, waits for PLL lock and sends each hop's
+/// blocks, every hop a segment of its own. The hops are read off the segment table as they arrive: no retunes, guards
+/// or settle checks here. The board steps the measured hops' whole range (hops in between that the plan skips are
+/// swept and dropped). `Err` when the device won't start it; the caller then sweeps by retuning.
+fn run_native(
+    ctx: &Ctx<'_>,
+    plan: &SweepPlan,
+    generation: u64,
+    snap: &crate::source::DeviceSnapshot,
+) -> Result<Option<Ended>, sdr_core::Error> {
+    let grid = Grid::new(plan, snap);
+    let rate = snap.sample_rate;
+    let (Some(h0), Some(h1)) = (grid.measured.iter().position(|m| *m), grid.measured.iter().rposition(|m| *m)) else {
+        return Err(sdr_core::Error::Unsupported("no hop to measure".into()));
+    };
+    if h1 == h0 {
+        // One step would repeat one centre, which the segment table can't tell apart from a single long hop.
+        return Err(sdr_core::Error::Unsupported("a single hop".into()));
+    }
+    let want = sdr_core::NativeSweep {
+        first_center_hz: grid.center(plan, h0),
+        step_hz: grid.hop_hz,
+        steps: (h1 - h0 + 1) as u32,
+        dwell_blocks: plan.native_dwell,
+        block_samples: 0,
+    };
+    let mut cursor = ctx.source.head();
+    let got = ctx.source.start_native_sweep(want)?;
+    let (n, bph, first_bin) = (grid.fft, grid.bins_per_hop, grid.first_bin);
+    let (block, dwell) = (got.block_samples, usize::from(got.dwell_blocks));
+    let need = (block * dwell) as u64;
+    let take = block.min(n);
+    let mut st = Stitcher::new(ctx, plan, &grid, &snap.info.serial, generation, true);
+    *ctx.status.lock() = Some(grid.status(plan, true));
+    let bump = |f: &dyn Fn(&mut SweepStatus)| {
+        if let Some(s) = ctx.status.lock().as_mut() {
+            f(s);
+        }
+    };
+    log::info!(
+        "sweep: on the board, {:.1}–{:.1} MHz, {} hops of {:.2} MHz ({} measured), {dwell} block(s) of {block} per hop",
+        plan.start_hz / 1e6,
+        (plan.start_hz + grid.hops as f64 * grid.hop_hz) / 1e6,
+        grid.hops,
+        grid.hop_hz / 1e6,
+        grid.measured_hops
+    );
+    let end = |st: &mut Stitcher, e: Option<Ended>| {
+        st.finish();
+        if e.is_some()
+            && let Err(err) = ctx.source.stop_native_sweep()
+        {
+            log::warn!("sweep: stopping the board's sweep: {err}");
+        }
+        Ok(e)
+    };
+
+    let mut sa = SpectrumAnalyzer::new(n);
+    let mut buf = vec![Complex32::default(); n];
+    let (mut lin, mut pw, mut db) = (vec![0.0f32; n], Vec::with_capacity(n), Vec::with_capacity(n));
+    let mut last_h: Option<usize> = None;
+    let (mut pass_first, mut pass_start) = (cursor, Instant::now());
+    let mut last_hop_at = Instant::now();
+    let mut rate_window = (Instant::now(), 0u32);
+    loop {
+        if let Some(e) = ctx.leave() {
+            return end(&mut st, Some(e));
+        }
+        let segs = ctx.source.segments_from(cursor);
+        let head = ctx.source.head();
+        let mut progressed = false;
+        for (i, seg) in segs.iter().enumerate() {
+            let next = segs.get(i + 1).map(|s| s.from_sample);
+            let from = seg.data_from();
+            if from + need > next.unwrap_or(head) {
+                match next {
+                    // Still arriving.
+                    None => break,
+                    // Cut short (a torn or dropped block): the board's next hop has begun.
+                    Some(nx) => {
+                        cursor = nx;
+                        bump(&|s| s.redone_hops += 1);
+                        continue;
+                    }
+                }
+            }
+            cursor = next.unwrap_or(from + need);
+            let k = ((seg.center_hz - got.first_center_hz) / got.step_hz).round();
+            let on_grid = k >= 0.0
+                && k < f64::from(got.steps)
+                && (seg.center_hz - (got.first_center_hz + k * got.step_hz)).abs() <= OFF_GRID_HZ
+                && (seg.sample_rate - rate).abs() < 1.0;
+            if !on_grid {
+                continue;
+            }
+            progressed = true;
+            let h = h0 + k as usize;
+            if !grid.measured[h] {
+                continue;
+            }
+            if last_h.is_some_and(|l| h <= l) {
+                // The board wrapped: the pass is done.
+                st.publish(ctx, pass_first, grid.measured_hops);
+                let took = pass_start.elapsed().as_secs_f64();
+                bump(&|s| {
+                    s.passes += 1;
+                    s.last_pass_s = took;
+                });
+                (pass_first, pass_start) = (seg.from_sample, Instant::now());
+                if ctx.source.sweep_plan().normalised() != *plan {
+                    // The board keeps sweeping; the next plan's start replaces its grid.
+                    return end(&mut st, None);
+                }
+            }
+            last_h = Some(h);
+            lin.iter_mut().for_each(|v| *v = 0.0);
+            let mut ok = true;
+            for b in 0..dwell {
+                if ctx.source.read(from + (b * block) as u64, &mut buf[..take]).is_err() {
+                    ok = false;
+                    break;
+                }
+                // A block is a little shorter than the FFT (4088 of 4096 on an RFOne): zero-padded.
+                buf[take..].iter_mut().for_each(|v| *v = Complex32::default());
+                sa.push(&buf);
+                sa.take_power(&mut pw);
+                for (l, p) in lin.iter_mut().zip(&pw) {
+                    *l += p;
+                }
+            }
+            if !ok {
+                // Overwritten before it was read (the stage fell behind).
+                bump(&|s| s.redone_hops += 1);
+                continue;
+            }
+            db.clear();
+            db.extend(lin.iter().map(|l| 10.0 * (l / dwell as f32 + 1e-20).log10()));
+            blank_hop(ctx, plan, &mut db, seg.center_hz, rate);
+            st.hop(h).copy_from_slice(&db[first_bin..first_bin + bph]);
+            rate_window.1 += 1;
+            let el = rate_window.0.elapsed().as_secs_f64();
+            bump(&|s| {
+                s.current_hop = h;
+                if el >= 1.0 {
+                    s.hops_per_sec = rate_window.1 as f64 / el;
+                }
+            });
+            if el >= 1.0 {
+                rate_window = (Instant::now(), 0);
+            }
+        }
+        if progressed {
+            last_hop_at = Instant::now();
+        } else {
+            if last_hop_at.elapsed() > BOARD_SILENCE {
+                log::warn!("sweep: no hop from the board for {} ms; starting its sweep again", BOARD_SILENCE.as_millis());
+                bump(&|s| s.unseen_retunes += 1);
+                if let Err(e) = ctx.source.start_native_sweep(want) {
+                    log::warn!("sweep: restarting the board's sweep: {e}");
+                }
+                last_hop_at = Instant::now();
+            }
+            std::thread::park_timeout(POLL);
         }
     }
 }

@@ -352,6 +352,20 @@ impl Source {
         self.device.lock().tuner_locked()
     }
 
+    /// Starts the device's own sweep (`Capabilities::native_sweep`); returns the grid it sweeps.
+    pub fn start_native_sweep(&self, plan: sdr_core::NativeSweep) -> sdr_core::Result<sdr_core::NativeSweep> {
+        self.device.lock().start_native_sweep(plan)
+    }
+
+    pub fn stop_native_sweep(&self) -> sdr_core::Result<()> {
+        self.device.lock().stop_native_sweep()
+    }
+
+    /// Every segment starting at or after `sample`, oldest first (a native sweep's hops).
+    pub fn segments_from(&self, sample: u64) -> Vec<Segment> {
+        self.inner.segments.starting_from(sample)
+    }
+
     /// The newest segment (the current tuning), even before any of its samples arrived.
     pub fn current_segment(&self) -> Segment {
         self.inner.segments.current()

@@ -97,6 +97,13 @@ impl SegmentTable {
         false
     }
 
+    /// Every segment starting at or after `sample`, oldest first.
+    pub fn starting_from(&self, sample: u64) -> Vec<Segment> {
+        let v = self.inner.lock();
+        let i = v.partition_point(|s| s.from_sample < sample);
+        v[i..].to_vec()
+    }
+
     pub fn current(&self) -> Segment {
         self.inner.lock().last().expect("never empty").clone()
     }

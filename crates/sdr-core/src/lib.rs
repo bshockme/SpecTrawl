@@ -123,6 +123,19 @@ pub struct Capabilities {
     pub transfer_samples: Option<usize>,
 }
 
+/// A grid a device sweeps by itself (`Device::start_native_sweep`): `steps`
+/// hop centres `step_hz` apart from `first_center_hz`, round and round.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NativeSweep {
+    pub first_center_hz: f64,
+    pub step_hz: f64,
+    pub steps: u32,
+    /// Blocks of samples sent per hop (more average down noise, at the cost of speed).
+    pub dwell_blocks: u8,
+    /// Samples in each block, as delivered (set by the device; ignored on a request).
+    pub block_samples: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
     pub backend: String,
@@ -186,6 +199,28 @@ pub trait Device: Send {
     }
     fn set_sample_rate(&mut self, rate: f64) -> Result<()>;
     fn set_gain(&mut self, gain: GainSetting) -> Result<()>;
+    /// Starts (or replaces) a sweep the device steps through itself
+    /// (`Capabilities::native_sweep`); the stream must be running. Returns the
+    /// grid actually swept (frequencies rounded to what the device takes).
+    ///
+    /// Until `stop_native_sweep`, the stream carries measured hops only, in
+    /// grid order and back to the first after the last: each starts with a
+    /// `Retune` at its first sample (`center_hz` the hop's centre,
+    /// `sample_rate` the device's), followed by `dwell_blocks` runs of
+    /// `block_samples` samples, all captured after the tuner reported lock. A
+    /// hop the device could not lock, or delivered torn, is left out whole.
+    /// The stream is not continuous in time: `TimeAnchor`s come from the
+    /// device's clock and are sent often enough (every few tens of ms) to time
+    /// each hop. `set_center` is refused while it runs; `set_gain` pauses it.
+    fn start_native_sweep(&mut self, plan: NativeSweep) -> Result<NativeSweep> {
+        let _ = plan;
+        Err(Error::Unsupported("native sweep".into()))
+    }
+    /// Stops a native sweep and returns the stream to the tuning it had
+    /// before (a `Retune` marks where). A no-op when none is running.
+    fn stop_native_sweep(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn start(&mut self, sink: Box<dyn StreamSink>) -> Result<()>;
     fn stop(&mut self) -> Result<()>;
     fn is_streaming(&self) -> bool;

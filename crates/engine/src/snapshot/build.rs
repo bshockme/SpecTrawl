@@ -86,6 +86,7 @@ pub(crate) fn receivers(engine: &Engine, registry: &Registry, rows: usize, watch
             slow_hops: s.slow_hops,
             lock_waits: s.lock_waits,
             unseen_retunes: s.unseen_retunes,
+            on_board: s.on_board,
         });
         let status = status_line(&StatusInput {
             mode,
