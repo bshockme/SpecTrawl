@@ -4,11 +4,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use api::{Command, Handle, Snapshot, SourceId};
+use api::{Command, Handle, RecordId, Snapshot, SourceId};
 use egui_dock::{DockArea, DockState, NodeIndex, Tree};
 
 use crate::devices_pane::{self, BudgetDraft};
 use crate::receiver_pane::{DEFAULT_DB_RANGE, ReceiverPane};
+use crate::records_pane::RecordsPane;
 use crate::tabs::Tab;
 use crate::{log_pane, theme};
 
@@ -29,6 +30,9 @@ pub struct App {
     db_ranges: HashMap<String, (f32, f32)>,
     /// Commands collected while drawing, sent once the frame is drawn.
     out: Vec<Command>,
+    records: RecordsPane,
+    /// The record selected in a waterfall or the list (shared by both).
+    selected: Option<RecordId>,
 }
 
 impl App {
@@ -36,7 +40,7 @@ impl App {
     pub fn new(handle: Handle) -> App {
         let snap = handle.latest();
         let mut dock = DockState::new(vec![Tab::Devices]);
-        dock.main_surface_mut().split_right(NodeIndex::root(), DEVICES_SHARE, vec![Tab::Log]);
+        dock.main_surface_mut().split_right(NodeIndex::root(), DEVICES_SHARE, vec![Tab::Log, Tab::Records]);
         App {
             handle,
             snap,
@@ -47,6 +51,8 @@ impl App {
             budget_draft: BudgetDraft { guaranteed_secs: 30.0, ceiling_mb: 4096 },
             db_ranges: HashMap::new(),
             out: Vec::new(),
+            records: RecordsPane::new(),
+            selected: None,
         }
     }
 
@@ -77,7 +83,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("SpecTrawl").strong());
                 ui.menu_button("View ⏷", |ui| {
-                    for tab in [Tab::Devices, Tab::Log] {
+                    for tab in [Tab::Devices, Tab::Log, Tab::Records] {
                         let shown = self.dock.find_tab(&tab).is_some();
                         if ui.add_enabled(!shown, egui::Button::new(tab.name())).clicked() {
                             reopen(&mut self.dock, tab);
@@ -101,8 +107,12 @@ impl App {
         self.dock = dock;
 
         self.remember_db_ranges();
-        for c in self.out.drain(..) {
-            self.handle.send(c);
+        for c in std::mem::take(&mut self.out) {
+            let query = matches!(c, Command::QueryRecords(_));
+            let seq = self.handle.send(c);
+            if query {
+                self.records.search_seq = Some(seq);
+            }
         }
         ui.ctx().request_repaint_after(Duration::from_millis(16));
     }
@@ -113,6 +123,27 @@ impl App {
 
     pub fn pane(&self, id: SourceId) -> Option<&ReceiverPane> {
         self.panes.get(&id)
+    }
+
+    pub fn records_pane(&self) -> &RecordsPane {
+        &self.records
+    }
+
+    pub fn records_pane_mut(&mut self) -> &mut RecordsPane {
+        &mut self.records
+    }
+
+    pub fn selected(&self) -> Option<RecordId> {
+        self.selected
+    }
+
+    pub fn select(&mut self, id: Option<RecordId>) {
+        self.selected = id;
+    }
+
+    /// Queues a command as a pane would (sent at the end of the next frame).
+    pub fn push_command(&mut self, c: Command) {
+        self.out.push(c);
     }
 
     /// New receivers get a pane and a tab; gone ones lose both.
@@ -191,11 +222,13 @@ impl egui_dock::TabViewer for App {
         match tab {
             Tab::Receiver(id) => {
                 if let (Some(r), Some(p)) = (snap.receivers.iter().find(|r| r.id == *id), self.panes.get_mut(id)) {
-                    p.show(ui, r, &mut self.out);
+                    let mine: Vec<_> = snap.records.records.iter().filter(|x| x.source == r.id).cloned().collect();
+                    p.show(ui, r, &mine, &mut self.selected, &mut self.out);
                 }
             }
             Tab::Devices => devices_pane::show(ui, &snap, &mut self.budget_draft, &mut self.out),
             Tab::Log => log_pane::show(ui, &snap),
+            Tab::Records => self.records.show(ui, &snap, &mut self.selected, &mut self.out),
         }
     }
 
@@ -243,6 +276,17 @@ fn reopen(dock: &mut DockState<Tab>, tab: Tab) {
         return;
     }
     match tab {
+        Tab::Records => match tree.find_tab(&Tab::Log) {
+            Some((node, _)) => tree[node].append_tab(tab),
+            None => match tree.find_tab_from(|t| matches!(t, Tab::Receiver(_))) {
+                Some((node, _)) => {
+                    tree.split_below(node, 0.7, vec![tab]);
+                }
+                None => {
+                    tree.split_right(NodeIndex::root(), DEVICES_SHARE, vec![tab]);
+                }
+            },
+        },
         Tab::Log => match tree.find_tab_from(|t| matches!(t, Tab::Receiver(_))) {
             Some((node, _)) => {
                 tree.split_below(node, 0.7, vec![tab]);

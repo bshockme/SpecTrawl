@@ -73,11 +73,19 @@ impl ReceiverPane {
         self.body.ingest(&r.rows, self.paused);
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, r: &Receiver, out: &mut Vec<Command>) {
+    /// `records`: this receiver's, from the snapshot; `selected` is shared with the records list.
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        r: &Receiver,
+        records: &[std::sync::Arc<api::SignalRecord>],
+        selected: &mut Option<api::RecordId>,
+        out: &mut Vec<Command>,
+    ) {
         self.header(ui, r, out);
         status_lines(ui, r);
         ui.add_space(4.0);
-        self.body.show(ui, r, self.db_range, &mut self.paused, out);
+        self.body.show(ui, r, records, selected, self.db_range, &mut self.paused, out);
     }
 
     pub fn last_status(&self) -> &Status {
@@ -92,6 +100,11 @@ impl ReceiverPane {
     /// Waterfall rows held.
     pub fn history_len(&self) -> usize {
         self.body.history.len()
+    }
+
+    /// The waterfall rows (0 = newest) a record's box spans, if any held row saw it.
+    pub fn record_rows(&self, r: &api::SignalRecord) -> Option<(usize, usize)> {
+        self.body.history.rows_of(r.first_sample, r.end_sample)
     }
 
     /// All-NaN rows the history holds, one per discontinuity between snapshot rows.

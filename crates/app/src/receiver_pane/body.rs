@@ -1,6 +1,8 @@
 //! The receiver pane's body: the spectrum trace over the ring-texture waterfall, with zoom, pan and drag-to-tune.
 
-use api::{Command, Receiver, Row};
+use std::sync::Arc;
+
+use api::{Command, Receiver, RecordId, Row, SignalRecord};
 use egui::{Color32, ColorImage, Mesh, Pos2, Rect, Sense, Shape, Stroke, TextureHandle, TextureOptions, pos2, vec2};
 
 use crate::theme;
@@ -100,7 +102,17 @@ impl Body {
         self.dirty = true;
     }
 
-    pub(super) fn show(&mut self, ui: &mut egui::Ui, r: &Receiver, db_range: (f32, f32), paused: &mut bool, out: &mut Vec<Command>) {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        r: &Receiver,
+        records: &[Arc<SignalRecord>],
+        selected: &mut Option<RecordId>,
+        db_range: (f32, f32),
+        paused: &mut bool,
+        out: &mut Vec<Command>,
+    ) {
         let (rect, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 4.0, theme::PLOT_BG);
@@ -125,6 +137,17 @@ impl Body {
 
         if wf.height() > 1.0 {
             self.draw_waterfall(ui, &painter, wf, span, view, r.letter);
+            let boxes = self.draw_records(&painter, wf, span, &view, records, *selected);
+            // A click (not a drag) picks the smallest box under the pointer, or clears the selection.
+            if wf_resp.clicked()
+                && let Some(p) = wf_resp.interact_pointer_pos()
+            {
+                *selected = boxes
+                    .iter()
+                    .filter(|(_, b)| b.expand(2.0).contains(p))
+                    .min_by(|a, b| a.1.area().total_cmp(&b.1.area()))
+                    .map(|(id, _)| *id);
+            }
         }
         self.draw_spectrum(&painter, spec, span, &view);
         painter.hline(rect.x_range(), spec.bottom() + 0.5, Stroke::new(1.0, theme::BORDER));
@@ -280,6 +303,50 @@ impl Body {
             );
             k += 1;
         }
+    }
+
+    /// Outlines each record over the rows that saw it: neutral for "unknown" (step 6 colours by the kind of claim),
+    /// the selection's colour when selected, no top edge while still open. Returns each drawn box.
+    fn draw_records(
+        &self,
+        painter: &egui::Painter,
+        wf: Rect,
+        span: (f64, f64),
+        view: &View,
+        records: &[Arc<SignalRecord>],
+        selected: Option<RecordId>,
+    ) -> Vec<(RecordId, Rect)> {
+        let row_h = wf.height() / ROWS as f32;
+        let behind = self.behind as isize;
+        let mut out = Vec::new();
+        for rec in records {
+            let Some((top, bottom)) = self.history.rows_of(rec.first_sample, rec.end_sample) else { continue };
+            let (top, bottom) = ((top as isize - behind).max(0), bottom as isize - behind);
+            if bottom < 0 {
+                continue;
+            }
+            let (mut x0, mut x1) = (view.hz_to_x(span, wf, rec.f_lo_hz), view.hz_to_x(span, wf, rec.f_hi_hz));
+            if x1 < wf.left() || x0 > wf.right() {
+                continue;
+            }
+            // At least a few points wide: a 600 Hz line on a 10 MHz span is a fraction of a pixel.
+            if x1 - x0 < 4.0 {
+                let c = (x0 + x1) / 2.0;
+                (x0, x1) = (c - 2.0, c + 2.0);
+            }
+            let (y0, y1) = (wf.top() + top as f32 * row_h, wf.top() + (bottom + 1) as f32 * row_h);
+            let b = Rect::from_min_max(pos2(x0, y0), pos2(x1, y1.max(y0 + 2.0))).intersect(wf);
+            let colour = if selected == Some(rec.id) { theme::SELECT } else { theme::RECORD.gamma_multiply(0.7) };
+            let stroke = Stroke::new(if selected == Some(rec.id) { 1.5 } else { 1.0 }, colour);
+            painter.line_segment([b.left_bottom(), b.right_bottom()], stroke);
+            painter.line_segment([b.left_top(), b.left_bottom()], stroke);
+            painter.line_segment([b.right_top(), b.right_bottom()], stroke);
+            if !rec.open {
+                painter.line_segment([b.left_top(), b.right_top()], stroke);
+            }
+            out.push((rec.id, b));
+        }
+        out
     }
 
     /// Recolours the whole texture from history (skipping rows that arrived during a pause).

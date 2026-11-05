@@ -9,6 +9,8 @@ pub enum Tab {
     Receiver(SourceId),
     Devices,
     Log,
+    /// The records list, beside the Log.
+    Records,
 }
 
 impl Tab {
@@ -18,6 +20,7 @@ impl Tab {
             Tab::Receiver(_) => "Receiver",
             Tab::Devices => "Devices",
             Tab::Log => "Log",
+            Tab::Records => "Records",
         }
     }
 }

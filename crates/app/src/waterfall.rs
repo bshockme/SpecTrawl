@@ -98,6 +98,19 @@ impl History {
         self.rows.iter()
     }
 
+    /// The history rows (0 = newest) holding samples `first .. end`, newest row first: `(top, bottom)`, clipped to the
+    /// rows held; `None` when no held row overlaps them.
+    pub fn rows_of(&self, first: u64, end: u64) -> Option<(usize, usize)> {
+        let (newest, oldest) = (self.rows.front()?, self.rows.back()?);
+        if end <= oldest.first_sample || first >= newest.end_sample || end <= first {
+            return None;
+        }
+        // Rows are newest first, so `first_sample` falls along the deque: the row holding sample `s` is the first whose
+        // start is at or before it.
+        let row_of = |s: u64| self.rows.partition_point(|r| r.first_sample > s).min(self.rows.len() - 1);
+        Some((row_of(end - 1), row_of(first)))
+    }
+
     /// The frequencies the rows cover: centre ± rate/2. `None` before the first row.
     pub fn span(&self) -> Option<(f64, f64)> {
         (!self.rows.is_empty()).then(|| (self.center_hz - self.sample_rate / 2.0, self.center_hz + self.sample_rate / 2.0))
@@ -358,6 +371,21 @@ mod tests {
         colorize(&[-200.0, -100.0, -75.0, -50.0, 0.0, f32::NAN], &v, &lut, &mut out);
         assert_eq!((out[0], out[1], out[3], out[4], out[5]), (lut.0[0], lut.0[0], lut.0[255], lut.0[255], GAP));
         assert_eq!(out[2], lut.0[127]);
+    }
+
+    #[test]
+    fn a_records_samples_map_to_the_rows_holding_them() {
+        let mut h = History::new();
+        // Rows of 10 samples each, starting at 0, 10, ..., 90 (overlapping by nothing here).
+        for k in 0..10u64 {
+            h.push(&row(k * 10, k * 10 + 10, 100e6, 5));
+        }
+        assert_eq!(h.rows_of(95, 100), Some((0, 0)), "the newest row");
+        assert_eq!(h.rows_of(0, 10), Some((9, 9)), "the oldest row");
+        assert_eq!(h.rows_of(25, 61), Some((3, 7)));
+        assert_eq!(h.rows_of(0, 1000), Some((0, 9)), "clipped to what is held");
+        assert_eq!(h.rows_of(100, 120), None, "newer than every row");
+        assert_eq!(History::new().rows_of(0, 10), None);
     }
 
     #[test]

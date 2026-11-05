@@ -6,6 +6,7 @@ pub mod app;
 pub mod devices_pane;
 pub mod log_pane;
 pub mod receiver_pane;
+pub mod records_pane;
 pub mod tabs;
 pub mod theme;
 pub mod trace;

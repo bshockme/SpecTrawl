@@ -36,6 +36,12 @@ pub fn secs(s: f64) -> String {
     if total >= 60 { format!("{} m {} s", total / 60, total % 60) } else { format!("{total} s") }
 }
 
+/// `21:47:04` UTC.
+pub fn clock(t: std::time::SystemTime) -> String {
+    let s = t.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    format!("{:02}:{:02}:{:02}", s / 3600 % 24, s / 60 % 60, s % 60)
+}
+
 /// `1 channel`, `3 channels`.
 pub fn count(n: usize, noun: &str) -> String {
     if n == 1 { format!("1 {noun}") } else { format!("{n} {noun}s") }
@@ -65,5 +71,7 @@ mod tests {
         assert_eq!(secs(0.05), "0.1 s");
         assert_eq!(count(1, "channel"), "1 channel");
         assert_eq!(count(3, "channel"), "3 channels");
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_791_547_624_123);
+        assert_eq!(clock(t), "12:07:04");
     }
 }

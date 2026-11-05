@@ -98,3 +98,62 @@ fn the_app_shows_the_simulator_and_never_blocks_on_the_engine() {
     assert!(max < 100.0, "a frame took {max:.1} ms while the engine ran (slow open at frame 60)");
     assert!(p50 < 10.0, "median frame {p50:.1} ms");
 }
+
+#[test]
+fn records_list_and_box_with_one_snapshot_in_five() {
+    let engine = Engine::new(EngineConfig {
+        budget: BudgetConfig { guaranteed_secs: 1.0, ceiling_bytes: 256 << 20, sweep_secs: 0.2 },
+        bus: BusConfig::default(),
+        source: SourceConfig::default(),
+        store: None,
+        slices: None,
+    });
+    let handle = engine::snapshot::spawn(engine, vec![Box::new(GapFreeSim)], PublisherConfig::default());
+    let ctx = egui::Context::default();
+    let mut app = App::new(handle.clone());
+    let input = |k: usize| egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 900.0))),
+        time: Some(k as f64 / 4.0),
+        ..Default::default()
+    };
+    let frame = |app: &mut App, k: usize| {
+        let mut output = ctx.run_ui(input(k), |ui| app.frame(ui));
+        output.textures_delta.clear();
+    };
+    handle.send(Command::Open { backend: "sim".into(), serial: "SIM-0001".into() });
+    // A frame every 250 ms: the app sees about one snapshot in five.
+    for k in 0..24 {
+        frame(&mut app, k);
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let snap = handle.latest();
+    let rows = app.records_pane().rows(&snap);
+    // The list holds what the engine's view holds (nothing lost to the skipped snapshots).
+    let ids = |v: &[std::sync::Arc<api::SignalRecord>]| v.iter().map(|r| r.id).collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(ids(&rows), ids(&snap.records.records));
+    // The default scenario's continuous emitters (P25 at 851.0125, CW at 855.000) are listed, unknown, with a box.
+    let id = snap.receivers.iter().find(|r| r.letter == 'A').expect("the simulator opened").id;
+    let pane = app.pane(id).expect("its pane");
+    for hz in [851.0125e6, 855.0e6] {
+        let r =
+            rows.iter().find(|r| (r.center_hz() - hz).abs() < 3e3 && r.open).unwrap_or_else(|| panic!("no open record at {hz}: {rows:?}"));
+        assert_eq!(spectrawl_app::records_pane::headline(r), "unknown");
+        let (top, bottom) = pane.record_rows(r).unwrap_or_else(|| panic!("no box for {r:?}"));
+        assert_eq!(top, 0, "an open record reaches the newest row: {r:?}");
+        assert!(bottom > 20, "{r:?} spans rows {top}..{bottom}");
+    }
+    // Tagging from the app shows in a later snapshot, and the filter finds it.
+    let cw = rows.iter().find(|r| (r.center_hz() - 855.0e6).abs() < 3e3).unwrap().id;
+    app.select(Some(cw));
+    app.push_command(Command::Tag { record: cw, tag: "birdie".into() });
+    for k in 24..32 {
+        frame(&mut app, k);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let snap = handle.latest();
+    app.records_pane_mut().filter = "birdie".into();
+    let found = app.records_pane().rows(&snap);
+    assert_eq!(found.iter().map(|r| r.id).collect::<Vec<_>>(), [cw]);
+    assert_eq!(found[0].tags, ["birdie"]);
+    assert_eq!(app.selected(), Some(cw));
+}
