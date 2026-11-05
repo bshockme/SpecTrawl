@@ -595,11 +595,8 @@ fn am_evidence(x: &[Complex32], fs: f64) -> Option<AmKind> {
             // (one sample's phase step is mostly noise even at 25 dB; a
             // symbol of FSK is 10 samples or more at these rates).
             let k = (fs / (2.0 * std::f64::consts::PI)) as f32;
-            let inst: Vec<f32> = x
-                .windows(2)
-                .filter(|w| w[0].norm() > 0.5 * hi && w[1].norm() > 0.5 * hi)
-                .map(|w| (w[1] * w[0].conj()).arg() * k)
-                .collect();
+            let inst: Vec<f32> =
+                x.windows(2).filter(|w| w[0].norm() > 0.5 * hi && w[1].norm() > 0.5 * hi).map(|w| (w[1] * w[0].conj()).arg() * k).collect();
             let mut dev: Vec<f32> = inst.windows(8).map(|w| (w.iter().sum::<f32>() / 8.0).abs()).collect();
             if dev.len() >= 256 {
                 let i98 = dev.len() * 98 / 100;

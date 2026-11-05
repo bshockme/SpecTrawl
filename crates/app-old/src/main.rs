@@ -594,7 +594,9 @@ fn same_device(a: &DeviceInfo, b: &DeviceInfo) -> bool {
 /// The pane-title note for a receiver that is losing samples.
 fn usb_note(loss: &std::collections::BTreeMap<String, (u32, bool)>, serial: &str) -> String {
     match loss.get(serial) {
-        Some(&(pct, true)) => format!(" · LOSING {pct}% OF SAMPLES: shares a USB controller with another radio, move one to another controller"),
+        Some(&(pct, true)) => {
+            format!(" · LOSING {pct}% OF SAMPLES: shares a USB controller with another radio, move one to another controller")
+        }
         Some(&(pct, false)) => format!(" · LOSING {pct}% OF SAMPLES (USB link)"),
         None => String::new(),
     }
@@ -632,7 +634,10 @@ impl App {
         if loss.keys().ne(self.usb_loss.keys()) && !loss.is_empty() {
             log::warn!(
                 "losing samples on the USB link: {}",
-                loss.iter().map(|(s, (p, sh))| format!("{s} {p}%{}", if *sh { " (shares a USB controller)" } else { "" })).collect::<Vec<_>>().join(", ")
+                loss.iter()
+                    .map(|(s, (p, sh))| format!("{s} {p}%{}", if *sh { " (shares a USB controller)" } else { "" }))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
         self.usb_counts.retain(|s, _| infos.iter().any(|i| &i.0 == s));
@@ -1911,7 +1916,8 @@ impl App {
     fn observe(p: &Receiver, e_center: f64, e_bw: f64, e_bin: f64) -> engine_old::explore::Observation {
         let half = e_bw.max(54e3) / 2.0 + 27e3;
         let (lo, hi) = (e_center - half, e_center + half);
-        let mut obs = engine_old::explore::observe(&p.source.emitters(), lo, hi, e_bw, e_bin, std::time::Duration::from_secs(1), SystemTime::now());
+        let mut obs =
+            engine_old::explore::observe(&p.source.emitters(), lo, hi, e_bw, e_bin, std::time::Duration::from_secs(1), SystemTime::now());
         // A known wideband occupant covering it is a classification in
         // itself, an identity when a decoder named it.
         if obs.id.is_none() {
@@ -1963,12 +1969,21 @@ impl App {
             for e in inside {
                 let half = e.bandwidth_hz.max(54e3) / 2.0 + 27e3;
                 let (elo, ehi) = (e.center_hz - half, e.center_hz + half);
-                let mut obs = engine_old::explore::observe(&focus, elo, ehi, e.bandwidth_hz, e.bin_hz(), std::time::Duration::from_secs(1), SystemTime::now());
+                let mut obs = engine_old::explore::observe(
+                    &focus,
+                    elo,
+                    ehi,
+                    e.bandwidth_hz,
+                    e.bin_hz(),
+                    std::time::Duration::from_secs(1),
+                    SystemTime::now(),
+                );
                 if obs.id.is_none() {
                     if let Some(k) = occupants.iter().find(|k| k.occupant.lo_hz <= ehi && k.occupant.hi_hz >= elo) {
                         let named = k.station.is_some() || k.cell.as_ref().is_some_and(|c| c.sync.is_some());
                         obs.label = Some(k.label());
-                        obs.evidence = Some(format!("occupant {} at {:.3}-{:.3} MHz", k.label(), k.occupant.lo_hz / 1e6, k.occupant.hi_hz / 1e6));
+                        obs.evidence =
+                            Some(format!("occupant {} at {:.3}-{:.3} MHz", k.label(), k.occupant.lo_hz / 1e6, k.occupant.hi_hz / 1e6));
                         obs.votes = u32::MAX;
                         if named {
                             obs.protocol = true;

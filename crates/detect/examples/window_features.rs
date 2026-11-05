@@ -80,7 +80,13 @@ fn disc_lines(w: &[Complex32], fs: f64) {
         }
     }
     let band = |a: f64, b: f64| pw[(a / bin) as usize..((b / bin) as usize).min(pw.len())].iter().sum::<f32>() / tot * 100.0;
-    println!("        lines: {} | 50-300 Hz {:.0}%, 300-3000 {:.0}%, >3000 {:.0}%", out.join(", "), band(50.0, 300.0), band(300.0, 3000.0), band(3000.0, fs / 2.0));
+    println!(
+        "        lines: {} | 50-300 Hz {:.0}%, 300-3000 {:.0}%, >3000 {:.0}%",
+        out.join(", "),
+        band(50.0, 300.0),
+        band(300.0, 3000.0),
+        band(3000.0, fs / 2.0)
+    );
     let mut h = [0u32; 20];
     for v in &d {
         let t = ((v + 2500.0) / 5000.0 * 20.0) as i64;

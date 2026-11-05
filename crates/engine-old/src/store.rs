@@ -190,8 +190,7 @@ impl Store {
         // Columns added since the schema was first written (older files
         // gain them in place; the error for an existing column is ignored).
         let _ = conn.execute("ALTER TABLE classifications ADD COLUMN tone_hz REAL", []);
-        let have: Option<String> =
-            conn.query_row("SELECT value FROM meta WHERE key = 'schema'", [], |r| r.get(0)).ok();
+        let have: Option<String> = conn.query_row("SELECT value FROM meta WHERE key = 'schema'", [], |r| r.get(0)).ok();
         match have.and_then(|v| v.parse::<i64>().ok()) {
             None => {
                 conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('schema', ?1)", params![SCHEMA.to_string()])
@@ -203,10 +202,7 @@ impl Store {
         conn.execute("INSERT INTO sessions(started, note) VALUES(?1, ?2)", params![now(), note]).map_err(|e| e.to_string())?;
         let session = conn.last_insert_rowid();
         let (tx, rx) = mpsc::channel();
-        std::thread::Builder::new()
-            .name("store".into())
-            .spawn(move || writer(conn, rx, session))
-            .map_err(|e| e.to_string())?;
+        std::thread::Builder::new().name("store".into()).spawn(move || writer(conn, rx, session)).map_err(|e| e.to_string())?;
         log::info!("store: {} (session {session})", path.display());
         Ok(Store { tx, path: Arc::new(path.to_path_buf()), session })
     }
@@ -303,9 +299,9 @@ impl SourceStore {
             field_id: fields.and_then(|f| f.id.clone()),
             activity: fields.and_then(|f| f.activity.map(|a| format!("{a:?}"))),
             talk: fields.and_then(|f| f.talk.clone()),
-            kinds: fields.filter(|f| !f.kinds.is_empty()).map(|f| {
-                f.kinds.iter().map(|(k, n)| format!("{k}×{n}")).collect::<Vec<_>>().join(", ")
-            }),
+            kinds: fields
+                .filter(|f| !f.kinds.is_empty())
+                .map(|f| f.kinds.iter().map(|(k, n)| format!("{k}×{n}")).collect::<Vec<_>>().join(", ")),
             messages: fields.filter(|f| !f.messages.is_empty()).map(|f| f.messages.join("\n")),
             ms: j.ms,
         };

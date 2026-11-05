@@ -464,7 +464,13 @@ impl Explorer {
                 best = Some((key, e, why.join(", ")));
             }
         }
-        best.map(|(_, e, reason)| Candidate { emitter: e.id, center_hz: e.center_hz, bandwidth_hz: e.bandwidth_hz, bin_hz: e.bin_hz, reason })
+        best.map(|(_, e, reason)| Candidate {
+            emitter: e.id,
+            center_hz: e.center_hz,
+            bandwidth_hz: e.bandwidth_hz,
+            bin_hz: e.bin_hz,
+            reason,
+        })
     }
 
     /// Starts a visit on `receiver`.
@@ -604,7 +610,15 @@ pub fn comparable(focus_bw: f64, survey_bw: f64, survey_bin: f64) -> bool {
 /// comparable width wins: one with a protocol, else the most-seen one. An
 /// emitter of the wrong shape (a narrow line under a wide blob) only says
 /// something is active.
-pub fn observe(focus: &[Emitter], lo: f64, hi: f64, survey_bw: f64, survey_bin: f64, active_within: Duration, now: SystemTime) -> Observation {
+pub fn observe(
+    focus: &[Emitter],
+    lo: f64,
+    hi: f64,
+    survey_bw: f64,
+    survey_bin: f64,
+    active_within: Duration,
+    now: SystemTime,
+) -> Observation {
     let mut obs = Observation::default();
     let mut best: Option<(i64, &Emitter)> = None;
     let mut skipped = 0usize;
@@ -739,7 +753,13 @@ mod tests {
         assert!(ex.finish(&v, &verdict, t0 + Duration::from_secs(4), None).is_none(), "gone isn't logged");
         // Identified: protocol with an identity.
         let mut v = ex.begin('A', &c, t0);
-        let obs = Observation { active: true, label: Some("P25 Phase 1".into()), protocol: true, id: Some("NAC 0x2A5".into()), ..Default::default() };
+        let obs = Observation {
+            active: true,
+            label: Some("P25 Phase 1".into()),
+            protocol: true,
+            id: Some("NAC 0x2A5".into()),
+            ..Default::default()
+        };
         let verdict = v.update(&obs, &cfg, t0 + Duration::from_secs(1)).unwrap();
         assert_eq!(verdict.kind, Kind::Identified);
         let e = ex.finish(&v, &verdict, t0 + Duration::from_secs(1), Some("cap".into())).unwrap();
@@ -809,7 +829,8 @@ mod tests {
         let classified = Observation { active: true, label: Some("4FSK 4800 Bd".into()), votes: 3, ..Default::default() };
         assert!(ex.determined_in_place('A', &e, &classified, t).is_some());
         assert!(ex.determined_in_place('A', &e, &classified, t).is_none(), "same again: no new row");
-        let identified = Observation { active: true, label: Some("NXDN48".into()), protocol: true, id: Some("RAN 12".into()), ..Default::default() };
+        let identified =
+            Observation { active: true, label: Some("NXDN48".into()), protocol: true, id: Some("RAN 12".into()), ..Default::default() };
         let row = ex.determined_in_place('A', &e, &identified, t).unwrap();
         assert!(row.in_place && row.kind == Kind::Identified);
         assert!(ex.determined_in_place('A', &e, &classified, t).is_none(), "a worse one isn't logged");

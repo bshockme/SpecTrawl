@@ -146,7 +146,9 @@ impl Api {
         let mut tried = Vec::new();
         for cand in candidates(hydra) {
             match open_library(&cand) {
-                Ok(lib) => return unsafe { Self::resolve(lib, hydra) }.map_err(|e| Error::LibraryMissing(format!("{}: {e}", cand.display()))),
+                Ok(lib) => {
+                    return unsafe { Self::resolve(lib, hydra) }.map_err(|e| Error::LibraryMissing(format!("{}: {e}", cand.display())));
+                }
                 Err(e) => tried.push(format!("{}: {e}", cand.display())),
             }
         }

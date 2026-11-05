@@ -46,7 +46,8 @@ const VOICE_CHANNEL_HZ: f64 = 30e3;
 /// confidence when it is at least unmodulated. A modulated transmitter on a
 /// grid frequency keeps its modulation label.
 pub fn refine(c: &mut Classification, ctx: &Context, x: &[Complex32], fs: f64) {
-    if c.protocol.is_some() || matches!(c.label.as_str(), "too short" | "IQ expired" | "interrupted" | "Unknown") || c.label == crate::WEAK {
+    if c.protocol.is_some() || matches!(c.label.as_str(), "too short" | "IQ expired" | "interrupted" | "Unknown") || c.label == crate::WEAK
+    {
         return;
     }
     let narrow = ctx.bandwidth_hz < NARROW_HZ;

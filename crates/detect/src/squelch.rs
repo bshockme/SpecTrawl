@@ -354,7 +354,8 @@ mod tests {
         };
         // Random 2FSK at 1200 Bd, ±1 kHz.
         let bits: Vec<bool> = (0..2000).map(|_| rnd() & 1 == 1).collect();
-        let d: Vec<f32> = (0..(fs * 0.8) as usize).map(|i| if bits[(i as f64 / fs * 1200.0) as usize] { 1000.0 } else { -1000.0 }).collect();
+        let d: Vec<f32> =
+            (0..(fs * 0.8) as usize).map(|i| if bits[(i as f64 / fs * 1200.0) as usize] { 1000.0 } else { -1000.0 }).collect();
         assert_eq!(measure(&d, fs), None);
         let d: Vec<f32> = (0..(fs * 0.8) as usize).map(|_| ((rnd() >> 11) as f32 / (1u64 << 53) as f32 - 0.5) * 6000.0).collect();
         assert_eq!(measure(&d, fs), None);

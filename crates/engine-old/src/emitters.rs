@@ -322,7 +322,9 @@ impl EmitterBook {
         others()
             .filter(|e| Self::contains(e, c, bw, bin))
             .max_by_key(|e| e.records)
-            .or_else(|| others().filter(|e| Self::fits(e, c, bw, bin)).min_by(|a, b| (a.center_hz - c).abs().total_cmp(&(b.center_hz - c).abs())))
+            .or_else(|| {
+                others().filter(|e| Self::fits(e, c, bw, bin)).min_by(|a, b| (a.center_hz - c).abs().total_cmp(&(b.center_hz - c).abs()))
+            })
             .map(|e| e.id)
     }
 
@@ -336,7 +338,9 @@ impl EmitterBook {
             // on an emitter with only a few records, built that emitter
             // from its own early fragments (two tracks of a broadcast
             // station that later merged): the emitter takes its final shape.
-            Some(&id) if closed && self.map.get(&id).is_some_and(|e| e.records == 1 || (e.records <= 3 && Self::covers(r, e))) => self.refit(r, id, c, bw),
+            Some(&id) if closed && self.map.get(&id).is_some_and(|e| e.records == 1 || (e.records <= 3 && Self::covers(r, e))) => {
+                self.refit(r, id, c, bw)
+            }
             Some(&id) => id,
             None => {
                 let id = self.find(c, bw, r.bin_hz, None).unwrap_or_else(|| {
@@ -476,7 +480,12 @@ impl EmitterBook {
     fn fold_station(&mut self, id: u64) {
         let Some(c) = self.map.get(&id).map(|e| e.center_hz) else { return };
         let is_station = |e: &Emitter| e.best.as_ref().is_some_and(|b| b.label.starts_with("FM broadcast"));
-        let pieces: Vec<u64> = self.map.values().filter(|e| e.id != id && (e.center_hz - c).abs() <= STATION_HALF_HZ && !is_station(e)).map(|e| e.id).collect();
+        let pieces: Vec<u64> = self
+            .map
+            .values()
+            .filter(|e| e.id != id && (e.center_hz - c).abs() <= STATION_HALF_HZ && !is_station(e))
+            .map(|e| e.id)
+            .collect();
         for p in pieces {
             self.fold(p, id);
         }
