@@ -42,6 +42,7 @@ fn engine() -> Engine {
         budget: BudgetConfig { guaranteed_secs: 1.0, ceiling_bytes: 512 << 20, sweep_secs: 0.2 },
         bus: BusConfig::default(),
         source: SourceConfig::default(),
+        store: None,
     })
 }
 

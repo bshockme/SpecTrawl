@@ -23,6 +23,7 @@ fn two_hundred_channels_recover_from_a_stall_of_every_worker() {
         budget: BudgetConfig { guaranteed_secs: 1.0, ceiling_bytes: 256 << 20, sweep_secs: 0.2 },
         bus: bus_config,
         source: cfg(),
+        store: None,
     });
     let (d, _c) = SimDevice::with_config(SimConfig { paced: true, report_lag_gaps: false, ..Default::default() }); // the default 800 MHz scenario
     let src = engine.add_source(Box::new(d), Mode::Live).unwrap();

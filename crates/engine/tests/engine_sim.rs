@@ -14,6 +14,7 @@ fn removing_a_source_ends_its_consumers_once_and_stops_its_stage() {
         budget: BudgetConfig { guaranteed_secs: 0.5, ceiling_bytes: 128 << 20, sweep_secs: 0.2 },
         bus: BusConfig { workers: 2, ..Default::default() },
         source: cfg(),
+        store: None,
     });
     let (d, _c) = sim(10e6, true);
     let src = engine.add_source(d, Mode::Live).unwrap();

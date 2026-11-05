@@ -48,6 +48,7 @@ fn the_app_shows_the_simulator_and_never_blocks_on_the_engine() {
         budget: BudgetConfig { guaranteed_secs: 1.0, ceiling_bytes: 256 << 20, sweep_secs: 0.2 },
         bus: BusConfig::default(),
         source: SourceConfig::default(),
+        store: None,
     });
     let handle = engine::snapshot::spawn(engine, vec![Box::new(GapFreeSim), Box::new(SlowBackend)], PublisherConfig::default());
     let ctx = egui::Context::default();

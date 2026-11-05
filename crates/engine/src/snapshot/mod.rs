@@ -151,8 +151,15 @@ impl Publisher {
         let target = command_source(&c).and_then(|id| self.registry.letter(id));
         let name = command_name(&c);
         let (registry, engine, log) = (&mut self.registry, &self.engine, &mut self.log);
-        let result = panic::catch_unwind(AssertUnwindSafe(|| registry.apply(engine, c, log)))
-            .unwrap_or_else(|payload| Err(format!("{name} panicked: {}", panic_text(payload.as_ref()))));
+        let result = panic::catch_unwind(AssertUnwindSafe(|| match c {
+            // Answered by the store into a later snapshot, under this command's number.
+            Command::QueryRecords(q) => match engine.store() {
+                Some(s) => s.query(seq, q).map(|()| api::Outcome::Queried),
+                None => Err("history search needs the record store".into()),
+            },
+            c => registry.apply(engine, c, log),
+        }))
+        .unwrap_or_else(|payload| Err(format!("{name} panicked: {}", panic_text(payload.as_ref()))));
         if let Err(e) = &result {
             self.log.push(target, format!("command {seq} failed: {e}"));
         }
@@ -173,8 +180,16 @@ impl Publisher {
             acks: self.acks.iter().cloned().collect(),
             log: self.log.lines.iter().cloned().collect(),
             records: self.engine.records().view(),
-            store: None,
-            query: None,
+            store: self.engine.store().map(|s| s.view()).or_else(|| {
+                self.engine.store_error().map(|e| api::StoreView {
+                    path: Default::default(),
+                    written: 0,
+                    queued: 0,
+                    dropped: 0,
+                    error: Some(e.to_string()),
+                })
+            }),
+            query: self.engine.store().and_then(|s| s.query_result()),
         }));
     }
 }

@@ -8,9 +8,10 @@ use sdr_core::Device;
 
 use crate::budget::{BudgetConfig, Mode, RingBudget, SourceId};
 use crate::channels::{BusConfig, ChannelBus};
-use crate::records::{Loaded, RecordBook};
+use crate::records::{Loaded, RecordBook, RecordSink};
 use crate::ring::keeper::Keeper;
 use crate::source::{Source, SourceConfig};
+use crate::store::{Store, StoreConfig};
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -19,12 +20,17 @@ pub struct EngineConfig {
     pub bus: BusConfig,
     /// Every source added starts with this configuration.
     pub source: SourceConfig,
+    /// Where records, emitters, tags and notes are kept across restarts; `None`: in memory only.
+    pub store: Option<StoreConfig>,
 }
 
 pub struct Engine {
     cfg: EngineConfig,
     /// Every source's rows go here (the stages' row sink).
     records: Arc<RecordBook>,
+    store: Option<Arc<Store>>,
+    /// Why the configured store could not be opened.
+    store_error: Option<String>,
     bus: Arc<ChannelBus>,
     sources: Mutex<HashMap<SourceId, Arc<Source>>>,
     /// The engine's handle; each `Source` holds the keeper too, so it lives
@@ -36,12 +42,21 @@ impl Engine {
     /// Starts the keeper (from `cfg.budget`) and the bus (from `cfg.bus`), with a record book on every source's rows
     /// (unless `cfg.bus` already names a row sink).
     pub fn new(cfg: EngineConfig) -> Engine {
-        let records = Arc::new(RecordBook::new(Loaded::default(), None));
+        let (store, loaded, store_error) = match cfg.store.clone().map(Store::open) {
+            None => (None, Loaded::default(), None),
+            Some(Ok((s, loaded))) => (Some(s), loaded, None),
+            Some(Err(e)) => {
+                log::error!("record store: {e}");
+                (None, Loaded::default(), Some(e))
+            }
+        };
+        let sink = store.clone().map(|s| s as Arc<dyn RecordSink>);
+        let records = Arc::new(RecordBook::new(loaded, sink));
         let keeper = Keeper::start(RingBudget::new(cfg.budget.clone()));
         let mut bus_cfg = cfg.bus.clone();
         bus_cfg.row_sink.get_or_insert_with(|| records.clone());
         let bus = ChannelBus::new(bus_cfg);
-        Engine { cfg, records, keeper, bus, sources: Mutex::new(HashMap::new()) }
+        Engine { cfg, records, store, store_error, keeper, bus, sources: Mutex::new(HashMap::new()) }
     }
 
     /// Starts the device streaming into a new source and attaches the source to the bus.
@@ -84,6 +99,16 @@ impl Engine {
         &self.records
     }
 
+    /// The record store, when one is configured and opened.
+    pub fn store(&self) -> Option<&Arc<Store>> {
+        self.store.as_ref()
+    }
+
+    /// Why the configured store could not be opened.
+    pub fn store_error(&self) -> Option<&str> {
+        self.store_error.as_deref()
+    }
+
     pub fn bus(&self) -> &Arc<ChannelBus> {
         &self.bus
     }
@@ -100,8 +125,13 @@ impl Drop for Engine {
         let ids: Vec<SourceId> = self.sources.lock().keys().copied().collect();
         for id in ids {
             self.bus.detach(id);
+            // Its stage has stopped: close its open records so the store keeps them.
+            self.records.remove_source(id);
         }
         self.bus.stop();
         self.sources.lock().clear();
+        if let Some(s) = &self.store {
+            s.close();
+        }
     }
 }
