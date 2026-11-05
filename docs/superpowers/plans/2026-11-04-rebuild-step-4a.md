@@ -25,4 +25,8 @@ Commands and views: `Command::SetSweep { source, start_hz, stop_hz, segments }` 
 ## Left
 
 - **No partial rows.** `engine-old` published the pass in progress every 100 ms for clock-driven views; the new sweep publishes completed passes only (a full 24–1800 MHz pass is ~1.3 s on an R2).
-- **The app's controls** for the span and the mode (task 2 of this step) and an on-air comparison with `engine-old` on the R2 (task 3).
+
+## Done after the engine part
+
+- The receiver header's Live/Sweep switch and the sweep span (from–to MHz, sent as `SetSweep` when an edit settles); a sweeping receiver's spectrum drag does not tune. Headless test: switched to Sweep over 845–875 MHz, the receiver takes `S` and its waterfall fills with passes over the hop grid.
+- On air (R2, 24–1797 MHz, 40 s each): 127 hops/s on both engines, the same floor to 0.02 dB per hop, the FM stations within 2.5 dB; fewer lock waits and redone hops on the new one. The 870–879 MHz hop varies by 40 dB from run to run on both (BACKLOG).
