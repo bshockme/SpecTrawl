@@ -3,71 +3,86 @@
 The RFOne (serial `36B463DC324C16C7`) runs custom firmware `v1.0.2-sweep2` with an on-device sweep.
 The board retunes itself, waits until the R828D reports PLL lock, and sends only blocks captured after
 that. Each block is tagged with its step and frequency. This is the `native_sweep` path in DESIGN §4.
-Lock-verified, it does **680 hops/s**: 24–1800 MHz in 8 MHz steps at 5.4 GHz/s, about 3 full passes per
-second. Retune-and-dwell is limited to one hop per USB transfer plus the lock wait.
+Lock-verified, it does about **673 hops/s** on average over 24–1800 MHz in 8 MHz steps, about 5.4 GHz/s
+or 3 full passes per second.
 
-Source, measurements and a working reference client live in `~/hydrasdr`:
-- `scripts/hydrasdr_sweep.py`: Python, about 100 lines that matter.
+SpecTrawl drives the sweep through the sweep calls in a patched libhydrasdr. An earlier version of this
+doc sent vendor requests on a second USB handle; that approach is superseded and would fail on Windows.
+
+Source, measurements and reference clients live in `~/hydrasdr`:
+- `host/`: the patched library, with API docs in `host/README.md` and the `sweep_api` group in `hydrasdr.h`.
+- `scripts/hydrasdr_sweep.py` and `host/tests/test_sweep_api.py`: ctypes clients.
 - `experiments/2026-11-04-sweep-fw/README.md`.
-- `firmware/patches/`.
+- `firmware/patches/`; firmware iterations are logged in `firmware/README.md`.
 
-Port that client rather than re-deriving anything here.
+## The library
 
-## Normal mode is untouched
+The patched library is a strict superset of libhydrasdr 1.1.4, so it replaces the stock one.
 
-Sweep mode exists only between SWEEP_START and SWEEP_STOP. Otherwise the board behaves exactly like
-stock v1.0.2, so the existing `airspy` backend works unchanged.
+| Platform | File |
+|---|---|
+| Linux | `~/hydrasdr/host/dist/linux-x86_64/libhydrasdr.so.1.1.4` |
+| Windows x64 (MinGW) | `~/hydrasdr/host/dist/windows-x64/hydrasdr.dll` plus `libusb-1.0.dll`; untested on hardware |
 
-Detect support from the version string (`hydrasdr_version_string_read`): it contains `sweep`, currently
-`v1.0.2-sweep2`. Stock firmware STALLs request 0x70.
+Each folder has a `SHA256SUMS`. The system (AUR) library is the stock one, so point SpecTrawl at the
+patched one:
+
+```
+SPECTRAWL_HYDRASDR_LIB=$HOME/hydrasdr/host/dist/linux-x86_64/libhydrasdr.so.1.1.4
+```
+
+The backend resolves the sweep calls as optional symbols. With the stock library, or stock firmware,
+`Capabilities::native_sweep` is false and Sweep mode retunes from the host as before. If the firmware can
+sweep but the library can't, the backend logs a warning naming the variable above.
+
+New calls, all `ADDCALL` (cdecl):
+
+| Call | Returns |
+|---|---|
+| `hydrasdr_sweep_supported(dev)` | 1 if the firmware version contains `-sweep`, 0 if not, below 0 on error |
+| `hydrasdr_sweep_start(dev, const hydrasdr_sweep_params_t*)` | 0; −2 for a bad plan or unless the sample type is RAW (5) with packing off; −1003 unless streaming; −12 on stock firmware. Calling it again replaces the plan without a stop |
+| `hydrasdr_sweep_stop(dev)` | 0; the stream carries on in normal mode. `hydrasdr_stop_rx` also ends a sweep |
+| `hydrasdr_sweep_parse_block(const uint16_t* block, info*)` | 0 valid, 1 untagged (normal-mode data), 2 torn (drop it) |
+
+SpecTrawl parses blocks itself (`backend-airspy/src/native.rs`), with the same checks as
+`hydrasdr_sweep_parse_block`, so the tests run without the library.
 
 ## Sequence
 
-1. Open by serial with libhydrasdr, as today.
+1. Open by serial with libhydrasdr, as for normal streaming.
 2. Configure the stream:
 
    | Call | Value |
    |---|---|
    | `set_samplerate` | 10 MSPS, so the ADC runs at 20 MSPS real |
-   | `set_packing` | 0 (required, because sweep mode refuses packed streams) |
+   | `set_packing` | 0 (sweep mode refuses packed streams) |
    | `set_rf_port` | as usual |
-   | gain | set it here (see the warning below) |
+   | gain | set it here (see below) |
    | `set_sample_type` | `HYDRASDR_SAMPLE_RAW` (5) |
    | `start_rx` | |
 
-   Gain can't change during a sweep. Requests for gain, AGC, frequency, sample rate, packing, RF port or tuner registers are STALLed while a sweep runs.
-3. Send **SWEEP_START** as a vendor control request on a *second* USB handle to the same device.
-   libhydrasdr has no raw-request API. Find the second handle by VID:PID `38af:0001` and the serial
-   string descriptor `HYDRASDR SN:36B463DC324C16C7`.
-   - Request: `bmRequestType 0x40` (vendor, host→device, recipient device), `bRequest 0x70`, `wValue 0`,
-     `wIndex 0`, followed by the 16-byte parameter block below.
-   - A device-recipient request needs no interface claim. That's why it coexists with libhydrasdr's
-     claimed interface. This is verified on Linux. On Windows (WinUSB) a second open will fail, and
-     libhydrasdr would need a passthrough.
-   - In Rust, use `rusb` (`DeviceHandle::write_control`), or dlopen `libusb-1.0` the way
-     `backend-airspy` loads libhydrasdr.
+3. `hydrasdr_sweep_start` with the plan.
 4. Consume RAW callbacks. Each callback holds a whole number of 8192-sample (16 KB) blocks. Parse each
-   block; discard any block that fails the tag check.
-5. To change gain or the plan: send SWEEP_STOP (`bRequest 0x71`, no data), make the change, then
-   SWEEP_START again. To finish: SWEEP_STOP, then `stop_rx`. `stop_rx` alone also ends the sweep.
+   block and discard any that isn't valid.
+5. To change gain: `hydrasdr_sweep_stop`, change it, `hydrasdr_sweep_start` again. Requests for gain, AGC,
+   frequency, sample rate, packing, RF port or tuner registers are STALLed while a sweep runs.
+6. To finish: `hydrasdr_sweep_stop`, then restore the sample type and packing, or `stop_rx`.
 
-SWEEP_START is acknowledged even when it doesn't start a sweep. That happens when the stream isn't
-running, `n_steps` is 0, or `dwell_blocks` is 0. Confirm the sweep started by seeing tagged blocks.
-
-## Parameters (16 bytes, little-endian, `<IIHBBBBH`)
+## Parameters (`hydrasdr_sweep_params_t`, 16 bytes, natural alignment, no padding)
 
 | Offset | Type | Field | Notes |
 |---|---|---|---|
 | 0 | u32 | `f_start_hz` | **centre** frequency of step 0 |
-| 4 | u32 | `f_step_hz` | centre spacing. 8 MHz recommended; usable flat span is ~9.3 MHz |
+| 4 | u32 | `f_step_hz` | centre spacing. 8 MHz recommended; the usable flat span is ~9.3 MHz (SpecTrawl uses 9 MHz) |
 | 8 | u16 | `n_steps` | after the last step it wraps to step 0 and increments the sweep number |
 | 10 | u8 | `skip_blocks` | extra 409.6 µs blocks discarded after lock. Use 0 |
-| 11 | u8 | `dwell_blocks` | blocks sent per step. Use 1; more blocks average down noise |
+| 11 | u8 | `dwell_blocks` | blocks sent per step. More blocks average down noise (SpecTrawl's default is 4) |
 | 12 | u8 | `lock_reads` | consecutive locked reads of R828D reg 2 bit 6 required. **2**; 0 disables the check: 1218 hops/s, but ~40 of 222 steps came out wrong, by up to −22 dB |
 | 13 | u8 | reserved | 0 |
 | 14 | u16 | `lock_timeout` | maximum number of lock polls (~0.1 ms each). 200 |
 
-For example, 24–1800 MHz uses `f_start_hz` = 28 000 000, `f_step_hz` = 8 000 000 and `n_steps` = 222.
+For example, 24–1800 MHz in 8 MHz steps uses `f_start_hz` = 28 000 000, `f_step_hz` = 8 000 000 and
+`n_steps` = 222.
 
 ## Block format
 
@@ -86,9 +101,9 @@ The first 8 and last 8 words are overwritten by tags, so **samples are words 8..
 A block is **valid** only if both magics match and the header's step, block and frequency equal the trailer's.
 
 - A header that matches but whose trailer differs means the DMA overwrote the block while USB was still reading it. Drop it.
-- Untagged blocks arrive before START and after STOP. Ignore them.
-- Sequence gaps (an `(sweep, step)` pair skipped) were never seen in testing. Count them anyway.
-- If lock timed out (bit 15 set), mark that step's bins suspect. It didn't happen in testing.
+- Untagged blocks arrive before the sweep starts and after it stops. Ignore them.
+- Sequence gaps (a `(sweep, step)` pair skipped) were never seen in testing. Count them anyway.
+- If lock timed out (bit 15 set), drop or mark that step. It didn't happen in testing.
 
 ## Spectrum
 
@@ -98,35 +113,45 @@ The data is real-valued at 20 MSPS with the IF at 5 MHz, and the **spectrum is i
 RF = centre_hz − (f_if − 5 MHz)        f_if = real-FFT bin frequency, 0..10 MHz
 ```
 
-The reference client does the following:
-1. Subtract the mean.
-2. Apply a Hann window.
-3. Run `rfft` with n = 8192. Bins are 2.44 kHz apart.
-4. Keep bins with |RF − centre| ≤ step/2.
-5. Reorder them into ascending RF.
+The flat passband is about ±4.65 MHz.
 
-The flat passband is about ±4.65 MHz. With 8 MHz steps, each hop's edges stay inside it.
-To use the analytic-signal path instead, multiply by e^(−jπn/2), which shifts fs/4 to DC, then low-pass and decimate by 2. Remember the inversion.
+SpecTrawl converts each block to IQ (`native::RawToIq`), so the engine sees ordinary 10 MS/s hops:
+1. Subtract the mean.
+2. Multiply by j^n, which shifts fs/4 to DC and undoes the inversion.
+3. Apply a 95-tap Kaiser half-band and decimate by 2: 4088 IQ samples per block.
+
+The scale matches libhydrasdr's float IQ (a full-scale real tone becomes complex amplitude 0.5), so
+noise floors read the same as in normal streaming.
 
 ## Throughput and timing
 
 - USB load is 16 KB per hop per dwell block: about 11 MB/s at 680 hops/s, against a 44.9 MB/s ceiling.
 - Most hops take 3 blocks (1.23 ms).
-- Hops just above VCO divider changes (RF ≈ 50, 106, 216, 438 and 880 MHz) take longer, as does the low band.
-- The wrap from the top of the range back to the bottom takes **~7 ms**. The lock check absorbs all of this; the host never has to guess.
-- The stream is **not continuous** in sweep mode. Turn off the backend's delivered-vs-clock check
-  (`check_delivery`, "LOSING n% OF SAMPLES") while sweeping, or it will report a huge shortfall.
-  Use the trailer's DMA counter for timing instead.
-- Gain is fixed for the whole pass. Linearity preset 10 is a reasonable survey default; the default maximum clips in FM and TV bands.
+- Hops just above VCO divider changes (RF ≈ 50, 106, 216, 438 and 880 MHz) take longer, as does the low
+  band. A 100–124 MHz sweep runs at only ~188 hops/s (about 4.9 ms per hop), so revisit times vary by band.
+- The wrap from the top of the range back to the bottom takes **~7 ms**. The lock check absorbs all of
+  this; the host never has to guess.
+- The stream is **not continuous** in sweep mode. The backend's delivered-vs-clock check
+  (`check_delivery`) is off while sweeping; the trailer's DMA counter times each hop instead.
+- Gain is fixed for the whole pass. Linearity preset 10 is a reasonable survey default; the default
+  maximum clips in FM and TV bands.
 
-## Mapping onto SpecTrawl
+## In SpecTrawl
 
-- Set `Capabilities::native_sweep = true` when the version string contains `sweep`.
-- A native sweep run produces finished per-hop power rows keyed by `(sweep, step, centre_hz)`.
-  The Survey role's row assembly (`sweep_partial`, segments, spur blanking) can consume them directly, with no guard time or retune logic.
-- **Segmented plans:** the firmware steps a uniform grid. Either sweep the full grid and drop hops
-  outside the segments, or restart with a new `f_start_hz`/`n_steps` for each segment.
-  A restart costs one 375 µs control request plus a retune.
-- The RFOne can't be a Focus receiver while it sweeps. It is a Survey device, or the other.
+- `backend-airspy` sets `Capabilities::native_sweep` when the sweep calls resolve and
+  `hydrasdr_sweep_supported` returns 1. `Device::start_native_sweep` and `stop_native_sweep` start and
+  stop it. Each hop reaches the engine as a `Retune` at its first sample, followed by its blocks.
+- The engine's Sweep mode uses the board sweep when it can (`SweepPlan::native_dwell` > 0, default 4),
+  reads hops off the segment table and stitches them into passes the same way as a host-retuned sweep.
+- Measured on air with 9 MHz steps, 24–1797 MHz (197 hops):
 
-Contact for firmware changes: the `~/hydrasdr` repo. New sweep firmware iterations get logged in `firmware/README.md` there.
+  | Dwell | Hops/s | Rate | Pass |
+  |---|---|---|---|
+  | 1 | ~649 | 5.8 GHz/s | 0.30 s |
+  | 2 | ~522 | 4.7 GHz/s | 0.39 s |
+  | 4 | ~355–375 | 3.3 GHz/s | 0.54 s |
+  | host retuning | 144 | 1.3 GHz/s | 1.38 s |
+
+- The RFOne can't be a Focus receiver while it sweeps.
+- `crates/backend-airspy/examples/native_sweep.rs` exercises the backend alone:
+  `SPECTRAWL_HYDRASDR_LIB=… target/release/examples/native_sweep 36B463DC324C16C7 6 1`.

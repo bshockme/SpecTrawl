@@ -82,6 +82,10 @@ fn main() {
         let mut sizes: Vec<u64> = hops.windows(2).map(|w| w[1].0 - w[0].0).collect();
         sizes.sort();
         let wraps = hops.windows(2).filter(|w| w[1].1 < w[0].1).count();
+        let usual = sizes[sizes.len() / 2];
+        for (i, w) in hops.windows(2).enumerate().filter(|(_, w)| w[1].0 - w[0].0 != usual) {
+            println!("hop {i} at {:.1} MHz: {} samples (next {:.1} MHz)", w[0].1 / 1e6, w[1].0 - w[0].0, w[1].1 / 1e6);
+        }
         println!(
             "{} hops in {el:.2} s = {:.0} hops/s, {wraps} wraps; hop sizes {:?}..{:?} (median {:?}); {} samples ({:.2} MS/s); {} anchors",
             hops.len(),

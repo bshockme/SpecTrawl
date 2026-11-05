@@ -144,6 +144,18 @@ struct Api {
     set_vga_gain: unsafe extern "C" fn(*mut AirspyDev, u8) -> c_int,
     r820t_read: unsafe extern "C" fn(*mut AirspyDev, u8, *mut u8) -> c_int,
     error_name: unsafe extern "C" fn(c_int) -> *const c_char,
+    /// The patched libhydrasdr only (~/hydrasdr `host/`): the RFOne sweep firmware's calls.
+    sweep: Option<SweepApi>,
+}
+
+/// `hydrasdr_sweep_*`.
+struct SweepApi {
+    /// 1 when the firmware sweeps, 0 when not, below 0 on error.
+    supported: unsafe extern "C" fn(*mut AirspyDev) -> c_int,
+    /// Starts, or replaces a running plan without a stop. Needs the raw, unpacked stream running.
+    start: unsafe extern "C" fn(*mut AirspyDev, *const native::SweepParams) -> c_int,
+    /// The stream carries on in normal mode.
+    stop: unsafe extern "C" fn(*mut AirspyDev) -> c_int,
 }
 
 impl Api {
@@ -195,6 +207,14 @@ impl Api {
                 set_vga_gain: sym!("set_vga_gain"),
                 r820t_read: sym!(if hydra { "r82x_read" } else { "r820t_read" }),
                 error_name: sym!("error_name"),
+                sweep: if hydra {
+                    (|| -> std::result::Result<SweepApi, libloading::Error> {
+                        Ok(SweepApi { supported: sym!("sweep_supported"), start: sym!("sweep_start"), stop: sym!("sweep_stop") })
+                    })()
+                    .ok()
+                } else {
+                    None
+                },
                 _lib: lib,
             })
         }
@@ -492,12 +512,17 @@ impl AirspyBackend {
         let sn = u64::from_str_radix(serial, 16).map_err(|_| Error::NotFound(serial.into()))?;
         let (api, dev, rates, model) = probe(&apis, self.scan_unlisted(), sn)?;
         let rate = rates.iter().copied().fold(0.0, f64::max);
-        // Custom RFOne firmware with an on-board sweep ("v1.0.2-sweep2"); stock
-        // firmware STALLs its requests. It needs libhydrasdr's raw stream.
+        // Custom RFOne firmware with an on-board sweep ("v1.0.2-sweep2"),
+        // driven through the patched libhydrasdr's sweep calls.
         let fw = firmware(&api, dev);
-        let native_sweep = api.hydra && fw.contains("sweep");
+        let native_sweep = api.sweep.as_ref().is_some_and(|s| unsafe { (s.supported)(dev) } == 1);
         if native_sweep {
             log::info!("{serial}: firmware {fw} sweeps on the board");
+        } else if api.hydra && fw.contains("sweep") {
+            log::warn!(
+                "{serial}: firmware {fw} can sweep on the board, but this libhydrasdr has no sweep calls \
+                 (point SPECTRAWL_HYDRASDR_LIB at the patched one); sweeping by retuning"
+            );
         }
         let mut d = AirspyDevice {
             api,
@@ -580,6 +605,20 @@ impl AirspyDevice {
             dwell_blocks: plan.dwell_blocks,
             block_samples: native::BLOCK_SAMPLES,
         }
+    }
+
+    fn sweep_api(&self) -> Result<&SweepApi> {
+        self.api.sweep.as_ref().ok_or_else(|| Error::Unsupported("native sweep (needs the patched libhydrasdr)".into()))
+    }
+
+    fn sweep_start(&self, params: &native::SweepParams) -> Result<()> {
+        let rc = unsafe { (self.sweep_api()?.start)(self.dev, params) };
+        self.api.check("sweep_start", rc)
+    }
+
+    fn sweep_stop(&self) -> Result<()> {
+        let rc = unsafe { (self.sweep_api()?.stop)(self.dev) };
+        self.api.check("sweep_stop", rc)
     }
 
     /// Stops the stream and starts it again raw for a firmware sweep (`Some`),
@@ -874,8 +913,7 @@ pub struct AirspyDevice {
 
 /// A running firmware sweep.
 struct NativeState {
-    handle: native::VendorHandle,
-    params: [u8; 16],
+    params: native::SweepParams,
 }
 
 // The raw handle is only used through libairspy, which is thread-safe for the
@@ -934,10 +972,10 @@ impl Device for AirspyDevice {
     fn set_gain(&mut self, gain: GainSetting) -> Result<()> {
         // The board refuses gain requests while it sweeps: pause it around them.
         if let Some(n) = &self.native {
-            n.handle.request(native::SWEEP_STOP, &[])?;
+            let params = n.params;
+            self.sweep_stop()?;
             let r = self.apply_gain(gain);
-            let n = self.native.as_ref().expect("still sweeping");
-            n.handle.request(native::SWEEP_START, &n.params)?;
+            self.sweep_start(&params)?;
             return r;
         }
         self.apply_gain(gain)
@@ -965,26 +1003,22 @@ impl Device for AirspyDevice {
             )));
         }
         let (first, step) = (plan.first_center_hz.round() as u32, plan.step_hz.round() as u32);
-        let params = native::start_params(first, step, plan.steps as u16, plan.dwell_blocks);
+        let params = native::SweepParams::new(first, step, plan.steps as u16, plan.dwell_blocks);
         match self.native.take() {
             Some(mut n) => {
-                let r = n.handle.request(native::SWEEP_STOP, &[]).and_then(|()| {
-                    // The callback is running; it only reads the step count, to spot skipped steps.
-                    if let Some(r) = unsafe { self.raw_mut() } {
-                        r.steps = plan.steps;
-                    }
-                    n.handle.request(native::SWEEP_START, &params)
-                });
+                // The callback is running; it only reads the step count, to spot skipped steps.
+                if let Some(r) = unsafe { self.raw_mut() } {
+                    r.steps = plan.steps;
+                }
                 n.params = params;
                 self.native = Some(n);
-                r?;
+                self.sweep_start(&params)?;
             }
             None => {
-                let handle = native::VendorHandle::open(&self.info.serial)?;
                 self.restart_stream(Some(RawRx::new(plan.steps)))?;
                 // As the reference client does: let the stream get going first.
                 std::thread::sleep(Duration::from_millis(50));
-                if let Err(e) = handle.request(native::SWEEP_START, &params) {
+                if let Err(e) = self.sweep_start(&params) {
                     let _ = self.restart_stream(None);
                     return Err(e);
                 }
@@ -997,7 +1031,7 @@ impl Device for AirspyDevice {
                     f64::from(step) / 1e6,
                     plan.dwell_blocks
                 );
-                self.native = Some(NativeState { handle, params });
+                self.native = Some(NativeState { params });
                 return Ok(self.granted(first, step, plan));
             }
         }
@@ -1005,9 +1039,10 @@ impl Device for AirspyDevice {
     }
 
     fn stop_native_sweep(&mut self) -> Result<()> {
-        let Some(n) = self.native.take() else { return Ok(()) };
-        let stopped = n.handle.request(native::SWEEP_STOP, &[]);
-        drop(n);
+        if self.native.take().is_none() {
+            return Ok(());
+        }
+        let stopped = self.sweep_stop();
         if let Some(r) = unsafe { self.raw_mut() } {
             let s = r.stats;
             log::info!(
@@ -1061,8 +1096,8 @@ impl Device for AirspyDevice {
         if self.ctx.is_null() {
             return Ok(());
         }
-        if let Some(n) = self.native.take() {
-            let _ = n.handle.request(native::SWEEP_STOP, &[]);
+        if self.native.take().is_some() {
+            let _ = self.sweep_stop();
             let _ = self.api.check("set_sample_type", unsafe { (self.api.set_sample_type)(self.dev, SAMPLE_FLOAT32_IQ) });
         }
         let rc = unsafe { (self.api.stop_rx)(self.dev) };

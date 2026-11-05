@@ -5,15 +5,11 @@
 //! blocks captured after it, each tagged with its step and frequency. The
 //! stream is raw (20 MS/s real, IF at 5 MHz, spectrum inverted, unpacked);
 //! each block becomes 4088 IQ samples at 10 MS/s here, the right way round,
-//! so the engine sees ordinary hops. The sweep is started and stopped with
-//! vendor requests on a second USB handle (libhydrasdr has no raw-request
-//! call), which a device-recipient request allows alongside libhydrasdr's
-//! claimed interface (Linux; WinUSB would refuse the second open).
+//! so the engine sees ordinary hops. The sweep is started and stopped through
+//! the sweep calls of the patched libhydrasdr (`hydrasdr_sweep_*`, ~/hydrasdr
+//! `host/`); a stock library lacks them and the board then never sweeps.
 
-use std::ffi::{c_int, c_uint, c_void};
-
-use libloading::Library;
-use sdr_core::{Complex32, Error, Result};
+use sdr_core::Complex32;
 
 /// 16 KB: 8192 12-bit samples in u16 words.
 pub const BLOCK_WORDS: usize = 8192;
@@ -26,29 +22,41 @@ pub const BLOCK_SAMPLES: usize = REAL_SAMPLES / 2;
 /// The DMA counter's tick: one 8192-sample block at 20 MS/s.
 pub const TICK_S: f64 = BLOCK_WORDS as f64 / 20e6;
 
-pub const SWEEP_START: u8 = 0x70;
-pub const SWEEP_STOP: u8 = 0x71;
-const VID: u16 = 0x38af;
-const PID: u16 = 0x0001;
-
 /// Consecutive locked reads of R828D register 2 bit 6 before capture (0 turns
 /// the check off: 1218 hops/s, but ~40 of 222 steps read up to 22 dB low).
 pub const LOCK_READS: u8 = 2;
 /// Lock polls (~0.1 ms each) before the board gives up and sends anyway.
 pub const LOCK_TIMEOUT: u16 = 200;
 
-/// SWEEP_START's 16-byte parameter block (`<IIHBBBBH`).
-pub fn start_params(first_center_hz: u32, step_hz: u32, steps: u16, dwell: u8) -> [u8; 16] {
-    let mut p = [0u8; 16];
-    p[0..4].copy_from_slice(&first_center_hz.to_le_bytes());
-    p[4..8].copy_from_slice(&step_hz.to_le_bytes());
-    p[8..10].copy_from_slice(&steps.to_le_bytes());
-    p[10] = 0; // extra settle blocks after lock
-    p[11] = dwell;
-    p[12] = LOCK_READS;
-    p[13] = 0;
-    p[14..16].copy_from_slice(&LOCK_TIMEOUT.to_le_bytes());
-    p
+/// `hydrasdr_sweep_params_t`: 16 bytes, naturally aligned, no padding.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweepParams {
+    /// Centre of step 0.
+    pub f_start_hz: u32,
+    pub f_step_hz: u32,
+    pub n_steps: u16,
+    /// Extra blocks discarded after lock.
+    pub skip_blocks: u8,
+    pub dwell_blocks: u8,
+    pub lock_reads: u8,
+    pub reserved: u8,
+    pub lock_timeout: u16,
+}
+
+impl SweepParams {
+    pub fn new(first_center_hz: u32, step_hz: u32, steps: u16, dwell: u8) -> Self {
+        Self {
+            f_start_hz: first_center_hz,
+            f_step_hz: step_hz,
+            n_steps: steps,
+            skip_blocks: 0,
+            dwell_blocks: dwell,
+            lock_reads: LOCK_READS,
+            reserved: 0,
+            lock_timeout: LOCK_TIMEOUT,
+        }
+    }
 }
 
 /// A block's tags, when header and trailer agree.
@@ -71,10 +79,12 @@ pub enum Block {
     Tagged(Tag),
     /// Header present but the trailer disagrees: the DMA overwrote the block while USB still read it.
     Torn,
-    /// No header: sent before SWEEP_START or after SWEEP_STOP.
+    /// No header: normal-mode data, sent before the sweep starts or after it stops.
     Untagged,
 }
 
+/// The checks `hydrasdr_sweep_parse_block` makes, done here so they cost no
+/// call into the library per block and are tested without it.
 pub fn parse(w: &[u16]) -> Block {
     debug_assert_eq!(w.len(), BLOCK_WORDS);
     let (h, t) = (&w[..TAG_WORDS], &w[BLOCK_WORDS - TAG_WORDS..]);
@@ -198,145 +208,6 @@ fn kaiser_halfband(taps: usize, beta: f64) -> Vec<f64> {
     h
 }
 
-#[repr(C)]
-#[derive(Default)]
-struct DeviceDescriptor {
-    b_length: u8,
-    b_descriptor_type: u8,
-    bcd_usb: u16,
-    b_device_class: u8,
-    b_device_sub_class: u8,
-    b_device_protocol: u8,
-    b_max_packet_size0: u8,
-    id_vendor: u16,
-    id_product: u16,
-    bcd_device: u16,
-    i_manufacturer: u8,
-    i_product: u8,
-    i_serial_number: u8,
-    b_num_configurations: u8,
-}
-
-type Ctx = c_void;
-type Dev = c_void;
-type Handle = c_void;
-
-/// libusb-1.0, loaded at run time like the radio libraries.
-struct Usb {
-    _lib: Library,
-    init: unsafe extern "C" fn(*mut *mut Ctx) -> c_int,
-    exit: unsafe extern "C" fn(*mut Ctx),
-    get_device_list: unsafe extern "C" fn(*mut Ctx, *mut *mut *mut Dev) -> isize,
-    free_device_list: unsafe extern "C" fn(*mut *mut Dev, c_int),
-    get_device_descriptor: unsafe extern "C" fn(*mut Dev, *mut DeviceDescriptor) -> c_int,
-    open: unsafe extern "C" fn(*mut Dev, *mut *mut Handle) -> c_int,
-    close: unsafe extern "C" fn(*mut Handle),
-    get_string_descriptor_ascii: unsafe extern "C" fn(*mut Handle, u8, *mut u8, c_int) -> c_int,
-    control_transfer: unsafe extern "C" fn(*mut Handle, u8, u8, u16, u16, *mut u8, u16, c_uint) -> c_int,
-}
-
-impl Usb {
-    fn load() -> Result<Self> {
-        let mut last = String::new();
-        for name in ["libusb-1.0.so.0", "libusb-1.0.so", "libusb-1.0.dylib", "libusb-1.0.dll"] {
-            match unsafe { Library::new(name) } {
-                Ok(lib) => return unsafe { Self::resolve(lib) }.map_err(|e| Error::LibraryMissing(format!("{name}: {e}"))),
-                Err(e) => last = format!("{name}: {e}"),
-            }
-        }
-        Err(Error::LibraryMissing(format!("libusb-1.0 ({last})")))
-    }
-
-    unsafe fn resolve(lib: Library) -> std::result::Result<Self, libloading::Error> {
-        unsafe {
-            Ok(Self {
-                init: *lib.get(b"libusb_init\0")?,
-                exit: *lib.get(b"libusb_exit\0")?,
-                get_device_list: *lib.get(b"libusb_get_device_list\0")?,
-                free_device_list: *lib.get(b"libusb_free_device_list\0")?,
-                get_device_descriptor: *lib.get(b"libusb_get_device_descriptor\0")?,
-                open: *lib.get(b"libusb_open\0")?,
-                close: *lib.get(b"libusb_close\0")?,
-                get_string_descriptor_ascii: *lib.get(b"libusb_get_string_descriptor_ascii\0")?,
-                control_transfer: *lib.get(b"libusb_control_transfer\0")?,
-                _lib: lib,
-            })
-        }
-    }
-}
-
-/// A second handle on an RFOne, for its vendor requests.
-pub struct VendorHandle {
-    usb: Usb,
-    ctx: *mut Ctx,
-    handle: *mut Handle,
-}
-
-// libusb handles may be used from any thread; this one is only used under the device's own lock.
-unsafe impl Send for VendorHandle {}
-
-impl VendorHandle {
-    /// The board whose USB serial string ends with `serial` (hex, as the backend names it).
-    pub fn open(serial: &str) -> Result<Self> {
-        let usb = Usb::load()?;
-        let mut ctx = std::ptr::null_mut();
-        if unsafe { (usb.init)(&mut ctx) } != 0 {
-            return Err(Error::Driver("libusb_init failed".into()));
-        }
-        let mut list = std::ptr::null_mut();
-        let n = unsafe { (usb.get_device_list)(ctx, &mut list) };
-        let mut found = std::ptr::null_mut();
-        let want = serial.to_ascii_uppercase();
-        for i in 0..n.max(0) as usize {
-            let dev = unsafe { *list.add(i) };
-            let mut d = DeviceDescriptor::default();
-            if unsafe { (usb.get_device_descriptor)(dev, &mut d) } != 0 || d.id_vendor != VID || d.id_product != PID {
-                continue;
-            }
-            let mut h = std::ptr::null_mut();
-            if unsafe { (usb.open)(dev, &mut h) } != 0 {
-                continue;
-            }
-            let mut buf = [0u8; 64];
-            let len = unsafe { (usb.get_string_descriptor_ascii)(h, d.i_serial_number, buf.as_mut_ptr(), buf.len() as c_int) };
-            let s = String::from_utf8_lossy(&buf[..len.max(0) as usize]).to_ascii_uppercase();
-            // "HYDRASDR SN:36B463DC324C16C7"; the backend's serial may have dropped leading zeros.
-            if s.rsplit(':').next().is_some_and(|sn| sn.trim_start_matches('0') == want.trim_start_matches('0')) {
-                found = h;
-                break;
-            }
-            unsafe { (usb.close)(h) };
-        }
-        if !list.is_null() {
-            unsafe { (usb.free_device_list)(list, 1) };
-        }
-        if found.is_null() {
-            unsafe { (usb.exit)(ctx) };
-            return Err(Error::NotFound(format!("RFOne {serial} over libusb")));
-        }
-        Ok(Self { usb, ctx, handle: found })
-    }
-
-    /// A vendor, host-to-device, device-recipient request with no value or index.
-    pub fn request(&self, request: u8, data: &[u8]) -> Result<()> {
-        let mut buf = data.to_vec();
-        let rc = unsafe { (self.usb.control_transfer)(self.handle, 0x40, request, 0, 0, buf.as_mut_ptr(), buf.len() as u16, 1000) };
-        if rc < 0 || rc as usize != data.len() {
-            return Err(Error::Driver(format!("vendor request {request:#04x}: libusb {rc}")));
-        }
-        Ok(())
-    }
-}
-
-impl Drop for VendorHandle {
-    fn drop(&mut self) {
-        unsafe {
-            (self.usb.close)(self.handle);
-            (self.usb.exit)(self.ctx);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,8 +237,11 @@ mod tests {
         torn[BLOCK_WORDS - 6] ^= 1;
         assert_eq!(parse(&torn), Block::Torn);
         assert_eq!(parse(&vec![2048u16; BLOCK_WORDS]), Block::Untagged);
-        let p = start_params(28_000_000, 8_000_000, 222, 1);
-        assert_eq!(p, [0x00, 0x3f, 0xab, 0x01, 0x00, 0x12, 0x7a, 0x00, 222, 0, 0, 1, 2, 0, 200, 0]);
+        // The C struct's layout: on a little-endian machine its bytes are the firmware's `<IIHBBBBH`.
+        let p = SweepParams::new(28_000_000, 8_000_000, 222, 1);
+        assert_eq!(std::mem::size_of::<SweepParams>(), 16);
+        let bytes: [u8; 16] = unsafe { std::mem::transmute(p) };
+        assert_eq!(bytes, [0x00, 0x3f, 0xab, 0x01, 0x00, 0x12, 0x7a, 0x00, 222, 0, 0, 1, 2, 0, 200, 0]);
     }
 
     /// Power per FFT bin of `iq` (zero-padded to 4096, Hann), DC-centred.

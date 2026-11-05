@@ -8,7 +8,7 @@
 
 **Backend (`backend-airspy::native`).**
 - Detects support from the firmware version (`sweep`) when libhydrasdr drives the board.
-- Start: open a second USB handle by VID:PID and serial string (libusb-1.0 loaded at run time); restart the stream raw (sample type 5, packing off); send SWEEP_START (0x70) with the 16-byte parameters (lock check 2 reads, timeout 200 polls).
+- Start: restart the stream raw (sample type 5, packing off); call `hydrasdr_sweep_start` with the 16-byte parameters (lock check 2 reads, timeout 200 polls). (Superseded the same day: the first version opened a second USB handle and sent vendor request 0x70 itself.)
 - Stop: send SWEEP_STOP (0x71); restart the stream as float IQ at the live centre.
 - The callback parses each 16 KB block:
   - It drops torn and untagged blocks, and any hop whose lock timed out or which doesn't start at block 0.
