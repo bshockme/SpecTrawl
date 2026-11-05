@@ -55,12 +55,14 @@ fn nothing_in_the_engine_constructs_a_down_converter_or_reads_the_wall_clock() {
 }
 
 #[test]
-fn threads_are_created_only_by_the_keeper_the_stage_the_pool_the_publisher_and_the_store() {
-    // The store's writer is the one thread spec §4.8 adds ("written by a single store thread off a queue").
-    let allowed = ["ring/keeper.rs", "stage.rs", "channels/sched.rs", "snapshot/mod.rs", "store/mod.rs"];
+fn only_the_source_holds_the_device_or_takes_its_stream() {
+    // Spec §7: only the backend's driver thread reads the radio, and its samples reach the
+    // rest of the engine through the ring. `engine.rs` only hands a device to `Source::start`.
     for (p, s) in sources() {
-        let spawns = s.contains("thread::spawn(") || s.contains("thread::Builder::new(");
-        let ok = allowed.iter().any(|a| p.to_string_lossy().replace('\\', "/").ends_with(a));
-        assert!(!spawns || ok, "{}: creates a thread", p.display());
+        let path = p.to_string_lossy().replace('\\', "/");
+        let source = path.ends_with("src/source.rs");
+        assert!(source || !s.contains("StreamSink for"), "{}: takes a device's stream", p.display());
+        let holds = s.contains("dyn Device");
+        assert!(!holds || source || path.ends_with("src/engine.rs"), "{}: holds a device", p.display());
     }
 }

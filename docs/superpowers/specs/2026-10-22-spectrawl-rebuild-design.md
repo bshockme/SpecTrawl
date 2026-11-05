@@ -32,7 +32,7 @@ This rebuild keeps the code that was verified on air (the `detect` crate and the
 
 **Anti-goals: the rebuild has failed if**
 
-- Any consumer creates its own down-converter or its own thread.
+- Any consumer reads the radio itself, or creates its own down-converter or clock.
 - A label is shown with no evidence behind it, or an inferred label (band plan, neighbour, position) is styled like a decoded one.
 - Two displays disagree about the same signal.
 - A requirement disappears without a backlog line saying so.
@@ -219,7 +219,7 @@ Each step ends with a test on the simulator and, where it touches a decoder, on 
 
 ## 7. Process rules
 
-- No feature creates a thread, a down-converter or a clock. Reviewers reject it.
+- Only the backend's driver thread reads the SDR, and only the source (`engine/src/source.rs`) holds the device. Every other part of the engine takes samples from the ring or the bus. No feature creates a down-converter or reads the clock; time comes from the timeline. A feature may start a thread when its job needs one (replay, audio output), provided the engine owns it and joins it on shutdown. Reviewers reject anything else. (Rewritten 2026-11-05 with the owner: the rule was aimed at private reads of the radio, not at threads as such.)
 - A requirement that is cut goes to BACKLOG with a reason the same day.
 - Parallel work (agent worktrees) is allowed for steps 6–9 only. Steps 0–5 are done serially on one branch.
 - Every claim shown to the user has evidence; "unknown" is an allowed answer.
