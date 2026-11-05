@@ -157,3 +157,44 @@ fn records_list_and_box_with_one_snapshot_in_five() {
     assert_eq!(found[0].tags, ["birdie"]);
     assert_eq!(app.selected(), Some(cw));
 }
+
+#[test]
+fn a_sweeping_receiver_shows_its_passes_over_the_span() {
+    let engine = Engine::new(EngineConfig {
+        budget: BudgetConfig { guaranteed_secs: 1.0, ceiling_bytes: 256 << 20, sweep_secs: 0.5 },
+        bus: BusConfig::default(),
+        source: SourceConfig::default(),
+        store: None,
+        slices: None,
+    });
+    let handle = engine::snapshot::spawn(engine, vec![Box::new(GapFreeSim)], PublisherConfig::default());
+    let ctx = egui::Context::default();
+    let mut app = App::new(handle.clone());
+    let input = |k: usize| egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 900.0))),
+        time: Some(k as f64 / 20.0),
+        ..Default::default()
+    };
+    handle.send(Command::Open { backend: "sim".into(), serial: "SIM-0001".into() });
+    let mut id = None;
+    for k in 0..80 {
+        let mut output = ctx.run_ui(input(k), |ui| app.frame(ui));
+        output.textures_delta.clear();
+        if id.is_none()
+            && let Some(r) = handle.latest().receivers.first()
+        {
+            id = Some(r.id);
+            app.push_command(Command::SetSweep { source: r.id, start_hz: 845e6, stop_hz: 875e6, segments: vec![] });
+            app.push_command(Command::SetMode { source: r.id, mode: api::Mode::Sweep });
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let id = id.expect("the simulator opened");
+    let r = handle.latest().receivers.iter().find(|r| r.id == id).cloned().unwrap();
+    assert_eq!(r.letter, 'S');
+    assert!(r.sweep.as_ref().is_some_and(|s| s.passes > 5), "{:?}", r.status);
+    let pane = app.pane(id).expect("its pane");
+    let (lo, hi) = pane.history_span().expect("rows in the waterfall");
+    assert!((lo - 845e6).abs() < 1.0 && (hi - 881e6).abs() < 1.0, "the waterfall spans {lo}..{hi}");
+    assert!(pane.history_len() > 5);
+}

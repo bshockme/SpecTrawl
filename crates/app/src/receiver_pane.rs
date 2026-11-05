@@ -21,6 +21,9 @@ pub struct ReceiverPane {
     /// The centre drag value's copy, in MHz; follows the snapshot except while it is being edited.
     centre_mhz: f64,
     centre_editing: bool,
+    /// The sweep span fields' copies, in MHz; follow the snapshot except while either is being edited.
+    span_mhz: (f64, f64),
+    span_editing: bool,
     gain: GainDraft,
     gain_open: bool,
     body: body::Body,
@@ -60,6 +63,8 @@ impl ReceiverPane {
             paused: false,
             centre_mhz: 0.0,
             centre_editing: false,
+            span_mhz: (24.0, 1800.0),
+            span_editing: false,
             gain: GainDraft { linearity: 0.5, sensitivity: 0.5, manual: [8, 8, 8] },
             gain_open: false,
             body: body::Body::new(),
@@ -102,6 +107,11 @@ impl ReceiverPane {
         self.body.history.len()
     }
 
+    /// The frequencies the waterfall's rows cover (`None` before the first row).
+    pub fn history_span(&self) -> Option<(f64, f64)> {
+        self.body.history.span()
+    }
+
     /// The waterfall rows (0 = newest) a record's box spans, if any held row saw it.
     pub fn record_rows(&self, r: &api::SignalRecord) -> Option<(usize, usize)> {
         self.body.history.rows_of(r.first_sample, r.end_sample)
@@ -134,9 +144,16 @@ impl ReceiverPane {
                 theme::chip(ui, &letter, theme::CHIP_FOCUS_BG, theme::CHIP_FOCUS_FG);
             }
             ui.label(egui::RichText::new(&r.device.label).strong());
-            ui.label(egui::RichText::new(mode_name(r.mode)).color(theme::MUTED));
+            for mode in [Mode::Live, Mode::Sweep] {
+                if ui.add(egui::Button::new(mode_name(mode)).selected(r.mode == mode)).clicked() && r.mode != mode {
+                    out.push(Command::SetMode { source: r.id, mode });
+                }
+            }
             ui.separator();
-            self.centre(ui, r, out);
+            match r.mode {
+                Mode::Live => self.centre(ui, r, out),
+                Mode::Sweep => self.span(ui, r, out),
+            }
             self.gain_menu(ui, r, out);
             self.db_menu(ui);
             if ui.add(egui::Button::new("Pause").selected(self.paused)).on_hover_text("Freeze the waterfall (Space)").clicked() {
@@ -173,6 +190,27 @@ impl ReceiverPane {
             let hz = if step > 0.0 { (hz / step).round() * step } else { hz };
             if hz != r.center_hz {
                 out.push(Command::Tune { source: r.id, center_hz: hz });
+            }
+        }
+    }
+
+    /// A sweeping receiver's span, from–to in MHz; an edit is sent once it settles.
+    fn span(&mut self, ui: &mut egui::Ui, r: &Receiver, out: &mut Vec<Command>) {
+        if !self.span_editing
+            && let Some(s) = &r.sweep
+        {
+            self.span_mhz = (s.start_hz / 1e6, s.stop_hz / 1e6);
+        }
+        let (lo, hi) = r.caps.freq_ranges_hz.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &(a, b)| (lo.min(a), hi.max(b)));
+        let range = if lo < hi { lo / 1e6..=hi / 1e6 } else { 0.0..=1e5 };
+        let a = ui.add(egui::DragValue::new(&mut self.span_mhz.0).speed(1.0).fixed_decimals(1).suffix(" MHz").range(range.clone()));
+        ui.label("–");
+        let b = ui.add(egui::DragValue::new(&mut self.span_mhz.1).speed(1.0).fixed_decimals(1).suffix(" MHz").range(range));
+        self.span_editing = a.has_focus() || a.dragged() || b.has_focus() || b.dragged();
+        if settled(&a) || settled(&b) {
+            let (start, stop) = (self.span_mhz.0.min(self.span_mhz.1) * 1e6, self.span_mhz.0.max(self.span_mhz.1) * 1e6);
+            if stop > start {
+                out.push(Command::SetSweep { source: r.id, start_hz: start, stop_hz: stop, segments: vec![] });
             }
         }
     }

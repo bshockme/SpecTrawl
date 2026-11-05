@@ -189,7 +189,8 @@ impl Body {
             spec.drag_delta().x,
         );
         self.tune_drag = offset;
-        if let Some(dx) = release {
+        // A sweeping receiver tunes itself: dragging its spectrum does nothing.
+        if let Some(dx) = release.filter(|_| r.mode == api::Mode::Live) {
             let (lo, hi) = view.window(span);
             let dhz = (dx / spec.rect.width()) as f64 * (hi - lo);
             let hz = round_to(r.center_hz - dhz, r.caps.tuning_step_hz);
