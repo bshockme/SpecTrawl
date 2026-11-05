@@ -1,0 +1,855 @@
+//! Groups records into emitters: persistent transmitters on a channel, per device (re-homed from
+//! `engine-old::emitters`, grouping and confirmation only; spec §4.4).
+//!
+//! A record joins the emitter whose centre is within tolerance and whose bandwidth is comparable, or a confirmed
+//! narrowband emitter it lies inside (one tone of a pager, a station's quiet carrier), which it then doesn't reshape;
+//! otherwise it starts a new one. A record is placed from its first rows, so when one that started an emitter of its own
+//! closes, it is matched again with its final shape. An emitter counts as `confirmed` once it can't be a noise blip; the
+//! unconfirmed ones are dropped if they don't recur.
+//!
+//! Where a line sits relative to the receiver's own artefacts (the mirror image of another line about the tuner, a comb
+//! of always-on lines, the spur grid, DC on a zero-IF radio) becomes a `Position` claim on the record: one claim among
+//! others, never a sticky label. Label voting over records' claims comes with the detector bank (step 6).
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use api::{Claim, EmitterId, EmitterView, Evidence, PositionKind, RecordId, SignalRecord};
+
+/// Most emitters kept per device; the least recently seen inactive ones go first.
+const MAX_EMITTERS: usize = 5000;
+/// Confirmed once it has had this many records that weren't weak one-row blips (rows ≥ 2 or SNR ≥ `BLIP_SNR_DB`)...
+const CONFIRM_RECORDS: u32 = 3;
+const BLIP_SNR_DB: f32 = 12.0;
+/// ...or one record lasting this long over at least `CONFIRM_ROWS` rows...
+const CONFIRM_DURATION_S: f64 = 0.5;
+const CONFIRM_ROWS: u32 = 3;
+/// ...or one this far above the floor.
+const CONFIRM_SNR_DB: f32 = 15.0;
+/// Unconfirmed emitters not seen again within this are dropped.
+const UNCONFIRMED_TTL: Duration = Duration::from_secs(120);
+/// Confirmed emitters not seen within this leave memory (the store keeps them).
+pub const EMITTER_WINDOW: Duration = Duration::from_secs(24 * 3600);
+/// Rows with bins this wide or wider (the survey's) match records by overlap.
+const COARSE_BIN_HZ: f64 = 10e3;
+/// Calls to `mark_active` between sweeps for stale emitters.
+const PRUNE_EVERY: u32 = 64;
+/// Widest emitter that takes in narrower records lying inside it: a narrowband channel.
+const CONTAIN_MAX_HZ: f64 = 30e3;
+/// Closed records whose sample extents an emitter remembers (for group windows, step 6).
+const RECENT_RECORDS: usize = 8;
+
+/// Narrower than this, a signal is a line: a carrier, a spur or a birdie.
+const LINE_HZ: f64 = 5e3;
+/// Lines this close in frequency are the same line (a bin or two).
+const LINE_TOL_HZ: f64 = 1.5e3;
+/// A comb needs this many lines at one spacing, this one included (with twenty-odd lines in a 10 MHz span, three at
+/// some common spacing is coincidence about once per line; four is not)...
+const COMB_LINES: usize = 4;
+/// ...each with this many records (the radio's own 750 kHz comb lines had 12–40 in a minute, the false members at a
+/// trunked site 1–5)...
+const COMB_MEMBER_RECORDS: u32 = 6;
+/// ...at spacings in this range (closer is one wide signal's structure, further apart is coincidence in a 10 MHz span)...
+const COMB_SPACING_HZ: (f64, f64) = (20e3, 2.5e6);
+/// ...and on the air at least this share of the time: a trunked site's narrow blips on its channel raster were 1–39% on
+/// air and read as combs at every multiple of 12.5 kHz.
+const COMB_MIN_DUTY: f64 = 0.5;
+/// A line this close to a multiple of the radio's spur grid is on it.
+const GRID_HZ: f64 = 2.5e3;
+/// A line this close to the tuner centre is at DC.
+const DC_HZ: f64 = 1.5e3;
+
+/// How sure a position alone makes us: a suspicion until the line is measured (step 6).
+const POSITION_CONFIDENCE: f32 = 0.3;
+/// An image pair or a comb is stronger: another line in view says so.
+const CONTEXT_CONFIDENCE: f32 = 0.5;
+
+/// What the store keeps of an emitter.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmitterState {
+    pub id: EmitterId,
+    pub serial: Arc<str>,
+    pub center_hz: f64,
+    pub bandwidth_hz: f64,
+    /// Bin width of the rows its records came from.
+    pub bin_hz: f64,
+    pub first_seen: SystemTime,
+    pub last_seen: SystemTime,
+    pub records: u32,
+    /// Finished records that weren't weak one-row blips.
+    pub solid_records: u32,
+    /// Summed duration of finished records, seconds.
+    pub on_time_s: f64,
+    pub confirmed: bool,
+    pub peak_snr_db: f32,
+    /// Owns its broadcast channel (set from its headline, step 6): narrow records near its centre are it.
+    pub station: bool,
+    pub headline: Option<Claim>,
+}
+
+#[derive(Debug, Clone)]
+struct Emitter {
+    s: EmitterState,
+    /// Start of the record still open on it (its time isn't in `on_time_s` yet).
+    open_start: Option<SystemTime>,
+    active: bool,
+    /// Sample extents of the newest closed records, oldest first.
+    recent: VecDeque<(u64, u64)>,
+}
+
+impl Emitter {
+    /// Fraction of the time between first and last seen that it was on, counting a record still open (a steady line has
+    /// one, all along).
+    fn duty(&self) -> f64 {
+        let s = &self.s;
+        let span = s.last_seen.duration_since(s.first_seen).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        let open = self.open_start.and_then(|t| s.last_seen.duration_since(t).ok()).map_or(0.0, |d| d.as_secs_f64());
+        if span <= 0.0 { 1.0 } else { ((s.on_time_s + open) / span).min(1.0) }
+    }
+
+    fn view(&self) -> EmitterView {
+        let s = &self.s;
+        EmitterView {
+            id: s.id,
+            serial: s.serial.clone(),
+            center_hz: s.center_hz,
+            bandwidth_hz: s.bandwidth_hz,
+            first_seen: s.first_seen,
+            last_seen: s.last_seen,
+            records: s.records,
+            on_time_s: s.on_time_s,
+            duty: self.duty() as f32,
+            confirmed: s.confirmed,
+            headline: s.headline.clone(),
+        }
+    }
+}
+
+/// What placing a record did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Observed {
+    pub emitter: EmitterId,
+    /// `(gone, into)`: an emitter its record had started on its own folded into another.
+    pub folded: Option<(EmitterId, EmitterId)>,
+}
+
+/// One device's emitters.
+pub struct EmitterBook {
+    serial: Arc<str>,
+    map: HashMap<EmitterId, Emitter>,
+    by_record: HashMap<RecordId, EmitterId>,
+    /// Newest record time seen (the book's clock, for pruning).
+    latest: Option<SystemTime>,
+    calls: u32,
+}
+
+impl EmitterBook {
+    pub fn new(serial: Arc<str>) -> Self {
+        Self { serial, map: HashMap::new(), by_record: HashMap::new(), latest: None, calls: 0 }
+    }
+
+    /// A book holding emitters loaded from the store.
+    pub fn load(serial: Arc<str>, states: Vec<EmitterState>) -> Self {
+        let mut b = Self::new(serial);
+        for s in states {
+            b.latest = b.latest.max(Some(s.last_seen));
+            b.map.insert(s.id, Emitter { s, open_start: None, active: false, recent: VecDeque::new() });
+        }
+        b
+    }
+
+    pub fn serial(&self) -> &Arc<str> {
+        &self.serial
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    pub fn emitter_of(&self, record: RecordId) -> Option<EmitterId> {
+        self.by_record.get(&record).copied()
+    }
+
+    pub fn state(&self, id: EmitterId) -> Option<&EmitterState> {
+        self.map.get(&id).map(|e| &e.s)
+    }
+
+    pub fn view(&self, id: EmitterId) -> Option<EmitterView> {
+        self.map.get(&id).map(Emitter::view)
+    }
+
+    /// Every emitter in memory.
+    pub fn views(&self) -> impl Iterator<Item = EmitterView> + '_ {
+        self.map.values().map(Emitter::view)
+    }
+
+    /// Frequency tolerance for joining: a quarter of the bandwidth, at least 2.5 kHz (record centres jitter with
+    /// modulation) and at least 1.5 bins (record edges are whole bins; coarse survey bins move centres by one).
+    fn tolerance(bw: f64, bin: f64) -> f64 {
+        (bw * 0.25).max(2.5e3).max(bin * 1.5)
+    }
+
+    /// Does a record of this centre and bandwidth belong to `e`? Bandwidths must be comparable, allowing a bin either
+    /// way. On coarse rows (the survey) a record only has to touch the emitter.
+    fn fits(e: &EmitterState, c: f64, bw: f64, bin: f64) -> bool {
+        let bin = bin.max(e.bin_hz);
+        if bin >= COARSE_BIN_HZ {
+            return (e.center_hz - c).abs() <= (e.bandwidth_hz + bw) / 2.0 + bin;
+        }
+        let ratio = (bw + bin) / (e.bandwidth_hz.max(1.0) + bin);
+        (e.center_hz - c).abs() <= Self::tolerance(e.bandwidth_hz.max(bw), bin) && (0.33..=3.0).contains(&ratio)
+    }
+
+    /// Does a clearly narrower record lie inside `e`, a confirmed narrowband emitter (or have its centre inside a
+    /// station's channel)? An FSK channel's records that caught one tone (an idle pager: ±4.8 kHz) or part of a burst
+    /// are that channel, not a new "carrier" beside it. Fine rows only; wide emitters are left out so narrow signals
+    /// inside them stay their own.
+    fn contains(e: &EmitterState, c: f64, bw: f64, bin: f64) -> bool {
+        let bin = bin.max(e.bin_hz);
+        if bin >= COARSE_BIN_HZ || !e.confirmed || bw * 2.0 > e.bandwidth_hz + bin {
+            return false;
+        }
+        if e.station {
+            return (e.center_hz - c).abs() <= e.bandwidth_hz / 2.0 + bin;
+        }
+        e.bandwidth_hz <= CONTAIN_MAX_HZ && (e.center_hz - c).abs() + bw / 2.0 <= e.bandwidth_hz / 2.0 + bin
+    }
+
+    /// Is `r` clearly wider than `e` and spanning all of it?
+    fn covers(r: &SignalRecord, e: &EmitterState) -> bool {
+        let bin = r.bin_hz.max(e.bin_hz);
+        r.bandwidth_hz() >= 1.5 * e.bandwidth_hz
+            && r.f_lo_hz <= e.center_hz - e.bandwidth_hz / 2.0 + bin
+            && r.f_hi_hz >= e.center_hz + e.bandwidth_hz / 2.0 - bin
+    }
+
+    /// The emitter a record belongs to, other than `except`: a confirmed narrowband emitter containing it (the
+    /// busiest), else the closest it fits.
+    fn find(&self, c: f64, bw: f64, bin: f64, except: Option<EmitterId>) -> Option<EmitterId> {
+        let others = || self.map.values().map(|e| &e.s).filter(move |e| Some(e.id) != except);
+        others()
+            .filter(|e| Self::contains(e, c, bw, bin))
+            .max_by_key(|e| e.records)
+            .or_else(|| {
+                others().filter(|e| Self::fits(e, c, bw, bin)).min_by(|a, b| (a.center_hz - c).abs().total_cmp(&(b.center_hz - c).abs()))
+            })
+            .map(|e| e.id)
+    }
+
+    /// Assigns a record (open or just closed) to an emitter, creating one (with an id from `ids`) if needed, and
+    /// updates the emitter's stats.
+    pub fn observe(&mut self, r: &SignalRecord, ids: &mut dyn FnMut() -> EmitterId) -> Observed {
+        let closed = !r.open;
+        let bw = r.bandwidth_hz().max(1.0);
+        let c = r.center_hz();
+        let mut folded = None;
+        let id = match self.by_record.get(&r.id) {
+            // A record that closes wider than its emitter and covering it, on an emitter with only a few records, built
+            // that emitter from its own early fragments (two tracks of a broadcast station that later merged): the
+            // emitter takes its final shape.
+            Some(&id) if closed && self.map.get(&id).is_some_and(|e| e.s.records == 1 || (e.s.records <= 3 && Self::covers(r, &e.s))) => {
+                let (to, f) = self.refit(r, id, c, bw);
+                folded = f;
+                to
+            }
+            Some(&id) => id,
+            None => {
+                let id = self.find(c, bw, r.bin_hz, None).unwrap_or_else(|| {
+                    let id = ids();
+                    self.map.insert(id, Self::new_emitter(id, self.serial.clone(), r, c, bw));
+                    id
+                });
+                // A record taken in because it lies inside the emitter is a partial view: it doesn't move the
+                // emitter's centre or width.
+                let partial = self.map.get(&id).is_some_and(|e| e.s.records > 0 && Self::contains(&e.s, c, bw, r.bin_hz));
+                if let Some(e) = self.map.get_mut(&id) {
+                    e.s.records += 1;
+                    if !partial {
+                        // Slow average so one odd record doesn't drag the centre.
+                        e.s.center_hz += (c - e.s.center_hz) * 0.1;
+                        e.s.bandwidth_hz += (bw - e.s.bandwidth_hz) * 0.1;
+                    }
+                }
+                self.by_record.insert(r.id, id);
+                id
+            }
+        };
+        if self.latest.is_none_or(|t| r.t_end > t) {
+            self.latest = Some(r.t_end);
+        }
+        if let Some(e) = self.map.get_mut(&id) {
+            let s = &mut e.s;
+            s.last_seen = s.last_seen.max(r.t_end);
+            s.first_seen = s.first_seen.min(r.t_start);
+            s.peak_snr_db = s.peak_snr_db.max(r.max_snr_db);
+            e.open_start = if closed { None } else { Some(e.open_start.map_or(r.t_start, |t| t.min(r.t_start))) };
+            if closed {
+                s.on_time_s += r.duration().as_secs_f64();
+                if r.rows >= 2 || r.max_snr_db >= BLIP_SNR_DB {
+                    s.solid_records += 1;
+                }
+                if e.recent.len() >= RECENT_RECORDS {
+                    e.recent.pop_front();
+                }
+                e.recent.push_back((r.first_sample, r.end_sample));
+            }
+            s.confirmed |= s.solid_records >= CONFIRM_RECORDS
+                || (r.duration().as_secs_f64() >= CONFIRM_DURATION_S && r.rows >= CONFIRM_ROWS)
+                || r.max_snr_db >= CONFIRM_SNR_DB;
+        }
+        Observed { emitter: id, folded }
+    }
+
+    /// A record that was visible merged into another before it closed: it no longer counts.
+    pub fn forget_record(&mut self, record: RecordId) {
+        if let Some(id) = self.by_record.remove(&record)
+            && let Some(e) = self.map.get_mut(&id)
+        {
+            e.s.records = e.s.records.saturating_sub(1);
+        }
+    }
+
+    /// A record that started emitter `id` on its own has closed: if its final shape fits another emitter, fold `id`
+    /// into that one; otherwise give `id` the final shape. Returns the record's emitter and the fold, if any.
+    fn refit(&mut self, r: &SignalRecord, id: EmitterId, c: f64, bw: f64) -> (EmitterId, Option<(EmitterId, EmitterId)>) {
+        let Some(to) = self.find(c, bw, r.bin_hz, Some(id)) else {
+            if let Some(e) = self.map.get_mut(&id) {
+                e.s.center_hz = c;
+                e.s.bandwidth_hz = bw;
+            }
+            return (id, None);
+        };
+        if !self.fold(id, to) {
+            return (id, None);
+        }
+        self.by_record.insert(r.id, to);
+        if let Some(e) = self.map.get_mut(&to) {
+            e.s.center_hz += (c - e.s.center_hz) * 0.1;
+            e.s.bandwidth_hz += (bw - e.s.bandwidth_hz) * 0.1;
+        }
+        (to, Some((id, to)))
+    }
+
+    /// Folds emitter `id` into `to`: its records (all of them), counts and times. False if either is gone.
+    pub fn fold(&mut self, id: EmitterId, to: EmitterId) -> bool {
+        if id == to || !self.map.contains_key(&to) {
+            return false;
+        }
+        let Some(from) = self.map.remove(&id) else { return false };
+        for v in self.by_record.values_mut() {
+            if *v == id {
+                *v = to;
+            }
+        }
+        let Some(e) = self.map.get_mut(&to) else { return false };
+        let (s, f) = (&mut e.s, &from.s);
+        s.records += f.records;
+        s.solid_records += f.solid_records;
+        s.on_time_s += f.on_time_s;
+        s.first_seen = s.first_seen.min(f.first_seen);
+        s.last_seen = s.last_seen.max(f.last_seen);
+        s.confirmed |= f.confirmed;
+        s.peak_snr_db = s.peak_snr_db.max(f.peak_snr_db);
+        s.station |= f.station;
+        if s.headline.is_none() {
+            s.headline = f.headline.clone();
+        }
+        e.active |= from.active;
+        e.open_start = match (e.open_start, from.open_start) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let mut recent: Vec<(u64, u64)> = e.recent.drain(..).chain(from.recent).collect();
+        recent.sort();
+        recent.dedup();
+        e.recent.extend(recent.into_iter().rev().take(RECENT_RECORDS).rev());
+        true
+    }
+
+    fn new_emitter(id: EmitterId, serial: Arc<str>, r: &SignalRecord, c: f64, bw: f64) -> Emitter {
+        Emitter {
+            s: EmitterState {
+                id,
+                serial,
+                center_hz: c,
+                bandwidth_hz: bw,
+                bin_hz: r.bin_hz,
+                first_seen: r.t_start,
+                last_seen: r.t_end,
+                records: 0,
+                solid_records: 0,
+                on_time_s: 0.0,
+                confirmed: false,
+                peak_snr_db: r.max_snr_db,
+                station: false,
+                headline: None,
+            },
+            open_start: None,
+            active: false,
+            recent: VecDeque::new(),
+        }
+    }
+
+    /// Recomputes `active` from the currently open records; now and then drops stale unconfirmed emitters, confirmed
+    /// ones unseen for [`EMITTER_WINDOW`], and the least recently seen past [`MAX_EMITTERS`]. Returns the ids dropped.
+    pub fn mark_active(&mut self, open: &[RecordId]) -> Vec<EmitterId> {
+        for e in self.map.values_mut() {
+            e.active = false;
+        }
+        for r in open {
+            if let Some(e) = self.by_record.get(r).and_then(|id| self.map.get_mut(id)) {
+                e.active = true;
+            }
+        }
+        self.calls = self.calls.wrapping_add(1);
+        let mut gone = Vec::new();
+        if let Some(now) = self.latest.filter(|_| self.calls.is_multiple_of(PRUNE_EVERY)) {
+            let stale = |e: &Emitter| {
+                let idle = now.duration_since(e.s.last_seen).unwrap_or_default();
+                !e.active && ((!e.s.confirmed && idle > UNCONFIRMED_TTL) || idle > EMITTER_WINDOW)
+            };
+            gone.extend(self.map.values().filter(|e| stale(e)).map(|e| e.s.id));
+        }
+        if self.map.len() > MAX_EMITTERS {
+            let mut order: Vec<(bool, SystemTime, EmitterId)> = self.map.values().map(|e| (e.active, e.s.last_seen, e.s.id)).collect();
+            order.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+            gone.extend(order[MAX_EMITTERS..].iter().map(|o| o.2));
+        }
+        if !gone.is_empty() {
+            gone.sort();
+            gone.dedup();
+            self.map.retain(|id, _| gone.binary_search(id).is_err());
+            let map = &self.map;
+            self.by_record.retain(|_, e| map.contains_key(e));
+        }
+        gone
+    }
+
+    /// Takes a record's claims into its emitter's headline: a better headline (decoded first, then more confident)
+    /// replaces it. `station` follows a headline that names a broadcast station.
+    pub fn note_claims(&mut self, id: EmitterId, claims: &[Claim]) {
+        let Some(e) = self.map.get_mut(&id) else { return };
+        let Some(best) = api::headline(claims) else { return };
+        // A decoder lock outranks a sync-bank claim whatever their confidences (the headline rule).
+        let rank = |c: &Claim| match c.by {
+            Evidence::Decoder { .. } => 2,
+            Evidence::SyncBank { .. } => 1,
+            _ => 0,
+        };
+        let better = match &e.s.headline {
+            None => true,
+            Some(h) => (rank(best), best.confidence) > (rank(h), h.confidence),
+        };
+        if better {
+            e.s.station = best.label.starts_with("FM broadcast");
+            e.s.headline = Some(best.clone());
+        }
+    }
+
+    /// What the receiver's own artefacts say about a record at `r`: at DC (on a zero-IF radio), on the spur grid, the
+    /// mirror image of another line about the tuner centre, or one line of a comb of always-on lines. Lines only
+    /// (narrower than 5 kHz); nothing for anything wider.
+    pub fn position_claims(&self, r: &SignalRecord, zero_if: bool, spur_grid_hz: Option<f64>) -> Vec<Claim> {
+        let (c, bw, tuner) = (r.center_hz(), r.bandwidth_hz(), r.tuner_hz);
+        let mut out = Vec::new();
+        if bw >= LINE_HZ {
+            return out;
+        }
+        if zero_if && (c - tuner).abs() < DC_HZ {
+            out.push(Claim::new("At the tuner centre (DC)", POSITION_CONFIDENCE, Evidence::Position(PositionKind::Dc)));
+        }
+        if let Some(g) = spur_grid_hz.filter(|g| *g > 0.0)
+            && (c - (c / g).round() * g).abs() < GRID_HZ
+        {
+            out.push(Claim::new(
+                "On the radio's spur grid",
+                POSITION_CONFIDENCE,
+                Evidence::Position(PositionKind::SpurGrid { grid_hz: g }),
+            ));
+        }
+        let own = self.by_record.get(&r.id).copied();
+        let lines = |min_records: u32, min_duty: f64| -> Vec<&EmitterState> {
+            self.map
+                .values()
+                .filter(|e| {
+                    Some(e.s.id) != own
+                        && e.s.bandwidth_hz < LINE_HZ
+                        && e.s.records >= min_records
+                        && e.duty() >= min_duty
+                        && (e.s.center_hz - c).abs() > LINE_TOL_HZ
+                })
+                .map(|e| &e.s)
+                .collect()
+        };
+        // Image pairs sit symmetrically about the tuner centre and move with it (the radio's own, from its IF or
+        // sampling).
+        let offset = c - tuner;
+        if offset.abs() > LINE_TOL_HZ
+            && let Some(m) = lines(2, 0.0).into_iter().find(|e| (e.center_hz - (tuner - offset)).abs() <= LINE_TOL_HZ)
+        {
+            out.push(Claim::new("Internal spur (image)", CONTEXT_CONFIDENCE, Evidence::Position(PositionKind::Image { of: m.id })));
+        }
+        // A comb is made of lines that are always there (a clock's harmonics); a busy site's brief blips fall on a
+        // common spacing by chance and must not count. Each other line proposes a spacing; the spacing most lines fit
+        // wins.
+        let members: Vec<f64> = lines(COMB_MEMBER_RECORDS, COMB_MIN_DUTY).into_iter().map(|e| e.center_hz).collect();
+        let mut best: Option<(usize, f64)> = None;
+        for l in &members {
+            let d = (l - c).abs();
+            if !(COMB_SPACING_HZ.0..=COMB_SPACING_HZ.1).contains(&d) {
+                continue;
+            }
+            let n = 1 + members
+                .iter()
+                .filter(|m| {
+                    let k = ((*m - c) / d).round();
+                    k != 0.0 && (*m - (c + k * d)).abs() <= LINE_TOL_HZ
+                })
+                .count();
+            if n >= COMB_LINES && best.is_none_or(|(bn, bd)| n > bn || (n == bn && d < bd)) {
+                best = Some((n, d));
+            }
+        }
+        if let Some((lines, spacing_hz)) = best {
+            let label = if spacing_hz >= 1e6 {
+                format!("Spur comb {:.2} MHz ({lines} lines)", spacing_hz / 1e6)
+            } else {
+                format!("Spur comb {:.0} kHz ({lines} lines)", spacing_hz / 1e3)
+            };
+            out.push(Claim::new(label, CONTEXT_CONFIDENCE, Evidence::Position(PositionKind::Comb { spacing_hz, lines: lines as u32 })));
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use api::{Role, SegmentId, SourceId};
+
+    fn rec(id: u64, mhz: f64, bw_khz: f64, t: u64) -> SignalRecord {
+        let (c, bw) = (mhz * 1e6, bw_khz * 1e3);
+        SignalRecord {
+            id: RecordId(id),
+            source: SourceId(1),
+            serial: "T".into(),
+            role: Role::Live,
+            segment: SegmentId(1),
+            tuner_hz: 0.0,
+            first_sample: t * 1000,
+            end_sample: t * 1000 + 30,
+            t_start: SystemTime::UNIX_EPOCH + Duration::from_secs(t),
+            t_end: SystemTime::UNIX_EPOCH + Duration::from_secs(t) + Duration::from_millis(30),
+            f_lo_hz: c - bw / 2.0,
+            f_hi_hz: c + bw / 2.0,
+            bin_hz: 610.0,
+            peak_dbfs: -60.0,
+            mean_dbfs: -62.0,
+            mean_snr_db: 20.0,
+            max_snr_db: 22.0,
+            rows: 2,
+            open: false,
+            claims: vec![],
+            emitter: None,
+            tags: vec![],
+            notes: vec![],
+            iq_clip: None,
+            slice_evicted: false,
+        }
+    }
+
+    fn open(mut r: SignalRecord) -> SignalRecord {
+        r.open = true;
+        r
+    }
+
+    struct Book {
+        b: EmitterBook,
+        next: u64,
+    }
+
+    impl Book {
+        fn new() -> Book {
+            Book { b: EmitterBook::new("T".into()), next: 0 }
+        }
+        fn observe(&mut self, r: &SignalRecord) -> EmitterId {
+            self.observed(r).emitter
+        }
+        fn observed(&mut self, r: &SignalRecord) -> Observed {
+            let next = &mut self.next;
+            self.b.observe(r, &mut || {
+                *next += 1;
+                EmitterId(*next)
+            })
+        }
+        fn of(&self, record: u64) -> EmitterId {
+            self.b.emitter_of(RecordId(record)).unwrap()
+        }
+        fn get(&self, id: EmitterId) -> Option<&EmitterState> {
+            self.b.state(id)
+        }
+    }
+
+    fn fm_station() -> Claim {
+        Claim::new("FM broadcast (stereo, RDS)", 0.9, Evidence::Decoder { mode: "WFM".into(), locked: true, summary: "RDS".into() })
+    }
+
+    #[test]
+    fn bursts_on_one_channel_form_one_emitter_neighbours_stay_apart() {
+        let mut b = Book::new();
+        for i in 0..40 {
+            // 30 ms TDMA bursts with a little centre jitter...
+            b.observe(&rec(i, 856.3375 + (i % 3) as f64 * 0.0008, 9.0, i));
+            // ...and the adjacent 12.5 kHz channel.
+            b.observe(&rec(1000 + i, 856.3500, 9.0, i));
+        }
+        // A wideband signal at the same centre is something else.
+        b.observe(&rec(5000, 856.3375, 200.0, 50));
+        assert_eq!(b.b.len(), 3);
+        let e = b.get(b.of(5)).unwrap();
+        assert_eq!(e.records, 40);
+        assert!((e.on_time_s - 1.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn coarse_bins_dont_split_a_signal() {
+        // Survey rows: 54 kHz bins. One FM station comes out 1, 2 or 4 bins wide with its centre moving.
+        let bin = 54.1e3;
+        let mut b = Book::new();
+        for (i, (off, bins)) in [(0.0, 1.0), (-0.5, 2.0), (0.0, 4.0), (1.0, 1.0), (0.5, 2.0)].iter().enumerate() {
+            let mut r = rec(i as u64, 96.3 + off * bin / 1e6, bins * bin / 1e3, i as u64 * 10);
+            r.bin_hz = bin;
+            b.observe(&r);
+        }
+        assert_eq!(b.b.len(), 1);
+    }
+
+    #[test]
+    fn record_placed_from_narrow_onset_joins_on_close() {
+        let mut b = Book::new();
+        for i in 0..3 {
+            b.observe(&rec(i, 856.3375, 9.0, i));
+        }
+        // First rows of a key-up: narrow, but inside the channel's confirmed emitter, so it joins it straight away...
+        let mut r = open(rec(10, 856.3380, 1.8, 10));
+        b.observe(&r);
+        assert_eq!(b.b.len(), 1);
+        // ...and stays there once it closes at full width.
+        r.f_lo_hz = 856.3375e6 - 4.5e3;
+        r.f_hi_hz = 856.3375e6 + 4.5e3;
+        r.open = false;
+        let id = b.observe(&r);
+        assert_eq!(b.b.len(), 1);
+        assert_eq!(b.of(10), id);
+        assert_eq!(b.get(id).unwrap().records, 4);
+    }
+
+    #[test]
+    fn pieces_of_a_named_station_join_it() {
+        let mut b = Book::new();
+        let st = b.observe(&rec(1, 93.7, 130.0, 1));
+        for i in 2..4 {
+            b.observe(&rec(i, 93.7, 130.0, i));
+        }
+        b.b.note_claims(st, &[fm_station()]);
+        assert!(b.get(st).unwrap().confirmed && b.get(st).unwrap().station);
+        // Its carrier alone (quiet programme), and a piece of its swing.
+        assert_eq!(b.observe(&rec(10, 93.7004, 10.0, 10)), st);
+        assert_eq!(b.observe(&rec(11, 93.6400, 40.0, 11)), st);
+        // A station 200 kHz away is not part of it.
+        assert_ne!(b.observe(&rec(12, 93.9, 130.0, 12)), st);
+    }
+
+    #[test]
+    fn a_station_built_from_its_fragments_takes_its_final_shape() {
+        let mut b = Book::new();
+        // Two pieces of one station seen while still open...
+        let a = b.observe(&open(rec(1, 97.64, 47.0, 1)));
+        assert_eq!(b.observe(&open(rec(2, 97.645, 45.0, 1))), a);
+        assert_eq!(b.get(a).unwrap().records, 2);
+        // ...then their tracks merged (record 2 went into 1) and the record closes at full width.
+        b.b.forget_record(RecordId(2));
+        assert_eq!(b.get(a).unwrap().records, 1);
+        let mut whole = rec(1, 97.7034, 207.0, 1);
+        whole.t_end = whole.t_start + Duration::from_secs(60);
+        assert_eq!(b.observe(&whole), a);
+        let e = b.get(a).unwrap();
+        assert!((e.center_hz - 97.7034e6).abs() < 2e3 && e.bandwidth_hz > 200e3, "{} {}", e.center_hz, e.bandwidth_hz);
+    }
+
+    #[test]
+    fn a_record_whose_emitter_fits_another_on_closing_folds_it_in() {
+        let mut b = Book::new();
+        let main = b.observe(&rec(1, 856.3375, 9.0, 1));
+        // A key-up seen first 5 kHz off to one side, outside the channel: its own emitter...
+        let side = b.observe(&open(rec(2, 856.3425, 3.0, 2)));
+        assert_ne!(side, main);
+        // ...that closes at the channel's full width.
+        let o = b.observed(&rec(2, 856.3375, 9.0, 2));
+        assert_eq!(o, Observed { emitter: main, folded: Some((side, main)) });
+        assert!(b.get(side).is_none());
+        assert_eq!(b.get(main).unwrap().records, 2);
+    }
+
+    #[test]
+    fn one_tone_of_a_pager_joins_its_channel() {
+        let mut b = Book::new();
+        // A FLEX channel at full width (both tones)...
+        for i in 0..3 {
+            b.observe(&rec(i, 929.6125, 14.0, i));
+        }
+        // ...then records that caught one tone each, 4.7 kHz either side.
+        let a = b.observe(&rec(10, 929.6078, 3.0, 10));
+        let c = b.observe(&rec(11, 929.6172, 3.0, 11));
+        assert_eq!((a, c), (b.of(0), b.of(0)));
+        assert_eq!(b.b.len(), 1);
+        // ...without shrinking it to a tone's width.
+        assert!(b.get(a).unwrap().bandwidth_hz > 13e3, "{}", b.get(a).unwrap().bandwidth_hz);
+        // A narrow line 20 kHz away is not part of it.
+        b.observe(&rec(12, 929.6325, 3.0, 12));
+        assert_eq!(b.b.len(), 2);
+    }
+
+    fn position(b: &Book, mhz: f64, khz: f64, tuner_mhz: f64) -> Vec<String> {
+        let mut r = rec(999_999, mhz, khz, 0);
+        r.tuner_hz = tuner_mhz * 1e6;
+        b.b.position_claims(&r, false, None).into_iter().map(|c| c.label).collect()
+    }
+
+    #[test]
+    fn image_pairs_and_combs_are_position_claims() {
+        let mut b = Book::new();
+        // Lines at the tuner (240 MHz) ± 96, ± 296 and ± 392 kHz, as seen on air...
+        let mut n = 0;
+        for off in [-392.0, -296.0, -96.0, 96.0, 296.0, 392.0] {
+            for _ in 0..3 {
+                b.observe(&rec(n, 240.0 + off / 1e3, 1.8, n));
+                n += 1;
+            }
+        }
+        // ...and a comb at 750 kHz, each line steady and seen often enough to be a member.
+        for mhz in [94.4992, 95.2492, 95.9992, 97.4992] {
+            for i in 0..COMB_MEMBER_RECORDS as u64 {
+                let mut r = rec(n, mhz, 1.8, 100 + i);
+                r.t_end = r.t_start + Duration::from_millis(900);
+                b.observe(&r);
+                n += 1;
+            }
+        }
+        // A lone line, and a voice channel.
+        b.observe(&rec(n, 241.0, 1.8, n));
+        b.observe(&rec(n + 1, 241.0, 1.8, n + 1));
+        b.observe(&rec(n + 2, 240.2, 12.5, n + 2));
+        assert_eq!(position(&b, 240.096, 1.8, 240.0), ["Internal spur (image)"]);
+        assert_eq!(position(&b, 239.608, 1.8, 240.0), ["Internal spur (image)"]);
+        assert_eq!(position(&b, 95.2492, 1.8, 98.0), ["Spur comb 750 kHz (4 lines)"]);
+        assert!(position(&b, 241.0, 1.8, 240.0).is_empty());
+        assert!(position(&b, 240.2, 12.5, 240.0).is_empty(), "not a line");
+        // Four brief blips on a 25 kHz grid (a trunked site's leftovers) are not a comb: members must be persistent.
+        for mhz in [852.325, 852.35, 852.375, 852.4] {
+            for _ in 0..3 {
+                b.observe(&rec(n, mhz, 3.0, n));
+                n += 1;
+            }
+        }
+        assert!(position(&b, 852.425, 3.0, 855.5).is_empty(), "blips on a grid");
+        // Nor are blips seen often enough to pass the record count: a few tenths of the time on air.
+        for (k, mhz) in [853.2, 853.2625, 853.325, 853.3875].into_iter().enumerate() {
+            for i in 0..(COMB_MEMBER_RECORDS as u64 + 4) {
+                let mut r = rec(n, mhz, 3.0, 200 + k as u64 + i * 10);
+                r.t_end = r.t_start + Duration::from_millis(400);
+                b.observe(&r);
+                n += 1;
+            }
+        }
+        assert!(position(&b, 853.45, 3.0, 855.5).is_empty(), "frequent blips on a raster");
+        // An image claim names the line it mirrors.
+        let mut r = rec(999_998, 240.096, 1.8, 0);
+        r.tuner_hz = 240e6;
+        let claims = b.b.position_claims(&r, false, None);
+        let Evidence::Position(PositionKind::Image { of }) = claims[0].by else { panic!("{claims:?}") };
+        assert!((b.get(of).unwrap().center_hz - 239.904e6).abs() < 1e3);
+        assert!(!claims[0].is_decoded() && claims[0].confidence <= 0.5);
+    }
+
+    #[test]
+    fn grid_and_dc_positions_are_suspicions_only() {
+        let b = Book::new();
+        let mut r = rec(1, 920.0004, 2.4, 0);
+        r.tuner_hz = 924e6;
+        let claims = b.b.position_claims(&r, false, Some(5e6));
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].by, Evidence::Position(PositionKind::SpurGrid { grid_hz: 5e6 }));
+        assert!(claims[0].confidence <= POSITION_CONFIDENCE);
+        assert!(b.b.position_claims(&r, false, None).is_empty());
+        let mut d = rec(2, 924.0003, 1.0, 0);
+        d.tuner_hz = 924e6;
+        assert!(b.b.position_claims(&d, false, None).is_empty(), "DC is an artefact only on a zero-IF radio");
+        assert_eq!(b.b.position_claims(&d, true, None)[0].by, Evidence::Position(PositionKind::Dc));
+        let mut wide = rec(3, 920.0, 12.5, 0);
+        wide.tuner_hz = 924e6;
+        assert!(b.b.position_claims(&wide, true, Some(5e6)).is_empty(), "a channel on a grid frequency is not a spur");
+    }
+
+    #[test]
+    fn noise_blips_stay_unconfirmed_and_expire() {
+        let mut b = Book::new();
+        let mut blip = rec(1, 300.0, 54.1, 0);
+        blip.max_snr_db = 9.0;
+        blip.rows = 1;
+        let id = b.observe(&blip);
+        // Weak one-row blips landing on the same patch again don't confirm it.
+        for i in 0..5 {
+            let mut again = blip.clone();
+            again.id = RecordId(100 + i);
+            assert_eq!(b.observe(&again), id);
+        }
+        assert!(!b.get(id).unwrap().confirmed);
+        // A strong one is confirmed at once.
+        let sid = b.observe(&rec(2, 400.0, 54.1, 0));
+        assert!(b.get(sid).unwrap().confirmed);
+        // Time passes (records elsewhere); the blip never recurs and is dropped.
+        let mut later = rec(3, 400.0, 54.1, 200);
+        later.max_snr_db = 9.0;
+        b.observe(&later);
+        let mut gone = vec![];
+        for _ in 0..PRUNE_EVERY {
+            gone.extend(b.b.mark_active(&[]));
+        }
+        assert_eq!(gone, [id]);
+        assert!(b.get(id).is_none());
+        assert!(b.get(sid).is_some());
+    }
+
+    #[test]
+    fn a_loaded_book_keeps_its_emitters_and_their_ids() {
+        let mut b = Book::new();
+        for i in 0..3 {
+            b.observe(&rec(i, 856.3375, 9.0, i));
+        }
+        let states: Vec<EmitterState> = b.b.map.values().map(|e| e.s.clone()).collect();
+        let mut again = Book { b: EmitterBook::load("T".into(), states), next: 100 };
+        let id = again.observe(&rec(50, 856.3376, 9.0, 50));
+        assert_eq!(id, b.of(0), "a new record joins the loaded emitter");
+        assert_eq!(again.get(id).unwrap().records, 4);
+    }
+
+    #[test]
+    fn a_decoded_headline_beats_a_more_confident_guess() {
+        let mut b = Book::new();
+        let id = b.observe(&rec(1, 851.0125, 9.0, 1));
+        let sync = Claim::new("P25", 0.95, Evidence::SyncBank { protocol: "P25".into(), syncs: 5, frames_tried: 0, frames_decoded: 0 });
+        b.b.note_claims(id, std::slice::from_ref(&sync));
+        assert_eq!(b.get(id).unwrap().headline.as_ref(), Some(&sync));
+        let dec = Claim::new("P25 Phase 1", 0.7, Evidence::Decoder { mode: "P25".into(), locked: true, summary: "NAC 0x340".into() });
+        b.b.note_claims(id, std::slice::from_ref(&dec));
+        assert_eq!(b.get(id).unwrap().headline.as_ref(), Some(&dec));
+        b.b.note_claims(id, &[sync]);
+        assert_eq!(b.get(id).unwrap().headline.as_ref(), Some(&dec), "a sync claim does not replace a decoder lock");
+    }
+}
