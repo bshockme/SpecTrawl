@@ -242,6 +242,8 @@ Chosen in step 3 (2026-10-23): snapshot cadence 20 Hz (50 ms); a snapshot carrie
 
 Changed in step 4 (2026-11-04): waterfall rows every 20 ms (ceil'd to whole blocks: 7 blocks, 22.9 ms, at 10 MS/s), the burst detector's verified row rate, so it keeps the configuration its on-air results came from; a snapshot carries each receiver's newest 48 rows (1.1 s, so a stalled tick still loses none); the app's waterfall history is 2048 rows (about 47 s).
 
+Chosen in step 4 (2026-11-04): the burst detector reads each row summed 4:1 in power (610 Hz bins at 10 MS/s) with `engine-old`'s live configuration; the record book keeps all open records, the newest 5000 closed ones and every emitter seen in the last 24 h in memory, and rebuilds the snapshot's `RecordsView` only when something changed; record and emitter ids come from the store's counters; the store is `<Documents>/SpecTrawl/records.db`, schema 1 (records, claims with their evidence as JSON, emitters, tags, notes, sessions, counters), WAL, a 4096-operation queue drained at most every 250 ms, closed with a 2 s wait; emitters are per device; `Position` claims are 0.3 sure for the spur grid and DC (zero-IF only), 0.5 for an image pair or a comb; slices are on, ci16 SigMF at the channelizer's rate for `max(1.25 × width, 12.5 kHz)`, 50 ms pre-roll, at most 120 s, cut back to the record's end, under `<Documents>/SpecTrawl/slices/<day>/<record id>`, capped at 4 GB oldest first.
+
 ## 10. Decisions taken with the owner (2026-10-22)
 
 1. **Licence: MIT.** SpecTrawl stays MIT; OnAir is used only as a separate process (§3, §4.6).

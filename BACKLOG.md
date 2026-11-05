@@ -27,10 +27,16 @@ Ideas and known rough edges that aren't scheduled yet. Newest at the top of each
 - **A back-filling subscription counts as a laggard for shedding** (2026-10-23): its distance from the live edge is lag like any other, so under a saturated pool it can be shed while it back-fills on purpose.
 - **Ended entries are scanned until unsubscribed** (2026-10-23): `on_block` and `stats` walk every entry, ended ones included, until `unsubscribe` removes them; keep a per-source live set if apps churn channels.
 - **Sub-side Overwritten/Lost jump lands below the stage's** (2026-10-23): a subscription jumps to `oldest/L + 2` while the stage jumps to the live edge: intended, a back-filling subscription wants every readable block.
+- **Step 4 on air** (2026-11-04): `records_db` (the new engine) and `engine-old`'s `trawl_db` on the R2, one after the other on `855.5:150,930:90,98:60,460:60` through the multicoupler. P25 site records at 35+ dB: median 12.2 kHz, widest 12.8 kHz on both (37 vs 27 records). FLEX 929.6125/929.9375/931.3375: 14.1/12.2/11.2 kHz, one emitter each (old: 15.8/13.4/12.0, 931.3375 split in two). FM 93.7/96.5/97.7: one emitter per station, 153/191/205 kHz (old: 93.7 only as two 4 kHz fragments). Confirmed emitters per stop 63/48/18/9 (old 65/41/19/11). Narrow lines ±125 kHz from 97.7 MHz are on both, so on the air. The HydraSDR was being reworked at the time, so the two engines did not run side by side.
+- **Emitter label voting not re-homed** (2026-11-04, step 4): `engine-old::emitters`' weighted tally, strong-protocol rule, FM-station folding by label and explore verdicts consume classifications; they come back in step 6 over records' claims. Step 4's emitter headline is its records' best claim (a decoder lock first).
+- **Emitters are per device** (2026-11-04): two radios hearing one transmitter make two emitters (their spurs and `Position` claims differ); a cross-receiver merge is not done.
+- **A full store queue drops changes** (2026-11-04): counted and shown (`StoreView::dropped`), never retried; a dropped record is lost after a restart and its id may be handed out again (never twice in the store).
+- **Slices end early at a gap or a shed, and at 120 s** (2026-11-04): the record keeps the partial slice; long records (a steady carrier) are sliced for their first two minutes only.
+- **Detector input is 610 Hz bins at ~44 rows/s** (2026-11-04): the stage's 65 536 bins are summed 4:1 and rows are 20 ms (7 blocks, 22.9 ms, at 10 MS/s) so the detector keeps the configuration verified on air; full-resolution detection is not tried.
 - **Golden captures re-recorded** (2026-10-23): the original P25/DMR/NXDN slices stayed on another machine; new ones live under testdata/small and the tests were re-pinned to the local systems.
 - DESIGN §1 L11: Find every emission, then classify and decode it — PARTIAL — step 6
-- DESIGN §1 L12: Browse, search, filter and sort records — PARTIAL — step 4
-- DESIGN §1 L13: Tag records and add notes — SILENTLY DROPPED — step 4
+- DESIGN §1 L12: Browse, search, filter and sort records — DONE (done 2026-11-04, step 4): the Records tab filters the snapshot's records by MHz, claim, tag, note or receiver, sorts by any column, and searches the store's history (`QueryRecords`, answered into a later snapshot)
+- DESIGN §1 L13: Tag records and add notes — DONE (done 2026-11-04, step 4): `Tag`/`Untag`/`Note` commands, kept by the store; a note is timed by its source's timeline
 - DESIGN §1 L14: Rewind to, replay and export records — PARTIAL — step 5
 - DESIGN §1 L17: Baseline comparison and TSCM baselines — MISSING — not scheduled
 - DESIGN §1 L23: Any SDR fills any role, matched on capabilities — PARTIAL — not scheduled
@@ -52,15 +58,15 @@ Ideas and known rough edges that aren't scheduled yet. Newest at the top of each
 - DESIGN §5 L144: Disk-backed rolling tier for the raw ring — SILENTLY DROPPED — not scheduled
 - DESIGN §5 L145: Ring readers include the user scrubbing — PARTIAL — step 5
 - DESIGN §5 L149: One overlap-save FFT per source, about 64k points — DONE (done 2026-10-23, step 2): one 65536-point overlap-save FFT per source (the stage, hop N/2); channels are cut from its cached bins
-- DESIGN §5 L154: Per-bin noise floor plus CFAR threshold — PARTIAL — step 4
-- DESIGN §5 L155: Regions become records with occupied bandwidth and mean power — PARTIAL — step 4
-- DESIGN §6 L170: Record id, source_id and role — PARTIAL — step 4
-- DESIGN §6 L171: Record times on the shared TimeAnchor timeline — PARTIAL — step 4 (the sample timeline exists since step 1, 2026-10-23; records are timed on it in step 4)
-- DESIGN §6 L173: Power: peak and mean dBFS, dBm if calibrated — PARTIAL — step 4
+- DESIGN §5 L154: Per-bin noise floor plus CFAR threshold — PARTIAL — step 6: step 4 kept the block-percentile floor the detector's on-air results came from; CFAR is to be judged against it on the acceptance captures
+- DESIGN §5 L155: Regions become records with occupied bandwidth and mean power — DONE (done 2026-11-04, step 4): a record's extent is its track's core trimmed to the occupied bandwidth; it carries peak and mean dBFS and SNR
+- DESIGN §6 L170: Record id, source_id and role — DONE (done 2026-11-04, step 4): `RecordId` from the store's counter (stable across restarts, never reused), `source`, `serial`, `role` (`Survey` from step 4a)
+- DESIGN §6 L171: Record times on the shared TimeAnchor timeline — DONE (done 2026-11-04, step 4): records are sample-indexed inside one segment, wall times from the source's timeline
+- DESIGN §6 L173: Power: peak and mean dBFS, dBm if calibrated — PARTIAL: peak and mean dBFS done in step 4 (2026-11-04); dBm waits for a calibration (the tinySA can supply one)
 - DESIGN §6 L174: Features on each record — PARTIAL — step 6
-- DESIGN §6 L178: Classification as list of label, confidence, by — PARTIAL — step 4
-- DESIGN §6 L180: iq_clip link to a SigMF file — PARTIAL — step 4
-- DESIGN §6 L182: group_id from frequency, features and IDs — PARTIAL — step 4
+- DESIGN §6 L178: Classification as list of label, confidence, by — PARTIAL — step 6: the `Claim`/`Evidence` list is on every record and in the store since step 4 (2026-11-04); step 4 makes only `Position` claims, the detector bank adds the rest
+- DESIGN §6 L180: iq_clip link to a SigMF file — DONE (done 2026-11-04, step 4): the slice tier writes each record's channelized ci16 SigMF under a disk cap
+- DESIGN §6 L182: group_id from frequency, features and IDs — PARTIAL — step 6: since step 4 records group into emitters by frequency and shape, per device; by features and decoded IDs needs the detector bank's claims
 - DESIGN §7 L192: One reusable symbol engine, all state per channel — CONTRADICTED — step 6
 - DESIGN §7 L194: Normalize to 10 samples per symbol — PARTIAL — not scheduled
 - DESIGN §7 L195: Lookahead delay ring — SILENTLY DROPPED — not scheduled
@@ -95,7 +101,7 @@ Ideas and known rough edges that aren't scheduled yet. Newest at the top of each
 - DESIGN §12 L290: Golden-output tests on known captures — DONE (done 2026-10-23, step 0/1)
 - DESIGN §13 L301: Wi-Fi/LTE/BLE labelled by spectral shape only — CONTRADICTED — not scheduled
 - DESIGN §14 L307: Milestone 1: GPU waterfall, scrub 10 s, SigMF export — PARTIAL — step 5
-- DESIGN §14 L309: Milestone 2: records, signal list, boxes, SQLite — PARTIAL — step 4
+- DESIGN §14 L309: Milestone 2: records, signal list, boxes, SQLite — DONE (done 2026-11-04, step 4)
 - DESIGN §14 L310: Milestone 3: channelizer, symbol engine, synthetic tests — PARTIAL — channelizer done (done 2026-10-23, step 2); symbol engine and synthetic tests remain (step 6)
 - DESIGN §14 L312: Milestone 5: unknown-signal features, rules, grouping — PARTIAL — step 6
 - DESIGN §14 L313: Milestone 6: HackRF sweep, RTL-SDR Park, role assigner — PARTIAL — not scheduled

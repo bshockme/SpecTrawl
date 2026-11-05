@@ -942,6 +942,7 @@ version = "0.1.0"
 dependencies = [
  "api",
  "arc-swap",
+ "backend-airspy",
  "backend-sim",
  "dsp",
  "libc",
