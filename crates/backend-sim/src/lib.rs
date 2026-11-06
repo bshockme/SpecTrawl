@@ -29,6 +29,73 @@ pub enum Modulation {
     FmTone { tone_hz: f64, dev_hz: f64 },
     /// AM (double sideband, full carrier) with a single audio tone: the envelope is `1 + depth·sin(2π·tone·t)`.
     AmTone { tone_hz: f64, depth: f64 },
+    /// A recorded clip (complex baseband centred on its signal), played at the emitter's frequency and level, looped.
+    Iq { clip: &'static Clip },
+}
+
+/// A recorded clip an emitter plays ([`Modulation::Iq`]), prepared once: low-passed to its signal, upsampled 4× (so
+/// the generator's linear interpolation up to the stream's rate leaves its images ~60 dB down) and scaled to unit RMS.
+pub struct Clip {
+    x: Vec<Complex32>,
+    /// `x`'s rate: four times the recording's.
+    rate: f64,
+}
+
+impl std::fmt::Debug for Clip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Clip({:.2} s at {:.0} Hz)", self.x.len() as f64 / self.rate, self.rate / 4.0)
+    }
+}
+
+/// Taps of the clip's 4× interpolation filter (64 per phase).
+const CLIP_TAPS: usize = 257;
+
+impl Clip {
+    /// `samples` at `rate`, low-passed to ±`half_width_hz` (the recording's own noise beyond its signal would otherwise
+    /// stand as a pedestal in the stream). Leaked: a simulator's clips live as long as the process.
+    pub fn leak(samples: &[Complex32], rate: f64, half_width_hz: f64) -> &'static Clip {
+        const UP: usize = 4;
+        let up_rate = rate * UP as f64;
+        // A Blackman-windowed sinc at the upsampled rate, gain UP (zero-stuffing divides it).
+        let m = (CLIP_TAPS - 1) as f64;
+        let fc = half_width_hz / up_rate;
+        let h: Vec<f32> = (0..CLIP_TAPS)
+            .map(|k| {
+                let t = k as f64 - m / 2.0;
+                let sinc = if t == 0.0 { 2.0 * fc } else { (std::f64::consts::TAU * fc * t).sin() / (std::f64::consts::PI * t) };
+                let w =
+                    0.42 - 0.5 * (std::f64::consts::TAU * k as f64 / m).cos() + 0.08 * (2.0 * std::f64::consts::TAU * k as f64 / m).cos();
+                (sinc * w * UP as f64) as f32
+            })
+            .collect();
+        let mut x = vec![Complex32::default(); samples.len() * UP];
+        for (mi, y) in x.iter_mut().enumerate() {
+            let (base, phase) = (mi / UP, mi % UP);
+            let mut acc = Complex32::default();
+            for (j, &tap) in h.iter().skip(phase).step_by(UP).enumerate() {
+                if let Some(&v) = base.checked_sub(j).and_then(|i| samples.get(i)) {
+                    acc += v * tap;
+                }
+            }
+            *y = acc;
+        }
+        let rms = (x.iter().map(|v| v.norm_sqr() as f64).sum::<f64>() / x.len().max(1) as f64).sqrt().max(1e-12);
+        let k = (1.0 / rms) as f32;
+        x.iter_mut().for_each(|v| *v *= k);
+        Box::leak(Box::new(Clip { x, rate: up_rate }))
+    }
+
+    /// The clip at `t` seconds into the stream (looped), linearly interpolated.
+    fn at(&self, t: f64) -> Complex32 {
+        let n = self.x.len();
+        if n == 0 {
+            return Complex32::default();
+        }
+        let p = (t * self.rate) % n as f64;
+        let i = p as usize;
+        let f = (p - i as f64) as f32;
+        self.x[i] * (1.0 - f) + self.x[(i + 1) % n] * f
+    }
 }
 
 /// A sync word sent every `period` symbols. 4-level patterns are dibits
@@ -592,7 +659,7 @@ impl Generator {
                                     }
                                 }
                             }
-                            Modulation::Cw | Modulation::AmTone { .. } => 0.0,
+                            Modulation::Cw | Modulation::AmTone { .. } | Modulation::Iq { .. } => 0.0,
                             Modulation::FmTone { tone_hz, dev_hz } => {
                                 // Update the tone ~32 times per cycle.
                                 let per = fs / tone_hz / 32.0;
@@ -601,7 +668,7 @@ impl Generator {
                                 s.tone_phase.sin() * dev_hz
                             }
                         };
-                        if matches!(e.modulation, Modulation::Cw | Modulation::AmTone { .. }) {
+                        if matches!(e.modulation, Modulation::Cw | Modulation::AmTone { .. } | Modulation::Iq { .. }) {
                             s.sym_left = f64::INFINITY;
                         }
                         let w = std::f64::consts::TAU * (off + dev) / fs;
@@ -616,6 +683,16 @@ impl Generator {
                     }
                     let span = &mut acc[i..i + run];
                     match (e.modulation, slot_s) {
+                        // A clip is timed by the stream's sample index, so it needs no state across blocks.
+                        (Modulation::Iq { clip }, slot) => {
+                            for (j, a) in span.iter_mut().enumerate() {
+                                s.z *= s.step;
+                                let t = (n + (i + j) as u64) as f64 / fs;
+                                if slot.is_none_or(|sl| ((t / sl) as u64).is_multiple_of(2)) {
+                                    *a += s.z * clip.at(t) * s.amp;
+                                }
+                            }
+                        }
                         (Modulation::AmTone { tone_hz, depth }, None) => {
                             // The tone as a phasor too: one sin/cos per run, not per sample.
                             let dt = std::f64::consts::TAU * tone_hz / fs;
@@ -920,6 +997,61 @@ mod tests {
         let depth = at(1000.0) / mean;
         assert!((depth - 0.5).abs() < 0.02, "depth {depth}");
         assert!(at(1500.0) / mean < 0.02, "the envelope has energy off the tone");
+    }
+
+    #[test]
+    fn a_clip_plays_at_its_frequency_with_nothing_beside_it() {
+        // A 2 kHz tone 30 dB over white noise across the whole recording (±26 kHz), as a P25 capture's 52 kHz.
+        let rate = 10e6 / 192.0;
+        let mut rng = XorShift(7);
+        let rec: Vec<Complex32> = (0..(2.0 * rate) as usize)
+            .map(|k| {
+                let ph = std::f64::consts::TAU * 2000.0 * k as f64 / rate;
+                Complex32::new(ph.cos() as f32 + 0.03 * rng.gauss(), ph.sin() as f32 + 0.03 * rng.gauss())
+            })
+            .collect();
+        let clip = Clip::leak(&rec, rate, 8_500.0);
+        let off = 100e3;
+        let e = Emitter { freq_hz: 855.25e6 + off, level_dbfs: -20.0, modulation: Modulation::Iq { clip }, keying: Keying::Continuous };
+        let (mut d, _c) = SimDevice::with_config(SimConfig { emitters: vec![e], center_hz: 855.25e6, paced: false, ..Default::default() });
+        let cap = Capture::default();
+        d.start(Box::new(cap.clone())).unwrap();
+        wait_until(|| cap.0.lock().unwrap().blocks.len() >= 9);
+        d.stop().unwrap();
+        let g = cap.0.lock().unwrap();
+        // Power at `hz`, averaged over eight blocks (Goertzel, 153 Hz bins).
+        let at = |hz: f64| {
+            let w = std::f64::consts::TAU * hz / 10e6;
+            let p: f64 = g.blocks[1..9]
+                .iter()
+                .map(|(_, b)| {
+                    // Blackman-Harris: a rectangular window's leakage from the tone would stand 38 dB over the floor
+                    // 13 kHz away.
+                    let len = b.len() as f64;
+                    let (re, im) = b.iter().enumerate().fold((0.0, 0.0), |(re, im), (n, v)| {
+                        let x = std::f64::consts::TAU * n as f64 / len;
+                        let win = 0.35875 - 0.48829 * x.cos() + 0.14128 * (2.0 * x).cos() - 0.01168 * (3.0 * x).cos();
+                        let (c, s) = ((w * n as f64).cos() * win, (w * n as f64).sin() * win);
+                        (re + f64::from(v[0]) * c + f64::from(v[1]) * s, im + f64::from(v[1]) * c - f64::from(v[0]) * s)
+                    });
+                    re * re + im * im
+                })
+                .sum();
+            10.0 * (p / 8.0).log10()
+        };
+        let floor = (at(-1.0e6) + at(-1.3e6) + at(1.7e6)) / 3.0;
+        let tone = at(off + 2000.0);
+        assert!(tone - floor > 40.0, "tone {tone:.1} dB, floor {floor:.1} dB");
+        // The recording's noise inside its signal band stays; beyond ±8.5 kHz it was filtered out.
+        for (what, hz) in
+            [("its noise at +15 kHz", off + 15e3), ("its noise at -20 kHz", off - 20e3), ("the recording-rate image", off + 2000.0 + rate)]
+        {
+            let p = at(hz);
+            assert!(p - floor < 6.0, "{what}: {:.1} dB over the floor (tone {:.1})", p - floor, tone - floor);
+        }
+        // Linear interpolation from 4× leaves its first image ~80 dB down (sinc² that close to the upsampled rate).
+        let image = at(off + 2000.0 + 4.0 * rate);
+        assert!(tone - image > 70.0, "the interpolation image is {:.1} dB under the tone", tone - image);
     }
 
     /// A recorder that blocks for 400 ms on its third block, like a descheduled runner.
