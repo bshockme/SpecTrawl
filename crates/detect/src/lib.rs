@@ -263,6 +263,14 @@ fn frames_from(x: &[Complex32], fs: f64, before: usize, after: usize, opts: fram
     frames::slice_with(&disc, fs, &hits, before, after, opts)
 }
 
+/// Every sync-table hit in `x` (complex baseband at `fs`) after the low-pass at `cutoff_hz`, as the sync bank searches it.
+pub fn sync_hits(x: &[Complex32], fs: f64, cutoff_hz: f64) -> Vec<sync::SyncHit> {
+    if x.len() < 64 {
+        return Vec::new();
+    }
+    sync::search(&sync_disc(&prepare_cutoff(x, fs, cutoff_hz), fs), fs, &sync::table())
+}
+
 /// The discriminator for the sync search: residual offset removed, and
 /// zero where the envelope gate is off (TDMA off-slots and gaps between
 /// bursts are just noise; zero has no sign, so no false symbols).
