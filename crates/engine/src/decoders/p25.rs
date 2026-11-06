@@ -32,6 +32,8 @@ pub struct P25Control {
     /// TSDU frames whose TSBKs all failed their CRC.
     bad: u64,
     lamp: Lamp,
+    /// The site has been registered for Phase 2 descrambling.
+    registered: bool,
 }
 
 impl P25Control {
@@ -47,6 +49,7 @@ impl P25Control {
             grants: 0,
             bad: 0,
             lamp: Lamp::Searching,
+            registered: false,
         }
     }
 
@@ -80,6 +83,15 @@ impl P25Control {
             }
             self.tsbks += msgs.len() as u64;
             locked |= !msgs.is_empty();
+        }
+        // Phase 2 channels are scrambled by their system's WACN, system and NAC: what this control channel names lets
+        // the bank's sync pass decode the site's TDMA traffic (detect's registry is still process-global: spec §8).
+        if let (Some(w), Some(sys), Some(nac)) = (self.info.wacn, self.info.system, self.nac())
+            && !self.registered
+        {
+            detect::p25p2::register_system(w, sys);
+            detect::p25p2::register_nac(nac);
+            self.registered = true;
         }
         self.lamp = if locked {
             Lamp::Locked

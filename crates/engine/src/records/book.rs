@@ -249,6 +249,11 @@ impl RecordBook {
             .or_else(|| inner.window.iter().rev().find(|r| r.id == record).cloned())
     }
 
+    /// The claims `from` last set on a record (empty if none, or if the book no longer holds it).
+    pub fn claims_by(&self, record: RecordId, from: &str) -> Vec<Claim> {
+        self.inner.lock().extra.get(&record).and_then(|m| m.get(from)).cloned().unwrap_or_default()
+    }
+
     /// Sets the claims `from` (the bank, a decoder) makes about a record, replacing what `from` said before; the
     /// record's emitter re-votes, and a closed record goes back to the store. False if the book doesn't hold it.
     pub fn set_claims(&self, record: RecordId, from: &str, claims: Vec<Claim>) -> bool {

@@ -64,6 +64,10 @@ impl ClassifyConfig {
 const MIN_WINDOW_SECS: f64 = detect::bank::MIN_SECONDS;
 /// The scheduler's tick.
 const TICK: Duration = Duration::from_millis(50);
+/// A record still open this long after its last window was cut gets another, from the live edge: a control channel or
+/// a TDMA channel is on for hours, and what can be decoded changes (a Phase 2 channel descrambles once its site's
+/// control channel has been heard).
+pub const RELOOK: Duration = Duration::from_secs(30);
 /// A window is never narrower than a 12.5 kHz channel, nor wider than 1 MHz (the bank's widest detectors want 600 kHz).
 const MIN_WINDOW_HZ: f64 = 12.5e3;
 const MAX_WINDOW_HZ: f64 = 1e6;
@@ -74,15 +78,31 @@ pub(crate) type Sources = Arc<Mutex<HashMap<SourceId, Arc<Source>>>>;
 
 struct Job {
     record: RecordId,
+    /// A later look at a record already looked at.
+    relook: bool,
     iq: Vec<Complex32>,
     rate: f64,
     bandwidth_hz: f64,
+    /// The channel's passband.
+    width_hz: f64,
     snr_db: f32,
 }
 
-/// A window being cut: where its record ends (`u64::MAX` while it is open).
+/// A window being cut: where its record ends (`u64::MAX` while it is open), and its width and SNR as they now stand
+/// (a record's first rows see only its core: the weak ~6 kHz signals on air were 3–4 kHz wide when their windows were
+/// cut, which the shape rules called "Carrier").
 struct Win {
     end: AtomicU64,
+    bandwidth_hz: AtomicU64,
+    snr_db: AtomicU64,
+}
+
+impl Win {
+    fn update(&self, r: &SignalRecord) {
+        self.end.store(if r.open { u64::MAX } else { r.end_sample }, Ordering::Relaxed);
+        self.bandwidth_hz.store(r.bandwidth_hz().to_bits(), Ordering::Relaxed);
+        self.snr_db.store(f64::from(r.mean_snr_db).to_bits(), Ordering::Relaxed);
+    }
 }
 
 #[derive(Default)]
@@ -189,14 +209,26 @@ impl Drop for Classifier {
 fn schedule(shared: Arc<Shared>, book: Arc<RecordBook>, bus: Arc<ChannelBus>, sources: Sources) {
     // Records already in the book when the engine started (loaded from the store) are not this run's to look at.
     let mut seen: HashSet<RecordId> = book.view().records.iter().map(|r| r.id).collect();
+    // When each open record's last window was cut.
+    let mut cut_at: HashMap<RecordId, Instant> = HashMap::new();
     while !shared.stop.load(Ordering::Relaxed) {
         let view = book.view();
         let mut present = HashSet::with_capacity(view.records.len());
         for r in view.records.iter() {
             present.insert(r.id);
             if !seen.insert(r.id) {
-                if let Some(w) = shared.windows.lock().get(&r.id) {
-                    w.end.store(if r.open { u64::MAX } else { r.end_sample }, Ordering::Relaxed);
+                let in_flight = if let Some(w) = shared.windows.lock().get(&r.id) {
+                    w.update(r);
+                    true
+                } else {
+                    false
+                };
+                let due = r.open && !in_flight && cut_at.get(&r.id).is_some_and(|t| t.elapsed() >= RELOOK);
+                if due && let Some(src) = sources.lock().get(&r.source).cloned() {
+                    cut_at.insert(r.id, Instant::now());
+                    if cut(&shared, &bus, &src, r, true).is_err() {
+                        log::debug!("classify: record {} not looked at again", r.id.0);
+                    }
                 }
                 continue;
             }
@@ -205,30 +237,33 @@ fn schedule(shared: Arc<Shared>, book: Arc<RecordBook>, bus: Arc<ChannelBus>, so
                 continue;
             }
             let source = sources.lock().get(&r.source).cloned();
-            if let Err(why) = source.ok_or("its source is gone").and_then(|s| cut(&shared, &bus, &s, r)) {
+            cut_at.insert(r.id, Instant::now());
+            if let Err(why) = source.ok_or("its source is gone").and_then(|s| cut(&shared, &bus, &s, r, false)) {
                 log::debug!("classify: record {} not looked at: {why}", r.id.0);
                 shared.stats.lock().missed += 1;
             }
         }
         // Ids never come back; forget the ones the view no longer holds.
         seen.retain(|id| present.contains(id));
+        cut_at.retain(|id, _| present.contains(id));
         std::thread::sleep(TICK);
     }
 }
 
-/// Subscribes the record's window.
-fn cut(shared: &Arc<Shared>, bus: &ChannelBus, source: &Arc<Source>, r: &SignalRecord) -> Result<(), &'static str> {
+/// Subscribes the record's window: from its first sample, or (`relook`) from the live edge.
+fn cut(shared: &Arc<Shared>, bus: &ChannelBus, source: &Arc<Source>, r: &SignalRecord, relook: bool) -> Result<(), &'static str> {
     let stage = bus.stage(source.id()).ok_or("its source is not on the bus")?;
     let bw = r.bandwidth_hz();
     let width = (1.25 * bw).clamp(MIN_WINDOW_HZ, MAX_WINDOW_HZ);
     let min_rate = (2.5 * bw).max(MIN_RATE);
-    let win = Arc::new(Win { end: AtomicU64::new(if r.open { u64::MAX } else { r.end_sample }) });
+    let win = Arc::new(Win { end: AtomicU64::new(0), bandwidth_hz: AtomicU64::new(0), snr_db: AtomicU64::new(0) });
+    win.update(r);
     let consumer = Window {
         shared: shared.clone(),
         win: win.clone(),
         record: r.id,
-        bandwidth_hz: bw,
-        snr_db: r.mean_snr_db,
+        relook,
+        width_hz: width,
         group_delay: stage.fft_size() as u64 / 4,
         hop: stage.hop(),
         input_rate: source.segment_at(r.first_sample).sample_rate,
@@ -238,7 +273,8 @@ fn cut(shared: &Arc<Shared>, bus: &ChannelBus, source: &Arc<Source>, r: &SignalR
     };
     shared.windows.lock().insert(r.id, win);
     let spec = ChannelSpec { source: source.id(), center_hz: r.center_hz(), bandwidth_hz: width, min_rate, parent: None };
-    match bus.subscribe(spec, Start::At(r.first_sample), Priority::Classify, Box::new(consumer)) {
+    let start = if relook { Start::Live } else { Start::At(r.first_sample) };
+    match bus.subscribe(spec, start, Priority::Classify, Box::new(consumer)) {
         Ok(_) => Ok(()),
         Err(e) => {
             shared.windows.lock().remove(&r.id);
@@ -255,8 +291,8 @@ struct Window {
     shared: Arc<Shared>,
     win: Arc<Win>,
     record: RecordId,
-    bandwidth_hz: f64,
-    snr_db: f32,
+    relook: bool,
+    width_hz: f64,
     group_delay: u64,
     hop: u64,
     input_rate: f64,
@@ -272,10 +308,12 @@ impl Window {
             self.shared.windows.lock().remove(&self.record);
             let job = Job {
                 record: self.record,
+                relook: self.relook,
                 iq: std::mem::take(&mut self.iq),
                 rate: self.rate.max(1.0),
-                bandwidth_hz: self.bandwidth_hz,
-                snr_db: self.snr_db,
+                bandwidth_hz: f64::from_bits(self.win.bandwidth_hz.load(Ordering::Relaxed)),
+                width_hz: self.width_hz,
+                snr_db: f64::from_bits(self.win.snr_db.load(Ordering::Relaxed)) as f32,
             };
             self.shared.submit(job);
         }
@@ -301,6 +339,9 @@ impl Consumer for Window {
                 self.iq.extend_from_slice(&samples[..take]);
                 if self.iq.len() >= room { self.finish() } else { Flow::Continue }
             }
+            // A record that starts at a retune is back-filled from the segment's first sample, and the block that
+            // straddles the boundary is a gap: nothing collected yet, so carry on. A gap later ends the window.
+            Delivery::Gap { .. } if self.iq.is_empty() => Flow::Continue,
             // A gap, a shed or the source going: look at what there is.
             _ => self.finish(),
         }
@@ -333,6 +374,45 @@ fn trim_edges(iq: &[Complex32], rate: f64) -> &[Complex32] {
     &iq[first * k..((last + 1) * k).min(iq.len())]
 }
 
+/// The window's SNR as `engine-old` measured it, which `detect`'s weak gate (7 dB) was tuned on: the mean power density
+/// over the record's bandwidth against the 20th percentile of the channel's other passband bins, in dB. The record's
+/// own SNR is its peak bin's (610 Hz) over the row's floor, which reads several dB higher on a weak signal: on air,
+/// 11–12 dB records 1–4 kHz wide passed the gate and the shape rules called their noise "Carrier". `None` when the
+/// record leaves fewer than 8 bins of floor in its channel (it fills it: strong signals, which the gate passes anyway).
+fn window_snr(iq: &[Complex32], rate: f64, bandwidth_hz: f64, width_hz: f64) -> Option<f32> {
+    const N: usize = 1024;
+    const MAX_FFTS: usize = 64;
+    if iq.len() < N {
+        return None;
+    }
+    let mut sa = dsp::SpectrumAnalyzer::new(N);
+    let ffts = (iq.len() / N).min(MAX_FFTS);
+    let stride = (iq.len() - N) / ffts.max(1);
+    for k in 0..ffts {
+        sa.push(&iq[k * stride..k * stride + N]);
+    }
+    let mut p = Vec::with_capacity(N);
+    if !sa.take_power(&mut p) {
+        return None;
+    }
+    let bin_hz = rate / N as f64;
+    let (c, half) = (N / 2, (bandwidth_hz / 2.0 / bin_hz).ceil().max(1.0) as usize);
+    // Beside the record, inside the flat part of the channel filter.
+    let (near, pass) = (half * 3 / 2 + 2, ((0.8 * width_hz / 2.0) / bin_hz) as usize);
+    if half >= c || pass >= c || near >= pass {
+        return None;
+    }
+    let band = &p[c - half..=c + half];
+    let density = band.iter().map(|v| f64::from(*v)).sum::<f64>() / band.len() as f64;
+    let mut beside: Vec<f32> = p[c - pass..c - near].iter().chain(&p[c + near + 1..=c + pass]).copied().collect();
+    if beside.len() < 8 {
+        return None;
+    }
+    let i20 = beside.len() / 5;
+    let floor = f64::from(*beside.select_nth_unstable_by(i20, f32::total_cmp).1).max(1e-30);
+    Some((10.0 * (density / floor).log10()) as f32)
+}
+
 /// A pool thread: windows off the queue, through the bank, into the book.
 fn work(shared: Arc<Shared>, book: Arc<RecordBook>) {
     let bank = bank::bank();
@@ -351,8 +431,9 @@ fn work(shared: Arc<Shared>, book: Arc<RecordBook>) {
         };
         let t0 = Instant::now();
         let looked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let hints = detect::Hints { snr_db: Some(job.snr_db).filter(|s| s.is_finite()) };
             let iq = trim_edges(&job.iq, job.rate);
+            let snr = window_snr(iq, job.rate, job.bandwidth_hz, job.width_hz).or(Some(job.snr_db).filter(|s| s.is_finite()));
+            let hints = detect::Hints { snr_db: snr };
             if (iq.len() as f64) < MIN_WINDOW_SECS * job.rate {
                 return Vec::new();
             }
@@ -366,7 +447,11 @@ fn work(shared: Arc<Shared>, book: Arc<RecordBook>) {
                 Vec::new()
             }
         };
-        book.set_claims(job.record, BANK, claims);
+        // A later look replaces the first only if it decoded something, or the first didn't: a fade must not undo it.
+        let decoded = |c: &[api::Claim]| c.iter().any(api::Claim::is_decoded);
+        if !job.relook || decoded(&claims) || !decoded(&book.claims_by(job.record, BANK)) {
+            book.set_claims(job.record, BANK, claims);
+        }
         let mut s = shared.stats.lock();
         s.looked += 1;
         s.looked_secs += job.iq.len() as f64 / job.rate;
