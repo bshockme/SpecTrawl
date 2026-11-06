@@ -4,6 +4,7 @@
 pub mod ambe;
 mod ambe_tables;
 pub mod bandplan;
+pub mod bank;
 pub mod blind;
 pub mod carrier;
 pub mod chirp;
@@ -307,220 +308,53 @@ pub fn classify_with(x: &[Complex32], fs: f64, bandwidth_hz: f64, hints: Hints) 
         c.label = "too short".into();
         return c;
     }
-    let raw = x;
-    let x = &prepare(x, fs, bandwidth_hz)[..];
-    // Features use only the samples where the envelope gate is on.
-    let gate = features::envelope_gate(x);
-    let disc = features::discriminator(x, fs);
-    let on: Vec<f32> = disc.iter().zip(&gate[1..]).filter(|(_, g)| **g).map(|(d, _)| *d).collect();
-    let on_iq: Vec<Complex32> = x.iter().zip(&gate).filter(|(_, g)| **g).map(|(v, _)| *v).collect();
-    c.features = features::extract(&on_iq, &on, fs);
-    c.features.envelope_cv = features::envelope_cv(x);
-    c.features.snr_db = hints.snr_db.unwrap_or(f32::NAN);
-
-    // FLEX pagers: a 1600-baud header (sync 1 and a checked frame info
-    // word) identifies them outright; the frame after it switches speed, so
-    // it has its own decoder rather than a sync-bank entry.
-    if (8e3..60e3).contains(&bandwidth_hz) {
-        let headers = flex::headers(raw, fs);
-        if let Some(h) = headers.first() {
-            let frames = flex::decode(raw, fs);
-            let pages: Vec<&flex::Page> = frames.iter().flat_map(|f| &f.pages).collect();
-            c.protocol = Some("FLEX".into());
-            c.label = format!("FLEX {}", h.mode());
-            c.confidence = 0.95;
-            // The header names the speed; FLEX deviates ±4.8 kHz at the outer levels.
-            c.features.symbol_rate = Some(h.baud as f64);
-            if c.features.symbol_rate_raw.is_none() {
-                c.features.symbol_rate_raw = Some(h.baud as f64);
-            }
-            c.features.fsk_levels = h.levels;
-            c.features.deviation_hz = 4_800.0;
-            c.fields = Some(decode::Fields {
-                kinds: vec![("frame".into(), headers.len()), ("page".into(), pages.len())],
-                decoded: headers.len(),
-                tried: headers.len(),
-                activity: Some(decode::Activity::Data),
-                messages: pages.iter().map(|p| p.summary()).collect(),
-                ..Default::default()
-            });
-            return c;
-        }
-    }
-
-    // Sync search for narrowband signals that aren't bare carriers: first
-    // through the narrow 4FSK pre-filter, then the bandwidth's own. Once a
-    // protocol is named, the channel is sliced again through the cutoff
-    // that protocol does best with, and the better of the two passes kept.
-    if (4.5e3..60e3).contains(&bandwidth_hz) {
-        let narrow = bandwidth_hz <= 25e3;
-        let own_cutoff = (bandwidth_hz * 0.5 + 500.0).clamp(4_000.0, 6_500.0);
-        let mut found: Option<(f64, SyncPass)> = None;
-        for (cutoff, d) in [
-            narrow.then(|| (NARROW_CUTOFF_HZ, sync_disc(&prepare_cutoff(raw, fs, NARROW_CUTOFF_HZ), fs))),
-            Some((own_cutoff, sync_disc(x, fs))),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if let Some(p) = sync_pass(&d, fs, None) {
-                found = Some((cutoff, p));
-                break;
-            }
-        }
-        if let Some((used, mut pass)) = found {
-            let pref = protocol_cutoff_hz(pass.best.protocol, pass.best.detail);
-            if (pref - used).abs() > 1.0 {
-                let d = sync_disc(&prepare_cutoff(raw, fs, pref), fs);
-                if let Some(again) = sync_pass(&d, fs, Some(&pass.best)) {
-                    if again.better_than(&pass) {
-                        pass = again;
-                    }
-                }
-            }
-            sync_features(&mut c.features, &pass.frames, &pass.best);
-            if pass.fields.tried > 0 {
-                c.fields = Some(pass.fields);
-            }
-            c.sync = Some(pass.best);
-        }
-    }
-    let f = &c.features;
-    if let Some(s) = &c.sync {
-        c.protocol = Some(s.protocol.to_string());
-        c.label = if s.detail.is_empty() { s.protocol.to_string() } else { format!("{} {}", s.protocol, s.detail) };
-        c.confidence = s.confidence;
+    // The rungs of `bank`, in order; the first that answers names the window.
+    let w = bank::Window::new(x, fs, bandwidth_hz, hints);
+    c.features = w.features.clone();
+    let identified = |c: &mut Classification, i: bank::Identified| {
+        c.protocol = i.protocol.map(String::from);
+        c.label = i.label;
+        c.confidence = i.confidence;
+        c.features = i.features;
+        c.fields = i.fields;
+    };
+    if let Some(i) = bank::flex(&w) {
+        identified(&mut c, i);
         return c;
     }
-    // Chirp spread spectrum (LoRa: 125/250/500 kHz): the first few bursts'
-    // frequency follows ramps at BW²/2^SF.
-    if (50e3..600e3).contains(&bandwidth_hz) {
-        for b in chirp::bursts(x, fs).iter().take(4) {
-            if let Some((bw, sf)) = chirp::lora(&x[b.0..b.1], fs) {
-                c.label = format!("LoRa {:.0} kHz SF{sf}", bw / 1e3);
-                c.confidence = 0.8;
-                return c;
-            }
-        }
+    if let Some(s) = bank::sync_bank(&w) {
+        c.features = s.features;
+        c.fields = s.fields;
+        c.protocol = Some(s.sync.protocol.to_string());
+        c.label = if s.sync.detail.is_empty() { s.sync.protocol.to_string() } else { format!("{} {}", s.sync.protocol, s.sync.detail) };
+        c.confidence = s.sync.confidence;
+        c.sync = Some(s.sync);
+        return c;
     }
-    // A GSM beacon: FCCH tone bursts on the frame grid, BSIC from the SCH.
-    // The tone bursts alone are not enough to name it (an FM broadcast
-    // station's pilot and programme passed that test on air); a decoded
-    // SCH is.
-    if (150e3..300e3).contains(&bandwidth_hz) {
-        if let Some(g) = gsm::detect(raw, fs).filter(|g| g.sch_ok > 0) {
-            c.protocol = Some("GSM".into());
-            c.label = g.label();
-            c.confidence = 0.95;
-            c.fields = Some(decode::Fields {
-                id: g.id(),
-                kinds: vec![("FCCH".into(), g.fcch_hits), ("SCH".into(), g.sch_ok)],
-                decoded: g.sch_ok,
-                tried: g.fcch_hits,
-                activity: Some(decode::Activity::Control),
-                ..Default::default()
-            });
-            return c;
-        }
+    if let Some(d) = bank::lora(&w) {
+        (c.label, c.confidence) = (d.label, d.confidence);
+        return c;
     }
-    // Feature labels describe the modulation, so they need a signal to
-    // describe: a window whose channel is within `WEAK_DB` of the floor
-    // beside it has noise statistics (envelope CV ≈ 0.52, a one-hump
-    // frequency histogram, a few kHz of "deviation"), which read as AM,
-    // analog FM or a carrier. On air those were most of the wrong labels.
-    if hints.snr_db.is_some_and(|s| s < WEAK_DB) {
+    if let Some(i) = bank::gsm(&w) {
+        identified(&mut c, i);
+        return c;
+    }
+    // Feature labels describe the modulation, so they need a signal to describe: a window whose channel is within
+    // `WEAK_DB` of the floor beside it has noise statistics (envelope CV ≈ 0.52, a one-hump frequency histogram, a few
+    // kHz of "deviation"), which read as AM, analog FM or a carrier. On air those were most of the wrong labels.
+    if w.weak() {
         c.label = WEAK.into();
         c.confidence = 0.1;
         return c;
     }
-    // Sub-audible squelch signalling identifies an analog FM transmitter
-    // (a DCS code or CTCSS tone stays with a repeater for years), and is
-    // what an idle repeater's carrier mostly carries. It goes before the
-    // modulation rules because DCS (two levels swinging ±1 kHz at 134
-    // bit/s) reads as 2FSK or 4FSK to the histogram, and voice over it
-    // does too; the decoder itself (a 23-bit word repeating, passing its
-    // Golay check) passes no data mode.
-    if bandwidth_hz <= 30e3 && f.envelope_cv < 0.3 {
-        if let Some(m) = squelch::measure(longest_on_run(&disc, &gate), fs) {
-            c.label = "Analog FM".into();
-            c.confidence = 0.8;
-            c.fields = Some(decode::Fields { id: Some(m.squelch.label()), decoded: m.words, tried: m.words, ..Default::default() });
-            return c;
-        }
+    // Squelch signalling goes before the modulation rules because DCS (two levels swinging ±1 kHz at 134 bit/s) reads
+    // as 2FSK or 4FSK to the histogram, and voice over it does too.
+    if let Some(i) = bank::squelch(&w) {
+        identified(&mut c, i);
+        return c;
     }
-    // A broadcast station's pilot and RDS subcarrier are as decisive as a
-    // sync word. The detector often cuts a station into fragments of
-    // 70–150 kHz (its centre, a sideband), whose discriminator still holds
-    // the pilot but whose squared derivative also holds lines the FSK
-    // rules took for "2FSK 2400 Bd"; so this goes first, for anything wide
-    // enough to carry a 19 kHz subcarrier.
-    let pilot = (bandwidth_hz >= 30e3).then(|| blind::fm_pilot(&disc, fs)).flatten();
-    let (label, conf) = if let Some(p) = pilot {
-        (if p.rds { "FM broadcast (stereo, RDS)".to_string() } else { "FM broadcast (stereo)".to_string() }, 0.9)
-    } else if bandwidth_hz > 150e3 {
-        if let Some(o) = blind::ofdm(x, fs, OFDM_USEFUL_S.0, OFDM_USEFUL_S.1) {
-            (ofdm_label(&o), 0.7)
-        } else if f.envelope_cv < 0.25 {
-            ("Wideband FM".to_string(), 0.5)
-        } else {
-            ("Wideband".to_string(), 0.5)
-        }
-    } else if bandwidth_hz < 4.5e3 && f.fsk_levels == 0 {
-        // Too narrow for voice or common FSK: a carrier or very slow data.
-        ("Carrier".to_string(), 0.6)
-    } else if f.fsk_levels <= 2 && f.tone_hz.is_some() && f.envelope_cv < 0.3 {
-        // One pure tone carries the frequency: analog FM with a steady
-        // tone (an idle repeater, a test tone). Its two-peak histogram and
-        // the line at twice the tone would otherwise read as 2FSK.
-        ("Analog FM".to_string(), 0.6)
-    } else if let (Some(r), 2 | 4) = (f.symbol_rate, f.fsk_levels) {
-        (format!("{}FSK {:.0} Bd", f.fsk_levels, r), 0.7)
-    } else if f.fsk_levels == 4 {
-        // Two histogram peaks without a symbol rate is more likely sine-tone
-        // FM (arcsine distribution) than FSK; four peaks isn't.
-        ("4FSK".to_string(), 0.5)
-    } else if let (Some(r), true) = (f.symbol_rate, f.envelope_cv < 0.3) {
-        // A timing line without clear levels is FSK only if the envelope is
-        // steady: AM and pulses put a line at their modulation rate too.
-        (format!("FSK {:.0} Bd", r), 0.5)
-    } else if let Some(p) = (f.envelope_cv < 0.6).then(|| blind::psk_order(x, fs, bandwidth_hz * 0.25)).flatten() {
-        // Phase modulation: the M-th power leaves a carrier line. The
-        // rate is the cyclic line of the envelope (shaped PSK has one).
-        let name = match p.order {
-            2 => "BPSK",
-            4 => "QPSK",
-            _ => "8PSK",
-        };
-        match blind::envelope_rate(x, fs, 200.0, bandwidth_hz) {
-            Some(r) => (format!("{name} {:.0} Bd", r.hz), 0.6),
-            None => (name.to_string(), 0.5),
-        }
-    } else if let Some(o) = blind::ofdm(x, fs, OFDM_USEFUL_S.0, OFDM_USEFUL_S.1) {
-        (ofdm_label(&o), 0.6)
-    } else if f.envelope_cv > 0.35 {
-        // The envelope varies. Amplitude
-        // modulation shows one of two shapes: a carrier line standing clear
-        // of its sidebands with voice-band envelope content (AM), or the
-        // signal switching between two levels (OOK, pulses). A varying
-        // envelope with neither is noise, a neighbour's skirt or a hump of
-        // floor: not a modulation... unless it repeats: a slotted or
-        // framed emission (TDMA whose sync the bank doesn't know, a beacon)
-        // shows its period in the envelope.
-        match am_evidence(raw, fs) {
-            Some(AmKind::Voice) => ("AM".to_string(), 0.6),
-            Some(AmKind::Keyed) => ("OOK".to_string(), 0.6),
-            None => match (analysed_s >= PERIOD_WINDOW_S).then(|| blind::burst_period(x, fs, 0.005, 0.5)).flatten() {
-                Some(p) if p.strength >= 0.5 => (format!("Bursts every {:.0} ms", p.period_s * 1e3), 0.4),
-                _ => ("Unknown".to_string(), 0.2),
-            },
-        }
-    } else if (1000.0..7000.0).contains(&f.deviation_hz) {
-        ("Analog FM".to_string(), 0.5)
-    } else {
-        ("Unknown".to_string(), 0.2)
-    };
-    c.label = label;
-    c.confidence = conf;
+    let d = bank::modulation(&w);
+    (c.label, c.confidence) = (d.label, d.confidence);
     c
 }
 
