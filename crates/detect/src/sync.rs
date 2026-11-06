@@ -226,12 +226,15 @@ pub enum Confirm {
     WithinFrame,
 }
 
-/// The longest gap between consecutive syncs of one transmission, in symbols: P25 Phase 1's LDU (864); a DMR voice
-/// superframe on one slot (sync in burst A of six, the slots interleaved: 12 bursts of 144); NXDN, dPMR, YSF, POCSAG and
-/// P25 Phase 2 sync every frame, batch or slot, so two of their periods (one missed). 0 for an unknown grid.
+/// The longest gap between consecutive syncs of one transmission, in symbols: P25 Phase 1's LDU (864); P25 Phase 2's
+/// 720-symbol fragment (its syncs sit at 360 and 540 of it, so consecutive syncs are 180 or 540 apart: measured on two
+/// outbound channels on air, 2026-11-05, with 720 where one was missed); a DMR voice superframe on one slot (sync in
+/// burst A of six, the slots interleaved: 12 bursts of 144); NXDN, dPMR, YSF and POCSAG sync every frame or batch, so
+/// two of their periods (one missed).
 pub fn max_gap(protocol: &str, period: u32) -> u32 {
     match protocol {
         "P25" if period == 36 => 864,
+        "P25" if period == 180 => 720,
         "DMR" => 12 * 144,
         _ => 2 * period,
     }
@@ -503,6 +506,9 @@ mod tests {
         let pocsag = table().into_iter().find(|e| e.protocol == "POCSAG" && e.baud == 1200.0).unwrap();
         assert_eq!(best(&[hit(pocsag, 10), hit(pocsag, 555), hit(pocsag, 10 + 2 * 544 + 2)]).unwrap().count, 3);
         assert_eq!(best(&[hit(pocsag, 10), hit(pocsag, 554), hit(pocsag, 10 + 20 * 544 + 40)]).unwrap().count, 2);
+        // P25 Phase 2 outbound: syncs 180 and 540 apart in turn (and 720 over a missed one) chain as one transmission.
+        let p2 = table().into_iter().find(|e| e.protocol == "P25" && e.detail == "Phase 2").unwrap();
+        assert_eq!(best(&[hit(p2, 100), hit(p2, 280), hit(p2, 820), hit(p2, 1000), hit(p2, 1720), hit(p2, 1900)]).unwrap().count, 6);
         // Under the old slack (0.5 % of the spacing), any two P25 syncs ~0.6 s apart were "on" its 36-symbol grid.
         assert!(best_with(&[hit(p25, 0), hit(p25, 3000)], Confirm::AnyPeriods).is_some());
         assert!(best(&[hit(p25, 0), hit(p25, 3000)]).is_none());
