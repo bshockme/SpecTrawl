@@ -21,6 +21,8 @@ pub struct Window<'a> {
     pub bandwidth_hz: f64,
     /// The window's SNR from the wideband spectrum, when the caller measured it.
     pub snr_db: Option<f32>,
+    /// See [`Hints::am_band`].
+    pub am_band: bool,
     /// `raw` re-centred and, for narrowband, low-passed (see [`prepare`]).
     x: Vec<Complex32>,
     gate: Vec<bool>,
@@ -40,7 +42,7 @@ impl<'a> Window<'a> {
         let mut features = features::extract(&on_iq, &on, fs);
         features.envelope_cv = features::envelope_cv(&x);
         features.snr_db = hints.snr_db.unwrap_or(f32::NAN);
-        Window { raw, fs, bandwidth_hz, snr_db: hints.snr_db, x, gate, disc, features }
+        Window { raw, fs, bandwidth_hz, snr_db: hints.snr_db, am_band: hints.am_band, x, gate, disc, features }
     }
 
     pub fn seconds(&self) -> f64 {
@@ -269,8 +271,13 @@ pub fn modulation(w: &Window<'_>) -> Described {
     } else if bw < 4.5e3 && f.fsk_levels == 0 {
         // Too narrow for voice or common FSK: a carrier or very slow data... or AM whose sidebands sit under the
         // detector's threshold. On air, air band calls were recorded 0.6–4 kHz wide, their carrier and a little more;
-        // `raw` is the wider channel the look was cut from, which holds the sidebands.
-        if carrier::coherent_am(raw, fs).is_some_and(|m| m.is_am()) { ("AM".to_string(), 0.6) } else { ("Carrier".to_string(), 0.6) }
+        // `raw` is the wider channel the look was cut from, which holds the sidebands. Only where AM voice is (see
+        // `Hints::am_band`).
+        if w.am_band && carrier::coherent_am(raw, fs).is_some_and(|m| m.is_am()) {
+            ("AM".to_string(), 0.6)
+        } else {
+            ("Carrier".to_string(), 0.6)
+        }
     } else if f.fsk_levels <= 2 && f.tone_hz.is_some() && f.envelope_cv < 0.3 {
         // One pure tone carries the frequency: analog FM with a steady tone (an idle repeater, a test tone). Its two-peak
         // histogram and the line at twice the tone would otherwise read as 2FSK.

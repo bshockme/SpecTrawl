@@ -436,7 +436,7 @@ fn classify_window(shared: &Shared, rate: f64, radio: &Radio, w: &Window, chunk:
     }
     let mut snr_buf = Vec::new();
     let snr_db = window_snr(shared, rate, start, end, offset, w.bandwidth_hz, &mut snr_buf);
-    let mut c = detect::classify_with(&chan, ddc.fs_out, w.bandwidth_hz, detect::Hints { snr_db });
+    let mut c = detect::classify_with(&chan, ddc.fs_out, w.bandwidth_hz, detect::Hints { snr_db, ..Default::default() });
     let ctx = detect::context::Context {
         center_hz: w.center_hz,
         tuner_hz,

@@ -70,6 +70,8 @@ const TICK: Duration = Duration::from_millis(50);
 pub const RELOOK: Duration = Duration::from_secs(30);
 /// A window is never narrower than a 12.5 kHz channel, nor wider than 1 MHz (the bank's widest detectors want 600 kHz).
 const MIN_WINDOW_HZ: f64 = 12.5e3;
+/// Rows a new open record has before its window is cut (8 rows: 180 ms).
+const SETTLE_ROWS: u32 = 8;
 const MAX_WINDOW_HZ: f64 = 1e6;
 /// The bank's sync search wants at least this rate (`engine-old` cut windows at `max(48 kHz, 2.5 × width)`).
 const MIN_RATE: f64 = 48e3;
@@ -86,6 +88,8 @@ struct Job {
     /// The channel's passband.
     width_hz: f64,
     snr_db: f32,
+    /// The band plan says AM voice ([`detect::Hints::am_band`]).
+    am_band: bool,
 }
 
 /// A window being cut: where its record ends (`u64::MAX` while it is open), and its width and SNR as they now stand
@@ -216,6 +220,12 @@ fn schedule(shared: Arc<Shared>, book: Arc<RecordBook>, bus: Arc<ChannelBus>, so
         let mut present = HashSet::with_capacity(view.records.len());
         for r in view.records.iter() {
             present.insert(r.id);
+            // A new open record is cut once its first rows have settled its centre and width (it is back-filled from its
+            // start, so waiting costs nothing but a moment): a FLEX pager's first rows sat 4.5 kHz below it on air,
+            // which no FLEX slicer survives.
+            if r.open && r.rows < SETTLE_ROWS && !seen.contains(&r.id) {
+                continue;
+            }
             if !seen.insert(r.id) {
                 let in_flight = if let Some(w) = shared.windows.lock().get(&r.id) {
                     w.update(r);
@@ -270,6 +280,7 @@ fn cut(shared: &Arc<Shared>, bus: &ChannelBus, source: &Arc<Source>, r: &SignalR
         iq: Vec::new(),
         rate: 0.0,
         sent: false,
+        am_band: am_band(r.center_hz()),
     };
     shared.windows.lock().insert(r.id, win);
     let spec = ChannelSpec { source: source.id(), center_hz: r.center_hz(), bandwidth_hz: width, min_rate, parent: None };
@@ -299,6 +310,13 @@ struct Window {
     iq: Vec<Complex32>,
     rate: f64,
     sent: bool,
+    am_band: bool,
+}
+
+/// Whether the band plan puts AM voice at `hz`: the civil and military air bands.
+fn am_band(hz: f64) -> bool {
+    use detect::bandplan::{Service, lookup};
+    lookup(hz).is_some_and(|b| matches!(b.service, Service::Aviation | Service::Military))
 }
 
 impl Window {
@@ -314,6 +332,7 @@ impl Window {
                 bandwidth_hz: f64::from_bits(self.win.bandwidth_hz.load(Ordering::Relaxed)),
                 width_hz: self.width_hz,
                 snr_db: f64::from_bits(self.win.snr_db.load(Ordering::Relaxed)) as f32,
+                am_band: self.am_band,
             };
             self.shared.submit(job);
         }
@@ -433,7 +452,7 @@ fn work(shared: Arc<Shared>, book: Arc<RecordBook>) {
         let looked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let iq = trim_edges(&job.iq, job.rate);
             let snr = window_snr(iq, job.rate, job.bandwidth_hz, job.width_hz).or(Some(job.snr_db).filter(|s| s.is_finite()));
-            let hints = detect::Hints { snr_db: snr };
+            let hints = detect::Hints { snr_db: snr, am_band: job.am_band };
             if (iq.len() as f64) < MIN_WINDOW_SECS * job.rate {
                 return Vec::new();
             }

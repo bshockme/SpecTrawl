@@ -24,7 +24,7 @@ fn main() {
         bus: BusConfig::default(),
         source: SourceConfig::default(),
         store: None,
-        slices: None,
+        slices: std::env::var_os("PROBE_SLICES").map(engine::recorder::SliceConfig::new),
         audio: engine::audio::AudioConfig::Manual,
         classify: Default::default(),
     });

@@ -297,6 +297,10 @@ pub struct Hints {
     /// The window's signal-to-noise ratio, dB, from the wideband spectrum
     /// (see `Features::snr_db`).
     pub snr_db: Option<f32>,
+    /// The band carries AM voice (the air bands): a narrow record there may be an AM call whose sidebands the detector
+    /// missed, and is tested for them. Elsewhere a narrow line with in-phase modulation is far likelier a receiver
+    /// artefact beside a strong signal (on air: lines 45–60 kHz from the 929–931 MHz pagers) than an AM transmitter.
+    pub am_band: bool,
 }
 
 /// Classifies one channel: `x` is complex baseband centred on the signal,
@@ -607,7 +611,7 @@ mod tests {
         let c = classify(&x, fs, 25_000.0);
         assert_eq!(c.label, "Unknown", "{c:?}");
         // Told the window is weak, it says so and stops.
-        let c = classify_with(&x, fs, 25_000.0, Hints { snr_db: Some(3.0) });
+        let c = classify_with(&x, fs, 25_000.0, Hints { snr_db: Some(3.0), ..Default::default() });
         assert_eq!(c.label, WEAK);
         assert_eq!(c.features.snr_db, 3.0);
     }
@@ -625,7 +629,7 @@ mod tests {
                 Complex32::new(a as f32, 0.0) * 18.0 + nz[i]
             })
             .collect();
-        let c = classify_with(&am, fs, 8_000.0, Hints { snr_db: Some(25.0) });
+        let c = classify_with(&am, fs, 8_000.0, Hints { snr_db: Some(25.0), ..Default::default() });
         assert_eq!(c.label, "AM", "{c:?}");
         // OOK: the carrier keyed at 40 Hz, half on.
         let ook: Vec<Complex32> = (0..n)
@@ -634,7 +638,7 @@ mod tests {
                 Complex32::new(if on { 18.0 } else { 0.0 }, 0.0) + nz[i]
             })
             .collect();
-        let c = classify_with(&ook, fs, 8_000.0, Hints { snr_db: Some(25.0) });
+        let c = classify_with(&ook, fs, 8_000.0, Hints { snr_db: Some(25.0), ..Default::default() });
         assert_eq!(c.label, "OOK", "{c:?}");
     }
 
@@ -664,7 +668,7 @@ mod tests {
                 Complex32::from_polar(30.0, ph as f32) + nz[i]
             })
             .collect();
-        let c = classify_with(&x, fs, 9_000.0, Hints { snr_db: Some(33.0) });
+        let c = classify_with(&x, fs, 9_000.0, Hints { snr_db: Some(33.0), ..Default::default() });
         assert_eq!(c.label, "Analog FM", "{c:?}");
     }
 

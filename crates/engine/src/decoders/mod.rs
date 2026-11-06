@@ -8,6 +8,7 @@
 //! has had no open record for [`IDLE`], or its source goes.
 
 pub mod airband;
+pub mod monitor;
 pub mod p25;
 
 use std::collections::HashMap;
@@ -31,8 +32,8 @@ pub use p25::P25Control;
 pub const DECODER: &str = "decoder";
 /// A decoder whose emitter has had no open record this long is detached.
 pub const IDLE: Duration = Duration::from_secs(30);
-/// Decoders per source, at most.
-pub const MAX_PER_SOURCE: usize = 4;
+/// Decoders per source, at most (a land-mobile span holds several control channels and pagers).
+pub const MAX_PER_SOURCE: usize = 8;
 /// The manager's tick.
 const TICK: Duration = Duration::from_millis(200);
 /// A P25 control channel's window: 12.5 kHz at 48 kHz or more (`engine-old`'s monitor).
@@ -137,10 +138,43 @@ impl Drop for DecoderBank {
     }
 }
 
-/// Whether the bank found this emitter to be a P25 control channel.
-fn is_p25_control(c: &Claim) -> bool {
-    matches!(&c.by, Evidence::Decoder { mode, .. } if mode == "P25 control")
+/// What decoder a claim says its emitter wants: a P25 control channel's, or a land-mobile monitor for the protocol the
+/// bank decoded (a `Decoder` claim; POCSAG's pages name no identity, so its `SyncBank` claim with frames decoded).
+#[derive(Debug, Clone, PartialEq)]
+enum Want {
+    P25Control,
+    Monitor { protocol: &'static str, label: String },
 }
+
+fn wants(c: &Claim) -> Option<Want> {
+    let protocol = |name: &str| monitor::PROTOCOLS.iter().copied().find(|p| name == *p || name.starts_with(&format!("{p} ")));
+    match &c.by {
+        Evidence::Decoder { mode, .. } if mode == "P25 control" => Some(Want::P25Control),
+        Evidence::Decoder { mode, .. } => protocol(mode).map(|p| Want::Monitor { protocol: p, label: c.label.clone() }),
+        Evidence::SyncBank { protocol: name, frames_decoded, .. } if *frames_decoded > 0 => {
+            protocol(name).map(|p| Want::Monitor { protocol: p, label: c.label.clone() })
+        }
+        _ => None,
+    }
+}
+
+/// A decoder's channel: its width and least rate, and its bus priority.
+fn channel_for(want: &Want, bandwidth_hz: f64) -> (f64, f64, Priority) {
+    match want {
+        Want::P25Control => (P25_WIDTH_HZ, P25_RATE, Priority::TrunkControl),
+        Want::Monitor { protocol, .. } => {
+            let width = (1.25 * bandwidth_hz).clamp(MONITOR_MIN_WIDTH_HZ, MONITOR_MAX_WIDTH_HZ);
+            let priority = if matches!(*protocol, "POCSAG" | "FLEX") { Priority::PagerMonitor } else { Priority::EmitterDecoder };
+            (width, MONITOR_RATE, priority)
+        }
+    }
+}
+
+/// A monitor's channel: as the bank's looks cut it (1.25 × the width, at least 12.5 kHz, at 48 kHz or more), at most
+/// a 25 kHz pager channel's.
+const MONITOR_MIN_WIDTH_HZ: f64 = 12.5e3;
+const MONITOR_MAX_WIDTH_HZ: f64 = 30e3;
+const MONITOR_RATE: f64 = 48e3;
 
 fn manage(shared: Arc<Shared>, book: Arc<RecordBook>, bus: Arc<ChannelBus>, sources: Sources) {
     while !shared.stop.load(Ordering::Relaxed) {
@@ -149,14 +183,21 @@ fn manage(shared: Arc<Shared>, book: Arc<RecordBook>, bus: Arc<ChannelBus>, sour
         airband::file_claims(&view, &book);
         // Each emitter's newest open record, and whether any of its records says P25 control.
         let mut open: HashMap<EmitterId, &Arc<SignalRecord>> = HashMap::new();
-        let mut control: HashMap<EmitterId, &Arc<SignalRecord>> = HashMap::new();
+        let mut wanted: HashMap<EmitterId, (&Arc<SignalRecord>, Want)> = HashMap::new();
         for r in view.records.iter() {
             let Some(em) = r.emitter else { continue };
             if r.open {
                 open.entry(em).and_modify(|o| *o = if r.first_sample > o.first_sample { r } else { o }).or_insert(r);
             }
-            if r.claims.iter().any(is_p25_control) {
-                control.entry(em).or_insert(r);
+            // A P25 control channel's decoder wins over a monitor; otherwise the first claim that wants one.
+            if let Some(w) = r.claims.iter().filter_map(wants).min_by_key(|w| !matches!(w, Want::P25Control)) {
+                match wanted.get(&em) {
+                    Some((_, Want::P25Control)) => {}
+                    Some(_) if w != Want::P25Control => {}
+                    _ => {
+                        wanted.insert(em, (r, w));
+                    }
+                }
             }
         }
         let mut attached = shared.attached.lock();
@@ -181,54 +222,65 @@ fn manage(shared: Arc<Shared>, book: Arc<RecordBook>, bus: Arc<ChannelBus>, sour
             }
             keep
         });
-        for (em, r) in control {
+        for (em, (r, want)) in wanted {
             if attached.iter().any(|a| a.emitter == em) || attached.iter().filter(|a| a.source == r.source).count() >= MAX_PER_SOURCE {
                 continue;
             }
             let Some(src) = sources.lock().get(&r.source).cloned() else { continue };
             let Some(stage) = bus.stage(src.id()) else { continue };
-            let center_hz = view.emitters.iter().find(|e| e.id == em).map_or(r.center_hz(), |e| e.center_hz);
+            let emitter = view.emitters.iter().find(|e| e.id == em);
+            let center_hz = emitter.map_or(r.center_hz(), |e| e.center_hz);
+            let bandwidth_hz = emitter.map_or(r.bandwidth_hz(), |e| e.bandwidth_hz);
+            let (mode, title): (&'static str, String) = match &want {
+                Want::P25Control => ("P25 control", "P25 control".into()),
+                Want::Monitor { protocol, label } => (protocol, label.clone()),
+            };
             let newest = open.get(&em);
             let a = Arc::new(Attached {
                 source: src.id(),
                 emitter: em,
                 center_hz,
-                mode: "P25 control",
+                mode,
                 record: AtomicU64::new(newest.map_or(u64::MAX, |o| o.id.0)),
                 last_open: Mutex::new(newest.map_or(r.t_end, |o| o.t_end)),
                 stop: AtomicBool::new(false),
                 ended: AtomicBool::new(false),
                 view: Mutex::new((
                     Telemetry { lamp: Lamp::Searching, blocks_ok: 0, blocks_bad: 0, identity: None },
-                    format!("P25 control {:.4} MHz: searching", center_hz / 1e6),
+                    format!("{title} {:.4} MHz: searching", center_hz / 1e6),
                 )),
                 channel: Mutex::new(None),
             });
             let feed = || -> Box<dyn Consumer> {
+                let decoder: Box<dyn Decoder> = match &want {
+                    Want::P25Control => Box::new(P25Control::new(center_hz)),
+                    Want::Monitor { protocol, label } => Box::new(monitor::Monitor::new(protocol, label, center_hz, bandwidth_hz)),
+                };
                 Box::new(Feed {
                     attached: a.clone(),
                     book: book.clone(),
-                    decoder: Box::new(P25Control::new(center_hz)),
+                    decoder,
                     hop: stage.hop(),
                     input_rate: src.current_segment().sample_rate,
                     configured: false,
                     last: None,
                 })
             };
-            let spec = ChannelSpec { source: src.id(), center_hz, bandwidth_hz: P25_WIDTH_HZ, min_rate: P25_RATE, parent: None };
-            // Back-filled from the open record's start, so the site shows from what the ring already holds; live if
-            // that has gone (the control channel is on the air: it will say it again).
-            let sub = match newest.map(|o| bus.subscribe(spec.clone(), Start::At(o.first_sample), Priority::TrunkControl, feed())) {
+            let (width, min_rate, priority) = channel_for(&want, bandwidth_hz);
+            let spec = ChannelSpec { source: src.id(), center_hz, bandwidth_hz: width, min_rate, parent: None };
+            // Back-filled from the open record's start, so what the ring already holds is decoded at once; live if that
+            // has gone (the channel is on the air: it will say it again).
+            let sub = match newest.map(|o| bus.subscribe(spec.clone(), Start::At(o.first_sample), priority, feed())) {
                 Some(Ok(info)) => Ok(info),
-                _ => bus.subscribe(spec, Start::Live, Priority::TrunkControl, feed()),
+                _ => bus.subscribe(spec, Start::Live, priority, feed()),
             };
             match sub {
                 Ok(info) => {
                     *a.channel.lock() = Some(info.id);
-                    log::info!("decoder P25 control attached at {:.4} MHz (emitter {})", center_hz / 1e6, em.0);
+                    log::info!("decoder {mode} attached at {:.4} MHz (emitter {})", center_hz / 1e6, em.0);
                     attached.push(a);
                 }
-                Err(e) => log::warn!("decoder P25 control at {:.4} MHz: the bus refused it: {e:?}", center_hz / 1e6),
+                Err(e) => log::warn!("decoder {mode} at {:.4} MHz: the bus refused it: {e:?}", center_hz / 1e6),
             }
         }
         drop(attached);

@@ -29,7 +29,10 @@ fn capture(name: &str) -> (Vec<Complex32>, f64) {
 fn windows(x: &[Complex32], fs: f64, bandwidth_hz: f64, snr_db: f32) -> Vec<Vec<api::Claim>> {
     let b = bank();
     let n = (1.5 * fs) as usize;
-    x.chunks(n).filter(|w| w.len() == n).map(|w| look(&b, &Window::new(w, fs, bandwidth_hz, Hints { snr_db: Some(snr_db) }))).collect()
+    x.chunks(n)
+        .filter(|w| w.len() == n)
+        .map(|w| look(&b, &Window::new(w, fs, bandwidth_hz, Hints { snr_db: Some(snr_db), ..Default::default() })))
+        .collect()
 }
 
 fn p25(c: &api::Claim) -> Option<&Identity> {
