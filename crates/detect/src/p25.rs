@@ -142,7 +142,7 @@ fn viterbi(d: &[u8; 98], transpose: bool) -> ([u8; 12], u32) {
     // The last input is a flush (0), so the path ends in state 0.
     let mut s = 0usize;
     let best = metric[0];
-    let mut inputs = vec![0u8; 49];
+    let mut inputs = [0u8; 49];
     for t in (0..49).rev() {
         let (p, i) = back[t][s];
         inputs[t] = i;

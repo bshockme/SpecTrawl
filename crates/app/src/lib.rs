@@ -7,6 +7,7 @@ pub mod devices_pane;
 pub mod log_pane;
 pub mod receiver_pane;
 pub mod records_pane;
+pub mod systems_pane;
 pub mod tabs;
 pub mod theme;
 pub mod trace;
@@ -27,7 +28,9 @@ pub fn run() -> eframe::Result {
     let store = Some(engine::store::StoreConfig::new(engine::store::default_path()));
     let slices = Some(engine::recorder::SliceConfig::new(engine::recorder::default_dir()));
     let audio = engine::audio::AudioConfig::Device;
-    let engine = Engine::new(EngineConfig { budget, bus: BusConfig::default(), source: SourceConfig::default(), store, slices, audio });
+    let classify = engine::classify::ClassifyConfig::default();
+    let engine =
+        Engine::new(EngineConfig { budget, bus: BusConfig::default(), source: SourceConfig::default(), store, slices, audio, classify });
     let backends = vec![Box::new(backend_airspy::AirspyBackend::new()) as _, Box::new(backend_sim::SimBackend) as _];
     let (handle, guard) = engine::snapshot::spawn_with_guard(engine, backends, PublisherConfig::default());
     let viewport = egui::ViewportBuilder::default().with_title("SpecTrawl").with_inner_size([1600.0, 960.0]);

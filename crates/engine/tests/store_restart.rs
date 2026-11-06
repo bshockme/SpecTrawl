@@ -36,6 +36,7 @@ fn engine(store: StoreConfig) -> Engine {
         store: Some(store),
         slices: None,
         audio: engine::audio::AudioConfig::Manual,
+        classify: engine::classify::ClassifyConfig::off(),
     })
 }
 

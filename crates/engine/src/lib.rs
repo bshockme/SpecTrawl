@@ -2,6 +2,8 @@ pub mod audio;
 pub mod budget;
 pub mod cache;
 pub mod channels;
+pub mod classify;
+pub mod decoders;
 pub mod engine;
 pub mod export;
 pub mod recorder;

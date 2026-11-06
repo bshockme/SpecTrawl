@@ -45,6 +45,7 @@ fn engine() -> Engine {
         store: None,
         slices: None,
         audio: engine::audio::AudioConfig::Manual,
+        classify: engine::classify::ClassifyConfig::off(),
     })
 }
 
@@ -199,4 +200,45 @@ fn a_tag_and_a_note_show_in_a_later_snapshot() {
         assert!(Instant::now() < deadline, "not acknowledged");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn claims_set_on_an_open_record_survive_its_rows_and_its_close_and_reach_its_emitter() {
+    let e = engine();
+    let src = e.add_source(device(), Mode::Live).unwrap();
+    let wait_for = |what: &str, f: &dyn Fn() -> Option<Arc<SignalRecord>>| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(r) = f() {
+                break r;
+            }
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let r = wait_for("an open CW record", &|| e.records().view().records.iter().find(|r| near(r, CW_HZ) && r.open).cloned());
+    // The band plan names 855 MHz without being asked, as an inferred claim, and is never the headline.
+    assert!(r.claims.iter().any(|c| matches!(c.by, api::Evidence::BandPlan { .. })), "{:?}", r.claims);
+    assert!(r.headline().is_none());
+    let sync = api::Claim::new(
+        "P25 Phase 1",
+        0.97,
+        api::Evidence::SyncBank { protocol: "P25 Phase 1".into(), syncs: 9, frames_tried: 4, frames_decoded: 4 },
+    );
+    assert!(e.records().set_claims(r.id, "bank", vec![sync.clone()]));
+    std::thread::sleep(Duration::from_millis(500));
+    let again = e.records().get(r.id).expect("still held");
+    assert!(again.open && again.rows > r.rows, "the record grew: {again:?}");
+    assert_eq!(again.headline(), Some(&sync), "the claim survived {} more rows", again.rows - r.rows);
+    let em = |id| e.records().view().emitters.iter().find(|v| Some(v.id) == id).and_then(|v| v.headline.clone());
+    assert_eq!(em(again.emitter), Some(sync.clone()), "a strong sync claim names the emitter");
+    // A retune closes it: the claim goes with it.
+    src.set_center(855.3e6).unwrap();
+    let closed = wait_for("the record closed", &|| e.records().get(r.id).filter(|r| !r.open));
+    assert_eq!(closed.headline(), Some(&sync));
+    // A maker's next set replaces its last; an empty set removes it.
+    assert!(e.records().set_claims(r.id, "bank", vec![]));
+    assert!(e.records().get(r.id).unwrap().headline().is_none());
+    assert!(e.records().get(r.id).unwrap().claims.iter().any(|c| matches!(c.by, api::Evidence::BandPlan { .. })), "derived claims stay");
+    assert!(!e.records().set_claims(RecordId(9_999_999), "bank", vec![sync]));
 }

@@ -18,6 +18,7 @@ fn engine() -> Engine {
         store: None,
         slices: None,
         audio: engine::audio::AudioConfig::Manual,
+        classify: engine::classify::ClassifyConfig::off(),
     })
 }
 

@@ -64,6 +64,50 @@ pub fn headline(r: &SignalRecord) -> &str {
     r.headline().map_or("unknown", |c| c.label.as_str())
 }
 
+/// The "What" column: the headline, or "unknown" with what its shape suggests (spec §4.5: "unknown" with the
+/// features), and whether it is that muted kind.
+pub fn what(r: &SignalRecord) -> (String, bool) {
+    if let Some(h) = r.headline() {
+        return (h.label.clone(), false);
+    }
+    let shape = r.claims.iter().filter(|c| matches!(c.by, Evidence::Features { .. })).max_by(|a, b| a.confidence.total_cmp(&b.confidence));
+    (shape.map_or_else(|| "unknown".to_string(), |c| format!("unknown · looks like {}", c.label)), true)
+}
+
+/// Inferred from where a signal is or what is next to it, not from the signal (spec §5: muted, with the word).
+fn inferred(c: &Claim) -> bool {
+    matches!(c.by, Evidence::BandPlan { .. } | Evidence::Neighbour { .. } | Evidence::Position(_))
+}
+
+/// One claim as the inspector shows it: decoded solid with its summary, a sync-bank claim with its counts, inferred
+/// ones muted and marked.
+fn claim_line(ui: &mut egui::Ui, c: &Claim) {
+    let pct = c.confidence * 100.0;
+    match &c.by {
+        Evidence::Decoder { summary, locked, .. } => {
+            let lock = if *locked { "" } else { ", not locked now" };
+            ui.label(RichText::new(format!("{} · decoded{lock} · {pct:.0}%", c.label)).strong());
+            if !summary.is_empty() {
+                ui.label(RichText::new(format!("    {summary}")).small());
+            }
+        }
+        Evidence::SyncBank { syncs, frames_tried, frames_decoded, .. } => {
+            let frames = if *frames_tried > 0 { format!(", {frames_decoded} of {frames_tried} frames decoded") } else { String::new() };
+            ui.label(format!("{} · sync bank: {syncs} syncs{frames} · {pct:.0}%", c.label));
+        }
+        _ if inferred(c) => {
+            let entry = match &c.by {
+                Evidence::BandPlan { entry } => format!(" ({entry})"),
+                _ => String::new(),
+            };
+            ui.label(RichText::new(format!("{}{entry} · inferred from {} · {pct:.0}%", c.label, evidence_kind(c))).color(theme::MUTED));
+        }
+        _ => {
+            ui.label(format!("{} · {} · {pct:.0}%", c.label, evidence_kind(c)));
+        }
+    }
+}
+
 fn evidence_kind(c: &Claim) -> &'static str {
     match c.by {
         Evidence::SyncBank { .. } => "sync bank",
@@ -168,6 +212,7 @@ impl RecordsPane {
             format!("{} of {}", fmt::count(rows.len(), "record"), snap.records.records.len())
         };
         ui.label(RichText::new(format!("{source} · {store_line}")).color(theme::MUTED).small());
+        ui.label(RichText::new(crate::systems_pane::budget_line(snap)).color(theme::MUTED).small());
         ui.separator();
 
         ui.horizontal(|ui| {
@@ -199,7 +244,7 @@ impl RecordsPane {
                             if r.open { "open".into() } else { fmt::secs(r.duration().as_secs_f64()) },
                             format!("{:.1}", r.peak_dbfs),
                             format!("{:.0}", r.max_snr_db),
-                            headline(r).to_string(),
+                            what(r).0,
                             r.emitter.map_or("–".into(), |e| e.0.to_string()),
                         ];
                         for ((col, _, w), text) in COLS.iter().zip(cells) {
@@ -329,8 +374,11 @@ impl RecordsPane {
         if r.claims.is_empty() {
             ui.label(RichText::new("unknown: no claims yet").italics().color(theme::MUTED));
         }
+        if r.headline().is_none() && !r.claims.is_empty() {
+            ui.label(RichText::new("unknown: nothing decoded").italics().color(theme::MUTED));
+        }
         for c in &r.claims {
-            ui.label(format!("{} · {} · {:.0}%", c.label, evidence_kind(c), c.confidence * 100.0));
+            claim_line(ui, c);
         }
         match (&r.iq_clip, r.slice_evicted) {
             (Some(c), _) => {

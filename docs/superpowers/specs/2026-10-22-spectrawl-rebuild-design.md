@@ -250,6 +250,31 @@ Chosen with the RFOne's sweep firmware (2026-11-05, `docs/hydrasdr-sweep-mode.md
 
 Chosen in step 5 (2026-11-05): a replay is a bus subscription at `Listen` priority back-filled from 50 ms before the record (its slice's pre-roll), at the record's centre and 1.25 × its width bounded by the mode's own and twice that (AM 10 kHz, NFM 14 kHz, WFM 200 kHz), demodulated with the squelch open and ending at the record's end plus the channel filter's delay (following the live edge while the record is open); when the ring no longer holds the start, or the source is gone, the record's slice is demodulated on the `replay` thread; otherwise the play is refused with the reason. A record's source counts as holding it only when it is the same device and its timeline puts the record's first sample within 1 s of the record's start (source ids repeat across runs). The mode is the caller's, or AM on 108–137 and 225–400 MHz, WFM on 88–108 MHz and NFM elsewhere, shown as chosen "by band". Audio is 48 kHz mono, at most 120 s a play; the mixer sums voices with their gains behind a 100 ms jitter buffer and counts underruns; cpal's default device plays it from its own thread (resampled linearly to the device's rate); a WAV goes to `<Documents>/SpecTrawl/audio` unless the path is absolute.
 
+Chosen in step 6 (2026-11-05):
+
+- **The bank.** `detect`'s classifier is split into its rungs (`detect::bank`: the sync pass, FLEX, GSM, LoRa, squelch codes, the modulation rules), which `classify_with` still tries in its old order. The engine's bank runs them side by side:
+  - a `SyncBank` claim, with its sync count and frames, plus a `Decoder` claim when frames decoded and named the signal (a P25 site from two or more agreeing NIDs and its TSBKs; a colour code);
+  - `Decoder` claims for FLEX, GSM and squelch codes;
+  - a `Features` claim (at most 0.6) from the modulation rules, only when nothing decoded, and only above the weak gate.
+  - Confidence: `detect`'s own for syncs (0.8, 0.9, 0.97), 0.95 for identifiers, 0.99 for a P25 site named in a window, 0.999 for a decoder's claim.
+- **The pool.**
+  - Size: `max(1, (available_parallelism − 2) / 4)` threads, with a 64-window queue that drops the newest window when full.
+  - A look: a bus window at `Classify` priority for every live record. It is back-filled from the record's first sample (skipping a leading gap at a retune), at its centre, `max(1.25 × width, 12.5 kHz)` wide (at most 1 MHz), at least `max(48 kHz, 2.5 × width)`. It collects up to 1.5 s or to the record's end, trimmed of the quiet at its ends.
+  - Re-looks: a record still open 30 s after its last window gets another from the live edge, which replaces the first look's claims only if it decoded something or the first didn't.
+  - The weak gate takes the window's own SNR (in-band density over the 20th percentile of the channel's other passband bins). Where the record fills its channel, it takes the record's SNR instead.
+- **Sync confirmation** (DESIGN §7.1): a second sync must be on the protocol's grid within its longest sync-to-sync gap + 3 %, give or take 3 symbols + 0.05 %. The gaps are P25 Phase 1 864 symbols, Phase 2 720, a DMR voice superframe 1728, and two periods elsewhere. A transmission's count is its longest chain. Entries with no grid need six syncs evenly spaced on a grid of their own.
+- **The book.**
+  - Claims from the bank and decoders are kept per record and per maker, across an open record's rebuilds.
+  - Every record gets the band plan's entry as a `BandPlan` claim, 0.2 sure.
+  - An emitter's headline is voted: the newest decoder claim (unless it is a thinner identity of the same site), else a sync protocol that two records name, or one record names strongly (4 syncs, or half its frames decoded), else what the store had.
+- **Decoders.**
+  - `P25Control` decodes on 0.6 s blocks with 0.12 s of overlap and registers its site for Phase 2.
+  - It attaches at `TrunkControl` priority to an emitter whose records carry a `P25 control` claim, back-filled from its open record's start.
+  - At most 4 per source; one detaches 30 s after its emitter has no open record.
+- **The systems view** is built from emitters' decoder headlines only, so a row, its emitter and its records read one `Identity`.
+- **The channelizer:** a channel's passband must be in the usable span, and its output band within the span (before, the whole output band had to be usable, and records within ~40 kHz of the usable edge could not be cut).
+- **Acceptance.** The owner's wideband capture was never recorded, so the acceptance stream is the simulator's scenario at 855.5 MHz with the committed P25 control channel played into it (`Modulation::Iq`).
+
 ## 10. Decisions taken with the owner (2026-10-22)
 
 1. **Licence: MIT.** SpecTrawl stays MIT; OnAir is used only as a separate process (§3, §4.6).

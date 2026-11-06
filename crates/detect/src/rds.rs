@@ -332,23 +332,24 @@ impl BlockSync {
             let s = syndrome(self.reg);
             if let Some(i) = OFFSETS.iter().position(|&o| o == s) {
                 let blk = Self::block_index(i);
-                if let Some((pb, pt)) = self.pend {
-                    if self.total - pt == 26 && blk == (pb + 1) % 4 {
-                        self.locked = true;
-                        self.bits = 0;
-                        self.bad_run = 0;
+                if let Some((pb, pt)) = self.pend
+                    && self.total - pt == 26
+                    && blk == (pb + 1) % 4
+                {
+                    self.locked = true;
+                    self.bits = 0;
+                    self.bad_run = 0;
+                    self.group = Group::default();
+                    self.group.blocks[blk] = Some((self.reg >> 10) as u16);
+                    self.group.cprime = i == 3;
+                    self.expect = (blk + 1) % 4;
+                    self.pend = None;
+                    self.last_clean = true;
+                    if blk == 3 {
+                        // Locked on a D block: that group is incomplete.
                         self.group = Group::default();
-                        self.group.blocks[blk] = Some((self.reg >> 10) as u16);
-                        self.group.cprime = i == 3;
-                        self.expect = (blk + 1) % 4;
-                        self.pend = None;
-                        self.last_clean = true;
-                        if blk == 3 {
-                            // Locked on a D block: that group is incomplete.
-                            self.group = Group::default();
-                        }
-                        return None;
                     }
+                    return None;
                 }
                 self.pend = Some((blk, self.total));
             }
@@ -623,16 +624,14 @@ impl RdsDecoder {
                         }
                     }
                 }
-                if !version_b {
-                    if let Some(c) = g.blocks[2] {
-                        for code in [(c >> 8) as u8, c as u8] {
-                            if (1..=204).contains(&code) {
-                                let mhz = 87.5 + 0.1 * code as f64;
-                                let mhz = (mhz * 10.0).round() / 10.0;
-                                if !self.info.af_mhz.iter().any(|f| (*f - mhz).abs() < 0.01) {
-                                    self.info.af_mhz.push(mhz);
-                                    self.info.af_mhz.sort_by(|a, b| a.total_cmp(b));
-                                }
+                if !version_b && let Some(c) = g.blocks[2] {
+                    for code in [(c >> 8) as u8, c as u8] {
+                        if (1..=204).contains(&code) {
+                            let mhz = 87.5 + 0.1 * code as f64;
+                            let mhz = (mhz * 10.0).round() / 10.0;
+                            if !self.info.af_mhz.iter().any(|f| (*f - mhz).abs() < 0.01) {
+                                self.info.af_mhz.push(mhz);
+                                self.info.af_mhz.sort_by(|a, b| a.total_cmp(b));
                             }
                         }
                     }

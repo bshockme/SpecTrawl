@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use api::{Command, Mode, Outcome, Role};
+use api::{Command, Mode, Outcome, Role, SignalRecord};
 use backend_sim::{Emitter, Keying, Modulation, SimConfig, SimDevice};
 use engine::snapshot::PublisherConfig;
 use engine::sweep::{STITCHED, SweepPlan};
@@ -40,6 +40,7 @@ fn engine() -> Engine {
         store: None,
         slices: None,
         audio: engine::audio::AudioConfig::Manual,
+        classify: engine::classify::ClassifyConfig::off(),
     })
 }
 
@@ -195,6 +196,8 @@ fn a_sweep_makes_survey_records_and_the_snapshot_shows_it() {
     for f in [A_HZ, B_HZ] {
         assert!(survey.iter().any(|x| (x.center_hz() - f).abs() < 30e3), "no survey record at {f}: {survey:?}");
     }
-    assert!(survey.iter().all(|x| x.claims.is_empty() && x.iq_clip.is_none()), "{survey:?}");
+    // No position claims on a stitched row (and no IQ to look at); the band plan's entry, which needs neither.
+    let only_band_plan = |x: &SignalRecord| x.claims.iter().all(|c| matches!(c.by, api::Evidence::BandPlan { .. }));
+    assert!(survey.iter().all(|x| only_band_plan(x) && x.iq_clip.is_none()), "{survey:?}");
     let _ = Arc::clone(&s);
 }

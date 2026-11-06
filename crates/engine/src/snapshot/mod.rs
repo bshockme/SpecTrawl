@@ -65,6 +65,8 @@ struct Publisher {
     log: Log,
     watch: Watch,
     version: u64,
+    /// The systems view and the records view version it was built from.
+    systems: (u64, Arc<api::SystemsView>),
     swap: Arc<ArcSwap<Snapshot>>,
 }
 
@@ -82,7 +84,17 @@ pub fn spawn_with_guard(engine: Engine, backends: Vec<Box<dyn Backend>>, cfg: Pu
     let swap = Arc::new(ArcSwap::from_pointee(Snapshot::empty()));
     let mut log = Log { lines: VecDeque::new(), kept: cfg.log_kept, n: 0 };
     let registry = Registry::new(&engine, backends, &mut log);
-    let mut p = Publisher { engine, registry, cfg, acks: VecDeque::new(), log, watch: Watch::default(), version: 0, swap: swap.clone() };
+    let mut p = Publisher {
+        engine,
+        registry,
+        cfg,
+        acks: VecDeque::new(),
+        log,
+        watch: Watch::default(),
+        version: 0,
+        swap: swap.clone(),
+        systems: (0, Arc::default()),
+    };
     p.publish();
     let (done_tx, done) = mpsc::channel::<()>();
     let thread = thread::Builder::new()
@@ -180,6 +192,10 @@ impl Publisher {
 
     fn publish(&mut self) {
         let (receivers, bus) = build::receivers(&self.engine, &self.registry, self.cfg.rows_per_snapshot, &mut self.watch, &mut self.log);
+        let records = self.engine.records().view();
+        if self.systems.0 != records.version {
+            self.systems = (records.version, Arc::new(crate::decoders::systems(&records)));
+        }
         self.version += 1;
         self.swap.store(Arc::new(Snapshot {
             version: self.version,
@@ -188,7 +204,7 @@ impl Publisher {
             bus,
             acks: self.acks.iter().cloned().collect(),
             log: self.log.lines.iter().cloned().collect(),
-            records: self.engine.records().view(),
+            records,
             store: self.engine.store().map(|s| s.view()).or_else(|| {
                 self.engine.store_error().map(|e| api::StoreView {
                     path: Default::default(),
@@ -200,6 +216,9 @@ impl Publisher {
             }),
             query: self.engine.store().and_then(|s| s.query_result()),
             audio: Arc::new(self.engine.audio_view()),
+            classify: self.engine.classify_view(),
+            decoders: self.engine.decoder_views(),
+            systems: self.systems.1.clone(),
         }));
     }
 }

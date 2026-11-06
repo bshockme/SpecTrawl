@@ -210,17 +210,76 @@ struct Group {
     at: Vec<usize>,
 }
 
-/// Whether two sync positions `a` and `b` symbols into the stream can
-/// belong to one transmission on a grid of `period` symbols: a whole number
-/// of periods apart, give or take the sync search's symbol resolution and
-/// a little clock error. Any spacing fits an unknown grid.
-fn on_grid(a: usize, b: usize, period: u32) -> bool {
+/// How a second sync confirms the first (DESIGN §7.1: "two-sync confirmation within one frame period + 3%").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Confirm {
+    /// A whole number of grid periods apart, any number, ±(3 symbols + 0.5 % of the spacing). The rule before the
+    /// rebuild's step 6; at that slack, two syncs more than ~0.6 s apart are always "on" P25's 36-symbol grid.
+    AnyPeriods,
+    /// Like `AnyPeriods`, ±(3 symbols + 0.05 % of the spacing): a transmitter's symbol clock is within tens of ppm of
+    /// ours, not 5000.
+    AnyPeriodsTight,
+    /// On the grid, ±(3 symbols + 0.05 %), and no further apart than the protocol's longest sync-to-sync gap + 3 %; a
+    /// transmission's count is its longest chain of such links. An entry with no known grid needs six syncs evenly
+    /// spaced on one of their own.
+    #[default]
+    WithinFrame,
+}
+
+/// The longest gap between consecutive syncs of one transmission, in symbols: P25 Phase 1's LDU (864); P25 Phase 2's
+/// 720-symbol fragment (its syncs sit at 360 and 540 of it, so consecutive syncs are 180 or 540 apart: measured on two
+/// outbound channels on air, 2026-11-05, with 720 where one was missed); a DMR voice superframe on one slot (sync in
+/// burst A of six, the slots interleaved: 12 bursts of 144); NXDN, dPMR, YSF and POCSAG sync every frame or batch, so
+/// two of their periods (one missed).
+pub fn max_gap(protocol: &str, period: u32) -> u32 {
+    match protocol {
+        "P25" if period == 36 => 864,
+        "P25" if period == 180 => 720,
+        "DMR" => 12 * 144,
+        _ => 2 * period,
+    }
+}
+
+/// Whether two sync positions `a` and `b` symbols into the stream can belong to one transmission on a grid of `period`
+/// symbols under `rule`: a whole number of periods apart, give or take the sync search's symbol resolution and a little
+/// clock error. Any spacing fits an unknown grid.
+fn on_grid(a: usize, b: usize, period: u32, protocol: &str, rule: Confirm) -> bool {
     if period == 0 {
         return true;
     }
     let d = a.abs_diff(b) as f64;
     let k = (d / period as f64).round();
-    k >= 1.0 && (d - k * period as f64).abs() <= 3.0 + 0.005 * d
+    let slack = match rule {
+        Confirm::AnyPeriods => 0.005,
+        Confirm::AnyPeriodsTight | Confirm::WithinFrame => 0.0005,
+    };
+    let near = rule != Confirm::WithinFrame || d <= 1.03 * max_gap(protocol, period) as f64;
+    k >= 1.0 && near && (d - k * period as f64).abs() <= 3.0 + slack * d
+}
+
+/// The most occurrences in `at` on one grid that two of them define (their spacing, at least `min_gap` symbols): the
+/// first pair, plus each other occurrence a whole number of that spacing from the first, ±3 symbols + 0.05 %.
+fn own_grid(at: &mut [usize], min_gap: usize) -> usize {
+    at.sort_unstable();
+    let mut best = usize::from(!at.is_empty());
+    for i in 0..at.len() {
+        for j in i + 1..at.len() {
+            let gap = at[j] - at[i];
+            if gap < min_gap {
+                continue;
+            }
+            let n = at
+                .iter()
+                .filter(|&&b| {
+                    let d = b.abs_diff(at[i]) as f64;
+                    let k = (d / gap as f64).round();
+                    (d - k * gap as f64).abs() <= 3.0 + 0.0005 * d
+                })
+                .count();
+            best = best.max(n);
+        }
+    }
+    best
 }
 
 /// Picks the protocol with the most distinct sync occurrences on its grid.
@@ -231,6 +290,11 @@ fn on_grid(a: usize, b: usize, period: u32) -> bool {
 /// frames allowed): two syncs at an arbitrary spacing are what noise and
 /// analog voice produce, and confirm nothing.
 pub fn best(hits: &[SyncHit]) -> Option<SyncResult> {
+    best_with(hits, Confirm::default())
+}
+
+/// [`best`] under a given confirmation rule.
+pub fn best_with(hits: &[SyncHit], rule: Confirm) -> Option<SyncResult> {
     let mut groups: Vec<Group> = Vec::new();
     for h in hits {
         let key = (h.entry.protocol, h.entry.detail, h.entry.baud, h.inverted);
@@ -255,15 +319,54 @@ pub fn best(hits: &[SyncHit]) -> Option<SyncResult> {
     }
     // A group's count is the most occurrences that agree with any one of
     // them about the grid (the anchor itself included).
-    let counted = groups.into_iter().map(|g| {
-        let count = g.at.iter().map(|&a| 1 + g.at.iter().filter(|&&b| b != a && on_grid(a, b, g.period)).count()).max().unwrap_or(0);
+    let counted = groups.into_iter().map(|mut g| {
+        let count = match rule {
+            // Within one frame, a long transmission is a chain: each sync confirmed by the one before it.
+            Confirm::WithinFrame if g.period > 0 => {
+                g.at.sort_unstable();
+                let mut best = usize::from(!g.at.is_empty());
+                let mut chain = vec![1usize; g.at.len()];
+                for j in 1..g.at.len() {
+                    for i in (0..j).rev() {
+                        if on_grid(g.at[i], g.at[j], g.period, g.protocol, rule) {
+                            chain[j] = chain[j].max(chain[i] + 1);
+                        }
+                        if g.at[j] - g.at[i] > 2 * max_gap(g.protocol, g.period) as usize {
+                            break;
+                        }
+                    }
+                    best = best.max(chain[j]);
+                }
+                best
+            }
+            // No known grid: the syncs must make one of their own, evenly spaced at least a sync word apart (chance
+            // matches in analog voice fall anywhere: 8 of 300 FM voice windows confirmed "ProVoice" without this).
+            Confirm::WithinFrame => own_grid(&mut g.at, g.len as usize),
+            _ => {
+                g.at.iter()
+                    .map(|&a| 1 + g.at.iter().filter(|&&b| b != a && on_grid(a, b, g.period, g.protocol, rule)).count())
+                    .max()
+                    .unwrap_or(0)
+            }
+        };
         (g, count)
     });
     // An entry whose frame grid is unknown (period 0: the unverified
     // ProVoice and X2-TDMA patterns) can't use the grid to reject chance
     // pairs, so it needs a third occurrence instead: on a 40 s window of
     // floor the ProVoice patterns matched twice.
-    let (g, count) = counted.filter(|(g, count)| *count >= if g.period == 0 { 3 } else { 2 }).max_by_key(|(g, count)| (*count, g.len))?;
+    let (g, count) = counted
+        .filter(|(g, count)| {
+            *count
+                >= if g.period > 0 {
+                    2
+                } else if rule == Confirm::WithinFrame {
+                    6
+                } else {
+                    3
+                }
+        })
+        .max_by_key(|(g, count)| (*count, g.len))?;
     let confidence = match count {
         2 => 0.8,
         3..=4 => 0.9,
@@ -398,9 +501,27 @@ mod tests {
         let p25 = table().into_iter().find(|e| e.protocol == "P25" && e.detail == "Phase 1").unwrap();
         assert_eq!(best(&[hit(p25, 0), hit(p25, 864), hit(p25, 936)]).unwrap().count, 3);
         assert!(best(&[hit(p25, 0), hit(p25, 101)]).is_none());
-        // POCSAG batches, 544 bits, over a long stretch with clock error.
+        // POCSAG batches, 544 bits: consecutive batches chain with a little clock error; a sync 20 batches on is
+        // another stretch (DESIGN §7.1: within one frame + 3 %), so it doesn't add to the count.
         let pocsag = table().into_iter().find(|e| e.protocol == "POCSAG" && e.baud == 1200.0).unwrap();
-        assert_eq!(best(&[hit(pocsag, 10), hit(pocsag, 554), hit(pocsag, 10 + 20 * 544 + 40)]).unwrap().count, 3);
+        assert_eq!(best(&[hit(pocsag, 10), hit(pocsag, 555), hit(pocsag, 10 + 2 * 544 + 2)]).unwrap().count, 3);
+        assert_eq!(best(&[hit(pocsag, 10), hit(pocsag, 554), hit(pocsag, 10 + 20 * 544 + 40)]).unwrap().count, 2);
+        // P25 Phase 2 outbound: syncs 180 and 540 apart in turn (and 720 over a missed one) chain as one transmission.
+        let p2 = table().into_iter().find(|e| e.protocol == "P25" && e.detail == "Phase 2").unwrap();
+        assert_eq!(best(&[hit(p2, 100), hit(p2, 280), hit(p2, 820), hit(p2, 1000), hit(p2, 1720), hit(p2, 1900)]).unwrap().count, 6);
+        // Under the old slack (0.5 % of the spacing), any two P25 syncs ~0.6 s apart were "on" its 36-symbol grid.
+        assert!(best_with(&[hit(p25, 0), hit(p25, 3000)], Confirm::AnyPeriods).is_some());
+        assert!(best(&[hit(p25, 0), hit(p25, 3000)]).is_none());
+    }
+
+    #[test]
+    fn a_grid_of_their_own_confirms_an_entry_without_one_only_at_six() {
+        let pv = table().into_iter().find(|e| e.protocol == "ProVoice").unwrap();
+        let even: Vec<SyncHit> = (0..6).map(|k| hit(pv, 50 + k * 400)).collect();
+        assert_eq!(best(&even).unwrap().count, 6);
+        assert!(best(&even[..5]).is_none(), "five is not enough");
+        let scattered: Vec<SyncHit> = [50, 333, 790, 1410, 2002, 2600, 3333].into_iter().map(|s| hit(pv, s)).collect();
+        assert!(best(&scattered).is_none(), "seven at no common spacing");
     }
 
     #[test]

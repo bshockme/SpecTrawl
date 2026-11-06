@@ -6,6 +6,7 @@ use std::time::SystemTime;
 use sdr_core::{Capabilities, DeviceInfo, GainSetting};
 
 use crate::audio::AudioView;
+use crate::classify::{ClassifyView, DecoderView, SystemsView};
 use crate::command::Ack;
 use crate::records::{QueryResult, RecordsView, StoreView};
 use crate::timeline::{Row, SegmentId};
@@ -27,6 +28,12 @@ pub struct Snapshot {
     pub query: Option<Arc<QueryResult>>,
     /// The audio output and the replays.
     pub audio: Arc<AudioView>,
+    /// The detector bank's budget.
+    pub classify: ClassifyView,
+    /// The running decoders.
+    pub decoders: Vec<DecoderView>,
+    /// The systems the decoders' claims name (the same `Arc` while nothing changed).
+    pub systems: Arc<SystemsView>,
 }
 
 impl Snapshot {
@@ -43,6 +50,9 @@ impl Snapshot {
             store: None,
             query: None,
             audio: Arc::new(AudioView::default()),
+            classify: ClassifyView::default(),
+            decoders: Vec::new(),
+            systems: Arc::new(SystemsView::default()),
         }
     }
 }

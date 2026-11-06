@@ -10,6 +10,8 @@ use sdr_core::Device;
 use crate::audio::AudioConfig;
 use crate::budget::{BudgetConfig, Mode, RingBudget, SourceId};
 use crate::channels::{BusConfig, ChannelBus};
+use crate::classify::{Classifier, ClassifyConfig};
+use crate::decoders::DecoderBank;
 use crate::recorder::{Recorder, SliceConfig};
 use crate::records::{Loaded, RecordBook, RecordSink};
 use crate::replay::{Player, Resolved};
@@ -30,6 +32,8 @@ pub struct EngineConfig {
     pub slices: Option<SliceConfig>,
     /// What plays the replays' audio.
     pub audio: AudioConfig,
+    /// The detector bank's pool.
+    pub classify: ClassifyConfig,
 }
 
 pub struct Engine {
@@ -41,7 +45,9 @@ pub struct Engine {
     store_error: Option<String>,
     bus: Arc<ChannelBus>,
     player: Player,
-    sources: Mutex<HashMap<SourceId, Arc<Source>>>,
+    classifier: Classifier,
+    decoders: DecoderBank,
+    sources: Arc<Mutex<HashMap<SourceId, Arc<Source>>>>,
     /// The engine's handle; each `Source` holds the keeper too, so it lives
     /// as long as the last of them whatever the field order.
     keeper: Arc<Keeper>,
@@ -71,7 +77,11 @@ impl Engine {
             records.set_recorder(r);
         }
         let player = Player::new(cfg.audio);
-        Engine { cfg, records, store, store_error, keeper, bus, player, sources: Mutex::new(HashMap::new()) }
+        let sources = Arc::new(Mutex::new(HashMap::new()));
+        let classifier = Classifier::start(cfg.classify.clone(), records.clone(), bus.clone(), sources.clone());
+        // Decoders attach to what the bank found: on with it.
+        let decoders = DecoderBank::start(cfg.classify.enabled, records.clone(), bus.clone(), sources.clone());
+        Engine { cfg, records, store, store_error, keeper, bus, player, classifier, decoders, sources }
     }
 
     /// Starts the device streaming into a new source and attaches the source to the bus.
@@ -112,6 +122,16 @@ impl Engine {
     /// Records and emitters.
     pub fn records(&self) -> &Arc<RecordBook> {
         &self.records
+    }
+
+    /// The detector bank's budget.
+    pub fn classify_view(&self) -> api::ClassifyView {
+        self.classifier.view()
+    }
+
+    /// The running decoders.
+    pub fn decoder_views(&self) -> Vec<api::DecoderView> {
+        self.decoders.views()
     }
 
     /// The record store, when one is configured and opened.
@@ -191,6 +211,9 @@ impl Drop for Engine {
     /// Detaches every source (its consumers end with `SourceDetached`),
     /// stops the bus and drops the engine's handles on the sources.
     fn drop(&mut self) {
+        // No new windows from here; the ones on the bus end with their sources.
+        self.classifier.stop();
+        self.decoders.stop();
         let ids: Vec<SourceId> = self.sources.lock().keys().copied().collect();
         for id in ids {
             self.bus.detach(id);

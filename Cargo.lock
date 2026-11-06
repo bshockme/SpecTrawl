@@ -946,6 +946,7 @@ dependencies = [
  "backend-airspy",
  "backend-sim",
  "cpal",
+ "detect",
  "dsp",
  "libc",
  "log",

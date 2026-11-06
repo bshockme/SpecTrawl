@@ -11,6 +11,8 @@ pub enum Tab {
     Log,
     /// The records list, beside the Log.
     Records,
+    /// The systems the decoders found, and the decoders' lamps, beside the records.
+    Systems,
 }
 
 impl Tab {
@@ -21,6 +23,7 @@ impl Tab {
             Tab::Devices => "Devices",
             Tab::Log => "Log",
             Tab::Records => "Records",
+            Tab::Systems => "Systems",
         }
     }
 }
