@@ -129,6 +129,13 @@ impl Engine {
         self.classifier.view()
     }
 
+    /// Serves a channel of `source` as an rtl_tcp stream on loopback, for a decoder worker (`docs/decoder-worker.md`).
+    /// The server's threads stop when it drops.
+    pub fn serve_iq(&self, source: SourceId, cfg: crate::iqserve::IqServeConfig) -> Result<crate::iqserve::IqServer, String> {
+        let src = self.source(source).ok_or("no such source")?;
+        crate::iqserve::IqServer::start(self.bus.clone(), src, cfg)
+    }
+
     /// The running decoders.
     pub fn decoder_views(&self) -> Vec<api::DecoderView> {
         self.decoders.views()

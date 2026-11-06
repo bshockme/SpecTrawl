@@ -6,6 +6,7 @@ pub mod classify;
 pub mod decoders;
 pub mod engine;
 pub mod export;
+pub mod iqserve;
 pub mod recorder;
 pub mod records;
 pub mod replay;
