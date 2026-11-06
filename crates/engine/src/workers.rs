@@ -1,7 +1,8 @@
-//! Decoder workers (spec §4.6): separate programs, such as OnAir's `onair-server`, fed a channel of a source as rtl_tcp
-//! by [`crate::iqserve`] and polled for what they decode (`docs/decoder-worker.md`). The engine knows workers only
-//! through [`WorkerFactory`] and [`Worker`]; `onair-rx` implements them, and the app hands its factories to the engine
-//! ([`crate::Engine::add_worker_factory`]), so the engine never depends on a worker's crate.
+//! Decoder workers (spec §4.6): separate programs that read rtl_tcp (rtl_433, AIS-catcher, OnAir's `onair-server`),
+//! fed a channel of a source by [`crate::iqserve`] and polled for what they decode (`docs/decoder-worker.md`). The
+//! engine knows workers only through [`WorkerFactory`] and [`Worker`]; a worker's own crate implements them, and the app
+//! hands its factories to the engine ([`crate::Engine::add_worker_factory`]), so the engine never depends on a worker's
+//! crate.
 //!
 //! A manager thread polls every worker each [`POLL`]. Its view goes into the snapshot. Each message it decoded becomes
 //! a `Decoder` claim, filed under `worker:<mode>`, on the record nearest the message's frequency: an open one, or one

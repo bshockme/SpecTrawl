@@ -144,7 +144,7 @@ impl Engine {
         crate::iqserve::IqServer::start(self.bus.clone(), src, cfg)
     }
 
-    /// Installs a worker program's modes (`onair-rx`'s, say): the app calls this; the engine depends on no worker crate.
+    /// Installs a worker program's modes: the app calls this; the engine depends on no worker crate.
     pub fn add_worker_factory(&self, f: Arc<dyn WorkerFactory>) {
         self.workers.add_factory(f);
         *self.worker_modes.lock() = Arc::new(self.workers.modes());

@@ -1,6 +1,6 @@
 # The decoder-worker protocol
 
-A decoder worker is a separate program that decodes modes SpecTrawl has no native decoder for (spec §4.6). SpecTrawl feeds it IQ over loopback and reads what it decodes back. The worker's code never enters a SpecTrawl crate: this protocol is the whole contract. OnAir's `onair-server` (GPL-3) is the first worker in mind, but anything that speaks it can be one.
+A decoder worker is a separate program that decodes modes SpecTrawl has no native decoder for (spec §4.6). SpecTrawl feeds it IQ over loopback and reads what it decodes back. The worker's code never enters a SpecTrawl crate: this protocol is the whole contract. Any program that reads rtl_tcp can be one. OnAir's `onair-server` (GPL-3) was the first tried (2026-11-05): it decodes through this feed, but the stock server reports only its lamp and counters, so SpecTrawl does not use it (2026-11-06).
 
 Status (2026-11-05):
 
@@ -65,9 +65,9 @@ port=<a free port for its control API>
   - Over the WebSocket `/api/v1/ws`, send `{"telemetry":true,"events":true}`. Frames then come as `{"type":"telemetry","data":{…}}`, `{"type":"event","data":{…}}`, and `{"type":"gap"}` when the worker dropped messages because SpecTrawl read too slowly.
 - **Decoded messages**, in the desktop app and in the patched server, are one JSON object each, for example `{"v":1,"type":"pager.message","time":…,"mode":"POCSAG","freqHz":…,"fields":{…}}`.
 
-## How SpecTrawl uses a worker (`onair-rx`, planned)
+## How SpecTrawl uses a worker
 
-- **The process:** the supervisor starts one worker per mode per span, on demand, writing its settings file in SpecTrawl's own data folder.
+- **The process:** a worker's crate implements `engine::workers::WorkerFactory`; its supervisor starts one worker per mode per span, on demand, writing its settings file in SpecTrawl's own data folder.
 - **Health and restarts:** it checks health, restarts with a backoff, and stops the worker when nothing uses it.
 - **Results:** telemetry becomes the `Decoder` trait's telemetry and `Decoder` claims on the records it concerns.
 - **Registry:** which implementation serves a mode, native or worker, is a registry entry the app hands the engine.

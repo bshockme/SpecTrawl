@@ -2,6 +2,8 @@
 
 > On branch `rebuild-step-7` (worktree `.worktrees/step-7`).
 
+> **Changed course 2026-11-06 (owner): OnAir is not the tool for this job.** What it would take is below: stock `onair-server` reports nothing it decodes, and air band runs only from the desktop app. The `onair-rx` crate was removed (it is in history at 264141f). `engine::iqserve` and `engine::workers` stay, for any program that reads rtl_tcp. Air band is native: see "Air band, native" at the end.
+
 **Goal.** Spec §6 step 7: "`onair-rx` worker supervisor and protocol, with airband AM first (it is the multi-channel case), then the land-mobile modes, then the rest of the catalogue in the order the survey meets them. A GPL fork of OnAir carrying the JSON export patch lives in its own repository."
 
 **Spec:** §4.6 (DecoderBank, OnAir's decoders, the licence boundary, the worker protocol), §5 (the slots), §9, §10 decisions 1–2.
@@ -79,15 +81,13 @@
 
 1. `engine::iqserve`, with tests. **Done.**
 2. `docs/decoder-worker.md`. **Done.**
-3. **The engine's worker interface:**
-   - `WorkerFactory` and `Worker` (polled: lamp, summary, counters, decoded messages);
-   - `Command::StartWorker` and `StopWorker`, and worker views in the snapshot;
-   - messages as claims on the records at their frequencies.
-4. **`onair-rx`.** Done against the fake server and the real 3.6.0 (lamp and counters); messages wait on the patched server:
-   - the supervisor (settings, a contained `HOME`, the radio check, restart with backoff, stop on drop);
-   - the HTTP client for `status`, `telemetry` and `events`;
-   - a fake `onair-server` binary, so CI tests it all without OnAir;
-   - an on-air check against the real 3.6.0 with FLEX and POCSAG.
-5. **The app:** start a worker for a span and see it in Systems/Decoders.
-6. **The fork:** air band headless (channels from settings or the capture, air band telemetry), built under `onair/`. Then air band through it, on air on 118–137 MHz, against step 5's native AM replay.
-7. **The land-mobile modes** (P25, DMR, NXDN as sessions), then the rest of the catalogue as the survey meets them.
+3. **The engine's worker interface** (`WorkerFactory`, `Worker`, `Command::StartWorker`/`StopWorker`, worker views, messages as claims). **Done.**
+4. ~~`onair-rx`~~: built, verified with OnAir 3.6.0 on FLEX (lamp and counters only), then removed with the change of course.
+5. **Air band, native** (below).
+6. **The land-mobile modes**, native: DMR and NXDN control and voice-channel monitors, FLEX and POCSAG monitors.
+
+## Air band, native
+
+- **What the user gets:** the CHANNELS list (spec §5) for every air band in a source's span (118–137 MHz civil, 225–400 MHz military): each channel on its raster, open now or not, its level, its transmissions and airtime, and when it was last heard. A transmission plays from its record (step 5's replay).
+- **Built on the records, not a second detector:** each record in an air band, snapped to the band's channel raster, is a transmission on that channel. The bank's look (the carrier rung) says whether it is AM voice; a record that isn't (a birdie, a hump of floor, a data burst) is not counted as a transmission.
+- **Claims:** a channel monitor claims "Air band AM" on a record it counts, filed under `decoder`, with the channel as its identity; a record it rejects keeps the bank's verdict. So the record, the emitter and the CHANNELS row read the same thing.
