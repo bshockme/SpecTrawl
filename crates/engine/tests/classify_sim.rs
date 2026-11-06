@@ -78,19 +78,24 @@ fn every_record_is_looked_at_and_each_says_only_what_it_shows() {
         assert!(matches!(&h.by, Evidence::SyncBank { protocol, syncs, .. } if protocol == "P25 Phase 1" && *syncs >= 2), "{:?}", r.claims);
         assert!(!decoded(r), "random payload decoded: {:?}", r.claims);
     }
-    for (hz, label) in [(CW_HZ, "Carrier"), (FM_HZ, "Analog FM")] {
+    // A carrier is described and headlines nothing; an FM tone is measured analog FM, which headlines (owner,
+    // 2026-11-06: analog modulations carry no code words; only digital modes need a sync or a decode to be named).
+    for (hz, label, headlines) in [(CW_HZ, "Carrier", false), (FM_HZ, "Analog FM", true)] {
         let mine: Vec<_> = recs.iter().filter(|r| near(r, hz)).collect();
         assert!(!mine.is_empty());
         for r in mine {
-            assert!(r.headline().is_none() && !decoded(r), "{hz}: {:?}", r.claims);
+            assert!(!decoded(r), "{hz}: {:?}", r.claims);
             let f = r.claims.iter().find(|c| matches!(c.by, Evidence::Features { .. })).unwrap_or_else(|| panic!("{hz}: {:?}", r.claims));
             assert!(f.label == label && f.confidence <= 0.6, "{hz}: {f:?}");
+            assert_eq!(r.headline().map(|h| h.label.as_str()), headlines.then_some(label), "{hz}: {:?}", r.claims);
         }
     }
     // The emitters vote the same way.
-    let p25_emitter = view.emitters.iter().find(|v| (v.center_hz - P25_HZ).abs() < 3e3).unwrap();
-    assert_eq!(p25_emitter.headline.as_ref().map(|c| c.label.as_str()), Some("P25 Phase 1"));
-    assert!(view.emitters.iter().filter(|v| (v.center_hz - P25_HZ).abs() > 3e3).all(|v| v.headline.is_none()));
+    let headline =
+        |hz: f64| view.emitters.iter().find(|v| (v.center_hz - hz).abs() < 3e3).and_then(|v| v.headline.as_ref()).map(|c| c.label.clone());
+    assert_eq!(headline(P25_HZ).as_deref(), Some("P25 Phase 1"));
+    assert_eq!(headline(FM_HZ).as_deref(), Some("Analog FM"));
+    assert_eq!(headline(CW_HZ), None);
 }
 
 #[test]

@@ -120,7 +120,7 @@ Every backend emits the same stream, including Soapy and file sources. It's a se
 - `TimeAnchor { at_sample, host_time, [hw_time] }`: maps the sample counter to the wall clock. Records from different SDRs share one timeline.
 - `GainChange`, `Overload` (ADC clipping), `DeviceLost`.
 
-The driver's USB callback **only copies data into a lock-free ring**. It never blocks, allocates or does DSP.
+The driver's USB callback **keeps up with the stream**: it copies into the ring and may convert as it goes (the Airspy's floats to i16, the RFOne board sweep's half-band), but never waits on another thread. A callback that falls behind loses samples on the board, unseen, so the backend counts delivered against wall-clock samples and reports the shortfall. (Owner, 2026-11-06, replacing "only copies data… never blocks, allocates or does DSP".)
 
 ### 4.4 Roles
 
