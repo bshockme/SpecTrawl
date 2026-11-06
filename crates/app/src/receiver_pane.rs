@@ -84,11 +84,16 @@ impl ReceiverPane {
         ui: &mut egui::Ui,
         r: &Receiver,
         records: &[std::sync::Arc<api::SignalRecord>],
+        decoders: &[api::DecoderView],
         selected: &mut Option<api::RecordId>,
         out: &mut Vec<Command>,
     ) {
         self.header(ui, r, out);
         status_lines(ui, r);
+        // One sentence per decoder on this receiver, with its lamp (spec §5's status line and lamps).
+        for d in decoders {
+            crate::systems_pane::decoder_line(ui, d);
+        }
         ui.add_space(4.0);
         self.body.show(ui, r, records, selected, self.db_range, &mut self.paused, out);
     }

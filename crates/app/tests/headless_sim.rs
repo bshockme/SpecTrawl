@@ -280,3 +280,102 @@ fn play_on_a_record_plays_it_and_stop_stops_it() {
     let max = *frame_ms.last().unwrap();
     assert!(max < 100.0, "a frame took {max:.1} ms");
 }
+
+/// The simulator's scenario tuned to 855.5 MHz with the committed real P25 control channel (NAC 0x34D) at 859.7625 MHz.
+struct P25Sim;
+
+impl Backend for P25Sim {
+    fn name(&self) -> &str {
+        "sim"
+    }
+    fn enumerate(&self) -> sdr_core::Result<Vec<DeviceInfo>> {
+        SimBackend.enumerate()
+    }
+    fn open(&self, _serial: &str) -> sdr_core::Result<Box<dyn Device>> {
+        let stem = format!("{}/../../testdata/small/859.7677MHz_P25_Phase_1", env!("CARGO_MANIFEST_DIR"));
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(format!("{stem}.sigmf-meta")).expect("the P25 capture")).unwrap();
+        let (fs, tuned) = (meta["global"]["core:sample_rate"].as_f64().unwrap(), meta["captures"][0]["core:frequency"].as_f64().unwrap());
+        let w = std::f64::consts::TAU * (tuned - 859.7625e6) / fs;
+        let raw = std::fs::read(format!("{stem}.sigmf-data")).unwrap();
+        let x: Vec<sdr_core::Complex32> = raw
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .enumerate()
+            .map(|(k, c)| {
+                sdr_core::Complex32::new(f32::from_le_bytes([c[0], c[1], c[2], c[3]]), f32::from_le_bytes([c[4], c[5], c[6], c[7]]))
+                    * sdr_core::Complex32::from_polar(1.0, (w * k as f64) as f32)
+            })
+            .collect();
+        let clip = backend_sim::Clip::leak(&x, fs, 8_500.0);
+        let mut emitters = backend_sim::default_scenario();
+        emitters.push(backend_sim::Emitter {
+            freq_hz: 859.7625e6,
+            level_dbfs: -45.0,
+            modulation: backend_sim::Modulation::Iq { clip },
+            keying: backend_sim::Keying::Continuous,
+        });
+        let (d, _) =
+            SimDevice::with_config(SimConfig { emitters, center_hz: 855.5e6, paced: true, report_lag_gaps: false, ..Default::default() });
+        Ok(Box::new(d))
+    }
+}
+
+#[test]
+fn the_systems_tab_shows_the_p25_site_its_decoder_and_its_record_says_the_same() {
+    let engine = Engine::new(EngineConfig {
+        budget: BudgetConfig { guaranteed_secs: 10.0, ceiling_bytes: 1 << 30, sweep_secs: 0.2 },
+        bus: BusConfig::default(),
+        source: SourceConfig::default(),
+        store: None,
+        slices: None,
+        audio: engine::audio::AudioConfig::Manual,
+        classify: Default::default(),
+    });
+    let handle = engine::snapshot::spawn(engine, vec![Box::new(P25Sim)], PublisherConfig::default());
+    let ctx = egui::Context::default();
+    let mut app = App::new(handle.clone());
+    app.show_tab(spectrawl_app::tabs::Tab::Systems);
+    let mut frame_ms: Vec<f64> = Vec::new();
+    let mut frame = |app: &mut App, k: usize| {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 900.0))),
+            time: Some(k as f64 / 20.0),
+            ..Default::default()
+        };
+        let t = Instant::now();
+        let mut output = ctx.run_ui(input, |ui| app.frame(ui));
+        output.textures_delta.clear();
+        frame_ms.push(t.elapsed().as_secs_f64() * 1e3);
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    handle.send(Command::Open { backend: "sim".into(), serial: "SIM-0001".into() });
+    let mut k = 0;
+    let row = loop {
+        frame(&mut app, k);
+        k += 1;
+        let s = handle.latest();
+        let locked = |e| s.decoders.iter().any(|d| d.emitter == e && d.lamp == api::Lamp::Locked);
+        if let Some(row) = s.systems.systems.first().filter(|r| locked(r.emitter)) {
+            break row.clone();
+        }
+        assert!(k < 200, "no locked P25 system in 10 s: {:?} {:?}", s.systems, s.decoders);
+    };
+    assert_eq!(row.identity.line(), "NAC 0x34D WACN BEE00 SYS 348 RFSS 1 SITE 13");
+    // The control channel's newest record, selected: the list's "What" and the detail read the row's claim.
+    let s = handle.latest();
+    let rec = s.records.records.iter().filter(|r| r.emitter == Some(row.emitter)).max_by_key(|r| r.first_sample).unwrap().clone();
+    assert_eq!(spectrawl_app::records_pane::what(&rec), ("P25 Phase 1 control".to_string(), false));
+    app.select(Some(rec.id));
+    app.show_tab(spectrawl_app::tabs::Tab::Records);
+    for _ in 0..10 {
+        frame(&mut app, k);
+        k += 1;
+    }
+    let line = spectrawl_app::systems_pane::budget_line(&handle.latest());
+    assert!(line.starts_with("Looked at ") && line.contains(" 0 missed"), "{line}");
+    frame_ms.sort_by(|a, b| a.total_cmp(b));
+    let max = *frame_ms.last().unwrap();
+    assert!(max < 100.0, "a frame took {max:.1} ms");
+}

@@ -40,7 +40,7 @@ impl App {
     pub fn new(handle: Handle) -> App {
         let snap = handle.latest();
         let mut dock = DockState::new(vec![Tab::Devices]);
-        dock.main_surface_mut().split_right(NodeIndex::root(), DEVICES_SHARE, vec![Tab::Log, Tab::Records]);
+        dock.main_surface_mut().split_right(NodeIndex::root(), DEVICES_SHARE, vec![Tab::Log, Tab::Records, Tab::Systems]);
         App {
             handle,
             snap,
@@ -83,7 +83,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("SpecTrawl").strong());
                 ui.menu_button("View ⏷", |ui| {
-                    for tab in [Tab::Devices, Tab::Log, Tab::Records] {
+                    for tab in [Tab::Devices, Tab::Log, Tab::Records, Tab::Systems] {
                         let shown = self.dock.find_tab(&tab).is_some();
                         if ui.add_enabled(!shown, egui::Button::new(tab.name())).clicked() {
                             reopen(&mut self.dock, tab);
@@ -142,6 +142,16 @@ impl App {
     }
 
     /// Queues a command as a pane would (sent at the end of the next frame).
+    /// Brings `tab` to the front of its dock node, reopening it if it was closed.
+    pub fn show_tab(&mut self, tab: Tab) {
+        if self.dock.find_tab(&tab).is_none() {
+            reopen(&mut self.dock, tab.clone());
+        }
+        if let Some(path) = self.dock.find_tab(&tab) {
+            let _ = self.dock.set_active_tab(path);
+        }
+    }
+
     pub fn push_command(&mut self, c: Command) {
         self.out.push(c);
     }
@@ -223,12 +233,14 @@ impl egui_dock::TabViewer for App {
             Tab::Receiver(id) => {
                 if let (Some(r), Some(p)) = (snap.receivers.iter().find(|r| r.id == *id), self.panes.get_mut(id)) {
                     let mine: Vec<_> = snap.records.records.iter().filter(|x| x.source == r.id).cloned().collect();
-                    p.show(ui, r, &mine, &mut self.selected, &mut self.out);
+                    let decoders: Vec<_> = snap.decoders.iter().filter(|d| d.source == r.id).cloned().collect();
+                    p.show(ui, r, &mine, &decoders, &mut self.selected, &mut self.out);
                 }
             }
             Tab::Devices => devices_pane::show(ui, &snap, &mut self.budget_draft, &mut self.out),
             Tab::Log => log_pane::show(ui, &snap),
             Tab::Records => self.records.show(ui, &snap, &mut self.selected, &mut self.out),
+            Tab::Systems => crate::systems_pane::show(ui, &snap),
         }
     }
 
@@ -276,6 +288,12 @@ fn reopen(dock: &mut DockState<Tab>, tab: Tab) {
         return;
     }
     match tab {
+        Tab::Systems => match tree.find_tab(&Tab::Records).or_else(|| tree.find_tab(&Tab::Log)) {
+            Some((node, _)) => tree[node].append_tab(tab),
+            None => {
+                tree.split_right(NodeIndex::root(), DEVICES_SHARE, vec![tab]);
+            }
+        },
         Tab::Records => match tree.find_tab(&Tab::Log) {
             Some((node, _)) => tree[node].append_tab(tab),
             None => match tree.find_tab_from(|t| matches!(t, Tab::Receiver(_))) {
