@@ -33,6 +33,7 @@ fn main() {
         store: None,
         slices: Some(SliceConfig::new(out.join("slices"))),
         audio: AudioConfig::Manual,
+        classify: engine::classify::ClassifyConfig::default(),
     });
     let src = e.add_source(device, Mode::Live).expect("start the radio");
     src.set_center(center).expect("tune");

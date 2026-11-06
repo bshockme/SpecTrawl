@@ -47,6 +47,11 @@ impl<'a> Window<'a> {
         self.raw.len() as f64 / self.fs
     }
 
+    /// The share of the window the envelope gate holds on (a burst's duty within it).
+    pub fn on_fraction(&self) -> f32 {
+        if self.gate.is_empty() { 0.0 } else { self.gate.iter().filter(|g| **g).count() as f32 / self.gate.len() as f32 }
+    }
+
     /// Within [`WEAK_DB`] of the floor beside it: noise statistics, too weak to describe by its modulation.
     pub fn weak(&self) -> bool {
         self.snr_db.is_some_and(|s| s < WEAK_DB)

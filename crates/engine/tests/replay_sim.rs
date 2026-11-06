@@ -54,6 +54,7 @@ fn engine(slices: Option<&Dir>) -> Engine {
         store: None,
         slices: slices.map(|d| SliceConfig::new(&d.0)),
         audio: AudioConfig::Manual,
+        classify: engine::classify::ClassifyConfig::off(),
     })
 }
 

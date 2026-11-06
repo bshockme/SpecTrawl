@@ -31,6 +31,7 @@ fn main() {
         store: Some(StoreConfig::new(db)),
         slices: None,
         audio: engine::audio::AudioConfig::Manual,
+        classify: engine::classify::ClassifyConfig::default(),
     });
     if let Some(err) = e.store_error() {
         panic!("store: {err}");

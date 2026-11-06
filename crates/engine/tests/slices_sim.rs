@@ -32,6 +32,7 @@ fn engine(slices: SliceConfig) -> Engine {
         store: None,
         slices: Some(slices),
         audio: engine::audio::AudioConfig::Manual,
+        classify: engine::classify::ClassifyConfig::off(),
     })
 }
 
