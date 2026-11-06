@@ -20,14 +20,30 @@
 - **Air band:** the "Airband" mode: AM voice on several 25 and 8.33 kHz channels at once, with scan and priority.
 - **Distribution:** releases carry a portable Linux x86_64 build (`onair-3.6.0-linux-x86_64-portable.tar.gz`, 143 MB, checked against the release's `SHA256SUMS`) and a Windows zip.
 
-## Open question for the owner (blocking the worker half)
+## Running OnAir here (decided with the owner, 2026-11-05)
 
-Running OnAir's binaries on this machine was refused by the session's permission check ("code from an external source"). Nothing that needs OnAir running (the supervisor, the protocol client against a real `onair-server`, the air band acceptance) can be verified until the owner allows it, and says where OnAir should live:
+- **Where it lives:** OnAir lives in `~/SpecTrawl/onair/`, ignored by git (`.git/info/exclude` and `.gitignore`), so no OnAir file enters SpecTrawl's tracked tree:
+  - the checksummed release build: `release/3.6.0`;
+  - a shallow clone of its repository: `OnAir/`;
+  - later, any fork or variant;
+  - workers' run folders under `run/`.
+- **Containment:** a worker runs with `HOME` and `XDG_CONFIG_HOME` set to its run folder. Beyond its `--config` file it writes only crash markers there.
+- **Never a real radio:** `onair-server` opens the first radio it finds unless its settings name one. It tried the R2 the first time. A worker's settings always say `device=rtl_tcp`, and the supervisor checks `/api/v1/status` says so, or it kills the worker.
 
-- a release build unpacked outside SpecTrawl's tree, e.g. `~/onair/3.6.0`;
-- or a build from source in its own repository (the fork the spec foresees).
+## What was verified with OnAir 3.6.0 (2026-11-05)
 
-The fork is only needed if a patch is (richer per-mode JSON). Creating it on GitHub is an outward action, done only when asked.
+- **The worker reaches the feed:** with `net_radio=rtltcp,127.0.0.1,<port>`, `device=rtl_tcp`, `rate_msps=2.5` (or 1.25), OnAir connects to `engine::iqserve`. Its log reads *"SPTW", tuner type 0, 0 gains: not an RTL-SDR, any rate up to 20 Msps*. It asks for no other rate, sends one gain command, and tunes 50 kHz off its dial (it keeps DC off its channels).
+- **FLEX decodes through it:** the FLEX pager at 929.6125 MHz, served from the R2 at 1.25 MS/s, decoded "locked", with 5367 blocks OK and 969 bad (85 % passing FEC), quality "good". No page events came: SpecTrawl's own bank found no pages in those frames either.
+- **What the stock server reports, per mode:**
+  - `/api/v1/telemetry` has the common block (`state`, `locked`, `snrDb`, `cfoHz`, `blocksOk`, `blocksBad`, `quality`) for every mode. Per-mode `details` exist only for DVB-T/T2, DVB-S/C, ATSC, DAB, FM, DTMB, LBJ, Horus and the railway modes (`core/src/results/rx_json.cpp`).
+  - Decoded messages come through `/api/v1/events`.
+  - Voice modes log calls as sessions (`/api/v1/sessions`).
+- **Air band does not work headless in stock OnAir:**
+  - the receiver decodes only the channels in its list, which the desktop app sets from its airport search and the server cannot set;
+  - its telemetry has no air band details;
+  - it writes no sessions.
+
+  This is the patch the spec foresaw: a `airband_channels=` server setting (or one that takes every raster channel in the capture) and air band in the telemetry JSON (channels, open, level, last heard). It is built from source in a fork under `onair/`.
 
 ## Architecture
 
@@ -48,8 +64,17 @@ The fork is only needed if a patch is (richer per-mode JSON). Creating it on Git
 
 ## Tasks
 
-1. `engine::iqserve`, with tests (a client reads the greeting, tunes, and finds the simulator's emitters where they are; a slow client loses blocks, not the bus).
-2. `docs/decoder-worker.md`.
-3. *(Needs OnAir.)* `onair-rx`: the supervisor and the client against a real `onair-server`.
-4. *(Needs OnAir.)* Air band through it, on air on 118–137 MHz, against the native AM replay of step 5.
-5. *(Needs OnAir.)* The land-mobile modes, then the rest of the catalogue as the survey meets them.
+1. `engine::iqserve`, with tests. **Done.**
+2. `docs/decoder-worker.md`. **Done.**
+3. **The engine's worker interface:**
+   - `WorkerFactory` and `Worker` (polled: lamp, summary, counters, decoded messages);
+   - `Command::StartWorker` and `StopWorker`, and worker views in the snapshot;
+   - messages as claims on the records at their frequencies.
+4. **`onair-rx`:**
+   - the supervisor (settings, a contained `HOME`, the radio check, restart with backoff, stop on drop);
+   - the HTTP client for `status`, `telemetry` and `events`;
+   - a fake `onair-server` binary, so CI tests it all without OnAir;
+   - an on-air check against the real 3.6.0 with FLEX and POCSAG.
+5. **The app:** start a worker for a span and see it in Systems/Decoders.
+6. **The fork:** air band headless (channels from settings or the capture, air band telemetry), built under `onair/`. Then air band through it, on air on 118–137 MHz, against step 5's native AM replay.
+7. **The land-mobile modes** (P25, DMR, NXDN as sessions), then the rest of the catalogue as the survey meets them.
