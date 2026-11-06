@@ -6,11 +6,11 @@
 //! `Position` claims their place suggests. Closed records, emitter changes, tags and notes go to the [`RecordSink`]
 //! (the store) after the book's lock is released.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
-use api::{EmitterId, EmitterView, Note, RecordId, RecordsView, Role, Row, SignalRecord};
+use api::{Claim, EmitterId, EmitterView, Evidence, Note, RecordId, RecordsView, Role, Row, SignalRecord};
 use parking_lot::Mutex;
 use sdr_core::IfArchitecture;
 
@@ -87,6 +87,9 @@ struct Inner {
     view: Arc<RecordsView>,
     emitter_views: HashMap<EmitterId, Arc<EmitterView>>,
     dirty_emitters: HashSet<EmitterId>,
+    /// Claims from outside the row path (the detector bank, a decoder), by record and by what made them; each maker's
+    /// set replaces its last. Kept for open records and the window.
+    extra: HashMap<RecordId, BTreeMap<String, Vec<Claim>>>,
 }
 
 pub struct RecordBook {
@@ -121,6 +124,7 @@ impl RecordBook {
                 view: Arc::new(RecordsView::default()),
                 emitter_views: HashMap::new(),
                 dirty_emitters,
+                extra: HashMap::new(),
             }),
             sink,
             recorder: OnceLock::new(),
@@ -245,6 +249,49 @@ impl RecordBook {
             .or_else(|| inner.window.iter().rev().find(|r| r.id == record).cloned())
     }
 
+    /// Sets the claims `from` (the bank, a decoder) makes about a record, replacing what `from` said before; the
+    /// record's emitter re-votes, and a closed record goes back to the store. False if the book doesn't hold it.
+    pub fn set_claims(&self, record: RecordId, from: &str, claims: Vec<Claim>) -> bool {
+        let out = {
+            let mut inner = self.inner.lock();
+            let inner = &mut *inner;
+            if inner.extra.get(&record).and_then(|m| m.get(from)) == Some(&claims) {
+                return true;
+            }
+            let mut out = Outbox::default();
+            let extra = inner.extra.entry(record).or_default();
+            if claims.is_empty() {
+                extra.remove(from);
+            } else {
+                extra.insert(from.to_string(), claims);
+            }
+            let all: Vec<Claim> = extra.values().flatten().cloned().collect();
+            let mut changed = None;
+            let held = inner.edit(record, |r| {
+                r.claims.retain(derived);
+                r.claims.extend(all);
+                changed = Some((r.emitter, r.serial.clone(), r.claims.clone(), (!r.open).then(|| r.clone())));
+            });
+            if !held {
+                inner.extra.remove(&record);
+                return false;
+            }
+            if let Some((Some(em), serial, claims, closed)) = changed {
+                if let Some(b) = inner.emitters.get_mut(&serial) {
+                    b.note_claims(em, record, &claims);
+                    if let Some(s) = b.state(em).filter(|_| closed.is_some()) {
+                        out.emitters.push(s.clone());
+                    }
+                }
+                inner.dirty_emitters.insert(em);
+                out.records.extend(closed.map(Arc::new));
+            }
+            out
+        };
+        self.send(out);
+        true
+    }
+
     fn send(&self, out: Outbox) {
         if let Some(r) = self.recorder.get() {
             for id in &out.slice_cancel {
@@ -286,6 +333,22 @@ fn slice_request(ps: &PerSource, d: &Detected) -> SliceRequest {
         t_start: ps.source.time_of(d.first_sample).unwrap_or(SystemTime::UNIX_EPOCH),
         hw: ps.serial.to_string(),
     }
+}
+
+/// Claims the book derives itself each time it places a record (where it sits, the band plan); everything else comes
+/// from [`RecordBook::set_claims`].
+fn derived(c: &Claim) -> bool {
+    matches!(c.by, Evidence::Position(_) | Evidence::BandPlan { .. })
+}
+
+/// How sure the band plan alone makes us of anything: it says what the band is for, not what is in it.
+const BAND_PLAN_CONFIDENCE: f32 = 0.2;
+
+/// The band plan's entry for `hz` (spec §4.5: a claim, never a rename).
+fn band_plan(hz: f64) -> Option<Claim> {
+    let b = detect::bandplan::lookup(hz)?;
+    let entry = if b.name == b.service.name() { b.name.to_string() } else { format!("{} ({})", b.name, b.service.name()) };
+    Some(Claim::new(b.name, BAND_PLAN_CONFIDENCE, Evidence::BandPlan { entry }))
 }
 
 fn take_id(next: &mut u64) -> RecordId {
@@ -351,6 +414,7 @@ impl Inner {
         let before = self.next_record;
         for (gone, into) in result.merged {
             ps.open.remove(&gone);
+            self.extra.remove(&gone);
             out.slice_cancel.push(gone);
             if let Some(b) = self.emitters.get_mut(&ps.serial) {
                 b.forget_record(gone);
@@ -432,8 +496,12 @@ impl Inner {
             r.emitter = Some(o.emitter);
             // A stitched row's "tuner" is the middle of the span: no position claims there (the sweep blanks the
             // radio's spur grid itself).
-            r.claims = if survey { Vec::new() } else { b.position_claims(&r, ps.zero_if, ps.spur_grid_hz) };
-            b.note_claims(o.emitter, &r.claims);
+            if !survey {
+                r.claims = b.position_claims(&r, ps.zero_if, ps.spur_grid_hz);
+            }
+            r.claims.extend(band_plan(r.center_hz()));
+            r.claims.extend(self.extra.get(&r.id).into_iter().flat_map(|m| m.values().flatten().cloned()));
+            b.note_claims(o.emitter, r.id, &r.claims);
             self.dirty_emitters.insert(o.emitter);
             if !r.open
                 && let Some(s) = b.state(o.emitter)
@@ -456,7 +524,9 @@ impl Inner {
         ps.open.remove(&r.id);
         self.window.push_back(r.clone());
         while self.window.len() > WINDOW {
-            self.window.pop_front();
+            if let Some(gone) = self.window.pop_front() {
+                self.extra.remove(&gone.id);
+            }
         }
         out.records.push(r);
     }

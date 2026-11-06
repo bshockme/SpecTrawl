@@ -273,7 +273,7 @@ fn crs_positions(pci: u32, port: usize, ns: usize, l: usize) -> [usize; 12] {
         _ => 3 + 3 * (ns % 2),
     };
     let shift = (v + pci as usize % 6) % 6;
-    std::array::from_fn(|m| 6 * m + shift as usize)
+    std::array::from_fn(|m| 6 * m + shift)
 }
 
 // ------------------------------------------------------------------- Sync
@@ -405,11 +405,12 @@ pub fn cell_sync(x: &[Complex32], cfo_hint: Option<f32>) -> Option<CellSync> {
     let mut cfo = h + fine;
     shift(x, cfo, &mut rot);
     // Residual from the cyclic prefixes of the whole stretch (±7.5 kHz range).
-    if let Some(num) = cp_autocorrelation(&rot, FS) {
-        if num.scs_khz == 15 && num.cfo_hz.abs() < 2e3 {
-            cfo += num.cfo_hz as f64;
-            shift(x, cfo, &mut rot);
-        }
+    if let Some(num) = cp_autocorrelation(&rot, FS)
+        && num.scs_khz == 15
+        && num.cfo_hz.abs() < 2e3
+    {
+        cfo += num.cfo_hz as f64;
+        shift(x, cfo, &mut rot);
     }
     // SSS: the symbol before the PSS, equalised by the PSS. Occurrences
     // alternate between subframes 0 and 5; the two hypotheses are which
@@ -985,7 +986,7 @@ pub mod synth {
                 for l in 0..7 {
                     // Per-port frequency grids.
                     let mut grid = vec![vec![Complex32::default(); N]; ports];
-                    let mut used = vec![false; 72];
+                    let mut used = [false; 72];
                     // Reference symbols: ports 0/1 in symbols 0 and 4, ports
                     // 2/3 in symbol 1; every port leaves the others' pilot
                     // REs empty.
@@ -1016,8 +1017,8 @@ pub mod synth {
                             for g in grid.iter_mut() {
                                 g[sync_bin(i)] = v / (ports as f32).sqrt();
                             }
-                            // RE index of sync subcarrier i within the 72.
-                            let k = if i < 31 { i + 5 } else { i + 5 };
+                            // RE index of sync subcarrier i within the 72 (which skip DC, as `sync_bin` does).
+                            let k = i + 5;
                             used[k] = true;
                         }
                         // The 5 guard subcarriers either side of the sync

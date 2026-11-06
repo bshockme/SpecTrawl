@@ -1,6 +1,10 @@
 //! Signal classification: features from channelised IQ, then the
 //! sync bank for protocol identification (DESIGN.md §7).
 
+// Index loops mirror the standards' tables and equations (bit, symbol and subcarrier numbers), and the slicers take
+// their parameters by name; `detect` came under the workspace's clippy gate in rebuild step 6 with these as written.
+#![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+
 pub mod ambe;
 mod ambe_tables;
 pub mod bandplan;

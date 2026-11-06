@@ -90,11 +90,19 @@ pub struct Page {
 const NUMERIC: [char; 16] = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.', 'U', ' ', '-', ')', '('];
 
 fn numeric(bits: &[u8]) -> String {
-    bits.chunks_exact(4).map(|c| NUMERIC[(c[0] | c[1] << 1 | c[2] << 2 | c[3] << 3) as usize]).collect::<String>().trim_end().to_string()
+    bits.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| NUMERIC[(c[0] | c[1] << 1 | c[2] << 2 | c[3] << 3) as usize])
+        .collect::<String>()
+        .trim_end()
+        .to_string()
 }
 
 fn alpha(bits: &[u8]) -> String {
-    bits.chunks_exact(7)
+    bits.as_chunks::<7>()
+        .0
+        .iter()
         .map(|c| c.iter().enumerate().fold(0u8, |a, (i, b)| a | b << i))
         .filter(|&c| c != 0 && c != 0x04) // NUL padding, EOT
         .map(|c| if (0x20..0x7F).contains(&c) || c == b'\n' { c as char } else { '·' })

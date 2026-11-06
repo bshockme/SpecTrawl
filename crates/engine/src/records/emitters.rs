@@ -96,6 +96,56 @@ struct Emitter {
     active: bool,
     /// Sample extents of the newest closed records, oldest first.
     recent: VecDeque<(u64, u64)>,
+    /// What its records' claims say, for the headline vote.
+    votes: Votes,
+}
+
+/// An emitter's records' claims, as votes (re-homed from `engine-old::emitters`).
+#[derive(Debug, Clone, Default)]
+struct Votes {
+    /// The newest decoder claim, and its record.
+    decoded: Option<(RecordId, Claim)>,
+    /// Sync-bank protocols by label: the records that claimed it, whether any was strong, the most confident claim.
+    synced: HashMap<String, SyncVote>,
+    /// The headline the store had, kept until the votes name one.
+    loaded: Option<Claim>,
+}
+
+#[derive(Debug, Clone)]
+struct SyncVote {
+    records: Vec<RecordId>,
+    strong: bool,
+    best: Claim,
+}
+
+fn identity(c: &Claim) -> Option<&api::Identity> {
+    match &c.by {
+        Evidence::Decoder { identity, .. } => identity.as_ref(),
+        _ => None,
+    }
+}
+
+/// A protocol the sync bank names is believed for the emitter once this many of its records say so...
+const PROTOCOL_RECORDS: usize = 2;
+/// ...or once one record says so strongly: this many syncs, or half its frames decoded.
+const STRONG_SYNCS: u32 = 4;
+/// Records remembered per protocol vote.
+const VOTE_RECORDS: usize = 16;
+
+impl Votes {
+    /// The headline the votes give: the decoder's claim, else a believed sync-bank protocol (most records, then most
+    /// confident), else what the store had.
+    fn headline(&self) -> Option<Claim> {
+        if let Some((_, c)) = &self.decoded {
+            return Some(c.clone());
+        }
+        let believed = self
+            .synced
+            .values()
+            .filter(|v| v.records.len() >= PROTOCOL_RECORDS || v.strong)
+            .max_by(|a, b| a.records.len().cmp(&b.records.len()).then(a.best.confidence.total_cmp(&b.best.confidence)));
+        believed.map(|v| v.best.clone()).or_else(|| self.loaded.clone())
+    }
 }
 
 impl Emitter {
@@ -154,7 +204,8 @@ impl EmitterBook {
         let mut b = Self::new(serial);
         for s in states {
             b.latest = b.latest.max(Some(s.last_seen));
-            b.map.insert(s.id, Emitter { s, open_start: None, active: false, recent: VecDeque::new() });
+            let votes = Votes { loaded: s.headline.clone(), ..Default::default() };
+            b.map.insert(s.id, Emitter { s, open_start: None, active: false, recent: VecDeque::new(), votes });
         }
         b
     }
@@ -392,6 +443,7 @@ impl EmitterBook {
             open_start: None,
             active: false,
             recent: VecDeque::new(),
+            votes: Votes::default(),
         }
     }
 
@@ -430,25 +482,42 @@ impl EmitterBook {
         gone
     }
 
-    /// Takes a record's claims into its emitter's headline: a better headline (decoded first, then more confident)
-    /// replaces it. `station` follows a headline that names a broadcast station.
-    pub fn note_claims(&mut self, id: EmitterId, claims: &[Claim]) {
+    /// Takes record `record`'s claims (all of them, as they now stand) into its emitter's vote, and the vote into the
+    /// headline (spec §4.4: an emitter's label is computed from its records' claims). `station` follows a headline that
+    /// names a broadcast station.
+    pub fn note_claims(&mut self, id: EmitterId, record: RecordId, claims: &[Claim]) {
         let Some(e) = self.map.get_mut(&id) else { return };
-        let Some(best) = api::headline(claims) else { return };
-        // A decoder lock outranks a sync-bank claim whatever their confidences (the headline rule).
-        let rank = |c: &Claim| match c.by {
-            Evidence::Decoder { .. } => 2,
-            Evidence::SyncBank { .. } => 1,
-            _ => 0,
-        };
-        let better = match &e.s.headline {
-            None => true,
-            Some(h) => (rank(best), best.confidence) > (rank(h), h.confidence),
-        };
-        if better {
-            e.s.station = best.label.starts_with("FM broadcast");
-            e.s.headline = Some(best.clone());
+        let v = &mut e.votes;
+        // The newest decoder claim stands for the emitter, unless it names the same identity as the one standing with
+        // fewer of its fields (a site heard again before its network broadcast came round).
+        if let Some(c) =
+            claims.iter().filter(|c| matches!(c.by, Evidence::Decoder { .. })).max_by(|a, b| a.confidence.total_cmp(&b.confidence))
+        {
+            let thinner = match (&v.decoded, identity(c)) {
+                (Some((r, old)), Some(new)) if *r != record => identity(old).is_some_and(|o| o.same(new) && o.known() > new.known()),
+                _ => false,
+            };
+            if !thinner {
+                v.decoded = Some((record, c.clone()));
+            }
         }
+        for c in claims {
+            let Evidence::SyncBank { syncs, frames_tried, frames_decoded, .. } = &c.by else { continue };
+            let strong = *syncs >= STRONG_SYNCS || (*frames_tried > 0 && 2 * frames_decoded >= *frames_tried);
+            let vote = v.synced.entry(c.label.clone()).or_insert_with(|| SyncVote { records: Vec::new(), strong: false, best: c.clone() });
+            if !vote.records.contains(&record) {
+                vote.records.push(record);
+                if vote.records.len() > VOTE_RECORDS {
+                    vote.records.remove(0);
+                }
+            }
+            vote.strong |= strong;
+            if c.confidence > vote.best.confidence {
+                vote.best = c.clone();
+            }
+        }
+        e.s.headline = v.headline();
+        e.s.station = e.s.headline.as_ref().is_some_and(|h| h.label.starts_with("FM broadcast"));
     }
 
     /// What the receiver's own artefacts say about a record at `r`: at DC (on a zero-IF radio), on the spur grid, the
@@ -660,7 +729,7 @@ mod tests {
         for i in 2..4 {
             b.observe(&rec(i, 93.7, 130.0, i));
         }
-        b.b.note_claims(st, &[fm_station()]);
+        b.b.note_claims(st, RecordId(0), &[fm_station()]);
         assert!(b.get(st).unwrap().confirmed && b.get(st).unwrap().station);
         // Its carrier alone (quiet programme), and a piece of its swing.
         assert_eq!(b.observe(&rec(10, 93.7004, 10.0, 10)), st);
@@ -848,16 +917,56 @@ mod tests {
         let mut b = Book::new();
         let id = b.observe(&rec(1, 851.0125, 9.0, 1));
         let sync = Claim::new("P25", 0.95, Evidence::SyncBank { protocol: "P25".into(), syncs: 5, frames_tried: 0, frames_decoded: 0 });
-        b.b.note_claims(id, std::slice::from_ref(&sync));
-        assert_eq!(b.get(id).unwrap().headline.as_ref(), Some(&sync));
+        b.b.note_claims(id, RecordId(1), std::slice::from_ref(&sync));
+        assert_eq!(b.get(id).unwrap().headline.as_ref(), Some(&sync), "five syncs are strong");
         let dec = Claim::new(
             "P25 Phase 1",
             0.7,
             Evidence::Decoder { mode: "P25".into(), locked: true, summary: "NAC 0x340".into(), identity: None },
         );
-        b.b.note_claims(id, std::slice::from_ref(&dec));
+        b.b.note_claims(id, RecordId(2), std::slice::from_ref(&dec));
         assert_eq!(b.get(id).unwrap().headline.as_ref(), Some(&dec));
-        b.b.note_claims(id, &[sync]);
+        b.b.note_claims(id, RecordId(3), &[sync]);
         assert_eq!(b.get(id).unwrap().headline.as_ref(), Some(&dec), "a sync claim does not replace a decoder lock");
+    }
+
+    #[test]
+    fn a_protocol_is_believed_from_two_records_or_one_strong_one() {
+        let mut b = Book::new();
+        let id = b.observe(&rec(1, 857.2375, 9.0, 1));
+        let weak = |syncs| Claim::new("DMR", 0.8, Evidence::SyncBank { protocol: "DMR".into(), syncs, frames_tried: 4, frames_decoded: 0 });
+        b.b.note_claims(id, RecordId(1), &[weak(2)]);
+        assert_eq!(b.get(id).unwrap().headline, None, "one record with two syncs is not enough");
+        b.b.note_claims(id, RecordId(1), &[weak(2)]);
+        assert_eq!(b.get(id).unwrap().headline, None, "the same record again is still one record");
+        b.b.note_claims(id, RecordId(2), &[weak(3)]);
+        assert_eq!(b.get(id).unwrap().headline.as_ref().map(|c| c.label.as_str()), Some("DMR"));
+        let id2 = b.observe(&rec(3, 858.8125, 9.0, 3));
+        let decoded = Claim::new("NXDN", 0.8, Evidence::SyncBank { protocol: "NXDN".into(), syncs: 2, frames_tried: 2, frames_decoded: 1 });
+        b.b.note_claims(id2, RecordId(3), &[decoded]);
+        assert_eq!(b.get(id2).unwrap().headline.as_ref().map(|c| c.label.as_str()), Some("NXDN"), "half its frames decoded");
+    }
+
+    #[test]
+    fn a_thinner_identity_of_the_same_site_does_not_replace_a_fuller_one() {
+        let mut b = Book::new();
+        let id = b.observe(&rec(1, 859.7677, 9.0, 1));
+        let p25 = |wacn: Option<u32>, site: Option<u8>| {
+            Claim::new(
+                "P25 control",
+                0.99,
+                Evidence::Decoder {
+                    mode: "P25".into(),
+                    locked: true,
+                    summary: String::new(),
+                    identity: Some(api::Identity::P25 { nac: 0x34D, wacn, system: wacn.map(|_| 0x348), rfss: site.map(|_| 1), site }),
+                },
+            )
+        };
+        b.b.note_claims(id, RecordId(1), &[p25(Some(0xBEE00), Some(13))]);
+        b.b.note_claims(id, RecordId(2), &[p25(None, None)]);
+        assert_eq!(b.get(id).unwrap().headline, Some(p25(Some(0xBEE00), Some(13))));
+        b.b.note_claims(id, RecordId(2), &[p25(Some(0xBEE00), Some(14))]);
+        assert_eq!(b.get(id).unwrap().headline, Some(p25(Some(0xBEE00), Some(14))), "another site replaces it");
     }
 }
