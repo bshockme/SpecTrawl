@@ -66,7 +66,10 @@ pub fn design_channel(
         return Err(DesignError::TooWide);
     }
     let out_rate = fs * k as f64 / n as f64;
-    if offset_hz.abs() + out_rate / 2.0 > usable_fraction * fs / 2.0 {
+    // The passband must lie in the usable part of the span (where the detector finds records); the rest of the
+    // channel's band may reach into the tuner's roll-off, which is attenuated but real, as long as it stays in the span.
+    // (Requiring the whole output band to be usable left every record within ~40 kHz of the usable edge uncut.)
+    if offset_hz.abs() + bandwidth_hz / 2.0 > usable_fraction * fs / 2.0 || offset_hz.abs() + out_rate / 2.0 > fs / 2.0 {
         return Err(DesignError::OutsideSpan);
     }
     let bin_hz = fs / n as f64;
@@ -149,7 +152,10 @@ mod tests {
         let narrow = design_channel(65_536, 10e6, 0.9, -2.0e6, 6_250.0, 8_000.0).unwrap();
         assert_eq!((narrow.k, narrow.out_rate), (128, 19_531.25));
         assert_eq!(design_channel(65_536, 10e6, 0.9, 0.0, 3.0e6, 48e3), Err(DesignError::TooWide));
-        assert_eq!(design_channel(65_536, 10e6, 0.9, 4.49e6, 12_500.0, 48e3), Err(DesignError::OutsideSpan));
+        // The passband inside the usable 90 % with its output band in the roll-off is cut; a passband past it is not.
+        assert!(design_channel(65_536, 10e6, 0.9, 4.49e6, 12_500.0, 48e3).is_ok());
+        assert_eq!(design_channel(65_536, 10e6, 0.9, 4.495e6, 12_500.0, 48e3), Err(DesignError::OutsideSpan));
+        assert_eq!(design_channel(65_536, 10e6, 0.9, 4.99e6, 1_000.0, 48e3), Err(DesignError::OutsideSpan));
         assert_eq!(design_channel(65_536, 10e6, 0.9, 0.0, 0.0, 48e3), Err(DesignError::BadSpec));
     }
 
