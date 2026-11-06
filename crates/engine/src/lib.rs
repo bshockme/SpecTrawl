@@ -20,6 +20,7 @@ pub mod stage;
 pub mod store;
 pub mod sweep;
 pub mod timeline;
+pub mod workers;
 
 pub use budget::{Allowance, BudgetConfig, Mode, RingBudget, SourceId};
 pub use cache::SpectrumCache;

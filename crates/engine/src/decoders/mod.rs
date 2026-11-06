@@ -229,7 +229,11 @@ fn manage(shared: Arc<Shared>, book: Arc<RecordBook>, bus: Arc<ChannelBus>, sour
             }
         }
         drop(attached);
-        std::thread::sleep(TICK);
+        // In slices, so a stop is seen promptly (the engine's drop joins this thread).
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < TICK && !shared.stop.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
     for a in shared.attached.lock().drain(..) {
         if let Some(ch) = a.channel.lock().take() {

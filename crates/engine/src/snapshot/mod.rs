@@ -178,6 +178,16 @@ impl Publisher {
                     Err(format!("replay {} is not playing", id.0))
                 }
             }
+            Command::StartWorker { source, mode, center_hz } => {
+                engine.start_worker(source, &mode, center_hz).map(api::Outcome::WorkerStarted)
+            }
+            Command::StopWorker(id) => {
+                if engine.stop_worker(id) {
+                    Ok(api::Outcome::Done)
+                } else {
+                    Err(format!("worker {} is not running", id.0))
+                }
+            }
             c => registry.apply(engine, c, log),
         }))
         .unwrap_or_else(|payload| Err(format!("{name} panicked: {}", panic_text(payload.as_ref()))));
@@ -219,6 +229,8 @@ impl Publisher {
             classify: self.engine.classify_view(),
             decoders: self.engine.decoder_views(),
             systems: self.systems.1.clone(),
+            workers: self.engine.worker_views(),
+            worker_modes: self.engine.worker_modes(),
         }));
     }
 }
@@ -240,6 +252,8 @@ fn command_name(c: &Command) -> &'static str {
         Command::QueryRecords(_) => "query records",
         Command::Play { .. } => "play",
         Command::StopPlay(_) => "stop play",
+        Command::StartWorker { .. } => "start worker",
+        Command::StopWorker(_) => "stop worker",
     }
 }
 
@@ -263,7 +277,9 @@ fn command_source(c: &Command) -> Option<SourceId> {
         | Command::Untag { .. }
         | Command::Note { .. }
         | Command::QueryRecords(_)
-        | Command::StopPlay(_) => None,
+        | Command::StopPlay(_)
+        | Command::StopWorker(_) => None,
+        Command::StartWorker { source, .. } => Some(*source),
         Command::Play { target: api::PlayTarget::Region { source, .. }, .. } => Some(*source),
         Command::Play { .. } => None,
     }

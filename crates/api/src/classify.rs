@@ -73,3 +73,53 @@ pub struct SystemRow {
 pub struct SystemsView {
     pub systems: Vec<SystemRow>,
 }
+
+/// A decoder worker's id, unique for the engine's life.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WorkerId(pub u64);
+
+/// A mode a worker program offers (the catalogue, spec §5).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkerMode {
+    /// The worker's own id for it ("flex", "airband").
+    pub id: String,
+    pub name: String,
+    /// Which program serves it ("OnAir 3.6.0").
+    pub by: String,
+    /// The channel rate it is served at, S/s.
+    pub rate: f64,
+}
+
+/// One message a worker decoded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkerMessage {
+    /// The worker's time for it.
+    pub time: SystemTime,
+    pub freq_hz: f64,
+    /// The worker's kind ("pager.message").
+    pub kind: String,
+    /// One line.
+    pub text: String,
+}
+
+/// One running decoder worker.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkerView {
+    pub id: WorkerId,
+    pub source: SourceId,
+    pub mode: String,
+    pub by: String,
+    pub center_hz: f64,
+    pub rate: f64,
+    pub lamp: Lamp,
+    /// One sentence.
+    pub summary: String,
+    pub blocks_ok: u64,
+    pub blocks_bad: u64,
+    /// The newest messages, oldest first.
+    pub messages: Vec<WorkerMessage>,
+    /// Why it is not running, when it is not (it is restarted with a backoff).
+    pub error: Option<String>,
+    /// Times the process was restarted.
+    pub restarts: u32,
+}

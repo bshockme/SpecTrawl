@@ -18,6 +18,7 @@ use crate::replay::{Player, Resolved};
 use crate::ring::keeper::Keeper;
 use crate::source::{Source, SourceConfig};
 use crate::store::{Store, StoreConfig};
+use crate::workers::{WorkerFactory, Workers};
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -47,6 +48,9 @@ pub struct Engine {
     player: Player,
     classifier: Classifier,
     decoders: DecoderBank,
+    workers: Workers,
+    /// The worker modes as last listed (the factories are asked again when one is added).
+    worker_modes: Mutex<Arc<Vec<api::WorkerMode>>>,
     sources: Arc<Mutex<HashMap<SourceId, Arc<Source>>>>,
     /// The engine's handle; each `Source` holds the keeper too, so it lives
     /// as long as the last of them whatever the field order.
@@ -81,7 +85,9 @@ impl Engine {
         let classifier = Classifier::start(cfg.classify.clone(), records.clone(), bus.clone(), sources.clone());
         // Decoders attach to what the bank found: on with it.
         let decoders = DecoderBank::start(cfg.classify.enabled, records.clone(), bus.clone(), sources.clone());
-        Engine { cfg, records, store, store_error, keeper, bus, player, classifier, decoders, sources }
+        let workers = Workers::start(records.clone());
+        let worker_modes = Mutex::new(Arc::new(Vec::new()));
+        Engine { cfg, records, store, store_error, keeper, bus, player, classifier, decoders, workers, worker_modes, sources }
     }
 
     /// Starts the device streaming into a new source and attaches the source to the bus.
@@ -100,6 +106,8 @@ impl Engine {
         if self.sources.lock().remove(&id).is_none() {
             return false;
         }
+        // Its workers' processes first, then their feeds with the bus.
+        self.workers.stop_source(id);
         self.bus.detach(id);
         // The stage has stopped: no row can race the book's closing of the source's records.
         self.records.remove_source(id);
@@ -134,6 +142,31 @@ impl Engine {
     pub fn serve_iq(&self, source: SourceId, cfg: crate::iqserve::IqServeConfig) -> Result<crate::iqserve::IqServer, String> {
         let src = self.source(source).ok_or("no such source")?;
         crate::iqserve::IqServer::start(self.bus.clone(), src, cfg)
+    }
+
+    /// Installs a worker program's modes (`onair-rx`'s, say): the app calls this; the engine depends on no worker crate.
+    pub fn add_worker_factory(&self, f: Arc<dyn WorkerFactory>) {
+        self.workers.add_factory(f);
+        *self.worker_modes.lock() = Arc::new(self.workers.modes());
+    }
+
+    /// Starts a worker in `mode` on a channel of `source` at `center_hz` (served at the mode's rate, or the nearest
+    /// lower one the channelizer gives exactly).
+    pub fn start_worker(&self, source: SourceId, mode: &str, center_hz: f64) -> Result<api::WorkerId, String> {
+        let src = self.source(source).ok_or("no such source")?;
+        self.workers.launch(self.bus.clone(), src, mode, center_hz)
+    }
+
+    pub fn stop_worker(&self, id: api::WorkerId) -> bool {
+        self.workers.stop_worker(id)
+    }
+
+    pub fn worker_views(&self) -> Vec<api::WorkerView> {
+        self.workers.views()
+    }
+
+    pub fn worker_modes(&self) -> Arc<Vec<api::WorkerMode>> {
+        self.worker_modes.lock().clone()
     }
 
     /// The running decoders.
@@ -221,6 +254,7 @@ impl Drop for Engine {
         // No new windows from here; the ones on the bus end with their sources.
         self.classifier.stop();
         self.decoders.stop();
+        self.workers.stop();
         let ids: Vec<SourceId> = self.sources.lock().keys().copied().collect();
         for id in ids {
             self.bus.detach(id);
