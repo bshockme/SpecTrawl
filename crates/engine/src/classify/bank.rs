@@ -76,8 +76,8 @@ impl Detector for SyncBank {
     }
 }
 
-/// Identifiers that need no sync bank: FLEX headers, a GSM SCH, sub-audible squelch codes (on windows strong enough to
-/// describe). Each is a `Decoder` claim.
+/// Identifiers that need no sync bank: FLEX headers, a GSM SCH, ACARS blocks, sub-audible squelch codes (on windows
+/// strong enough to describe). Each is a `Decoder` claim.
 pub struct Identifiers;
 
 impl Detector for Identifiers {
@@ -87,7 +87,7 @@ impl Detector for Identifiers {
 
     fn look(&self, w: &Window<'_>) -> Vec<Claim> {
         let squelch = (!w.weak()).then(|| rungs::squelch(w)).flatten();
-        [rungs::flex(w), rungs::gsm(w), squelch]
+        [rungs::flex(w), rungs::gsm(w), rungs::acars(w), squelch]
             .into_iter()
             .flatten()
             .map(|i| {
@@ -186,6 +186,10 @@ fn summary(f: &Fields, identity: Option<&Identity>) -> String {
     }
     if let Some(t) = &f.talk {
         s.push_str(&format!(", {t}"));
+    }
+    // The newest message decoded (an ACARS block, a page), as the decoder words it.
+    if let Some(m) = f.messages.last() {
+        s.push_str(&format!(" | {m}"));
     }
     s
 }

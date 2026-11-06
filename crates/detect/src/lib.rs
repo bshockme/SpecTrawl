@@ -5,6 +5,7 @@
 // their parameters by name; `detect` came under the workspace's clippy gate in rebuild step 6 with these as written.
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
+pub mod acars;
 pub mod ambe;
 mod ambe_tables;
 pub mod bandplan;

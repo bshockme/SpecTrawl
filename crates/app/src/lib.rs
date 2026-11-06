@@ -3,6 +3,7 @@
 //! place the engine is named, to start it.
 
 pub mod app;
+pub mod channels_pane;
 pub mod devices_pane;
 pub mod log_pane;
 pub mod receiver_pane;

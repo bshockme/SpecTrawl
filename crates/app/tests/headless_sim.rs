@@ -379,3 +379,72 @@ fn the_systems_tab_shows_the_p25_site_its_decoder_and_its_record_says_the_same()
     let max = *frame_ms.last().unwrap();
     assert!(max < 100.0, "a frame took {max:.1} ms");
 }
+
+/// An AM transmitter keying on 124.850 MHz, alone.
+struct AirSim;
+
+impl Backend for AirSim {
+    fn name(&self) -> &str {
+        "sim"
+    }
+    fn enumerate(&self) -> sdr_core::Result<Vec<DeviceInfo>> {
+        SimBackend.enumerate()
+    }
+    fn open(&self, _serial: &str) -> sdr_core::Result<Box<dyn Device>> {
+        let emitters = vec![backend_sim::Emitter {
+            freq_hz: 124.85e6,
+            level_dbfs: -40.0,
+            modulation: backend_sim::Modulation::AmTone { tone_hz: 1000.0, depth: 0.7 },
+            keying: backend_sim::Keying::Bursts { period_s: 2.5, duty: 0.6, phase: 0.2 },
+        }];
+        let (d, _) =
+            SimDevice::with_config(SimConfig { emitters, center_hz: 124.5e6, paced: true, report_lag_gaps: false, ..Default::default() });
+        Ok(Box::new(d))
+    }
+}
+
+#[test]
+fn the_channels_tab_lists_an_air_band_call_and_its_record_reads_the_same() {
+    let engine = Engine::new(EngineConfig {
+        budget: BudgetConfig { guaranteed_secs: 10.0, ceiling_bytes: 1 << 30, sweep_secs: 0.2 },
+        bus: BusConfig::default(),
+        source: SourceConfig::default(),
+        store: None,
+        slices: None,
+        audio: engine::audio::AudioConfig::Manual,
+        classify: Default::default(),
+    });
+    let handle = engine::snapshot::spawn(engine, vec![Box::new(AirSim)], PublisherConfig::default());
+    let ctx = egui::Context::default();
+    let mut app = App::new(handle.clone());
+    app.show_tab(spectrawl_app::tabs::Tab::Channels);
+    let frame = |app: &mut App, k: usize| {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 900.0))),
+            time: Some(k as f64 / 20.0),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.frame(ui));
+        output.textures_delta.clear();
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    handle.send(Command::Open { backend: "sim".into(), serial: "SIM-0001".into() });
+    let mut k = 0;
+    let row = loop {
+        frame(&mut app, k);
+        k += 1;
+        if let Some(row) = handle.latest().channels.channels.iter().find(|c| c.name == "124.850").cloned() {
+            break row;
+        }
+        assert!(k < 300, "no channel row in 15 s: {:?}", handle.latest().channels);
+    };
+    assert_eq!((row.plan.as_str(), row.summary.as_str()), ("Air band", "AM voice"));
+    // Its newest record headlines as the channel's voice, in the records list too.
+    let s = handle.latest();
+    let rec = s.records.records.iter().find(|r| Some(&r.id) == row.records.last()).unwrap().clone();
+    assert_eq!(spectrawl_app::records_pane::what(&rec).0, "Air band voice");
+    for _ in 0..5 {
+        frame(&mut app, k);
+        k += 1;
+    }
+}

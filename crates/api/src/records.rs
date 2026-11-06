@@ -87,7 +87,9 @@ pub enum Evidence {
 pub enum Identity {
     /// A P25 site: the NAC from the frames' NID, the rest from the control channel's broadcasts as they arrive.
     P25 { nac: u16, wacn: Option<u32>, system: Option<u16>, rfss: Option<u8>, site: Option<u8> },
-    /// Any other decoder's identifier, as it names it (a DCS code, a colour code, a BSIC).
+    /// A channel of a band plan's raster, as the band names it: air band "128.775".
+    Channel { plan: String, name: String },
+    /// Any other decoder's identifier, as it names it (a DCS code, a colour code, a BSIC, an aircraft's registration).
     Other { id: String },
 }
 
@@ -104,6 +106,7 @@ impl Identity {
                 v.extend(site.map(|s| ("SITE", s.to_string())));
                 v
             }
+            Identity::Channel { name, .. } => vec![("CH", name.clone())],
             Identity::Other { id } => vec![("ID", id.clone())],
         }
     }
@@ -112,6 +115,7 @@ impl Identity {
     pub fn line(&self) -> String {
         match self {
             Identity::Other { id } => id.clone(),
+            Identity::Channel { plan, name } => format!("{plan} {name}"),
             _ => self.fields().iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(" "),
         }
     }
@@ -132,6 +136,7 @@ impl Identity {
                     && agree(t1.map(u32::from), t2.map(u32::from))
             }
             (Identity::Other { id: a }, Identity::Other { id: b }) => a == b,
+            (Identity::Channel { plan: p1, name: n1 }, Identity::Channel { plan: p2, name: n2 }) => p1 == p2 && n1 == n2,
             _ => false,
         }
     }

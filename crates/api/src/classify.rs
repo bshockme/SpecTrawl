@@ -74,6 +74,42 @@ pub struct SystemsView {
     pub systems: Vec<SystemRow>,
 }
 
+/// A channel of a band plan's raster that something was heard on (spec §5's CHANNELS: air band first), built from the
+/// records' claims and nothing else, like [`SystemRow`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChannelRow {
+    /// "Air band", "Military air".
+    pub plan: String,
+    /// "128.775".
+    pub name: String,
+    pub hz: f64,
+    /// The source of its newest record.
+    pub source: SourceId,
+    /// A record on it is open: someone is transmitting now.
+    pub open: bool,
+    /// Records on it: AM voice, decoded data (ACARS), and a carrier with nothing measured on it (the gaps in a call).
+    pub voice: u32,
+    pub data: u32,
+    pub carrier: u32,
+    /// What its decoders said, newest first, one per mode ("ACARS").
+    pub modes: Vec<String>,
+    /// The newest decoded summary ("N365NB NW2320 H1: …"), else "AM voice".
+    pub summary: String,
+    /// Seconds on the air over its records.
+    pub airtime_s: f64,
+    pub peak_dbfs: f32,
+    pub first_heard: SystemTime,
+    pub last_heard: SystemTime,
+    /// Its records, oldest first.
+    pub records: Vec<RecordId>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ChannelsView {
+    /// By frequency.
+    pub channels: Vec<ChannelRow>,
+}
+
 /// A decoder worker's id, unique for the engine's life.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WorkerId(pub u64);

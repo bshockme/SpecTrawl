@@ -13,6 +13,8 @@ pub enum Tab {
     Records,
     /// The systems the decoders found, and the decoders' lamps, beside the records.
     Systems,
+    /// The band-plan channels heard (air band), beside the systems.
+    Channels,
 }
 
 impl Tab {
@@ -24,6 +26,7 @@ impl Tab {
             Tab::Log => "Log",
             Tab::Records => "Records",
             Tab::Systems => "Systems",
+            Tab::Channels => "Channels",
         }
     }
 }

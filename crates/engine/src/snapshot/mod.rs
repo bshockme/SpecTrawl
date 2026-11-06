@@ -67,6 +67,8 @@ struct Publisher {
     version: u64,
     /// The systems view and the records view version it was built from.
     systems: (u64, Arc<api::SystemsView>),
+    /// The channels view, likewise.
+    channels: (u64, Arc<api::ChannelsView>),
     swap: Arc<ArcSwap<Snapshot>>,
 }
 
@@ -94,6 +96,7 @@ pub fn spawn_with_guard(engine: Engine, backends: Vec<Box<dyn Backend>>, cfg: Pu
         version: 0,
         swap: swap.clone(),
         systems: (0, Arc::default()),
+        channels: (0, Arc::default()),
     };
     p.publish();
     let (done_tx, done) = mpsc::channel::<()>();
@@ -206,6 +209,9 @@ impl Publisher {
         if self.systems.0 != records.version {
             self.systems = (records.version, Arc::new(crate::decoders::systems(&records)));
         }
+        if self.channels.0 != records.version {
+            self.channels = (records.version, Arc::new(crate::decoders::airband::channels(&records)));
+        }
         self.version += 1;
         self.swap.store(Arc::new(Snapshot {
             version: self.version,
@@ -229,6 +235,7 @@ impl Publisher {
             classify: self.engine.classify_view(),
             decoders: self.engine.decoder_views(),
             systems: self.systems.1.clone(),
+            channels: self.channels.1.clone(),
             workers: self.engine.worker_views(),
             worker_modes: self.engine.worker_modes(),
         }));

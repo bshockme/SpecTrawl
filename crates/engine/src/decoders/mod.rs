@@ -1,5 +1,5 @@
 //! The decoder bank (spec §4.6): decoders attached to confirmed emitters, as bus consumers. Native first: P25 Phase 1
-//! control channels decode with `detect`. A decoder's identity reaches the user only as a claim on its emitter's open
+//! control channels decode with `detect`; air band voice is named from the bank's looks ([`airband`]). A decoder's identity reaches the user only as a claim on its emitter's open
 //! record, so the record, the emitter's headline and the system row read the same value (spec §5).
 //!
 //! A manager thread watches the record book. An emitter whose records carry a `P25 control` decoder claim from the
@@ -7,6 +7,7 @@
 //! open record's start so its site appears without waiting for the next broadcast. A decoder detaches when its emitter
 //! has had no open record for [`IDLE`], or its source goes.
 
+pub mod airband;
 pub mod p25;
 
 use std::collections::HashMap;
@@ -144,6 +145,8 @@ fn is_p25_control(c: &Claim) -> bool {
 fn manage(shared: Arc<Shared>, book: Arc<RecordBook>, bus: Arc<ChannelBus>, sources: Sources) {
     while !shared.stop.load(Ordering::Relaxed) {
         let view = book.view();
+        // Air band voice: a claim per AM record on a raster channel (no bus consumer: the bank's look measured it).
+        airband::file_claims(&view, &book);
         // Each emitter's newest open record, and whether any of its records says P25 control.
         let mut open: HashMap<EmitterId, &Arc<SignalRecord>> = HashMap::new();
         let mut control: HashMap<EmitterId, &Arc<SignalRecord>> = HashMap::new();
