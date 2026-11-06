@@ -53,8 +53,13 @@ impl P25Control {
         }
     }
 
+    /// The NAC most NIDs name, once two do.
     fn nac(&self) -> Option<u16> {
-        self.nacs.iter().max_by_key(|&(nac, n)| (*n, std::cmp::Reverse(*nac))).map(|(nac, _)| *nac)
+        self.nacs
+            .iter()
+            .max_by_key(|&(nac, n)| (*n, std::cmp::Reverse(*nac)))
+            .filter(|(_, n)| **n >= crate::classify::bank::MIN_NIDS as u64)
+            .map(|(nac, _)| *nac)
     }
 
     fn identity(&self) -> Option<Identity> {

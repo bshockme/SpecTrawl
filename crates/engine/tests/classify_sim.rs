@@ -92,3 +92,34 @@ fn every_record_is_looked_at_and_each_says_only_what_it_shows() {
     assert_eq!(p25_emitter.headline.as_ref().map(|c| c.label.as_str()), Some("P25 Phase 1"));
     assert!(view.emitters.iter().filter(|v| (v.center_hz - P25_HZ).abs() > 3e3).all(|v| v.headline.is_none()));
 }
+
+#[test]
+fn a_record_that_starts_at_a_retune_is_looked_at() {
+    // On air, every continuous signal opens a record at the retune that tunes it; its window, back-filled from the
+    // segment's first sample, begins with the block that straddles the boundary (a gap). It must still be looked at.
+    let e = Engine::new(EngineConfig {
+        budget: BudgetConfig { guaranteed_secs: 10.0, ceiling_bytes: 1 << 30, sweep_secs: 0.2 },
+        bus: BusConfig::default(),
+        source: SourceConfig::default(),
+        store: None,
+        slices: None,
+        audio: engine::audio::AudioConfig::Manual,
+        classify: ClassifyConfig { workers: 1, ..Default::default() },
+    });
+    let src = e.add_source(device(), Mode::Live).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let retuned_at = src.head();
+    src.set_center(855.3e6).unwrap();
+    let t0 = Instant::now();
+    let cw = loop {
+        let view = e.records().view();
+        let r = view.records.iter().find(|r| near(r, CW_HZ) && r.open && r.first_sample >= retuned_at).cloned();
+        if let Some(r) = r.as_ref().filter(|r| r.claims.iter().any(|c| matches!(c.by, Evidence::Features { .. }))) {
+            break r.clone();
+        }
+        assert!(t0.elapsed() < Duration::from_secs(6), "the CW record after the retune was never looked at: {r:?} {:?}", e.classify_view());
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(cw.claims.iter().find(|c| matches!(c.by, Evidence::Features { .. })).unwrap().label, "Carrier");
+    assert_eq!(e.classify_view().missed, 0, "{:?}", e.classify_view());
+}

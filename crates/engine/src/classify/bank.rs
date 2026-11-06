@@ -12,6 +12,8 @@ pub const MAX_FEATURE_CONFIDENCE: f32 = 0.6;
 pub const IDENTIFIED_CONFIDENCE: f32 = 0.95;
 /// A P25 site named by its NAC and a TSBK.
 pub const P25_SITE_CONFIDENCE: f32 = 0.99;
+/// NIDs that must agree on a NAC before it names anything.
+pub const MIN_NIDS: usize = 2;
 
 /// One member of the bank.
 pub trait Detector: Send + Sync {
@@ -153,7 +155,12 @@ pub fn p25_site(frames: &[Frame]) -> Option<P25Site> {
     for n in frames.iter().filter_map(detect::decode::p25_nid) {
         *nacs.entry(n.nac).or_default() += 1;
     }
-    let nac = nacs.into_iter().max_by_key(|&(nac, n)| (n, std::cmp::Reverse(nac)))?.0;
+    // Two NIDs must agree (DESIGN §7.1's two-confirmation): the NID's BCH code "corrects" a badly hit word to another
+    // valid one, and on air single-NID records named NACs no site here uses (0x018, and 0x344 a bit from 0x340).
+    let (nac, votes) = nacs.into_iter().max_by_key(|&(nac, n)| (n, std::cmp::Reverse(nac)))?;
+    if votes < MIN_NIDS {
+        return None;
+    }
     let msgs = detect::p25::messages(frames);
     let mut info = detect::p25::SystemInfo::default();
     let grants: usize = msgs.iter().map(|m| info.apply(m).len()).sum();

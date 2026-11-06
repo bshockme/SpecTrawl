@@ -94,3 +94,28 @@ The spec's step 6 is: "Detector bank with `detect` wrapped and the pool. P25 acc
     - a radio at 855.25 MHz on the local system;
     - spec §9's choices;
     - the `detect` defects this step does not fix, with their reasons.
+
+## Results
+
+- **`detect::bank`:** `classify_with` is the rungs in their old order, giving identical results on every committed capture (603 window classifications).
+- **Sync confirmation** (`detect/examples/confirm_rules`):
+  - no false confirmation in 300 windows each of noise and random 2FSK and 4FSK at 1200–9600 Bd;
+  - FM voice-like windows confirmed ProVoice 16 times in 1000 before the change, 2 after;
+  - every real-capture window still confirms.
+  - On air, Phase 2's sync gap was measured (180 and 540 symbols) and fixed.
+- **The bank on the captures:**
+  - the P25 control channel is "P25 Phase 1 control", NAC 0x34D WACN BEE00 SYS 348 RFSS 1 SITE 13;
+  - DMR is colour code 9;
+  - the FM repeater is DCS 205 and never a protocol;
+  - noise gets nothing;
+  - `P25Control` names the whole site within 2 s.
+- **Acceptance on the simulator** (`p25_acceptance.rs`):
+  - the system row after 1.8 s;
+  - the decoder locked at 1.9 s;
+  - row, emitter and newest record agree before and after the decoder's claim takes over;
+  - the scenario's sync-only P25 emitters are sync claims, decoded as nothing.
+- **App, headless:** SYSTEMS shows the site and its locked decoder; the record's "What" is "P25 Phase 1 control"; every frame is under 100 ms.
+- **On air:** see BACKLOG "Step 6 on air". In short:
+  - two P25 sites, both decoders locked, the first row at 1.8 s, no view disagreeing;
+  - 1 of 488 records missed;
+  - fixes made on the way: windows at a retune, the weak gate, Phase 2's gap, single-NID NACs, the channel edge rule.
