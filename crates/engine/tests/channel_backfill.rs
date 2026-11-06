@@ -50,7 +50,7 @@ fn a_channel_backfilled_from_five_seconds_ago_matches_a_direct_ddc() {
     let want = 78_125usize; // 1 s of channel output
     // Reference: the old-style DDC straight off the ring (same rate: 10e6 / 128 = 78125).
     let mut raw = vec![Complex32::default(); 12_000_000]; // 1.2 s: the reference must be ≥ `want` long for the slice below
-    src.read(start - L, &mut raw).unwrap();
+    src.read_ring(start - L, &mut raw).unwrap();
     let mut ddc = Ddc::new(fs, TONE_OFFSET, 6_250.0, 78_125.0);
     assert_eq!(ddc.fs_out, 78_125.0);
     let mut reference = Vec::new();

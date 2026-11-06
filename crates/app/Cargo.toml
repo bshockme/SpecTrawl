@@ -8,22 +8,16 @@ license.workspace = true
 name = "spectrawl_app"
 path = "src/lib.rs"
 
-[[bin]]
-name = "spectrawl-next"
-path = "src/main.rs"
-
 [dependencies]
 api = { path = "../api", features = ["serde"] }
-backend-airspy = { path = "../backend-airspy" }
-backend-sim = { path = "../backend-sim" }
 eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11", "persistence"] }
 egui = "0.36.2"
 egui_dock = { version = "0.21", features = ["serde"] }
-engine = { path = "../engine" }
-env_logger = "0.11"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
+backend-sim = { path = "../backend-sim" }
+engine = { path = "../engine" }
 sdr-core = { path = "../sdr-core" }

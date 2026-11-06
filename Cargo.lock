@@ -3165,17 +3165,29 @@ name = "spectrawl-app"
 version = "0.1.0"
 dependencies = [
  "api",
- "backend-airspy",
  "backend-sim",
  "eframe",
  "egui",
  "egui_dock",
  "engine",
- "env_logger",
  "log",
  "sdr-core",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "spectrawl-next"
+version = "0.1.0"
+dependencies = [
+ "backend-airspy",
+ "backend-sim",
+ "eframe",
+ "egui",
+ "engine",
+ "env_logger",
+ "log",
+ "spectrawl-app",
 ]
 
 [[package]]
