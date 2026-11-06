@@ -596,7 +596,11 @@ mod tests {
     }
 
     fn fm_station() -> Claim {
-        Claim::new("FM broadcast (stereo, RDS)", 0.9, Evidence::Decoder { mode: "WFM".into(), locked: true, summary: "RDS".into() })
+        Claim::new(
+            "FM broadcast (stereo, RDS)",
+            0.9,
+            Evidence::Decoder { mode: "WFM".into(), locked: true, summary: "RDS".into(), identity: None },
+        )
     }
 
     #[test]
@@ -846,7 +850,11 @@ mod tests {
         let sync = Claim::new("P25", 0.95, Evidence::SyncBank { protocol: "P25".into(), syncs: 5, frames_tried: 0, frames_decoded: 0 });
         b.b.note_claims(id, std::slice::from_ref(&sync));
         assert_eq!(b.get(id).unwrap().headline.as_ref(), Some(&sync));
-        let dec = Claim::new("P25 Phase 1", 0.7, Evidence::Decoder { mode: "P25".into(), locked: true, summary: "NAC 0x340".into() });
+        let dec = Claim::new(
+            "P25 Phase 1",
+            0.7,
+            Evidence::Decoder { mode: "P25".into(), locked: true, summary: "NAC 0x340".into(), identity: None },
+        );
         b.b.note_claims(id, std::slice::from_ref(&dec));
         assert_eq!(b.get(id).unwrap().headline.as_ref(), Some(&dec));
         b.b.note_claims(id, &[sync]);

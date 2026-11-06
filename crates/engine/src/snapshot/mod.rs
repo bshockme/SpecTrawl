@@ -200,6 +200,9 @@ impl Publisher {
             }),
             query: self.engine.store().and_then(|s| s.query_result()),
             audio: Arc::new(self.engine.audio_view()),
+            classify: Default::default(),
+            decoders: Vec::new(),
+            systems: Arc::default(),
         }));
     }
 }

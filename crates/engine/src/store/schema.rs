@@ -378,3 +378,22 @@ pub fn query(conn: &Connection, q: &RecordQuery) -> rusqlite::Result<(Vec<Signal
     ids.truncate(limit);
     Ok((records_by_id(conn, &ids)?, truncated))
 }
+
+#[cfg(test)]
+mod tests {
+    use api::{Evidence, Identity};
+
+    #[test]
+    fn decoder_evidence_written_before_identities_still_reads() {
+        let old = r#"{"Decoder":{"mode":"P25","locked":true,"summary":"NAC 0x340"}}"#;
+        let by: Evidence = serde_json::from_str(old).expect("step 4's evidence reads");
+        assert_eq!(by, Evidence::Decoder { mode: "P25".into(), locked: true, summary: "NAC 0x340".into(), identity: None });
+        let new = Evidence::Decoder {
+            mode: "P25".into(),
+            locked: true,
+            summary: String::new(),
+            identity: Some(Identity::P25 { nac: 0x34D, wacn: Some(0xBEE00), system: Some(0x348), rfss: Some(1), site: Some(13) }),
+        };
+        assert_eq!(serde_json::from_str::<Evidence>(&serde_json::to_string(&new).unwrap()).unwrap(), new);
+    }
+}

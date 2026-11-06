@@ -64,14 +64,82 @@ pub enum Evidence {
     SyncBank { protocol: String, syncs: u32, frames_tried: u32, frames_decoded: u32 },
     /// The record's own shape and power.
     Features { bandwidth_hz: f64, snr_db: f32, duty: f32, envelope_cv: Option<f32> },
-    /// A decoder that locked, with its telemetry.
-    Decoder { mode: String, locked: bool, summary: String },
+    /// A decoder that locked, with its telemetry, and who the signal says it is when it says.
+    Decoder {
+        mode: String,
+        locked: bool,
+        summary: String,
+        #[cfg_attr(feature = "serde", serde(default))]
+        identity: Option<Identity>,
+    },
     /// The band plan's entry for the frequency: never a rename.
     BandPlan { entry: String },
     /// Borrowed from a neighbouring emitter (confidence at most [`NEIGHBOUR_MAX_CONFIDENCE`]).
     Neighbour { emitter: EmitterId },
     /// Where it sits relative to the receiver's own artefacts.
     Position(PositionKind),
+}
+
+/// Who a decoded signal says it is. Every view of a signal's identity (its record, its emitter, a system row) reads
+/// this one value, so they cannot disagree (spec §5).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Identity {
+    /// A P25 site: the NAC from the frames' NID, the rest from the control channel's broadcasts as they arrive.
+    P25 { nac: u16, wacn: Option<u32>, system: Option<u16>, rfss: Option<u8>, site: Option<u8> },
+    /// Any other decoder's identifier, as it names it (a DCS code, a colour code, a BSIC).
+    Other { id: String },
+}
+
+impl Identity {
+    /// The fields as `(name, value)`, in the order a reader looks for them: "NAC 0x34D", "WACN BEE00", "SYS 348",
+    /// "RFSS 1", "SITE 13".
+    pub fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Identity::P25 { nac, wacn, system, rfss, site } => {
+                let mut v = vec![("NAC", format!("0x{nac:03X}"))];
+                v.extend(wacn.map(|w| ("WACN", format!("{w:05X}"))));
+                v.extend(system.map(|s| ("SYS", format!("{s:03X}"))));
+                v.extend(rfss.map(|r| ("RFSS", r.to_string())));
+                v.extend(site.map(|s| ("SITE", s.to_string())));
+                v
+            }
+            Identity::Other { id } => vec![("ID", id.clone())],
+        }
+    }
+
+    /// One line: "NAC 0x34D WACN BEE00 SYS 348 RFSS 1 SITE 13".
+    pub fn line(&self) -> String {
+        match self {
+            Identity::Other { id } => id.clone(),
+            _ => self.fields().iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(" "),
+        }
+    }
+
+    /// Whether `other` can be the same system: equal where both are known (a site seen before its network broadcast
+    /// is the same site).
+    pub fn same(&self, other: &Identity) -> bool {
+        let agree = |a: Option<u32>, b: Option<u32>| a.is_none() || b.is_none() || a == b;
+        match (self, other) {
+            (
+                Identity::P25 { nac: n1, wacn: w1, system: s1, rfss: r1, site: t1 },
+                Identity::P25 { nac: n2, wacn: w2, system: s2, rfss: r2, site: t2 },
+            ) => {
+                n1 == n2
+                    && agree(*w1, *w2)
+                    && agree(s1.map(u32::from), s2.map(u32::from))
+                    && agree(r1.map(u32::from), r2.map(u32::from))
+                    && agree(t1.map(u32::from), t2.map(u32::from))
+            }
+            (Identity::Other { id: a }, Identity::Other { id: b }) => a == b,
+            _ => false,
+        }
+    }
+
+    /// How many fields are known (a fuller identity replaces a thinner one it is the [`same`](Identity::same) as).
+    pub fn known(&self) -> usize {
+        self.fields().len()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -267,6 +335,18 @@ pub struct QueryResult {
 mod tests {
     use super::*;
 
+    #[test]
+    fn an_identity_reads_as_one_line_and_matches_a_thinner_one_of_the_same_site() {
+        let full = Identity::P25 { nac: 0x34D, wacn: Some(0xBEE00), system: Some(0x348), rfss: Some(1), site: Some(13) };
+        assert_eq!(full.line(), "NAC 0x34D WACN BEE00 SYS 348 RFSS 1 SITE 13");
+        let thin = Identity::P25 { nac: 0x34D, wacn: None, system: None, rfss: None, site: None };
+        assert!(full.same(&thin) && thin.same(&full));
+        assert!(full.known() > thin.known());
+        let other_site = Identity::P25 { nac: 0x34D, wacn: Some(0xBEE00), system: Some(0x348), rfss: Some(1), site: Some(14) };
+        assert!(!full.same(&other_site));
+        assert!(!thin.same(&Identity::P25 { nac: 0x340, wacn: None, system: None, rfss: None, site: None }));
+    }
+
     fn record(claims: Vec<Claim>) -> SignalRecord {
         SignalRecord {
             id: RecordId(7),
@@ -307,7 +387,11 @@ mod tests {
         assert_eq!(record(vec![shape.clone()]).headline(), None);
         let r = record(vec![shape.clone(), sync("DMR", 0.6), sync("P25", 0.8)]);
         assert_eq!(r.headline().unwrap().label, "P25");
-        let dec = Claim::new("P25 Phase 1", 0.4, Evidence::Decoder { mode: "P25".into(), locked: true, summary: "NAC 0x340".into() });
+        let dec = Claim::new(
+            "P25 Phase 1",
+            0.4,
+            Evidence::Decoder { mode: "P25".into(), locked: true, summary: "NAC 0x340".into(), identity: None },
+        );
         let r = record(vec![shape, sync("P25", 0.9), dec]);
         assert_eq!(r.headline().unwrap().label, "P25 Phase 1", "a decoder lock beats a more confident sync");
         assert!(r.headline().unwrap().is_decoded());

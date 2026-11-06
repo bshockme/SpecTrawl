@@ -12,6 +12,7 @@
 //! thread or clock. This crate itself creates no threads and reads no clocks.
 
 pub mod audio;
+pub mod classify;
 pub mod command;
 pub mod fmt;
 pub mod handle;
@@ -20,10 +21,11 @@ pub mod snapshot;
 pub mod timeline;
 
 pub use audio::{AudioMode, AudioView, PlayFrom, PlayId, PlayState, PlayTarget, PlayTo, PlayView};
+pub use classify::{ClassifyView, DecoderView, Lamp, SystemRow, SystemsView};
 pub use command::{Ack, Command, CommandReceiver, CommandSender, Outcome, command_channel};
 pub use handle::Handle;
 pub use records::{
-    Claim, EmitterId, EmitterView, Evidence, IqClip, Note, PositionKind, QueryResult, RecordId, RecordQuery, RecordsView, Role,
+    Claim, EmitterId, EmitterView, Evidence, Identity, IqClip, Note, PositionKind, QueryResult, RecordId, RecordQuery, RecordsView, Role,
     SignalRecord, StoreView, headline,
 };
 pub use sdr_core::{Capabilities, DeviceInfo, GainSetting};
