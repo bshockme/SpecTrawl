@@ -38,6 +38,11 @@
   - `/api/v1/telemetry` has the common block (`state`, `locked`, `snrDb`, `cfoHz`, `blocksOk`, `blocksBad`, `quality`) for every mode. Per-mode `details` exist only for DVB-T/T2, DVB-S/C, ATSC, DAB, FM, DTMB, LBJ, Horus and the railway modes (`core/src/results/rx_json.cpp`).
   - Decoded messages come through `/api/v1/events`.
   - Voice modes log calls as sessions (`/api/v1/sessions`).
+- **The full worker path with the real OnAir:** `onair_air` drives the factory, supervisor and client through the engine. Two minutes on the FLEX pager: locked from the first poll, 11043 blocks OK and 1277 bad, no restarts.
+- **The stock server reports no decoded content:**
+  - `onair-server` 3.6.0 implements no message stream (`/api/v1/events`: *"no message stream in this program"*) and no sessions. Only the desktop app hooks OnAir's automation engine into its event ring (`app/platform/remote_api_app.cpp`, `applyStreamer`).
+  - So through stock OnAir a worker gives its lamp and counters, never a page, a call or a channel.
+  - The patch is the same hook in `server/server_host.cpp`: an `apipol::EventRing`, `eventsSince`, and `automation::global().setStreamer(...)`. Decoders emit to the automation engine from the core (ACARS, AIS, VDL2, ADS-B, …), so the server would see them.
 - **Air band does not work headless in stock OnAir:**
   - the receiver decodes only the channels in its list, which the desktop app sets from its airport search and the server cannot set;
   - its telemetry has no air band details;
@@ -62,6 +67,14 @@
   - Which implementation serves a mode is a registry entry the app passes to the engine. The engine never depends on `onair-rx`.
 - **`docs/decoder-worker.md`:** the protocol as SpecTrawl speaks it, so a worker can be anything.
 
+## Building the patched OnAir: blocked (2026-11-05)
+
+- **What's missing:** OnAir builds with CMake and Ninja. It needs libusb, FFmpeg (installed here) and libhackrf (not installed; GLFW is needed only for the desktop app).
+- **What was tried:** building libhackrf from its upstream source into `onair/deps/prefix`, so nothing would be installed system-wide.
+- **What happened:** the session's permission check refused it. Building the patched server from source waits on the owner. Two routes:
+  - allow source builds under `onair/`;
+  - or install `hackrf` from the distribution, then allow the OnAir build.
+
 ## Tasks
 
 1. `engine::iqserve`, with tests. **Done.**
@@ -70,7 +83,7 @@
    - `WorkerFactory` and `Worker` (polled: lamp, summary, counters, decoded messages);
    - `Command::StartWorker` and `StopWorker`, and worker views in the snapshot;
    - messages as claims on the records at their frequencies.
-4. **`onair-rx`:**
+4. **`onair-rx`.** Done against the fake server and the real 3.6.0 (lamp and counters); messages wait on the patched server:
    - the supervisor (settings, a contained `HOME`, the radio check, restart with backoff, stop on drop);
    - the HTTP client for `status`, `telemetry` and `events`;
    - a fake `onair-server` binary, so CI tests it all without OnAir;

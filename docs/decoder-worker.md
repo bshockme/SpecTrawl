@@ -56,10 +56,14 @@ port=<a free port for its control API>
 - **Health:** `GET /api/v1/status`, which gives running, device, mode, frequency, rate and gain.
 - **Modes:** `GET /api/v1/modes` lists `family`, `name`, `sub`. `POST /api/v1/mode` takes `{"family":N,"sub":"id"}` while stopped.
 - **Tuning inside the stream:** `POST /api/v1/frequency` with `{"hz":…}`, which reaches SpecTrawl as the rtl_tcp `0x01` command above.
+- **What stock `onair-server` 3.6.0 offers:**
+  - It implements only status, devices, modes, telemetry, spectrum, start/stop, mode, frequency, rate, bandwidth, gain and audio (`server/server_host.h`).
+  - `/api/v1/events` answers *"no message stream in this program"*, and there is no `/api/v1/sessions`.
+  - So a stock worker reports its lamp and its counters, but not what it decoded. The patched OnAir adds both (see the step 7 plan).
 - **Telemetry:**
   - `GET /api/v1/telemetry` returns the mode's figures.
   - Over the WebSocket `/api/v1/ws`, send `{"telemetry":true,"events":true}`. Frames then come as `{"type":"telemetry","data":{…}}`, `{"type":"event","data":{…}}`, and `{"type":"gap"}` when the worker dropped messages because SpecTrawl read too slowly.
-- **Decoded messages** are one JSON object each, for example `{"v":1,"type":"pager.message","time":…,"mode":"POCSAG","freqHz":…,"fields":{…}}`.
+- **Decoded messages**, in the desktop app and in the patched server, are one JSON object each, for example `{"v":1,"type":"pager.message","time":…,"mode":"POCSAG","freqHz":…,"fields":{…}}`.
 
 ## How SpecTrawl uses a worker (`onair-rx`, planned)
 
