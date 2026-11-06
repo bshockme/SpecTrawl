@@ -116,3 +116,36 @@ fn noise_gets_no_claim() {
         }
     }
 }
+
+#[test]
+fn the_p25_control_decoder_names_the_whole_site_within_two_seconds() {
+    use engine::decoders::{Decoder, P25Control};
+    let (x, fs) = capture("859.7677MHz_P25_Phase_1");
+    let mut d = P25Control::new(859.7677e6);
+    d.configure(fs);
+    assert!(d.claim().is_none(), "no claim before any TSBK");
+    let mut fed = 0;
+    for piece in x.chunks(4096) {
+        d.feed(piece);
+        fed += piece.len();
+        if d.telemetry().identity.is_some_and(|i| i.known() == 5) {
+            break;
+        }
+    }
+    let secs = fed as f64 / fs;
+    let t = d.telemetry();
+    assert_eq!(t.lamp, api::Lamp::Locked);
+    assert_eq!(t.identity, Some(Identity::P25 { nac: 0x34D, wacn: Some(0xBEE00), system: Some(0x348), rfss: Some(1), site: Some(13) }));
+    assert!(secs <= 2.0, "the whole site after {secs:.2} s");
+    let c = d.claim().expect("a claim");
+    assert_eq!(c.label, "P25 Phase 1 control");
+    assert!(d.summary().starts_with("P25 control 859.7677 MHz, NAC 0x34D WACN BEE00 SYS 348 RFSS 1 SITE 13: "), "{}", d.summary());
+    // The rest of the capture: every TSDU block decodes, and a gap's reset keeps what was learned.
+    d.reset();
+    for piece in x.chunks(4096) {
+        d.feed(piece);
+    }
+    let t = d.telemetry();
+    assert!(t.blocks_ok >= 200 && t.blocks_bad * 10 <= t.blocks_ok, "{t:?}");
+    assert_eq!(t.identity.map(|i| i.known()), Some(5));
+}
