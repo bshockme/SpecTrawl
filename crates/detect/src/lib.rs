@@ -156,6 +156,72 @@ pub fn p25_voice_frames(x: &[Complex32], fs: f64) -> Vec<frames::Frame> {
     found
 }
 
+/// POCSAG batches in `x` (complex baseband at `fs`), sliced for [`pocsag::pages`]: the sync search's, at the rate it
+/// found most, and those it missed on the batch grid ([`pocsag_grid`]).
+pub fn pocsag_frames(x: &[Complex32], fs: f64) -> Vec<frames::Frame> {
+    if x.len() < 64 {
+        return Vec::new();
+    }
+    let disc = sync_disc(&prepare_cutoff(x, fs, protocol_cutoff_hz("POCSAG", "")), fs);
+    let hits: Vec<sync::SyncHit> = sync::search(&disc, fs, &sync::table()).into_iter().filter(|h| h.entry.protocol == "POCSAG").collect();
+    let Some(baud) = [512.0, 1200.0, 2400.0].into_iter().max_by_key(|&b| hits.iter().filter(|h| h.entry.baud == b).count()) else {
+        return Vec::new();
+    };
+    let mine: Vec<sync::SyncHit> = hits.into_iter().filter(|h| h.entry.baud == baud).collect();
+    let (before, after) = slice_extent("POCSAG", "");
+    let found = frames::slice(&disc, fs, &mine, before, after);
+    pocsag_grid(&disc, fs, &mine, found, before, after)
+}
+
+/// A POCSAG transmission sends batches back to back, a sync and 16 codewords (544 bits) each, so a batch whose sync
+/// the search missed (on air, one or two of the four in a strong 1200 Bd transmission) is sliced where the grid puts
+/// it, out from every batch found, and kept when its sync word reads there within four bits (random bits do once in
+/// 100 000). `hits` are one rate's, and `found` their frames.
+fn pocsag_grid(
+    disc: &[f32],
+    fs: f64,
+    hits: &[sync::SyncHit],
+    mut found: Vec<frames::Frame>,
+    before: usize,
+    after: usize,
+) -> Vec<frames::Frame> {
+    const BATCH: usize = 544;
+    const SYNC_ERRORS: usize = 4;
+    let sync_errors = |f: &frames::Frame| {
+        (0..32).filter(|&i| f.soft.get(f.sync_start + i).is_none_or(|v| (*v < 0.0) != (0x7CD2_15D8u32 >> (31 - i) & 1 == 1))).count()
+    };
+    // The sync's last symbol, where a hit is.
+    let end = |f: &frames::Frame| f.at_symbol + 31;
+    let mut frontier: Vec<sync::SyncHit> = Vec::new();
+    for h in hits {
+        if found.iter().any(|f| end(f).abs_diff(h.symbol) <= 2) && !frontier.iter().any(|g| g.symbol.abs_diff(h.symbol) <= 2) {
+            frontier.push(h.clone());
+        }
+    }
+    while !frontier.is_empty() {
+        let mut next = Vec::new();
+        for h in &frontier {
+            let max_symbol = (disc.len() as f64 / fs * h.entry.baud) as usize;
+            for s in [h.symbol + BATCH, h.symbol.wrapping_sub(BATCH)] {
+                if s >= max_symbol || s < BATCH || found.iter().any(|f| end(f).abs_diff(s) < BATCH / 2) {
+                    continue;
+                }
+                let mut g = h.clone();
+                g.symbol = s;
+                if let Some(f) =
+                    frames::slice(disc, fs, std::slice::from_ref(&g), before, after).into_iter().find(|f| sync_errors(f) <= SYNC_ERRORS)
+                {
+                    found.push(f);
+                    next.push(g);
+                }
+            }
+        }
+        frontier = next;
+    }
+    found.sort_by_key(|f| f.at_symbol);
+    found
+}
+
 /// One sync search and slice of a discriminator: the protocol named, its
 /// frames and what decoded from them.
 struct SyncPass {
@@ -215,7 +281,10 @@ fn sync_pass(d: &[f32], fs: f64, want: Option<&SyncResult>) -> Option<SyncPass> 
     let best = sync::best(&hits)?;
     let mine: Vec<sync::SyncHit> = hits.into_iter().filter(|h| h.entry.protocol == best.protocol && h.entry.baud == best.baud).collect();
     let (before, after) = slice_extent(best.protocol, best.detail);
-    let fr = frames::slice(d, fs, &mine, before, after);
+    let mut fr = frames::slice(d, fs, &mine, before, after);
+    if best.protocol == "POCSAG" {
+        fr = pocsag_grid(d, fs, &mine, fr, before, after);
+    }
     let mut fields = decode::summarise(&fr);
     if best.protocol == "POCSAG" {
         let pages = pocsag::pages(&fr);
@@ -223,7 +292,7 @@ fn sync_pass(d: &[f32], fs: f64, want: Option<&SyncResult>) -> Option<SyncPass> 
         fields.decoded = pages.len();
         fields.activity = Some(decode::Activity::Data);
         fields.kinds = vec![("page".into(), pages.len())];
-        fields.messages = pages.iter().map(|p| format!("{} ({}): {}", p.address, (b'A' + p.function) as char, p.text)).collect();
+        fields.messages = pages.iter().map(pocsag::Page::summary).collect();
     }
     Some(SyncPass { best, frames: fr, fields })
 }

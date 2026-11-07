@@ -384,11 +384,11 @@ pub fn decode(x: &[Complex32], fs: f64) -> Vec<Block> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Reads a slice's SigMF data file: cf32_le (slices since 2026-11-07) or ci16_le (earlier ones), as `meta` says.
-    fn read_slice(path: &std::path::Path, meta: &str) -> Vec<Complex32> {
+    pub(crate) fn read_slice(path: &std::path::Path, meta: &str) -> Vec<Complex32> {
         let raw = std::fs::read(path).unwrap();
         if meta.contains("\"cf32_le\"") {
             raw.as_chunks::<8>()

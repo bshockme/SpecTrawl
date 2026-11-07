@@ -1045,7 +1045,7 @@ pub(super) mod tests {
 }
 
 #[cfg(test)]
-pub(super) mod simulcast {
+pub(crate) mod simulcast {
     //! Pages under simulcast fading: two transmitters a few hertz apart beat, and the nulls between them put bursts of
     //! errors into every block. Pages are known, so a page is right, damaged (its words failed and show as '?'), or
     //! false (an address nobody sent, or text that differs from what was sent without being marked damaged).
@@ -1081,7 +1081,7 @@ pub(super) mod simulcast {
 
     /// The signal plus a second copy `beat_hz` off, `delay_s` late, at `ratio` of its amplitude, plus noise at
     /// `snr_db` (over the whole channel).
-    pub(super) fn simulcast(x: &[Complex32], fs: f64, beat_hz: f64, delay_s: f64, ratio: f32, snr_db: f64, seed: u64) -> Vec<Complex32> {
+    pub(crate) fn simulcast(x: &[Complex32], fs: f64, beat_hz: f64, delay_s: f64, ratio: f32, snr_db: f64, seed: u64) -> Vec<Complex32> {
         let d = (delay_s * fs).round() as usize;
         let mut s = seed | 1;
         let mut gauss = move || {

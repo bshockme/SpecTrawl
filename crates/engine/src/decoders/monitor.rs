@@ -135,7 +135,7 @@ impl Monitor {
                 let pages = detect::pocsag::pages(&s.frames);
                 locked = !pages.is_empty();
                 for p in pages {
-                    let line = format!("{} ({}): {}", p.address, (b'A' + p.function) as char, p.text);
+                    let line = p.summary();
                     if Self::push(&mut self.pages, line) {
                         self.pages_total += 1;
                         self.decoded += 1;
