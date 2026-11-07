@@ -441,8 +441,15 @@ fn decode_with(x: &[Complex32], fs: f64, soft: bool) -> Vec<FlexFrame> {
         let n = (baud as f64 * 0.16).round() as usize;
         // First data symbol: after the FIW and sync 2.
         let t0 = end + 48.5 * sps + SYNC2_S * fs;
-        if t0 + (BLOCKS * n) as f64 * s + 2.0 * s > (d.len() - 1) as f64 {
-            break;
+        // The blocks the buffer holds, with two symbols to spare past each and room for its timing search (three
+        // symbols in block 0, under one after): past the buffer's end `at` repeats the last sample, which slices as a
+        // constant word, and the all-zero word is a valid codeword. A transmitter may stop once the frame's last used
+        // block is sent (on air at 929.6125 MHz many 3200/4 transmissions are 0.42 s, a header and two blocks), so a
+        // slice of one holds no more. The rest are missing, not failed: no words and nothing for the soft repair.
+        let fits = |b: usize| t0 + (((b + 1) * n) as f64 + 2.0 + if b == 0 { 3.0 } else { 1.0 }) * s <= (d.len() - 1) as f64;
+        let present = (0..BLOCKS).take_while(|&b| fits(b)).count();
+        if present == 0 {
+            continue;
         }
         let nph = phase_names(baud, levels).len();
         // Full deviation, from the 1600-baud header after sync 1's start.
@@ -465,6 +472,12 @@ fn decode_with(x: &[Complex32], fs: f64, soft: bool) -> Vec<FlexFrame> {
         let mut anchor = (locked.unwrap_or(0.0), 0usize);
         let mut previous: Option<f64> = None;
         for (blk, ok_out) in block_ok.iter_mut().enumerate() {
+            if blk >= present {
+                for p in &mut phases {
+                    p.extend([None; 8]);
+                }
+                continue;
+            }
             // Timing: the offset whose words need the fewest corrections.
             let span = if locked.is_some() {
                 5
@@ -851,6 +864,47 @@ pub(super) mod tests {
     fn data21_reverses() {
         assert_eq!(data21(word(0x12345)), 0x12345);
         assert_eq!(data21(word(1)), 1);
+    }
+
+    /// A transmitter that stops after the blocks it used (on air, 0.42 s 3200/4 transmissions): its slice holds the
+    /// header, those blocks, and then noise. The blocks sent decode; the rest are missing, and nothing comes of them.
+    #[test]
+    fn a_frame_cut_short_decodes_the_blocks_sent() {
+        let (a, sent) = super::simulcast::pages_frame(2);
+        assert!(a.len() <= 3 * 8, "the pages fit in three blocks");
+        let fs = 62_500.0;
+        let full = modulate(&a, 4, 33, fs, 350.0);
+        let block = (0.16 * fs) as usize;
+        let cut = |kept: usize| {
+            let mut x = full[..full.len() - (0.05 * fs) as usize - (BLOCKS - kept) * block].to_vec();
+            let mut rng = 0x9E37_79B9u32;
+            let mut noise = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 17;
+                rng ^= rng << 5;
+                (rng as f32 / u32::MAX as f32 - 0.5) * 0.2
+            };
+            // The slice's post-roll: 150 ms of the channel with nobody on it.
+            x.extend((0..(0.15 * fs) as usize).map(|_| Complex32::new(noise(), noise())));
+            x
+        };
+        let fr = decode(&cut(4), fs);
+        assert_eq!(fr.len(), 1);
+        let f = &fr[0];
+        assert_eq!((f.mode().as_str(), f.cycle, f.frame), ("3200/4", 4, 33));
+        assert!(f.block_ok[..4].iter().all(|&n| n == 32) && f.block_ok[4..].iter().all(|&n| n == 0), "{:?}", f.block_ok);
+        let got: Vec<(u64, String)> = f.pages.iter().map(|p| (p.capcode, p.text.clone())).collect();
+        assert_eq!(got, sent);
+        assert!(f.pages.iter().all(|p| !p.damaged));
+        // Cut sooner, inside the messages: what decodes was sent, and a page whose words are missing says so.
+        for kept in 1..4 {
+            for f in decode(&cut(kept), fs) {
+                for p in &f.pages {
+                    let s = sent.iter().find(|s| s.0 == p.capcode).unwrap_or_else(|| panic!("{kept} blocks: {p:?} was never sent"));
+                    assert!(p.damaged || p.text == s.1, "{kept} blocks: {p:?}");
+                }
+            }
+        }
     }
 
     #[test]

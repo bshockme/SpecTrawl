@@ -387,14 +387,24 @@ pub fn decode(x: &[Complex32], fs: f64) -> Vec<Block> {
 mod tests {
     use super::*;
 
-    /// Reads a ci16_le SigMF data file.
-    fn read_ci16(path: &std::path::Path) -> Vec<Complex32> {
+    /// Reads a slice's SigMF data file: cf32_le (slices since 2026-11-07) or ci16_le (earlier ones), as `meta` says.
+    fn read_slice(path: &std::path::Path, meta: &str) -> Vec<Complex32> {
         let raw = std::fs::read(path).unwrap();
-        raw.as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| Complex32::new(i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0, i16::from_le_bytes([c[2], c[3]]) as f32 / 32768.0))
-            .collect()
+        if meta.contains("\"cf32_le\"") {
+            raw.as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| Complex32::new(f32::from_le_bytes([c[0], c[1], c[2], c[3]]), f32::from_le_bytes([c[4], c[5], c[6], c[7]])))
+                .collect()
+        } else {
+            raw.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| {
+                    Complex32::new(i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0, i16::from_le_bytes([c[2], c[3]]) as f32 / 32768.0)
+                })
+                .collect()
+        }
     }
 
     /// Scratch: every slice in `ACARS_DIR` (the slice tier's layout), decoded.
@@ -412,7 +422,7 @@ mod tests {
             let meta = std::fs::read_to_string(f.with_extension("sigmf-meta")).unwrap();
             let rate: f64 = meta.split("\"core:sample_rate\":").nth(1).unwrap().split([',', '\n']).next().unwrap().trim().parse().unwrap();
             let hz: f64 = meta.split("\"core:frequency\":").nth(1).unwrap().split([',', '\n']).next().unwrap().trim().parse().unwrap();
-            let x = read_ci16(&f);
+            let x = read_slice(&f, &meta);
             let t0 = std::time::Instant::now();
             let blocks = decode(&x, rate);
             let ms = t0.elapsed().as_secs_f64() * 1e3;

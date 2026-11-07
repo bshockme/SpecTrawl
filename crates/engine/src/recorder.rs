@@ -1,17 +1,23 @@
-//! The slice tier (spec §4.8): every confirmed record's channelized IQ, written to disk as i16 SigMF by a bus consumer
+//! The slice tier (spec §4.8): every confirmed record's channelized IQ, written to disk as cf32 SigMF by a bus consumer
 //! at the lowest priority, so a record can be replayed or decoded after its samples have left the ring.
 //!
 //! A slice starts `pre_roll` before the record (back-filled from the ring, or from the oldest block it still holds) and
-//! ends when the record closes, after `max`, at a gap in the stream, or when the pool sheds it. Finished slices are
-//! handed back to the record book, which sets the record's `iq_clip`. The directory is kept under `cap_bytes`, oldest
-//! slice first; an evicted slice's record says so.
+//! ends `post_roll` after the record closes, after `max`, at a gap in the stream, or when the pool sheds it. Finished
+//! slices are handed back to the record book, which sets the record's `iq_clip`. The directory is kept under
+//! `cap_bytes`, oldest slice first; an evicted slice's record says so.
+//!
+//! A slice is cut where the record's first rows put it, which can be kHz from where the record ends up: those rows
+//! see only part of the signal. So it is collected [`COLLECT_SLACK_HZ`] wider each side, and once the record closes
+//! the recorder's finisher thread re-centres it on the record's final centre and narrows it to the record's final
+//! width, at the same rate and sample for sample.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Weak, mpsc};
+use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
 use api::{IqClip, Priority, RecordId};
@@ -19,7 +25,7 @@ use parking_lot::Mutex;
 use sdr_core::Complex32;
 
 use crate::budget::SourceId;
-use crate::channels::{BusError, ChannelBus, ChannelSpec, Consumer, Delivery, Flow, Start};
+use crate::channels::{BusError, ChannelBus, ChannelId, ChannelSpec, Consumer, Delivery, Flow, Start};
 use crate::sigmf;
 
 #[derive(Debug, Clone)]
@@ -29,13 +35,23 @@ pub struct SliceConfig {
     pub cap_bytes: u64,
     /// A slice starts this long before its record.
     pub pre_roll: Duration,
+    /// A slice ends this long after its record.
+    pub post_roll: Duration,
     /// Longest slice.
     pub max: Duration,
 }
 
 impl SliceConfig {
     pub fn new(dir: impl Into<PathBuf>) -> SliceConfig {
-        SliceConfig { dir: dir.into(), cap_bytes: 4 << 30, pre_roll: Duration::from_millis(50), max: Duration::from_secs(120) }
+        // The looks' lead (a record opens once its rows clear the threshold, after a transmission's start: a short FLEX
+        // frame's only header is its first 80 ms), at both ends.
+        SliceConfig {
+            dir: dir.into(),
+            cap_bytes: 4 << 30,
+            pre_roll: crate::classify::LEAD,
+            post_roll: crate::classify::LEAD,
+            max: Duration::from_secs(120),
+        }
     }
 }
 
@@ -48,6 +64,21 @@ pub fn default_dir() -> PathBuf {
 const MIN_SLICE_HZ: f64 = 12.5e3;
 /// The slice channel is this much wider than its record (its skirts and drift).
 const SLICE_MARGIN: f64 = 1.25;
+/// A slice is collected this much wider each side than its record's first rows ask for, so that re-centred on the
+/// record's final centre it still holds the record's final width. On air (931 MHz FLEX pagers on the R2, 2026-11-07)
+/// the first rows sat 4–5 kHz off a 15 kHz signal's centre and saw 5 kHz of it; the 12.5 kHz slices cut there held
+/// one side of the signal, and 1 of 39 decoded. ±10 kHz around a centre 5 kHz away needs this much past ±6.25 kHz.
+const COLLECT_SLACK_HZ: f64 = 12e3;
+
+/// A slice's passband for a record `bw` wide.
+fn slice_width(bw: f64) -> f64 {
+    (bw * SLICE_MARGIN).max(MIN_SLICE_HZ)
+}
+
+/// Slices are stored as floats: i16 at full scale left a weak channel, whose level after channelizing is far below the
+/// ADC's, with a few bits (a 931 MHz pager peaked at 10–12 counts). Twice the disk of i16 (owner, 2026-11-07: quality
+/// first).
+pub const FORMAT: sigmf::Format = sigmf::Format::Cf32;
 
 /// What a record asks for.
 #[derive(Debug, Clone)]
@@ -69,10 +100,38 @@ pub enum SliceEvent {
     Evicted(RecordId),
 }
 
+/// A slice in progress: from its start until its finisher has handed it to the book. A slice whose entry is gone by
+/// then was cancelled.
 struct Live {
-    channel: crate::channels::ChannelId,
-    /// The record's end sample once it closed (`u64::MAX` while open).
-    end: Arc<AtomicU64>,
+    /// `None` until the bus has taken the subscription.
+    channel: Option<ChannelId>,
+    ending: Arc<Ending>,
+}
+
+/// How the record ended, set when it closed.
+struct Ending {
+    /// Where the slice ends: the record's end plus the post-roll (`u64::MAX` while the record is open).
+    end: AtomicU64,
+    /// The post-roll in source samples.
+    post: u64,
+    /// The record's centre and width: as it now stands while it is open, its final ones once it closed.
+    shape: Mutex<Option<(f64, f64)>>,
+}
+
+/// A written slice, for the finisher thread.
+struct Finish {
+    record: RecordId,
+    stem: PathBuf,
+    from_sample: u64,
+    samples: u64,
+    rate: f64,
+    /// The slice channel's centre and passband as collected.
+    center_hz: f64,
+    collected_hz: f64,
+    /// The record's final centre and width, or the latest while it was open (`None` if no row gave one).
+    shape: Option<(f64, f64)>,
+    t_start: SystemTime,
+    hw: String,
 }
 
 pub struct Recorder {
@@ -82,6 +141,9 @@ pub struct Recorder {
     events: Mutex<Vec<SliceEvent>>,
     /// Finished slices on disk: record → (stem, bytes), oldest id first.
     index: Mutex<BTreeMap<RecordId, (PathBuf, u64)>>,
+    /// Written slices to the finisher thread, which re-centres them off the bus's workers.
+    jobs: Mutex<Option<mpsc::Sender<Finish>>>,
+    finisher: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Recorder {
@@ -97,12 +159,30 @@ impl Recorder {
                 index.insert(RecordId(id), (p.with_file_name(stem), bytes));
             }
         }
-        Arc::new(Recorder {
-            cfg,
-            bus: Mutex::new(Weak::new()),
-            live: Mutex::new(HashMap::new()),
-            events: Mutex::new(Vec::new()),
-            index: Mutex::new(index),
+        let (tx, rx) = mpsc::channel::<Finish>();
+        Arc::new_cyclic(|weak: &Weak<Recorder>| {
+            let recorder = weak.clone();
+            let finisher = std::thread::Builder::new()
+                .name("slice-finisher".into())
+                .spawn(move || {
+                    for job in rx {
+                        let done = job.write();
+                        // Gone (the engine is closing): the files are whole, and indexed when the next engine starts.
+                        if let Some(rec) = recorder.upgrade() {
+                            rec.completed(&job, done);
+                        }
+                    }
+                })
+                .expect("spawn the slice finisher");
+            Recorder {
+                cfg,
+                bus: Mutex::new(Weak::new()),
+                live: Mutex::new(HashMap::new()),
+                events: Mutex::new(Vec::new()),
+                index: Mutex::new(index),
+                jobs: Mutex::new(Some(tx)),
+                finisher: Mutex::new(Some(finisher)),
+            }
         })
     }
 
@@ -122,59 +202,131 @@ impl Recorder {
     /// Starts slicing a record. Logged and ignored when the bus refuses.
     pub fn start(self: &Arc<Self>, req: SliceRequest) {
         let Some(bus) = self.bus.lock().upgrade() else { return };
-        if self.live.lock().contains_key(&req.record) {
-            return;
-        }
         let Some(stage) = bus.stage(req.source) else { return };
         let rate = stage.source().segment_at(req.first_sample).sample_rate;
+        let ending = Arc::new(Ending {
+            end: AtomicU64::new(u64::MAX),
+            post: (self.cfg.post_roll.as_secs_f64() * rate) as u64,
+            shape: Mutex::new(None),
+        });
+        {
+            let mut live = self.live.lock();
+            if live.contains_key(&req.record) {
+                return;
+            }
+            live.insert(req.record, Live { channel: None, ending: ending.clone() });
+        }
         let pre = (self.cfg.pre_roll.as_secs_f64() * rate) as u64;
-        let bandwidth_hz = (req.bandwidth_hz * SLICE_MARGIN).max(MIN_SLICE_HZ);
-        // The channelizer picks the rate (at least 1.6 × the bandwidth); this only has to be positive.
-        let spec = ChannelSpec { source: req.source, center_hz: req.center_hz, bandwidth_hz, min_rate: bandwidth_hz, parent: None };
-        let end = Arc::new(AtomicU64::new(u64::MAX));
-        let writer = |start_sample: u64| SliceWriter {
+        let writer = |start_sample: u64, collected_hz: f64| SliceWriter {
             recorder: Arc::downgrade(self),
             req: req.clone(),
-            end: end.clone(),
+            ending: ending.clone(),
             max_input: (self.cfg.max.as_secs_f64() * rate) as u64,
             group_delay: stage.fft_size() as u64 / 4,
             start_sample,
             input_rate: rate,
             hop: stage.hop(),
+            collected_hz,
             out: None,
         };
         let want = req.first_sample.saturating_sub(pre);
-        let sub = match bus.subscribe(spec.clone(), Start::At(want), Priority::Recorder, Box::new(writer(want))) {
-            // The ring no longer holds the record's start: from the oldest block it does hold.
-            Err(BusError::NotHeld { oldest }) => {
-                let from = oldest + stage.hop();
-                bus.subscribe(spec, Start::At(from), Priority::Recorder, Box::new(writer(from)))
+        let width = slice_width(req.bandwidth_hz);
+        let mut sub = Err(BusError::NoSuchSource);
+        // With slack for the centre to move; at a span's edge, where the bus may refuse the wider channel, as the
+        // record's first rows stand.
+        for w in [width + 2.0 * COLLECT_SLACK_HZ, width] {
+            // The channelizer picks the rate (at least 1.6 × the bandwidth); this only has to be positive.
+            let spec = ChannelSpec { source: req.source, center_hz: req.center_hz, bandwidth_hz: w, min_rate: w, parent: None };
+            sub = match bus.subscribe(spec.clone(), Start::At(want), Priority::Recorder, Box::new(writer(want, w))) {
+                // The ring no longer holds the record's start: from the oldest block it does hold.
+                Err(BusError::NotHeld { oldest }) => {
+                    let from = oldest + stage.hop();
+                    bus.subscribe(spec, Start::At(from), Priority::Recorder, Box::new(writer(from, w)))
+                }
+                other => other,
+            };
+            if !matches!(sub, Err(BusError::Design(_))) {
+                break;
             }
-            other => other,
-        };
+        }
         match sub {
             Ok(info) => {
-                self.live.lock().insert(req.record, Live { channel: info.id, end });
+                if let Some(l) = self.live.lock().get_mut(&req.record) {
+                    l.channel = Some(info.id);
+                }
             }
-            Err(e) => log::warn!("record {}: no slice: {e:?}", req.record.0),
+            Err(e) => {
+                self.live.lock().remove(&req.record);
+                log::warn!("record {}: no slice: {e:?}", req.record.0);
+            }
         }
     }
 
-    /// The record closed at `end_sample`: its slice ends there.
-    pub fn end(&self, record: RecordId, end_sample: u64) {
+    /// Open records' (id, centre, width) as they now stand.
+    pub fn shapes(&self, shapes: &[(RecordId, f64, f64)]) {
+        if shapes.is_empty() {
+            return;
+        }
+        let live = self.live.lock();
+        for &(record, center_hz, bandwidth_hz) in shapes {
+            if let Some(l) = live.get(&record) {
+                *l.ending.shape.lock() = Some((center_hz, bandwidth_hz));
+            }
+        }
+    }
+
+    /// The record closed at `end_sample`, centred at `center_hz` and `bandwidth_hz` wide: its slice ends a post-roll
+    /// later and is re-centred on it.
+    pub fn end(&self, record: RecordId, end_sample: u64, center_hz: f64, bandwidth_hz: f64) {
         if let Some(l) = self.live.lock().get(&record) {
-            l.end.store(end_sample, Ordering::Relaxed);
+            *l.ending.shape.lock() = Some((center_hz, bandwidth_hz));
+            l.ending.end.store(end_sample.saturating_add(l.ending.post), Ordering::Release);
         }
     }
 
-    /// The record is gone (merged into another): its slice stops and its files are removed.
+    /// The record is gone (merged into another): its slice stops and its files are removed (by the finisher, if the
+    /// slice is already with it).
     pub fn cancel(&self, record: RecordId) {
-        if let (Some(l), Some(bus)) = (self.live.lock().remove(&record), self.bus.lock().upgrade()) {
-            bus.unsubscribe(l.channel);
+        let channel = self.live.lock().remove(&record).and_then(|l| l.channel);
+        if let (Some(ch), Some(bus)) = (channel, self.bus.lock().upgrade()) {
+            bus.unsubscribe(ch);
         }
         if let Some((stem, _)) = self.index.lock().remove(&record) {
             remove(&stem);
         }
+    }
+
+    /// Hands a written slice to the finisher thread (or finishes it here once the thread has stopped).
+    fn submit(&self, job: Finish) {
+        let job = match self.jobs.lock().as_ref() {
+            Some(tx) => match tx.send(job) {
+                Ok(()) => return,
+                Err(mpsc::SendError(job)) => job,
+            },
+            None => job,
+        };
+        let done = job.write();
+        self.completed(&job, done);
+    }
+
+    /// The finisher is done with a slice: to the book, unless its record was cancelled meanwhile.
+    fn completed(&self, job: &Finish, done: std::io::Result<(IqClip, u64)>) {
+        if self.live.lock().remove(&job.record).is_none() {
+            remove(&job.stem);
+            return;
+        }
+        match done {
+            Ok((clip, bytes)) => self.finished(job.record, clip, bytes),
+            Err(e) => {
+                log::warn!("record {}: slice not finished: {e}", job.record.0);
+                remove(&job.stem);
+            }
+        }
+    }
+
+    /// A slice that never got going: forgotten.
+    fn abandon(&self, record: RecordId) {
+        self.live.lock().remove(&record);
     }
 
     /// Finished and evicted slices since the last call.
@@ -184,7 +336,6 @@ impl Recorder {
 
     /// A slice is finished: index it, keep the directory under the cap, tell the book.
     fn finished(&self, record: RecordId, clip: IqClip, bytes: u64) {
-        self.live.lock().remove(&record);
         let mut events = vec![SliceEvent::Done { record, clip: clip.clone() }];
         {
             let mut index = self.index.lock();
@@ -207,8 +358,95 @@ impl Recorder {
     }
 }
 
+impl Drop for Recorder {
+    /// Lets the finisher finish what it has. It may be the one dropping the last reference, and then it is not waited for
+    /// (it ends once the queue is closed).
+    fn drop(&mut self) {
+        drop(self.jobs.lock().take());
+        if let Some(h) = self.finisher.lock().take()
+            && h.thread().id() != std::thread::current().id()
+        {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Finish {
+    /// Re-centres the data file on the record's final centre and narrows it to its final width, then writes the
+    /// metadata: the clip and its bytes.
+    fn write(&self) -> std::io::Result<(IqClip, u64)> {
+        let mut center_hz = self.center_hz;
+        let mut note = String::new();
+        if let Some((c, bw)) = self.shape {
+            let width = slice_width(bw);
+            let offset = c - self.center_hz;
+            if offset.abs() >= 1.0 || self.collected_hz > width + 1.0 {
+                recentre(&self.stem.with_extension("sigmf-data"), self.samples, self.rate, offset, width)?;
+                center_hz = c;
+                note = format!(
+                    "; collected {:.1} kHz wide at {:.4} MHz, re-centred by {offset:+.0} Hz and narrowed to {:.1} kHz",
+                    self.collected_hz / 1e3,
+                    self.center_hz / 1e6,
+                    width / 1e3
+                );
+            }
+        }
+        let meta = sigmf::Meta {
+            datatype: FORMAT.datatype(),
+            sample_rate: self.rate,
+            frequency: center_hz,
+            datetime: Some(sigmf::rfc3339(self.t_start)),
+            hw: self.hw.clone(),
+            description: format!("record {} slice from source sample {}{note}", self.record.0, self.from_sample),
+            sample_count: self.samples,
+        };
+        if let Err(e) = sigmf::write_meta(&self.stem.with_extension("sigmf-meta"), &meta) {
+            log::warn!("record {}: slice metadata failed: {e}", self.record.0);
+        }
+        let clip = IqClip { path: self.stem.clone(), from_sample: self.from_sample, samples: self.samples, rate: self.rate, center_hz };
+        Ok((clip, self.samples * FORMAT.bytes() as u64))
+    }
+}
+
+/// Shifts the data file at `path` by `offset_hz` and low-passes it to `width_hz`, keeping its rate and its length: the
+/// filter's delay is taken up by zeros either side, so every sample stays at its source time.
+fn recentre(path: &Path, samples: u64, rate: f64, offset_hz: f64, width_hz: f64) -> std::io::Result<()> {
+    const CHUNK: usize = 1 << 16;
+    let mut ddc = dsp::Ddc::new(rate, offset_hz, width_hz / 2.0, rate);
+    let zeros = vec![Complex32::default(); ddc.delay()];
+    let part = path.with_extension("sigmf-data.part");
+    let mut input = BufReader::new(File::open(path)?);
+    let mut out = BufWriter::new(File::create(&part)?);
+    let size = FORMAT.bytes();
+    let (mut raw, mut x, mut y, mut bytes) = (vec![0u8; CHUNK * size], Vec::with_capacity(CHUNK), Vec::new(), Vec::new());
+    let mut written = 0u64;
+    let mut run = |x: &[Complex32], out: &mut BufWriter<File>| {
+        y.clear();
+        ddc.process(x, &mut y);
+        bytes.clear();
+        FORMAT.encode(&y, &mut bytes);
+        written += y.len() as u64;
+        out.write_all(&bytes)
+    };
+    run(&zeros, &mut out)?;
+    let mut left = samples;
+    while left > 0 {
+        let n = (left as usize).min(CHUNK);
+        input.read_exact(&mut raw[..n * size])?;
+        x.clear();
+        FORMAT.decode(&raw[..n * size], &mut x);
+        run(&x, &mut out)?;
+        left -= n as u64;
+    }
+    run(&zeros, &mut out)?;
+    out.flush()?;
+    drop(out);
+    debug_assert_eq!(written, samples);
+    std::fs::rename(&part, path)
+}
+
 fn remove(stem: &Path) {
-    for ext in ["sigmf-data", "sigmf-meta"] {
+    for ext in ["sigmf-data", "sigmf-meta", "sigmf-data.part"] {
         let _ = std::fs::remove_file(stem.with_extension(ext));
     }
 }
@@ -227,13 +465,15 @@ struct Out {
 struct SliceWriter {
     recorder: Weak<Recorder>,
     req: SliceRequest,
-    end: Arc<AtomicU64>,
+    ending: Arc<Ending>,
     max_input: u64,
     /// The channel filter's delay in input samples (`N/4`): a block's samples show the signal of that much earlier.
     group_delay: u64,
     start_sample: u64,
     input_rate: f64,
     hop: u64,
+    /// The slice channel's passband.
+    collected_hz: f64,
     out: Option<Out>,
 }
 
@@ -251,12 +491,8 @@ impl SliceWriter {
 
     fn write(&mut self, x: &[Complex32]) -> std::io::Result<()> {
         let Some(o) = self.out.as_mut() else { return Ok(()) };
-        let mut buf = Vec::with_capacity(x.len() * 4);
-        for c in x {
-            for v in [c.re, c.im] {
-                buf.extend_from_slice(&((v * 32767.0).round().clamp(-32768.0, 32767.0) as i16).to_le_bytes());
-            }
-        }
+        let mut buf = Vec::with_capacity(x.len() * FORMAT.bytes());
+        FORMAT.encode(x, &mut buf);
         o.data.write_all(&buf)?;
         o.samples += x.len() as u64;
         Ok(())
@@ -265,36 +501,37 @@ impl SliceWriter {
     /// Closes the files and tells the recorder. The record's end is known only once it closed, a hangover after its
     /// last active row, so the slice is cut back to it.
     fn finish(&mut self) {
-        let Some(mut o) = self.out.take() else { return };
         let Some(rec) = self.recorder.upgrade() else { return };
-        let end = self.end.load(Ordering::Relaxed);
+        let Some(mut o) = self.out.take() else {
+            rec.abandon(self.req.record);
+            return;
+        };
+        let end = self.ending.end.load(Ordering::Acquire);
         let decim = self.input_rate / o.rate;
         if end != u64::MAX && decim > 0.0 {
             let keep = ((end.saturating_sub(o.from_sample) as f64 / decim).ceil() as u64).min(o.samples);
             o.samples = keep;
         }
-        let cut = o.data.flush().and_then(|()| o.data.get_ref().set_len(o.samples * 4));
+        let cut = o.data.flush().and_then(|()| o.data.get_ref().set_len(o.samples * FORMAT.bytes() as u64));
+        drop(o.data);
         if let Err(e) = cut {
             log::warn!("record {}: slice write failed: {e}", self.req.record.0);
             remove(&o.stem);
+            rec.abandon(self.req.record);
             return;
         }
-        let meta = sigmf::Meta {
-            datatype: "ci16_le",
-            sample_rate: o.rate,
-            frequency: self.req.center_hz,
-            datetime: Some(sigmf::rfc3339(self.req.t_start)),
+        rec.submit(Finish {
+            record: self.req.record,
+            stem: o.stem,
+            from_sample: o.from_sample,
+            samples: o.samples,
+            rate: o.rate,
+            center_hz: self.req.center_hz,
+            collected_hz: self.collected_hz,
+            shape: *self.ending.shape.lock(),
+            t_start: self.req.t_start,
             hw: self.req.hw.clone(),
-            description: format!("record {} slice from source sample {}", self.req.record.0, o.from_sample),
-            sample_count: o.samples,
-        };
-        if let Err(e) = sigmf::write_meta(&o.stem.with_extension("sigmf-meta"), &meta) {
-            log::warn!("record {}: slice metadata failed: {e}", self.req.record.0);
-        }
-        let bytes = o.samples * 4;
-        let clip =
-            IqClip { path: o.stem.clone(), from_sample: o.from_sample, samples: o.samples, rate: o.rate, center_hz: self.req.center_hz };
-        rec.finished(self.req.record, clip, bytes);
+        });
     }
 }
 
@@ -302,7 +539,7 @@ impl Consumer for SliceWriter {
     fn deliver(&mut self, d: Delivery<'_>) -> Flow {
         match d {
             Delivery::Samples { first_sample, samples, .. } => {
-                if first_sample.saturating_sub(self.group_delay) >= self.end.load(Ordering::Relaxed)
+                if first_sample.saturating_sub(self.group_delay) >= self.ending.end.load(Ordering::Acquire)
                     || first_sample.saturating_sub(self.start_sample) >= self.max_input
                 {
                     self.finish();
@@ -313,6 +550,9 @@ impl Consumer for SliceWriter {
                     let rate = self.input_rate * samples.len() as f64 / self.hop as f64;
                     if let Err(e) = self.open(first_sample, rate) {
                         log::warn!("record {}: no slice: {e}", self.req.record.0);
+                        if let Some(rec) = self.recorder.upgrade() {
+                            rec.abandon(self.req.record);
+                        }
                         return Flow::Stop;
                     }
                 }
@@ -348,5 +588,51 @@ impl Drop for SliceWriter {
             drop(o.data);
             remove(&o.stem);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tone(hz: f64, rate: f64, k: usize) -> Complex32 {
+        let w = std::f64::consts::TAU * hz / rate * k as f64;
+        Complex32::new(w.cos() as f32, w.sin() as f32)
+    }
+
+    /// Power at `hz` (a single-bin DFT over `x`).
+    fn power_at(x: &[Complex32], hz: f64, rate: f64) -> f64 {
+        let s: Complex32 = x.iter().enumerate().map(|(k, v)| v * tone(-hz, rate, k)).sum();
+        (s.norm() as f64 / x.len() as f64).powi(2)
+    }
+
+    #[test]
+    fn recentring_moves_the_signal_keeps_its_timing_and_drops_what_is_outside() {
+        let dir = std::env::temp_dir().join(format!("spectrawl-recentre-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("1.sigmf-data");
+        let rate = 78_125.0;
+        // A tone 5 kHz above the slice's centre that starts at sample 4000, and a neighbour 20 kHz below it.
+        let n = 20_000;
+        let x: Vec<Complex32> =
+            (0..n).map(|k| if k >= 4000 { tone(5e3, rate, k) } else { Complex32::default() } + tone(-20e3, rate, k) * 0.5).collect();
+        let mut raw = Vec::new();
+        FORMAT.encode(&x, &mut raw);
+        std::fs::write(&path, raw).unwrap();
+
+        recentre(&path, n as u64, rate, 5e3, 12.5e3).unwrap();
+        let mut y = Vec::new();
+        FORMAT.decode(&std::fs::read(&path).unwrap(), &mut y);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(y.len(), n, "sample for sample");
+        let on = &y[6000..];
+        assert!(power_at(on, 0.0, rate) > 0.9, "the tone is at the centre now: {}", power_at(on, 0.0, rate));
+        assert!(power_at(on, 5e3, rate) < 1e-4);
+        // The neighbour, now 25 kHz off, is outside the 12.5 kHz passband.
+        assert!(power_at(on, -25e3, rate) < 1e-4, "{}", power_at(on, -25e3, rate));
+        // The burst still starts at sample 4000: half-way up there, within a couple of samples.
+        let rise = y.iter().position(|v| v.norm() > 0.5).unwrap();
+        assert!(rise.abs_diff(4000) <= 2, "rises at {rise}");
     }
 }

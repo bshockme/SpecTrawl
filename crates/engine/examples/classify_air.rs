@@ -129,9 +129,10 @@ fn main() {
                 })
                 .collect();
             println!(
-                "DUMP {:.4} MHz {:5.1} kHz {:7.2} s {:5} snr {:4.1}/{:4.1} em {:?} record {}: {claims:?}",
+                "DUMP {:.4} MHz {:5.1} kHz at {:7.2} s for {:7.2} s {:5} snr {:4.1}/{:4.1} em {:?} record {}: {claims:?}",
                 r.center_hz() / 1e6,
                 r.bandwidth_hz() / 1e3,
+                r.first_sample as f64 / 10e6,
                 (r.end_sample - r.first_sample) as f64 / 10e6,
                 if r.open { "open" } else { "" },
                 r.mean_snr_db,

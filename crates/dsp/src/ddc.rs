@@ -108,6 +108,12 @@ impl Ddc {
         }
     }
 
+    /// The FIR's delay in its input samples: output k is centred on FIR input `k × decimation + delay`. Without a CIC
+    /// (`target_fs` = `fs`, say) that is input sample `k + delay`.
+    pub fn delay(&self) -> usize {
+        (self.taps.len() - 1) / 2
+    }
+
     /// Forgets the samples in flight (the oscillator keeps its phase):
     /// for a discontinuity in the input, so the filters don't smear the
     /// old stream into the new one.

@@ -59,16 +59,12 @@ fn dir_bytes(d: &Path) -> u64 {
     total
 }
 
-fn read_ci16(stem: &Path) -> Vec<Complex32> {
+fn read_slice(stem: &Path) -> Vec<Complex32> {
+    let format = engine::sigmf::Format::of_meta(&stem.with_extension("sigmf-meta")).expect("the slice's metadata");
     let raw = std::fs::read(stem.with_extension("sigmf-data")).expect("the slice's data");
-    raw.as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| {
-            let (i, q) = (i16::from_le_bytes([c[0], c[1]]), i16::from_le_bytes([c[2], c[3]]));
-            Complex32::new(i as f32 / 32767.0, q as f32 / 32767.0)
-        })
-        .collect()
+    let mut x = Vec::new();
+    format.decode(&raw, &mut x);
+    x
 }
 
 #[test]
@@ -80,7 +76,7 @@ fn a_records_slice_holds_its_signal_from_where_it_should() {
     let view = e.records().view();
     let sliced: Vec<_> = view.records.iter().filter(|r| !r.open && r.iq_clip.is_some() && r.first_sample > 2_000_000).collect();
     assert!(!sliced.is_empty(), "no closed record with a slice: {:?}", view.records);
-    let pre_roll = 500_000; // 50 ms at 10 MS/s
+    let (pre_roll, post_roll) = (1_500_000, 1_500_000); // 150 ms each at 10 MS/s
     for r in sliced {
         let clip = r.iq_clip.as_ref().unwrap();
         // Where it starts: within one block (L = 32 768: the block holding the start) plus the channel filter's delay
@@ -92,12 +88,15 @@ fn a_records_slice_holds_its_signal_from_where_it_should() {
             clip.from_sample,
             r.first_sample
         );
-        // How long: the record and its pre-roll, give or take a few blocks.
+        // How long: the record and its pre- and post-roll, give or take a few blocks.
         let secs = clip.samples as f64 / clip.rate;
         let rec_secs = (r.end_sample - r.first_sample) as f64 / 10e6;
-        assert!((secs - (rec_secs + 0.05)).abs() < 0.08, "{secs:.3} s slice for a {rec_secs:.3} s record");
+        let rolls = (pre_roll + post_roll) as f64 / 10e6;
+        assert!((secs - (rec_secs + rolls)).abs() < 0.08, "{secs:.3} s slice for a {rec_secs:.3} s record");
+        // Where it is centred: on the record as it closed, not as its first rows had it.
+        assert!((clip.center_hz - r.center_hz()).abs() < 1.0, "slice at {} Hz, record at {} Hz", clip.center_hz, r.center_hz());
         // What it holds: the carrier, at the slice's centre (the record's), within one channel bin.
-        let x = read_ci16(&clip.path);
+        let x = read_slice(&clip.path);
         assert_eq!(x.len() as u64, clip.samples);
         let n = 4096.min(x.len().next_power_of_two() / 2);
         let mid = x.len() / 2 - n / 2;
@@ -110,15 +109,19 @@ fn a_records_slice_holds_its_signal_from_where_it_should() {
         // Its metadata is SigMF the rest of the tooling reads.
         let meta: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(clip.path.with_extension("sigmf-meta")).unwrap()).unwrap();
-        assert_eq!(meta["global"]["core:datatype"], "ci16_le");
+        assert_eq!(meta["global"]["core:datatype"], "cf32_le");
+        // Stored as floats, not rounded to i16 counts: the noise between samples is finer than one count.
+        let on_grid = x.iter().filter(|c| ((c.re * 32767.0) - (c.re * 32767.0).round()).abs() < 1e-3).count();
+        assert!(on_grid * 10 < x.len(), "{on_grid} of {} samples on the i16 grid", x.len());
         assert_eq!(meta["global"]["core:sample_rate"].as_f64().unwrap(), clip.rate);
+        assert_eq!(meta["captures"][0]["core:frequency"].as_f64().unwrap(), clip.center_hz);
     }
 }
 
 #[test]
 fn the_slice_directory_stays_under_its_cap_oldest_first() {
     let dir = Dir::new("cap");
-    let cap = 400_000;
+    let cap = 1_200_000; // about two slices
     let e = engine(SliceConfig { cap_bytes: cap, ..SliceConfig::new(&dir.0) });
     e.add_source(device(), Mode::Live).unwrap();
     let mut max_seen = 0;
@@ -137,6 +140,6 @@ fn the_slice_directory_stays_under_its_cap_oldest_first() {
         assert!(r.iq_clip.is_none(), "{r:?}");
     }
     // Never more than the cap plus the slice being written and one just finished.
-    let slice = 120_000; // ~0.6 s at 39 kS/s, 4 bytes a sample, with room
+    let slice = 640_000; // ~0.8 s (the burst and its rolls) at 78 kS/s, 8 bytes a sample, with room
     assert!(max_seen <= cap + 2 * slice, "{max_seen} B on disk under a {cap} B cap");
 }
