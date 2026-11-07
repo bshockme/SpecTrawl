@@ -5,7 +5,7 @@
 //! A manager thread watches the record book. An emitter whose records carry a `P25 control` decoder claim from the
 //! bank (TSBKs decoded in a window) gets a [`P25Control`] on the bus at `Priority::TrunkControl`, back-filled from its
 //! open record's start so its site appears without waiting for the next broadcast. A decoder detaches when its emitter
-//! has had no open record for [`IDLE`], or its source goes.
+//! has had no open record for [`IDLE`] ([`PAGER_IDLE`] for a pager monitor), or its source goes.
 
 pub mod airband;
 pub mod monitor;
@@ -32,6 +32,9 @@ pub use p25::P25Control;
 pub const DECODER: &str = "decoder";
 /// A decoder whose emitter has had no open record this long is detached.
 pub const IDLE: Duration = Duration::from_secs(30);
+/// A pager monitor's, instead: pagers send in bursts minutes apart (931.3375 MHz sent one-frame transmissions over
+/// 30 s apart on air, and its monitor, attached afresh for each, kept only the last one's pages).
+pub const PAGER_IDLE: Duration = Duration::from_secs(300);
 /// Decoders per source, at most (a land-mobile span holds several control channels and pagers).
 pub const MAX_PER_SOURCE: usize = 8;
 /// The manager's tick.
@@ -176,6 +179,14 @@ const MONITOR_MIN_WIDTH_HZ: f64 = 12.5e3;
 const MONITOR_MAX_WIDTH_HZ: f64 = 30e3;
 const MONITOR_RATE: f64 = 48e3;
 
+/// A decoder follows its emitter: one tuned more than this from where the emitter now is (1.5 kHz, or 15 % of its
+/// width) is detached and attached again there. An emitter's first records can put it kHz off (a fading FLEX pager's
+/// first record sat 4 kHz from its others on air, and the monitor attached there never decoded); its estimate moves
+/// a few hundred hertz once it has settled.
+fn moved(tuned_hz: f64, emitter_hz: f64, emitter_bw_hz: f64) -> bool {
+    (tuned_hz - emitter_hz).abs() > (0.15 * emitter_bw_hz).max(1.5e3)
+}
+
 fn manage(shared: Arc<Shared>, book: Arc<RecordBook>, bus: Arc<ChannelBus>, sources: Sources) {
     while !shared.stop.load(Ordering::Relaxed) {
         let view = book.view();
@@ -211,14 +222,24 @@ fn manage(shared: Arc<Shared>, book: Arc<RecordBook>, bus: Arc<ChannelBus>, sour
             if let Some(r) = rec {
                 *last = r.t_end;
             }
-            let quiet = now.is_some_and(|now| now.duration_since(*last).unwrap_or_default() > IDLE);
-            let keep = !a.ended.load(Ordering::Relaxed) && !quiet && sources.lock().contains_key(&a.source);
+            let idle = if matches!(a.mode, "POCSAG" | "FLEX") { PAGER_IDLE } else { IDLE };
+            let quiet = now.is_some_and(|now| now.duration_since(*last).unwrap_or_default() > idle);
+            let moved = view.emitters.iter().find(|e| e.id == a.emitter).filter(|e| moved(a.center_hz, e.center_hz, e.bandwidth_hz));
+            let keep = !a.ended.load(Ordering::Relaxed) && !quiet && moved.is_none() && sources.lock().contains_key(&a.source);
             if !keep {
                 a.stop.store(true, Ordering::Relaxed);
                 if let Some(ch) = a.channel.lock().take() {
                     bus.unsubscribe(ch);
                 }
-                log::info!("decoder {} at {:.4} MHz detached", a.mode, a.center_hz / 1e6);
+                match moved {
+                    Some(e) => log::info!(
+                        "decoder {} at {:.4} MHz detached: its emitter is at {:.4} MHz",
+                        a.mode,
+                        a.center_hz / 1e6,
+                        e.center_hz / 1e6
+                    ),
+                    None => log::info!("decoder {} at {:.4} MHz detached", a.mode, a.center_hz / 1e6),
+                }
             }
             keep
         });
@@ -270,7 +291,12 @@ fn manage(shared: Arc<Shared>, book: Arc<RecordBook>, bus: Arc<ChannelBus>, sour
             let spec = ChannelSpec { source: src.id(), center_hz, bandwidth_hz: width, min_rate, parent: None };
             // Back-filled from the open record's start, so what the ring already holds is decoded at once; live if that
             // has gone (the channel is on the air: it will say it again).
-            let sub = match newest.map(|o| bus.subscribe(spec.clone(), Start::At(o.first_sample), priority, feed())) {
+            // From a little before it, as a look's window is: a pager's first header is its transmission's start.
+            let from = |o: &SignalRecord| {
+                let seg = src.segment_at(o.first_sample);
+                o.first_sample.saturating_sub((crate::classify::LEAD.as_secs_f64() * seg.sample_rate) as u64).max(seg.from_sample)
+            };
+            let sub = match newest.map(|o| bus.subscribe(spec.clone(), Start::At(from(o)), priority, feed())) {
                 Some(Ok(info)) => Ok(info),
                 _ => bus.subscribe(spec, Start::Live, priority, feed()),
             };

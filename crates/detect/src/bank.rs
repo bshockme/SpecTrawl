@@ -16,7 +16,11 @@ pub const MIN_SECONDS: f64 = 0.02;
 /// One channel window, prepared once for every rung: `raw` is complex baseband centred on the signal at `fs`;
 /// `bandwidth_hz` is the detector's occupied bandwidth.
 pub struct Window<'a> {
+    /// What the shape is measured on: the window, or (see [`Window::with_full`]) the part of it the caller kept.
     pub raw: &'a [Complex32],
+    /// The whole window, for the decoders and the sync search. A caller may trim the quiet ends off `raw` for the
+    /// shape measurements, but a transmission can open in a fade, and its first frame's header is there.
+    pub full: &'a [Complex32],
     pub fs: f64,
     pub bandwidth_hz: f64,
     /// The window's SNR from the wideband spectrum, when the caller measured it.
@@ -42,7 +46,12 @@ impl<'a> Window<'a> {
         let mut features = features::extract(&on_iq, &on, fs);
         features.envelope_cv = features::envelope_cv(&x);
         features.snr_db = hints.snr_db.unwrap_or(f32::NAN);
-        Window { raw, fs, bandwidth_hz, snr_db: hints.snr_db, am_band: hints.am_band, x, gate, disc, features }
+        Window { raw, full: raw, fs, bandwidth_hz, snr_db: hints.snr_db, am_band: hints.am_band, x, gate, disc, features }
+    }
+
+    /// The same window, decoded from `full`, the whole of which `raw` is a part.
+    pub fn with_full(self, full: &'a [Complex32]) -> Window<'a> {
+        Window { full, ..self }
     }
 
     pub fn seconds(&self) -> f64 {
@@ -97,9 +106,9 @@ pub fn flex(w: &Window<'_>) -> Option<Identified> {
     if !(8e3..60e3).contains(&w.bandwidth_hz) {
         return None;
     }
-    let headers = flex::headers(w.raw, w.fs);
+    let headers = flex::headers(w.full, w.fs);
     let h = headers.first()?;
-    let frames = flex::decode(w.raw, w.fs);
+    let frames = flex::decode(w.full, w.fs);
     let pages: Vec<&flex::Page> = frames.iter().flat_map(|f| &f.pages).collect();
     let mut f = w.features.clone();
     // The header names the speed; FLEX deviates ±4.8 kHz at the outer levels.
@@ -132,7 +141,7 @@ pub fn acars(w: &Window<'_>) -> Option<Identified> {
     if w.bandwidth_hz > 30e3 {
         return None;
     }
-    let blocks = acars::decode(w.raw, w.fs);
+    let blocks = acars::decode(w.full, w.fs);
     let ok: Vec<&acars::Block> = blocks.iter().filter(|b| b.crc_ok).collect();
     let first = ok.first()?;
     let mut labels: Vec<(String, usize)> = Vec::new();
@@ -166,13 +175,13 @@ pub fn sync_bank(w: &Window<'_>) -> Option<Synced> {
     if !(4.5e3..60e3).contains(&w.bandwidth_hz) {
         return None;
     }
-    let (raw, fs) = (w.raw, w.fs);
+    let (raw, fs) = (w.full, w.fs);
     let narrow = w.bandwidth_hz <= 25e3;
     let own_cutoff = (w.bandwidth_hz * 0.5 + 500.0).clamp(4_000.0, 6_500.0);
     let mut found: Option<(f64, SyncPass)> = None;
     for (cutoff, d) in [
         narrow.then(|| (NARROW_CUTOFF_HZ, sync_disc(&prepare_cutoff(raw, fs, NARROW_CUTOFF_HZ), fs))),
-        Some((own_cutoff, sync_disc(&w.x, fs))),
+        Some((own_cutoff, if raw.len() == w.raw.len() { sync_disc(&w.x, fs) } else { sync_disc(&prepare(raw, fs, w.bandwidth_hz), fs) })),
     ]
     .into_iter()
     .flatten()
@@ -215,7 +224,7 @@ pub fn gsm(w: &Window<'_>) -> Option<Identified> {
     if !(150e3..300e3).contains(&w.bandwidth_hz) {
         return None;
     }
-    let g = gsm::detect(w.raw, w.fs).filter(|g| g.sch_ok > 0)?;
+    let g = gsm::detect(w.full, w.fs).filter(|g| g.sch_ok > 0)?;
     Some(Identified {
         protocol: Some("GSM"),
         label: g.label(),

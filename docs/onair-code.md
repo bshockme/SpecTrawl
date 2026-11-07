@@ -36,3 +36,11 @@ The owner decided on 2026-11-06 that SpecTrawl may include OnAir's code where it
 | What | From (OnAir path @ commit; upstream) | Where in SpecTrawl | Why | Replace by |
 |---|---|---|---|---|
 | (none yet) | | | | |
+
+## Techniques read, no code taken
+
+Ideas, not code, need no licence change; they are listed so the trail is clear.
+
+| Idea | Where OnAir has it | Where SpecTrawl has its own | What SpecTrawl does differently |
+|---|---|---|---|
+| Soft-decision (Chase) repair of the pagers' BCH(32,21) words, never overruling a confident bit, and never letting a soft-repaired word start a page | `core/src/pager/pager_rx.cpp` (`chaseWord`, `finishFrame`) at 25034214fa91; OnAir's own | `detect::pocsag::chase`, `detect::flex` (`soft_repair`) | Reliabilities are scaled by the envelope (cubed), which OnAir's are not: under simulcast fading that is most of the gain. Addresses decode hard only (OnAir repairs them with its strict doubt; in SpecTrawl's simulcast tests that put pages under capcodes nobody sent). Chase itself is Chase (1972). |

@@ -2,7 +2,8 @@
 //! leaves the ring, and the snapshot says how many didn't.
 //!
 //! A scheduler thread watches the record book. For each new live record it subscribes a window on the bus at
-//! `Priority::Classify`, back-filled from the record's first sample, at the record's centre and a little wider than it.
+//! `Priority::Classify`, back-filled from just before the record's first sample, at the record's centre and a little
+//! wider than it.
 //! The window collects until it holds [`ClassifyConfig::window_secs`] or the record has ended (its end plus the channel
 //! filter's delay), then goes to a bounded queue. The pool's own threads take windows off the queue, run the bank and
 //! set the record's `bank` claims in the book; a slow look never holds a bus worker. All threads are the engine's and
@@ -70,8 +71,18 @@ const TICK: Duration = Duration::from_millis(50);
 pub const RELOOK: Duration = Duration::from_secs(30);
 /// A window is never narrower than a 12.5 kHz channel, nor wider than 1 MHz (the bank's widest detectors want 600 kHz).
 const MIN_WINDOW_HZ: f64 = 12.5e3;
+/// A window is collected this much wider each side than its record, and re-centred on the record's centre when it is
+/// looked at, then narrowed to the record's width. The centre a record's first rows give can be kHz off: a fading
+/// FLEX pager's sat 3 kHz from its final one on air at 931.3375 MHz, and the 12.5 kHz window cut there held half its
+/// spectrum, which no header search survives.
+const CENTRE_SLACK_HZ: f64 = 6e3;
 /// Rows a new open record has before its window is cut (8 rows: 180 ms).
 const SETTLE_ROWS: u32 = 8;
+/// A window starts this long before its record (never before the record's segment): the detector opens a record once
+/// its rows clear the threshold, and a transmission's start can be below it. A FLEX pager's header, the only one in a
+/// one-frame transmission, is its first 80 ms: on air at 931.3375 MHz its first 55 ms were in a simulcast fade, and
+/// a window from the record's start never named the pager.
+pub(crate) const LEAD: Duration = Duration::from_millis(150);
 const MAX_WINDOW_HZ: f64 = 1e6;
 /// The bank's sync search wants at least this rate (`engine-old` cut windows at `max(48 kHz, 2.5 × width)`).
 const MIN_RATE: f64 = 48e3;
@@ -87,6 +98,9 @@ struct Job {
     bandwidth_hz: f64,
     /// The channel's passband.
     width_hz: f64,
+    /// The record's centre now, less the channel's: the pool re-centres the window by this and narrows it to the
+    /// record's width (see [`CENTRE_SLACK_HZ`]).
+    offset_hz: f64,
     snr_db: f32,
     /// The band plan says AM voice ([`detect::Hints::am_band`]).
     am_band: bool,
@@ -97,6 +111,7 @@ struct Job {
 /// cut, which the shape rules called "Carrier").
 struct Win {
     end: AtomicU64,
+    center_hz: AtomicU64,
     bandwidth_hz: AtomicU64,
     snr_db: AtomicU64,
 }
@@ -104,6 +119,7 @@ struct Win {
 impl Win {
     fn update(&self, r: &SignalRecord) {
         self.end.store(if r.open { u64::MAX } else { r.end_sample }, Ordering::Relaxed);
+        self.center_hz.store(r.center_hz().to_bits(), Ordering::Relaxed);
         self.bandwidth_hz.store(r.bandwidth_hz().to_bits(), Ordering::Relaxed);
         self.snr_db.store(f64::from(r.mean_snr_db).to_bits(), Ordering::Relaxed);
     }
@@ -260,32 +276,45 @@ fn schedule(shared: Arc<Shared>, book: Arc<RecordBook>, bus: Arc<ChannelBus>, so
     }
 }
 
-/// Subscribes the record's window: from its first sample, or (`relook`) from the live edge.
+/// Subscribes the record's window: from [`LEAD`] before its first sample, or (`relook`) from the live edge.
 fn cut(shared: &Arc<Shared>, bus: &ChannelBus, source: &Arc<Source>, r: &SignalRecord, relook: bool) -> Result<(), &'static str> {
     let stage = bus.stage(source.id()).ok_or("its source is not on the bus")?;
     let bw = r.bandwidth_hz();
-    let width = (1.25 * bw).clamp(MIN_WINDOW_HZ, MAX_WINDOW_HZ);
     let min_rate = (2.5 * bw).max(MIN_RATE);
-    let win = Arc::new(Win { end: AtomicU64::new(0), bandwidth_hz: AtomicU64::new(0), snr_db: AtomicU64::new(0) });
+    let win =
+        Arc::new(Win { end: AtomicU64::new(0), center_hz: AtomicU64::new(0), bandwidth_hz: AtomicU64::new(0), snr_db: AtomicU64::new(0) });
     win.update(r);
-    let consumer = Window {
+    let segment = source.segment_at(r.first_sample);
+    let consumer = |width_hz: f64| Window {
         shared: shared.clone(),
         win: win.clone(),
         record: r.id,
         relook,
-        width_hz: width,
+        center_hz: r.center_hz(),
+        width_hz,
         group_delay: stage.fft_size() as u64 / 4,
         hop: stage.hop(),
-        input_rate: source.segment_at(r.first_sample).sample_rate,
+        input_rate: segment.sample_rate,
         iq: Vec::new(),
         rate: 0.0,
         sent: false,
         am_band: am_band(r.center_hz()),
     };
-    shared.windows.lock().insert(r.id, win);
-    let spec = ChannelSpec { source: source.id(), center_hz: r.center_hz(), bandwidth_hz: width, min_rate, parent: None };
-    let start = if relook { Start::Live } else { Start::At(r.first_sample) };
-    match bus.subscribe(spec, start, Priority::Classify, Box::new(consumer)) {
+    shared.windows.lock().insert(r.id, win.clone());
+    let lead = (LEAD.as_secs_f64() * segment.sample_rate) as u64;
+    let start = if relook { Start::Live } else { Start::At(r.first_sample.saturating_sub(lead).max(segment.from_sample)) };
+    // Collected with slack either side for the centre to move; at a span's edge, where the bus may refuse the wider
+    // channel, as the record stands.
+    let width = window_width(bw);
+    let mut result = Err(BusError::NoSuchSource);
+    for w in [(width + 2.0 * CENTRE_SLACK_HZ).min(MAX_WINDOW_HZ), width] {
+        let spec = ChannelSpec { source: source.id(), center_hz: r.center_hz(), bandwidth_hz: w, min_rate, parent: None };
+        result = bus.subscribe(spec, start, Priority::Classify, Box::new(consumer(w)));
+        if !matches!(result, Err(BusError::Design(_))) {
+            break;
+        }
+    }
+    match result {
         Ok(_) => Ok(()),
         Err(e) => {
             shared.windows.lock().remove(&r.id);
@@ -297,12 +326,19 @@ fn cut(shared: &Arc<Shared>, bus: &ChannelBus, source: &Arc<Source>, r: &SignalR
     }
 }
 
+/// A window's passband for a record `bw` wide: a little wider than it, at least a 12.5 kHz channel.
+fn window_width(bw: f64) -> f64 {
+    (1.25 * bw).clamp(MIN_WINDOW_HZ, MAX_WINDOW_HZ)
+}
+
 /// One record's window, collected on the bus.
 struct Window {
     shared: Arc<Shared>,
     win: Arc<Win>,
     record: RecordId,
     relook: bool,
+    /// The channel's centre: the record's when the window was cut.
+    center_hz: f64,
     width_hz: f64,
     group_delay: u64,
     hop: u64,
@@ -331,6 +367,7 @@ impl Window {
                 rate: self.rate.max(1.0),
                 bandwidth_hz: f64::from_bits(self.win.bandwidth_hz.load(Ordering::Relaxed)),
                 width_hz: self.width_hz,
+                offset_hz: f64::from_bits(self.win.center_hz.load(Ordering::Relaxed)) - self.center_hz,
                 snr_db: f64::from_bits(self.win.snr_db.load(Ordering::Relaxed)) as f32,
                 am_band: self.am_band,
             };
@@ -375,7 +412,8 @@ impl Drop for Window {
     }
 }
 
-/// The window without the quiet at either end. A record's extent is whole rows (22.9 ms), so its window starts and ends
+/// The window without the quiet at either end, for the shape measurements (the decoders get the whole window). A
+/// record's extent is whole rows (22.9 ms), so its window starts and ends
 /// up to a row or two before and after the transmission; the shape rules measure the envelope's variation over the
 /// whole window, and 60 ms of floor each side of a clean FM tone made it "Unknown". Cut where the envelope, averaged
 /// over 1 ms, is below a quarter of its 90th percentile; nothing inside is touched.
@@ -432,6 +470,18 @@ fn window_snr(iq: &[Complex32], rate: f64, bandwidth_hz: f64, width_hz: f64) -> 
     Some((10.0 * (density / floor).log10()) as f32)
 }
 
+/// The window centred on its record as the record now stands, and narrowed to the record's width: (samples, passband).
+fn recentre(job: &Job) -> (std::borrow::Cow<'_, [Complex32]>, f64) {
+    let width = window_width(job.bandwidth_hz);
+    if job.offset_hz.abs() < 1.0 && job.width_hz <= width + 1.0 {
+        return (std::borrow::Cow::Borrowed(&job.iq), job.width_hz);
+    }
+    let mut ddc = detect::Ddc::new(job.rate, job.offset_hz, width / 2.0, job.rate);
+    let mut out = Vec::with_capacity(job.iq.len());
+    ddc.process(&job.iq, &mut out);
+    (std::borrow::Cow::Owned(out), width)
+}
+
 /// A pool thread: windows off the queue, through the bank, into the book.
 fn work(shared: Arc<Shared>, book: Arc<RecordBook>) {
     let bank = bank::bank();
@@ -450,13 +500,14 @@ fn work(shared: Arc<Shared>, book: Arc<RecordBook>) {
         };
         let t0 = Instant::now();
         let looked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let iq = trim_edges(&job.iq, job.rate);
-            let snr = window_snr(iq, job.rate, job.bandwidth_hz, job.width_hz).or(Some(job.snr_db).filter(|s| s.is_finite()));
+            let (full, width_hz) = recentre(&job);
+            let iq = trim_edges(&full, job.rate);
+            let snr = window_snr(iq, job.rate, job.bandwidth_hz, width_hz).or(Some(job.snr_db).filter(|s| s.is_finite()));
             let hints = detect::Hints { snr_db: snr, am_band: job.am_band };
             if (iq.len() as f64) < MIN_WINDOW_SECS * job.rate {
                 return Vec::new();
             }
-            let w = detect::bank::Window::new(iq, job.rate, job.bandwidth_hz, hints);
+            let w = detect::bank::Window::new(iq, job.rate, job.bandwidth_hz, hints).with_full(&full);
             bank::look(&bank, &w)
         }));
         let claims = match looked {

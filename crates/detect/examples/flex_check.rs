@@ -30,9 +30,10 @@ fn main() {
         let frames = flex::decode(&x, fs);
         let name = std::path::Path::new(&stem).file_name().unwrap().to_string_lossy().to_string();
         let words: usize = frames.iter().flat_map(|f| f.block_ok).map(|n| n as usize).sum();
+        let soft: usize = frames.iter().map(|f| f.soft_words as usize).sum();
         let pages: Vec<&flex::Page> = frames.iter().flat_map(|f| &f.pages).collect();
         println!(
-            "{name}: {} frames, words {words}/{} ok, {} pages ({} damaged), {:.2} s to decode {:.0} s",
+            "{name}: {} frames, words {words}/{} ok (+{soft} soft), {} pages ({} damaged), {:.2} s to decode {:.0} s",
             frames.len(),
             frames.len() * 11 * 32,
             pages.len(),

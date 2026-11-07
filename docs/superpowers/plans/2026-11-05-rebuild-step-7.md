@@ -139,3 +139,42 @@
   - 130.025 and 130.450 MHz are ACARS.
   - Channels whose calls never measured AM (126.375, 126.650, 128.775, 132.825 MHz: weak at this antenna) are not listed. Their records stay "Carrier" or have no claim.
 - **Before this:** one session earlier, at 124.9 MHz, the same channels read only "Carrier".
+
+## Land mobile, native: the pagers (2026-11-06)
+
+`engine::decoders::monitor` runs `detect`'s own rungs on a bus channel per emitter (DMR, NXDN, POCSAG, FLEX). On air at 930.5 MHz the FLEX pagers at 929.6125 (3200/4) and 929.9375 (1600/4) decoded from the start. Four things kept the rest from it.
+
+### Simulcast fading: soft repair (`detect::pocsag::chase`, `detect::flex`)
+
+- **What it was:** 931.3375 MHz (FLEX 1600/4) is a simulcast: transmitters a few hertz apart beat, and their nulls put bursts of errors into blocks. On a 60 s RFOne capture, blocks went from all 16 words good to 4–9 and back within a frame, and those blocks' envelopes dipped 18–22 dB (`flex_eye`). Each block interleaves 8 BCH(32,21) words, so a few nulls put 3 or more errors in a word, past hard correction.
+- **The repair:** each bit gets a reliability: its distance from its threshold, in units of a clean level's, times the envelope there (relative to its block's median) cubed. A word that hard correction can't (or, in a weak block, won't) trust is repaired by Chase's second algorithm: flip up to 3 of its 6 least reliable bits, correct, keep the cheapest. At most 4 bits may change, each less reliable than 0.6.
+- **Measured on simulated simulcast** (`flex::simulcast`, 6 pages × 20 seeds, a second transmitter at 0.7–0.9 of the first's level, 8–30 Hz away):
+  - 30 Hz, 11 dB: hard decisions 11 right, 50 damaged, 2 wrong; with the repair 90 right, 2 damaged, 2 wrong.
+  - 15 Hz, 8 dB: 2 right against 33. Without the envelope (the threshold distance alone, as OnAir weighs it) the repair barely helps; the square of the envelope helps, the cube most.
+- **Addresses decode hard only.** With soft-repaired addresses, at 4 dB, 18 of 100 pages carried the right text under a capcode nobody sent. With hard addresses, none in over 1,300 pages at 4–7 dB. The block information word and the vectors are repaired: each also has a checksum.
+
+### Two decoder bugs the tests found
+
+- **Vector checksum:** a vector word's nibbles sum to 0xF, as the block information word's do. Every alphanumeric and numeric vector heard on air checks; the "binary" pages from a damaged frame didn't (sums 0x0, 0x1, 0xA). A vector that fails it gives no page.
+- **Whole-symbol slips:** at 3200 baud the phases interleave by symbol, so a block read one symbol late reads the neighbouring phase. Idle fill there decodes without a correction, while the right timing's data needs one for a fade, so the slip won. Each block's timing now stays within 0.3 symbol of the previous block's. An idle word inside a message is now a failed word: no message holds one.
+
+### The look's window: lead, untrimmed, re-centred (`engine::classify`)
+
+None of 19–26 records at 931.3375 MHz was named FLEX on air, though offline 7 of 10 windows were. The last cause was the real one.
+
+- **Lead:** a window starts 150 ms before its record. One-frame transmissions carry one header, their first 80 ms, and at 12.36 s its first 55 ms were in a fade.
+- **Untrimmed for the decoders:** `trim_edges` cuts quiet ends off for the shape measurements; the decoders and the sync search now get the whole window (`bank::Window::full`).
+- **Re-centred:** windows were cut at the record's centre after its first 8 rows, about 3 kHz off the pager's (a fading 4-level signal's first rows sit near one tone). A 12.5 kHz window there held half the spectrum. Windows are now collected 6 kHz wider each side, then shifted to the record's final centre and narrowed to its width before the bank. After this, 24 of 25 records were named FLEX.
+
+### The monitors follow their emitters, and pagers stay attached
+
+- A monitor attached at its emitter's centre and kept it. One FLEX emitter's first records put it 4 kHz off, and its monitor never decoded. A decoder whose emitter moves more than 1.5 kHz (or 15 % of its width) is now re-attached there.
+- Pagers send minutes apart: a pager monitor stays attached 5 minutes without an open record (30 s for the others). A monitor's back-fill starts 150 ms before the record, as a look's does.
+
+### On air through the engine (2026-11-06, `classify_air` on the RFOne at 930.5 MHz, 600 s)
+
+- **The pool:** looked at 999 records, missed 51, at 9.9 % of real time.
+- **The monitors' totals, kept over the run:** 929.6125 MHz 179 pages in 112 frames; 929.6625 MHz 89 pages in 50 frames (0–4 before); 929.9375 MHz 283 pages in 90 frames; 931.3375 MHz 38 pages in 42 frames (none before: no look had named it).
+- **Records named:** 37 of 38 at 931.3375 MHz are FLEX 1600/4 (0 of 19–26 before).
+- **931.7125 MHz** carries both POCSAG and FLEX 3200/4 (both seen, in separate runs); no POCSAG page was decoded in these runs.
+- **The R2's antenna** heard 931 MHz about 6 dB weaker than the RFOne's.

@@ -75,6 +75,46 @@ pub fn correct(cw: u32) -> Option<(u32, u32)> {
     (errors <= 2).then_some((fixed, errors))
 }
 
+/// Least reliable bits a soft repair tries flipping, and how many at once.
+const CHASE_BITS: usize = 6;
+const CHASE_FLIPS: u32 = 3;
+/// Most bits a soft repair may change from the hard decisions.
+const CHASE_CHANGES: u32 = 4;
+
+/// Soft-decision repair of a received codeword (Chase's second algorithm): flip each combination of up to three of the
+/// six least reliable bits, correct what results, and keep the codeword whose changed bits are the least reliable in
+/// sum. It may change at most four bits, each less reliable than `doubt`. A confident bit is never overruled: hard
+/// correction alone passes about a quarter of random words, and this must not make noise look valid.
+///
+/// `rel[k]` is how reliable transmitted bit `k` (bit `31 - k` of `cw`) is: 0 on its decision threshold, about 1 on a
+/// clean level. Returns the codeword and the bits changed, as [`correct`] does.
+pub fn chase(cw: u32, rel: &[f32; 32], doubt: f32) -> Option<(u32, u32)> {
+    let mut order: [usize; 32] = std::array::from_fn(|k| k);
+    order.sort_by(|&a, &b| rel[a].total_cmp(&rel[b]));
+    let weakest = &order[..CHASE_BITS];
+    let mut best: Option<(f32, u32, u32)> = None;
+    for mask in 0u32..1 << CHASE_BITS {
+        if mask.count_ones() > CHASE_FLIPS {
+            continue;
+        }
+        let flip = weakest.iter().enumerate().filter(|(i, _)| mask >> i & 1 == 1).fold(0u32, |f, (_, &k)| f | 1 << (31 - k));
+        let Some((fixed, _)) = correct(cw ^ flip) else { continue };
+        let changed = fixed ^ cw;
+        if changed.count_ones() > CHASE_CHANGES {
+            continue;
+        }
+        let bits = (0..32).filter(|k| changed >> (31 - k) & 1 == 1);
+        if bits.clone().any(|k| rel[k] >= doubt) {
+            continue;
+        }
+        let cost: f32 = bits.map(|k| rel[k]).sum();
+        if best.is_none_or(|b| cost < b.0) {
+            best = Some((cost, fixed, changed.count_ones()));
+        }
+    }
+    best.map(|(_, fixed, n)| (fixed, n))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Page {
     pub address: u32,
@@ -211,6 +251,51 @@ mod tests {
         // One BCH error plus the parity bit: still two in all.
         assert_eq!(correct(cw ^ 1 << 7 ^ 1), Some((cw, 2)));
         assert_eq!(correct(cw ^ 1), Some((cw, 1)));
+    }
+
+    #[test]
+    fn chase_repairs_errors_on_doubtful_bits_only() {
+        let cw = encode(0x12345);
+        let mut rel = [1.0f32; 32];
+        // Four errors, past hard correction, on the four least reliable bits.
+        let hit = [3usize, 9, 17, 28].iter().fold(cw, |w, &k| w ^ 1 << (31 - k));
+        for k in [3, 9, 17, 28] {
+            rel[k] = 0.2;
+        }
+        rel[12] = 0.3;
+        rel[22] = 0.35;
+        assert_eq!(correct(hit), None);
+        assert_eq!(chase(hit, &rel, 0.6), Some((cw, 4)));
+        // One of the errors on a bit the slicer was sure of: not repaired, not guessed.
+        rel[28] = 0.9;
+        let found = chase(hit, &rel, 0.6);
+        assert!(found.is_none_or(|(w, _)| w != cw), "{found:?}");
+        // Clean words pass unchanged.
+        assert_eq!(chase(cw, &[1.0; 32], 0.6), Some((cw, 0)));
+    }
+
+    #[test]
+    fn chase_rarely_makes_noise_valid() {
+        // Random words with random reliabilities: hard correction passes about a quarter. The soft repair, with every
+        // bit allowed to be overruled, may pass more; with the strict doubt used for addresses, few beyond those.
+        let mut s = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let (mut hard, mut strict) = (0, 0);
+        let n = 20_000;
+        for _ in 0..n {
+            let w = next() as u32;
+            let rel: [f32; 32] = std::array::from_fn(|_| (next() % 1000) as f32 / 1000.0 * 2.0);
+            hard += correct(w).is_some() as usize;
+            strict += chase(w, &rel, 0.6).is_some() as usize;
+        }
+        let (hard, strict) = (hard as f64 / n as f64, strict as f64 / n as f64);
+        assert!((0.2..0.3).contains(&hard), "{hard}");
+        assert!(strict < 0.25, "hard {hard}, strict soft {strict}");
     }
 
     #[test]

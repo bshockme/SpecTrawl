@@ -129,14 +129,15 @@ fn main() {
                 })
                 .collect();
             println!(
-                "DUMP {:.4} MHz {:5.1} kHz {:7.2} s {:5} snr {:4.1}/{:4.1} em {:?}: {claims:?}",
+                "DUMP {:.4} MHz {:5.1} kHz {:7.2} s {:5} snr {:4.1}/{:4.1} em {:?} record {}: {claims:?}",
                 r.center_hz() / 1e6,
                 r.bandwidth_hz() / 1e3,
                 (r.end_sample - r.first_sample) as f64 / 10e6,
                 if r.open { "open" } else { "" },
                 r.mean_snr_db,
                 r.max_snr_db,
-                r.emitter.map(|e| e.0)
+                r.emitter.map(|e| e.0),
+                r.id.0
             );
         }
     }
