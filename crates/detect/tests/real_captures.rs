@@ -155,13 +155,16 @@ fn p25_phase2_voice_and_encryption_sync() {
     assert!(a1 > 8.0 && c1.is_empty(), "{a1} s, {c1:?}");
 }
 
+/// A synthetic FLEX 3200/4 slice (no real pager traffic is committed): four frames carrying five invented pages through
+/// a mild simulcast beat, as `detect::flex::simulcast::synthetic_slice` writes it.
 #[test]
 fn flex_pages_decode_from_the_committed_slice() {
-    let Some((x, fs)) = common::capture("flex_929.6127_10s") else { return };
+    let Some((x, fs)) = common::capture("flex_synthetic_929.6125") else { return };
     let frames = detect::flex::decode(&x, fs);
     let pages: Vec<_> = frames.iter().flat_map(|f| &f.pages).collect();
     assert_eq!(pages.len(), 5, "{frames:?}");
-    assert_eq!(pages[0].capcode, 6402344);
+    assert_eq!((pages[0].capcode, pages[0].text.as_str()), (1_234_567, "SYNTHETIC FLEX TEST PAGE ONE"));
+    assert!(pages.iter().all(|p| !p.damaged), "{pages:?}");
 }
 
 /// An analog FM repeater close by (855.6375 MHz, an industrial railroad

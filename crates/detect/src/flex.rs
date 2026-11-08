@@ -1054,16 +1054,19 @@ pub(crate) mod simulcast {
 
     /// A phase A with `n` short alpha pages: (the words, the pages as (capcode, text)).
     pub(super) fn pages_frame(n: u32) -> (Vec<u32>, Vec<(u64, String)>) {
+        let sent: Vec<(u64, String)> = (0..n).map(|k| (100_000 + 7_919 * k as u64, format!("PAGE {k} SIMULCAST"))).collect();
+        (frame_of(&sent), sent)
+    }
+
+    /// A phase A carrying `pages` (capcode, text) as short-address alpha pages.
+    pub(super) fn frame_of(pages: &[(u64, String)]) -> Vec<u32> {
+        let n = pages.len() as u32;
         let (aoff, voff) = (1u32, 1 + n);
         let biw = (aoff - 1) << 8 | voff << 10;
         let mut a = vec![word(biw | (0xF - ((0..6).map(|k| biw >> (4 * k) & 0xF).sum::<u32>() & 0xF)))];
-        let mut sent = Vec::new();
         let mut msgs = Vec::new();
-        for k in 0..n {
-            let capcode = 100_000 + 7_919 * k as u64;
-            let text = format!("PAGE {k} SIMULCAST");
-            a.push(word(0x8000 + capcode as u32));
-            sent.push((capcode, text.clone()));
+        for (capcode, text) in pages {
+            a.push(word(0x8000 + *capcode as u32));
             msgs.push(alpha_words(&format!("${text}")));
         }
         let mut mw = 1 + 2 * n;
@@ -1076,7 +1079,56 @@ pub(crate) mod simulcast {
             a.extend(m);
         }
         assert!(a.len() <= WORDS);
-        (a, sent)
+        a
+    }
+
+    /// The pages of the committed synthetic slice (`testdata/small/flex_synthetic_929.6125`), by frame: invented
+    /// capcodes and text, as no real pager traffic may be committed.
+    pub(crate) const SYNTHETIC_PAGES: [&[(u64, &str)]; 4] = [
+        &[(1_234_567, "SYNTHETIC FLEX TEST PAGE ONE"), (1_357_913, "CALL 555 0100 RE: TEST")],
+        &[(1_246_802, "MAINTENANCE WINDOW 0200-0400")],
+        &[(1_234_567, "SECOND PAGE TO THE FIRST CAPCODE")],
+        &[(1_470_369, "END OF SYNTHETIC SLICE")],
+    ];
+
+    /// The synthetic slice: four FLEX 3200/4 frames (cycle 3, frames 40-43) carrying [`SYNTHETIC_PAGES`], 0.2 s into a
+    /// 10 s slice at 50 kS/s, through a mild second transmitter (4 Hz beat, 30 us, 0.35) and noise 22 dB down, with
+    /// the channel's noise alone before and after.
+    pub(crate) fn synthetic_slice() -> (Vec<Complex32>, f64) {
+        let fs = 50_000.0;
+        let mut x = vec![Complex32::new(0.0, 0.0); (0.2 * fs) as usize];
+        for (k, pages) in SYNTHETIC_PAGES.iter().enumerate() {
+            let pages: Vec<(u64, String)> = pages.iter().map(|(c, t)| (*c, t.to_string())).collect();
+            x.extend(modulate(&frame_of(&pages), 3, 40 + k as u32, fs, 0.0));
+        }
+        x.resize((10.0 * fs) as usize, Complex32::new(0.0, 0.0));
+        (simulcast(&x, fs, 4.0, 30e-6, 0.35, 22.0, 2027), fs)
+    }
+
+    /// Writes the synthetic slice as SigMF to `$FLEX_SYNTH_OUT` (a path without extension):
+    ///
+    ///     FLEX_SYNTH_OUT=testdata/small/flex_synthetic_929.6125 cargo test -p detect --lib flex::simulcast::write_the_synthetic_slice -- --ignored
+    #[test]
+    #[ignore]
+    fn write_the_synthetic_slice() {
+        let Some(stem) = std::env::var_os("FLEX_SYNTH_OUT") else { return };
+        let stem = stem.to_string_lossy().to_string();
+        let (x, fs) = synthetic_slice();
+        let bytes: Vec<u8> = x.iter().flat_map(|v| v.re.to_le_bytes().into_iter().chain(v.im.to_le_bytes())).collect();
+        std::fs::write(format!("{stem}.sigmf-data"), bytes).unwrap();
+        let meta = format!(
+            "{{\n  \"annotations\": [],\n  \"captures\": [\n    {{\n      \"core:frequency\": 929612500.0,\n      \"core:sample_start\": 0\n    }}\n  ],\n  \"global\": {{\n    \"core:datatype\": \"cf32_le\",\n    \"core:description\": \"synthetic FLEX 3200/4: four frames, five invented pages, a 4 Hz simulcast beat and noise 22 dB down (detect::flex::simulcast::synthetic_slice)\",\n    \"core:recorder\": \"SpecTrawl detect tests\",\n    \"core:sample_rate\": {fs:.1},\n    \"core:version\": \"1.2.0\"\n  }}\n}}\n"
+        );
+        std::fs::write(format!("{stem}.sigmf-meta"), meta).unwrap();
+    }
+
+    #[test]
+    fn the_synthetic_slice_decodes_every_page_it_carries() {
+        let (x, fs) = synthetic_slice();
+        let frames = decode(&x, fs);
+        let got: Vec<(u64, &str)> = frames.iter().flat_map(|f| f.pages.iter().map(|p| (p.capcode, p.text.as_str()))).collect();
+        let sent: Vec<(u64, &str)> = SYNTHETIC_PAGES.iter().flat_map(|f| f.iter().copied()).collect();
+        assert_eq!(got, sent, "{frames:?}");
     }
 
     /// The signal plus a second copy `beat_hz` off, `delay_s` late, at `ratio` of its amplitude, plus noise at

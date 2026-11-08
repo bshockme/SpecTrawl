@@ -1,5 +1,5 @@
-//! Land-mobile monitors on the simulator (step 7, `engine::decoders::monitor`): the committed real DMR base station and
-//! FLEX pager slices, played at their own frequencies, get a monitor once the bank's look decodes them. The monitor
+//! Land-mobile monitors on the simulator (step 7, `engine::decoders::monitor`): the committed real DMR base station
+//! slice and the synthetic FLEX one, played at their own frequencies, get a monitor once the bank's look decodes them. The monitor
 //! locks, names the channel (DMR's colour code) or decodes its pages (FLEX), and its claim headlines the emitter. A
 //! channel sending FLEX and POCSAG by turns (931.7125 MHz does on air) gets a monitor for each, and each one's claim
 //! lands only on the records of its own protocol.
@@ -131,10 +131,10 @@ fn a_dmr_base_station_gets_a_monitor_that_names_its_colour_code() {
 #[test]
 fn a_flex_pager_gets_a_monitor_that_decodes_its_pages_once_each() {
     let on = 929.6125e6;
-    let e = engine(clip("flex_929.6127_10s", on, 9_000.0), on, 929.0e6);
-    // The 10 s slice holds five pages; looped, they repeat, and are kept once.
+    let e = engine(clip("flex_synthetic_929.6125", on, 9_000.0), on, 929.0e6);
+    // The 10 s synthetic slice holds five pages; looped, they repeat, and are kept once.
     let d = locked(&e, "FLEX", 40, |s| s.contains(": 5 pages"));
-    assert!(d.summary.contains("006402344") || d.summary.contains(" | "), "{}", d.summary);
+    assert!(d.summary.contains("END OF SYNTHETIC SLICE"), "the newest page last: {}", d.summary);
     std::thread::sleep(Duration::from_secs(12));
     let d = e.decoder_views().into_iter().find(|d| d.mode == "FLEX").unwrap();
     assert!(d.summary.contains(": 5 pages"), "a loop's repeats are not new pages: {}", d.summary);
@@ -143,25 +143,26 @@ fn a_flex_pager_gets_a_monitor_that_decodes_its_pages_once_each() {
 #[test]
 fn a_channel_sending_flex_and_pocsag_gets_a_monitor_for_each_whose_claims_stay_on_their_own_records() {
     let on = 931.7125e6;
-    // The FLEX slice's 8.1 s transmission (its quiet tail is the recording's noise, a pedestal in the simulator that
-    // would join the two into one record), 2 s quiet, a POCSAG transmission at the FLEX signal's level, 2 s quiet.
-    let (mut x, fs) = capture("flex_929.6127_10s", on);
+    // The FLEX slice's transmission (0.2-8.1 s; its quiet tail is noise, a pedestal in the simulator that would join
+    // the two into one record), 2 s quiet, a POCSAG transmission at the FLEX signal's level, 2 s quiet.
+    let (mut x, fs) = capture("flex_synthetic_929.6125", on);
     x.truncate((8.1 * fs) as usize);
-    let a = (x.iter().map(|v| v.norm_sqr()).sum::<f32>() / x.len() as f32).sqrt();
+    let sent = &x[(0.2 * fs) as usize..];
+    let a = (sent.iter().map(|v| v.norm_sqr()).sum::<f32>() / sent.len() as f32).sqrt();
     let quiet = || std::iter::repeat_n(Complex32::default(), (2.0 * fs) as usize);
     x.extend(quiet());
     x.extend(pocsag(fs, a));
     x.extend(quiet());
     let e = engine(Clip::leak(&x, fs, 9_000.0), on, 931.0e6);
-    // Both monitors decode: all five FLEX frames (the loop repeats them, and the monitor counts each once and then
-    // doesn't lock on it again, so its lamp is not waited for; its pages are the FLEX test's), and the three POCSAG
-    // pages, a page cut by a block's end not counting as a fourth.
+    // Both monitors decode: the four FLEX frames and their five pages (the loop repeats them, and the monitor counts
+    // each once and then doesn't lock on it again, so its lamp is not waited for), and the three POCSAG pages, a page
+    // cut by a block's end not counting as a fourth.
     let decoded = |mode: &str, frames: u64, pages: &str| {
         e.decoder_views().into_iter().find(|d| d.mode == mode && d.blocks_ok >= frames && d.summary.contains(pages))
     };
     let t0 = Instant::now();
     let (flex, pocsag) = loop {
-        if let (Some(f), Some(p)) = (decoded("FLEX", 5, " pages in 5 frames"), decoded("POCSAG", 3, ": 3 pages")) {
+        if let (Some(f), Some(p)) = (decoded("FLEX", 4, ": 5 pages in 4 frames"), decoded("POCSAG", 3, ": 3 pages")) {
             break (f, p);
         }
         // Counts only: what comes after " | " is a page's text.
