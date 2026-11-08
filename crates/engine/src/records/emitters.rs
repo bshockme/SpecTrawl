@@ -107,6 +107,8 @@ struct Votes {
     decoded: Option<(RecordId, Claim)>,
     /// Sync-bank protocols by label: the records that claimed it, whether any was strong, the most confident claim.
     synced: HashMap<String, SyncVote>,
+    /// Measured analog modulations by label ([`api::records::is_analog_shape`]), when nothing decoded or synced.
+    shaped: HashMap<String, SyncVote>,
     /// The headline the store had, kept until the votes name one.
     loaded: Option<Claim>,
 }
@@ -144,7 +146,15 @@ impl Votes {
             .values()
             .filter(|v| v.records.len() >= PROTOCOL_RECORDS || v.strong)
             .max_by(|a, b| a.records.len().cmp(&b.records.len()).then(a.best.confidence.total_cmp(&b.best.confidence)));
-        believed.map(|v| v.best.clone()).or_else(|| self.loaded.clone())
+        // An analog shape stands once two records measure it, or one broadcast pilot does.
+        let shaped = || {
+            self.shaped
+                .values()
+                .filter(|v| v.records.len() >= PROTOCOL_RECORDS || v.best.label.starts_with("FM broadcast"))
+                .max_by(|a, b| a.records.len().cmp(&b.records.len()).then(a.best.confidence.total_cmp(&b.best.confidence)))
+                .map(|v| v.best.clone())
+        };
+        believed.map(|v| v.best.clone()).or_else(shaped).or_else(|| self.loaded.clone())
     }
 }
 
@@ -512,6 +522,18 @@ impl EmitterBook {
                 }
             }
             vote.strong |= strong;
+            if c.confidence > vote.best.confidence {
+                vote.best = c.clone();
+            }
+        }
+        for c in claims.iter().filter(|c| api::records::is_analog_shape(c)) {
+            let vote = v.shaped.entry(c.label.clone()).or_insert_with(|| SyncVote { records: Vec::new(), strong: false, best: c.clone() });
+            if !vote.records.contains(&record) {
+                vote.records.push(record);
+                if vote.records.len() > VOTE_RECORDS {
+                    vote.records.remove(0);
+                }
+            }
             if c.confidence > vote.best.confidence {
                 vote.best = c.clone();
             }

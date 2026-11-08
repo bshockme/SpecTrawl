@@ -577,7 +577,7 @@ impl Ctx<'_> {
         }
         let mut sum = 0.0f64;
         for k in 0..ffts {
-            if self.source.read(from + (k * n) as u64, block).is_err() {
+            if self.source.read_ring(from + (k * n) as u64, block).is_err() {
                 return Ok(None);
             }
             sa.push(block);
@@ -783,7 +783,7 @@ fn run_plan(ctx: &Ctx<'_>, plan: &SweepPlan, generation: u64) -> Option<Ended> {
                 let mut floors = Vec::with_capacity(plan.ffts_per_hop);
                 lin.iter_mut().for_each(|v| *v = 0.0);
                 for k in 0..plan.ffts_per_hop {
-                    if ctx.source.read(from + (k * n) as u64, &mut block).is_err() {
+                    if ctx.source.read_ring(from + (k * n) as u64, &mut block).is_err() {
                         ok = false;
                         break;
                     }
@@ -976,7 +976,7 @@ fn run_native(
             lin.iter_mut().for_each(|v| *v = 0.0);
             let mut ok = true;
             for b in 0..dwell {
-                if ctx.source.read(from + (b * block) as u64, &mut buf[..take]).is_err() {
+                if ctx.source.read_ring(from + (b * block) as u64, &mut buf[..take]).is_err() {
                     ok = false;
                     break;
                 }

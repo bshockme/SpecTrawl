@@ -154,8 +154,9 @@ fn a_4_s_am_burst_is_heard_from_the_ring_and_from_its_slice() {
     let (ring_audio, v) = pull_until_over(&e, id, 20.0);
     assert_eq!((v.from, v.mode, v.mode_guessed, &v.state), (PlayFrom::Ring, AudioMode::Am, true, &PlayState::Finished));
     let ring_s = v.length_s;
-    // The record and its pre-roll, to within a block or two (and the jitter buffer's wait in what was pulled).
-    assert!((ring_s - (rec_s + 0.05)).abs() < 0.2, "{ring_s:.3} s from the ring for a {rec_s:.3} s record");
+    // The record and its pre- and post-roll, to within a block or two (and the jitter buffer's wait in what was pulled).
+    let rolls = (engine::replay::PRE_ROLL + engine::replay::POST_ROLL).as_secs_f64();
+    assert!((ring_s - (rec_s + rolls)).abs() < 0.2, "{ring_s:.3} s from the ring for a {rec_s:.3} s record");
     assert!(ring_audio.len() as f64 / RATE >= ring_s, "less pulled than played");
     let margin = tone_margin_db(&ring_audio);
     assert!(margin > 20.0, "the 1 kHz tone is only {margin:.1} dB over the rest");

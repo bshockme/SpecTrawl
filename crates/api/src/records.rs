@@ -87,7 +87,9 @@ pub enum Evidence {
 pub enum Identity {
     /// A P25 site: the NAC from the frames' NID, the rest from the control channel's broadcasts as they arrive.
     P25 { nac: u16, wacn: Option<u32>, system: Option<u16>, rfss: Option<u8>, site: Option<u8> },
-    /// Any other decoder's identifier, as it names it (a DCS code, a colour code, a BSIC).
+    /// A channel of a band plan's raster, as the band names it: air band "128.775".
+    Channel { plan: String, name: String },
+    /// Any other decoder's identifier, as it names it (a DCS code, a colour code, a BSIC, an aircraft's registration).
     Other { id: String },
 }
 
@@ -104,6 +106,7 @@ impl Identity {
                 v.extend(site.map(|s| ("SITE", s.to_string())));
                 v
             }
+            Identity::Channel { name, .. } => vec![("CH", name.clone())],
             Identity::Other { id } => vec![("ID", id.clone())],
         }
     }
@@ -112,6 +115,7 @@ impl Identity {
     pub fn line(&self) -> String {
         match self {
             Identity::Other { id } => id.clone(),
+            Identity::Channel { plan, name } => format!("{plan} {name}"),
             _ => self.fields().iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(" "),
         }
     }
@@ -132,6 +136,7 @@ impl Identity {
                     && agree(t1.map(u32::from), t2.map(u32::from))
             }
             (Identity::Other { id: a }, Identity::Other { id: b }) => a == b,
+            (Identity::Channel { plan: p1, name: n1 }, Identity::Channel { plan: p2, name: n2 }) => p1 == p2 && n1 == n2,
             _ => false,
         }
     }
@@ -226,8 +231,9 @@ impl SignalRecord {
         self.t_end.duration_since(self.t_start).unwrap_or_default()
     }
 
-    /// What to headline (spec §4.5): the most confident decoder claim, else the most confident sync-bank claim, else
-    /// nothing, which an interface shows as "unknown".
+    /// What to headline (spec §4.5): the most confident decoder claim, else the most confident sync-bank claim, else a
+    /// measured analog modulation ([`is_analog_shape`]), else nothing, which an interface shows as "unknown". A digital
+    /// mode is never named from its shape alone: it needs a sync word or a decode.
     pub fn headline(&self) -> Option<&Claim> {
         headline(&self.claims)
     }
@@ -235,14 +241,24 @@ impl SignalRecord {
 
 /// The headline of a set of claims; see [`SignalRecord::headline`].
 pub fn headline(claims: &[Claim]) -> Option<&Claim> {
-    let best = |decoder: bool| {
-        claims
-            .iter()
-            .filter(|c| if decoder { matches!(c.by, Evidence::Decoder { .. }) } else { matches!(c.by, Evidence::SyncBank { .. }) })
-            .max_by(|a, b| a.confidence.total_cmp(&b.confidence))
-    };
-    best(true).or_else(|| best(false))
+    let best = |keep: &dyn Fn(&Claim) -> bool| claims.iter().filter(|c| keep(c)).max_by(|a, b| a.confidence.total_cmp(&b.confidence));
+    best(&|c| matches!(c.by, Evidence::Decoder { .. }))
+        .or_else(|| best(&|c| matches!(c.by, Evidence::SyncBank { .. })))
+        .or_else(|| best(&is_analog_shape))
 }
+
+/// Analog modulations a shape measurement may name outright (owner, 2026-11-06): AM and analog FM carry no code
+/// words, and the shape rules measure them positively. `detect`'s rules give 0.6 where they measured the content (a
+/// carrier with voice-band sidebands, one steady tone, a broadcast's 19 kHz pilot) and 0.5 for FM read from its
+/// deviation alone, which an unnamed digital mode can show too; the `Features` cap is 0.6.
+pub fn is_analog_shape(c: &Claim) -> bool {
+    matches!(c.by, Evidence::Features { .. })
+        && c.confidence >= ANALOG_SHAPE_CONFIDENCE
+        && (c.label == "AM" || c.label == "Analog FM" || c.label.starts_with("FM broadcast"))
+}
+
+/// Least confidence of an analog shape that headlines (see [`is_analog_shape`]).
+pub const ANALOG_SHAPE_CONFIDENCE: f32 = 0.599;
 
 /// Short: claims, tags and notes are counted, not printed.
 impl std::fmt::Debug for SignalRecord {
@@ -334,6 +350,27 @@ pub struct QueryResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn digital_modes_need_a_sync_or_a_decode_and_measured_analog_headlines() {
+        let shape = |label: &str, confidence: f32| {
+            Claim::new(label, confidence, Evidence::Features { bandwidth_hz: 12.5e3, snr_db: 20.0, duty: 1.0, envelope_cv: None })
+        };
+        // A digital shape names nothing on its own, however confident.
+        assert_eq!(headline(&[shape("4FSK", 0.6), shape("2FSK 2400 Bd", 0.6), shape("QPSK", 0.6)]), None);
+        // Analog FM read from its deviation alone is not a measurement of analog content.
+        assert_eq!(headline(&[shape("Analog FM", 0.5)]), None);
+        for label in ["AM", "Analog FM", "FM broadcast (stereo, RDS)"] {
+            assert_eq!(headline(&[shape(label, 0.6)]).map(|c| c.label.as_str()), Some(label));
+        }
+        // A sync word outranks any shape.
+        let sync = Claim::new(
+            "DMR BS data",
+            0.9,
+            Evidence::SyncBank { protocol: "DMR BS data".into(), syncs: 3, frames_tried: 0, frames_decoded: 0 },
+        );
+        assert_eq!(headline(&[shape("Analog FM", 0.6), sync.clone()]), Some(&sync));
+    }
 
     #[test]
     fn an_identity_reads_as_one_line_and_matches_a_thinner_one_of_the_same_site() {

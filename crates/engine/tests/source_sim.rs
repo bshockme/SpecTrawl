@@ -22,7 +22,7 @@ fn streams_into_the_ring_and_reports_seconds() {
     assert_eq!(s.starved_samples, 0, "{s:?}");
     assert_eq!(s.device_gaps, 0);
     let mut out = vec![Complex32::default(); 1000];
-    let seg = src.read(src.head() - 2000, &mut out).unwrap();
+    let seg = src.read_ring(src.head() - 2000, &mut out).unwrap();
     assert_eq!(seg.center_hz, 855.25e6);
     assert!(src.time_of(src.head() - 1).is_some());
 }
@@ -40,7 +40,7 @@ fn retune_and_gap_make_segments_and_reads_across_them_are_refused() {
     assert_eq!(seg.boundary, Boundary::Retune);
     assert!(seg.from_sample >= before && seg.from_sample.is_multiple_of(65_536));
     let mut out = vec![[0i16; 2]; 10];
-    assert_eq!(src.read_raw(seg.from_sample - 5, &mut out), Err(ReadError::SpansSegments));
+    assert_eq!(src.read_ring_raw(seg.from_sample - 5, &mut out), Err(ReadError::SpansSegments));
     c.inject_gap(70_000);
     wait_until(|| matches!(src.segment_at(src.head() - 1).boundary, Boundary::Gap { .. }));
     let g = src.segment_at(src.head() - 1);
@@ -66,18 +66,18 @@ fn reads_and_exports_touching_a_device_gap_are_refused() {
     assert_eq!(g.data_from(), hole.end);
     wait_until(|| src.head() >= g.data_from() + 500_000);
     let mut out = vec![[0i16; 2]; 1000];
-    assert_eq!(src.read_raw(hole.start + 100, &mut out), Err(ReadError::Gap)); // inside the hole
-    assert_eq!(src.read_raw(hole.start - 500, &mut out), Err(ReadError::Gap)); // data, then hole
-    assert_eq!(src.read_raw(hole.end - 500, &mut out), Err(ReadError::Gap)); // hole, then data
+    assert_eq!(src.read_ring_raw(hole.start + 100, &mut out), Err(ReadError::Gap)); // inside the hole
+    assert_eq!(src.read_ring_raw(hole.start - 500, &mut out), Err(ReadError::Gap)); // data, then hole
+    assert_eq!(src.read_ring_raw(hole.end - 500, &mut out), Err(ReadError::Gap)); // hole, then data
     let mut f = vec![Complex32::default(); 1000];
-    assert_eq!(src.read(hole.start + 100, &mut f), Err(ReadError::Gap));
-    assert_eq!(src.read_raw(g.data_from(), &mut out).unwrap().id, g.id); // entirely after
-    assert_ne!(src.read_raw(hole.start - 1000, &mut out).unwrap().id, g.id); // entirely before
+    assert_eq!(src.read_ring(hole.start + 100, &mut f), Err(ReadError::Gap));
+    assert_eq!(src.read_ring_raw(g.data_from(), &mut out).unwrap().id, g.id); // entirely after
+    assert_ne!(src.read_ring_raw(hole.start - 1000, &mut out).unwrap().id, g.id); // entirely before
     // A range reaching past `head` is refused as Future before its segment is
     // resolved (a boundary may still land inside it), even though it also
     // touches the hole.
     let mut long = vec![[0i16; 2]; (src.head() + 1_000_000 - hole.start) as usize];
-    assert_eq!(src.read_raw(hole.start, &mut long), Err(ReadError::Future));
+    assert_eq!(src.read_ring_raw(hole.start, &mut long), Err(ReadError::Future));
     let dir = std::env::temp_dir().join(format!("spectrawl-export-gap-{}", std::process::id()));
     let over = src.export_wideband(hole.start - 100_000, hole.end + 100_000, &dir, "over");
     assert!(matches!(over, Err(ExportError::Ring(engine::ring::ReadError::Gap))), "{over:?}");

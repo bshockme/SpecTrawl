@@ -70,7 +70,11 @@ struct Outbox {
     folded: Vec<(EmitterId, EmitterId)>,
     ids: Option<(u64, u64)>,
     slice_start: Vec<SliceRequest>,
-    slice_end: Vec<(RecordId, u64)>,
+    /// (record, end sample, final centre, final width).
+    slice_end: Vec<(RecordId, u64, f64, f64)>,
+    /// Open records' centre and width as they now stand: a slice that stops before its record closes (the source
+    /// went, a gap, its longest) is re-centred on these.
+    slice_shape: Vec<(RecordId, f64, f64)>,
     slice_cancel: Vec<RecordId>,
     evicted_elsewhere: Vec<RecordId>,
 }
@@ -305,8 +309,9 @@ impl RecordBook {
             for q in out.slice_start.iter().cloned() {
                 r.start(q);
             }
-            for &(id, end) in &out.slice_end {
-                r.end(id, end);
+            r.shapes(&out.slice_shape);
+            for &(id, end, center_hz, bandwidth_hz) in &out.slice_end {
+                r.end(id, end, center_hz, bandwidth_hz);
             }
         }
         let Some(s) = &self.sink else { return };
@@ -391,7 +396,7 @@ impl Inner {
             };
             for d in closed {
                 if slicing {
-                    out.slice_end.push((d.id, d.end_sample));
+                    out.slice_end.push((d.id, d.end_sample, d.center_hz(), d.bandwidth_hz()));
                 }
                 self.close(ps, d, &mut out);
             }
@@ -432,15 +437,18 @@ impl Inner {
                 out.slice_start.push(slice_request(ps, &d));
             }
             if slicing {
-                out.slice_end.push((d.id, d.end_sample));
+                out.slice_end.push((d.id, d.end_sample, d.center_hz(), d.bandwidth_hz()));
             }
             self.close(ps, d, &mut out);
         }
         let mut still = HashSet::new();
         for d in open {
             still.insert(d.id);
-            if slicing && !ps.open.contains_key(&d.id) {
-                out.slice_start.push(slice_request(ps, &d));
+            if slicing {
+                if !ps.open.contains_key(&d.id) {
+                    out.slice_start.push(slice_request(ps, &d));
+                }
+                out.slice_shape.push((d.id, d.center_hz(), d.bandwidth_hz()));
             }
             let r = self.place(ps, d, &mut out);
             ps.open.insert(r.id, r);

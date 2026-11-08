@@ -1,0 +1,25 @@
+[package]
+name = "spectrawl-next"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "spectrawl-next"
+path = "src/main.rs"
+
+[dependencies]
+backend-airspy = { path = "../backend-airspy" }
+backend-sim = { path = "../backend-sim" }
+eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11", "persistence"] }
+egui = "0.36.2"
+engine = { path = "../engine" }
+env_logger = "0.11"
+log = "0.4"
+spectrawl-app = { path = "../app" }
+
+[dev-dependencies]
+api = { path = "../api" }
+egui_kittest = { version = "0.36.2", features = ["wgpu"] }
+image = { version = "0.25.6", default-features = false, features = ["png"] }
+serde_json = "1"

@@ -188,3 +188,57 @@ fn analog_fm_repeater_reads_its_dcs_code_and_is_never_fsk() {
         assert!(coded * 10 >= windows * 8, "{win} s: DCS read in {coded}/{windows} windows");
     }
 }
+
+/// An ACARS downlink on 131.550 MHz, recorded by the slice tier: the detector saw a 5.5 kHz burst. One block, its BCS
+/// checking, from N365NB flying NW2320 (an A319, KRSW to KJFK).
+#[test]
+fn acars_downlink_decodes_from_the_committed_slice() {
+    let Some((x, fs)) = common::capture("acars_131.5500_N365NB") else { return };
+    let blocks = detect::acars::decode(&x, fs);
+    assert_eq!(blocks.len(), 1, "{blocks:?}");
+    let b = &blocks[0];
+    assert!(b.crc_ok && b.parity_errors == 0, "{b:?}");
+    assert_eq!((b.registration(), b.label.as_str(), b.block_id, b.flight()), ("N365NB", "H1", '6', Some("NW2320")));
+    assert!(b.text.contains("KRSWKJFK"), "{}", b.text);
+}
+
+/// The same burst under 6 dB more noise still decodes (with its parity and BCS correcting what they can), and noise
+/// alone never makes a block: only a checked BCS counts.
+#[test]
+fn acars_survives_added_noise_and_noise_alone_is_nothing() {
+    let Some((x, fs)) = common::capture("acars_131.5500_N365NB") else { return };
+    // The burst's own floor: the median power of the slice's quietest tenth (the slice starts before the burst).
+    let mut p: Vec<f32> = x.iter().map(|v| v.norm_sqr()).collect();
+    p.sort_by(f32::total_cmp);
+    let floor = p[p.len() / 20];
+    let mut s = 0x2545_f491_4f6c_dd1du64;
+    let mut gauss = || {
+        let mut u = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+        };
+        let (a, b) = (u(), u());
+        let r = (-2.0 * a.ln()).sqrt();
+        num_complex::Complex32::new((r * (std::f64::consts::TAU * b).cos()) as f32, (r * (std::f64::consts::TAU * b).sin()) as f32)
+    };
+    let sd = (floor * 3.0 / 2.0).sqrt();
+    let noisy: Vec<_> = x.iter().map(|v| v + gauss() * sd).collect();
+    let blocks = detect::acars::decode(&noisy, fs);
+    assert!(blocks.iter().any(|b| b.crc_ok && b.registration() == "N365NB"), "{blocks:?}");
+    let noise: Vec<_> = (0..x.len()).map(|_| gauss()).collect();
+    assert!(detect::acars::decode(&noise, fs).iter().all(|b| !b.crc_ok));
+}
+
+/// A second, short block from the same aircraft (its label `_` DEL, a general response), weaker: two characters fail
+/// their parity, and the BCS accepts the one correction of each that makes it check.
+#[test]
+fn acars_corrects_a_weak_block_by_parity_and_bcs() {
+    let Some((x, fs)) = common::capture("acars_131.5500_N365NB_short") else { return };
+    let blocks = detect::acars::decode(&x, fs);
+    assert_eq!(blocks.len(), 1, "{blocks:?}");
+    let b = &blocks[0];
+    assert!(b.crc_ok && b.parity_errors == 2, "{b:?}");
+    assert_eq!((b.registration(), b.label.as_str(), b.flight()), ("N365NB", "_\u{7f}", Some("NW2320")));
+}

@@ -8,6 +8,7 @@ use std::time::Duration;
 use sdr_core::GainSetting;
 
 use crate::audio::{AudioMode, PlayId, PlayTarget, PlayTo};
+use crate::classify::WorkerId;
 use crate::records::{RecordId, RecordQuery};
 use crate::{Mode, SourceId};
 
@@ -66,6 +67,16 @@ pub enum Command {
         to: PlayTo,
     },
     StopPlay(PlayId),
+    /// Run a decoder worker (`docs/decoder-worker.md`) in `mode` (an id from [`Snapshot::worker_modes`]) on a channel
+    /// of `source` centred at `center_hz`. Acknowledged with [`Outcome::WorkerStarted`].
+    ///
+    /// [`Snapshot::worker_modes`]: crate::Snapshot::worker_modes
+    StartWorker {
+        source: SourceId,
+        mode: String,
+        center_hz: f64,
+    },
+    StopWorker(WorkerId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -76,6 +87,8 @@ pub enum Outcome {
     Queried,
     /// The replay is under way; it shows in [`Snapshot::audio`](crate::Snapshot::audio).
     Playing(PlayId),
+    /// The worker is starting; it shows in [`Snapshot::workers`](crate::Snapshot::workers).
+    WorkerStarted(WorkerId),
 }
 
 #[derive(Debug, Clone, PartialEq)]

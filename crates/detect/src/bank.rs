@@ -5,9 +5,9 @@
 use num_complex::Complex32;
 
 use crate::{
-    AmKind, Features, Hints, NARROW_CUTOFF_HZ, OFDM_USEFUL_S, PERIOD_WINDOW_S, SyncPass, SyncResult, WEAK_DB, am_evidence, blind, chirp,
-    decode, features, flex, frames, gsm, longest_on_run, ofdm_label, prepare, prepare_cutoff, protocol_cutoff_hz, squelch, sync_disc,
-    sync_features, sync_pass,
+    AmKind, Features, Hints, NARROW_CUTOFF_HZ, OFDM_USEFUL_S, PERIOD_WINDOW_S, SyncPass, SyncResult, WEAK_DB, acars, am_evidence, blind,
+    carrier, chirp, decode, features, flex, frames, gsm, longest_on_run, ofdm_label, prepare, prepare_cutoff, protocol_cutoff_hz, squelch,
+    sync_disc, sync_features, sync_pass,
 };
 
 /// The shortest window any rung looks at: 20 ms.
@@ -16,11 +16,17 @@ pub const MIN_SECONDS: f64 = 0.02;
 /// One channel window, prepared once for every rung: `raw` is complex baseband centred on the signal at `fs`;
 /// `bandwidth_hz` is the detector's occupied bandwidth.
 pub struct Window<'a> {
+    /// What the shape is measured on: the window, or (see [`Window::with_full`]) the part of it the caller kept.
     pub raw: &'a [Complex32],
+    /// The whole window, for the decoders and the sync search. A caller may trim the quiet ends off `raw` for the
+    /// shape measurements, but a transmission can open in a fade, and its first frame's header is there.
+    pub full: &'a [Complex32],
     pub fs: f64,
     pub bandwidth_hz: f64,
     /// The window's SNR from the wideband spectrum, when the caller measured it.
     pub snr_db: Option<f32>,
+    /// See [`Hints::am_band`].
+    pub am_band: bool,
     /// `raw` re-centred and, for narrowband, low-passed (see [`prepare`]).
     x: Vec<Complex32>,
     gate: Vec<bool>,
@@ -40,7 +46,12 @@ impl<'a> Window<'a> {
         let mut features = features::extract(&on_iq, &on, fs);
         features.envelope_cv = features::envelope_cv(&x);
         features.snr_db = hints.snr_db.unwrap_or(f32::NAN);
-        Window { raw, fs, bandwidth_hz, snr_db: hints.snr_db, x, gate, disc, features }
+        Window { raw, full: raw, fs, bandwidth_hz, snr_db: hints.snr_db, am_band: hints.am_band, x, gate, disc, features }
+    }
+
+    /// The same window, decoded from `full`, the whole of which `raw` is a part.
+    pub fn with_full(self, full: &'a [Complex32]) -> Window<'a> {
+        Window { full, ..self }
     }
 
     pub fn seconds(&self) -> f64 {
@@ -95,9 +106,9 @@ pub fn flex(w: &Window<'_>) -> Option<Identified> {
     if !(8e3..60e3).contains(&w.bandwidth_hz) {
         return None;
     }
-    let headers = flex::headers(w.raw, w.fs);
+    let headers = flex::headers(w.full, w.fs);
     let h = headers.first()?;
-    let frames = flex::decode(w.raw, w.fs);
+    let frames = flex::decode(w.full, w.fs);
     let pages: Vec<&flex::Page> = frames.iter().flat_map(|f| &f.pages).collect();
     let mut f = w.features.clone();
     // The header names the speed; FLEX deviates ±4.8 kHz at the outer levels.
@@ -123,6 +134,40 @@ pub fn flex(w: &Window<'_>) -> Option<Identified> {
     })
 }
 
+/// ACARS, the air band's data link (AM, MSK audio at 2400 bit/s): blocks whose BCS checks name the aircraft. Only a
+/// checked block counts, so this needs no SNR gate: the bursts are often weak and short, and recorded only as their
+/// carrier. Channels up to 30 kHz.
+pub fn acars(w: &Window<'_>) -> Option<Identified> {
+    if w.bandwidth_hz > 30e3 {
+        return None;
+    }
+    let blocks = acars::decode(w.full, w.fs);
+    let ok: Vec<&acars::Block> = blocks.iter().filter(|b| b.crc_ok).collect();
+    let first = ok.first()?;
+    let mut labels: Vec<(String, usize)> = Vec::new();
+    for b in &ok {
+        match labels.iter_mut().find(|(l, _)| *l == b.label) {
+            Some((_, n)) => *n += 1,
+            None => labels.push((b.label.clone(), 1)),
+        }
+    }
+    Some(Identified {
+        protocol: Some("ACARS"),
+        label: "ACARS".into(),
+        confidence: 0.95,
+        fields: Some(decode::Fields {
+            id: Some(first.registration().to_string()).filter(|r| !r.is_empty()),
+            kinds: labels.into_iter().map(|(l, n)| (format!("label {l}"), n)).collect(),
+            decoded: ok.len(),
+            tried: blocks.len(),
+            activity: Some(decode::Activity::Data),
+            messages: ok.iter().map(|b| b.summary()).collect(),
+            ..Default::default()
+        }),
+        features: w.features.clone(),
+    })
+}
+
 /// The sync bank, for narrowband signals that aren't bare carriers (4.5–60 kHz): first through the narrow 4FSK
 /// pre-filter, then the bandwidth's own. Once a protocol is named, the channel is sliced again through the cutoff that
 /// protocol does best with, and the better of the two passes kept.
@@ -130,13 +175,13 @@ pub fn sync_bank(w: &Window<'_>) -> Option<Synced> {
     if !(4.5e3..60e3).contains(&w.bandwidth_hz) {
         return None;
     }
-    let (raw, fs) = (w.raw, w.fs);
+    let (raw, fs) = (w.full, w.fs);
     let narrow = w.bandwidth_hz <= 25e3;
     let own_cutoff = (w.bandwidth_hz * 0.5 + 500.0).clamp(4_000.0, 6_500.0);
     let mut found: Option<(f64, SyncPass)> = None;
     for (cutoff, d) in [
         narrow.then(|| (NARROW_CUTOFF_HZ, sync_disc(&prepare_cutoff(raw, fs, NARROW_CUTOFF_HZ), fs))),
-        Some((own_cutoff, sync_disc(&w.x, fs))),
+        Some((own_cutoff, if raw.len() == w.raw.len() { sync_disc(&w.x, fs) } else { sync_disc(&prepare(raw, fs, w.bandwidth_hz), fs) })),
     ]
     .into_iter()
     .flatten()
@@ -179,7 +224,7 @@ pub fn gsm(w: &Window<'_>) -> Option<Identified> {
     if !(150e3..300e3).contains(&w.bandwidth_hz) {
         return None;
     }
-    let g = gsm::detect(w.raw, w.fs).filter(|g| g.sch_ok > 0)?;
+    let g = gsm::detect(w.full, w.fs).filter(|g| g.sch_ok > 0)?;
     Some(Identified {
         protocol: Some("GSM"),
         label: g.label(),
@@ -233,8 +278,15 @@ pub fn modulation(w: &Window<'_>) -> Described {
             ("Wideband".to_string(), 0.5)
         }
     } else if bw < 4.5e3 && f.fsk_levels == 0 {
-        // Too narrow for voice or common FSK: a carrier or very slow data.
-        ("Carrier".to_string(), 0.6)
+        // Too narrow for voice or common FSK: a carrier or very slow data... or AM whose sidebands sit under the
+        // detector's threshold. On air, air band calls were recorded 0.6–4 kHz wide, their carrier and a little more;
+        // `raw` is the wider channel the look was cut from, which holds the sidebands. Only where AM voice is (see
+        // `Hints::am_band`).
+        if w.am_band && carrier::coherent_am(raw, fs).is_some_and(|m| m.is_am()) {
+            ("AM".to_string(), 0.6)
+        } else {
+            ("Carrier".to_string(), 0.6)
+        }
     } else if f.fsk_levels <= 2 && f.tone_hz.is_some() && f.envelope_cv < 0.3 {
         // One pure tone carries the frequency: analog FM with a steady tone (an idle repeater, a test tone). Its two-peak
         // histogram and the line at twice the tone would otherwise read as 2FSK.

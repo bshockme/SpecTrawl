@@ -1,0 +1,17 @@
+{
+  "annotations": [],
+  "captures": [
+    {
+      "core:datetime": "2026-11-06T20:22:00.125Z",
+      "core:frequency": 131549987.79296875,
+      "core:sample_start": 0
+    }
+  ],
+  "global": {
+    "core:datatype": "cf32_le",
+    "core:description": "ACARS downlink from N365NB (NW2320), a slice-tier slice from the Airspy R2 at 130.0 MHz, 2026-11-06",
+    "core:recorder": "spectrawl",
+    "core:sample_rate": 39062.5,
+    "core:version": "1.2.0"
+  }
+}

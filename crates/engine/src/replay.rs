@@ -20,15 +20,16 @@ use std::time::Duration;
 use api::{AudioMode, AudioView, IqClip, PlayFrom, PlayId, PlayState, PlayTarget, PlayTo, PlayView, RecordId, SignalRecord};
 use dsp::demod::{Demod, Mode as DemodMode};
 use parking_lot::Mutex;
-use sdr_core::Complex32;
 
 use crate::audio::{AudioBuf, AudioConfig, AudioOutput, Mixer, RATE, write_wav};
 use crate::channels::{BusError, ChannelBus, ChannelId, ChannelSpec, Consumer, Delivery, EndReason, Flow, GapReason, Priority, Start};
 use crate::records::RecordBook;
 use crate::source::Source;
 
-/// A replay starts this long before its record (as its slice does).
-pub const PRE_ROLL: Duration = Duration::from_millis(50);
+/// A replay starts this long before its record and ends this long after it, as its slice does
+/// ([`crate::recorder::SliceConfig::new`]).
+pub const PRE_ROLL: Duration = crate::classify::LEAD;
+pub const POST_ROLL: Duration = crate::classify::LEAD;
 /// Ended plays stay in the view this many views (20 Hz snapshots: 10 s).
 const KEEP_ENDED_VIEWS: u64 = 200;
 
@@ -94,8 +95,9 @@ struct Play {
     buf: Arc<AudioBuf>,
     shared: Arc<Shared>,
     channel: Option<ChannelId>,
-    /// The record is still open: its end is passed on when it closes.
+    /// The record is still open: its end (and the post-roll, in source samples) is passed on when it closes.
     open_record: Option<RecordId>,
+    post: u64,
     on_speaker: bool,
     wav_queued: bool,
     stopped: bool,
@@ -176,6 +178,7 @@ impl Player {
         let guessed = mode.is_none();
         let mode = mode.unwrap_or_else(|| default_mode(center));
         let mut open_record = None;
+        let mut post = 0;
         let (from, channel) = match what {
             Resolved::Region { source, from_sample, to_sample, .. } => {
                 if to_sample <= from_sample {
@@ -189,10 +192,11 @@ impl Player {
             Resolved::Record { record, source } => {
                 let rate = source.as_ref().map(|s| s.segment_at(record.first_sample).sample_rate);
                 let pre = rate.map_or(0, |r| (PRE_ROLL.as_secs_f64() * r) as u64);
+                post = rate.map_or(0, |r| (POST_ROLL.as_secs_f64() * r) as u64);
                 if record.open {
                     open_record = Some(record.id);
                 } else {
-                    shared.end.store(record.end_sample, Ordering::Relaxed);
+                    shared.end.store(record.end_sample + post, Ordering::Relaxed);
                 }
                 let from_ring = source
                     .as_ref()
@@ -237,6 +241,7 @@ impl Player {
                 shared,
                 channel,
                 open_record,
+                post,
                 on_speaker,
                 wav_queued: false,
                 stopped: false,
@@ -270,7 +275,7 @@ impl Player {
                 match book.get(id) {
                     Some(r) if r.open => {}
                     Some(r) => {
-                        p.shared.end.store(r.end_sample, Ordering::Relaxed);
+                        p.shared.end.store(r.end_sample + p.post, Ordering::Relaxed);
                         p.open_record = None;
                     }
                     // Merged into another or gone: what was heard is all there will be.
@@ -474,22 +479,22 @@ fn work(rx: mpsc::Receiver<Job>) {
     }
 }
 
-/// Demodulates a ci16 slice into `buf`, 0.1 s at a time.
+/// Demodulates a slice into `buf`, 0.1 s at a time. Slices are cf32; those written before 2026-11-07 are ci16, and
+/// the metadata says which.
 fn slice(clip: &IqClip, mode: AudioMode, buf: &AudioBuf, shared: &Shared) -> std::io::Result<()> {
+    let format = crate::sigmf::Format::of_meta(&clip.path.with_extension("sigmf-meta"))?;
     let mut f = std::fs::File::open(clip.path.with_extension("sigmf-data"))?;
     let mut dm = demod(mode, clip.rate);
     let chunk = ((clip.rate * 0.1) as usize).max(1);
-    let mut raw = vec![0u8; chunk * 4];
+    let size = format.bytes();
+    let mut raw = vec![0u8; chunk * size];
     let (mut x, mut audio) = (Vec::with_capacity(chunk), Vec::new());
     let mut left = clip.samples;
     while left > 0 && !shared.cancel.load(Ordering::Relaxed) {
         let n = (left as usize).min(chunk);
-        f.read_exact(&mut raw[..n * 4])?;
+        f.read_exact(&mut raw[..n * size])?;
         x.clear();
-        x.extend(raw[..n * 4].as_chunks::<4>().0.iter().map(|b| {
-            let (re, im) = (i16::from_le_bytes([b[0], b[1]]), i16::from_le_bytes([b[2], b[3]]));
-            Complex32::new(f32::from(re) / 32767.0, f32::from(im) / 32767.0)
-        }));
+        format.decode(&raw[..n * size], &mut x);
         audio.clear();
         dm.process(&x, &mut audio);
         if !buf.push(&audio) {

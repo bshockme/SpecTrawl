@@ -6,7 +6,7 @@ use std::time::SystemTime;
 use sdr_core::{Capabilities, DeviceInfo, GainSetting};
 
 use crate::audio::AudioView;
-use crate::classify::{ClassifyView, DecoderView, SystemsView};
+use crate::classify::{ChannelsView, ClassifyView, DecoderView, SystemsView, WorkerMode, WorkerView};
 use crate::command::Ack;
 use crate::records::{QueryResult, RecordsView, StoreView};
 use crate::timeline::{Row, SegmentId};
@@ -34,6 +34,11 @@ pub struct Snapshot {
     pub decoders: Vec<DecoderView>,
     /// The systems the decoders' claims name (the same `Arc` while nothing changed).
     pub systems: Arc<SystemsView>,
+    /// The band-plan channels the records were heard on (air band), built like `systems`.
+    pub channels: Arc<ChannelsView>,
+    /// The decoder workers running, and the modes the installed workers offer.
+    pub workers: Vec<WorkerView>,
+    pub worker_modes: Arc<Vec<WorkerMode>>,
 }
 
 impl Snapshot {
@@ -53,6 +58,9 @@ impl Snapshot {
             classify: ClassifyView::default(),
             decoders: Vec::new(),
             systems: Arc::new(SystemsView::default()),
+            channels: Arc::new(ChannelsView::default()),
+            workers: Vec::new(),
+            worker_modes: Arc::new(Vec::new()),
         }
     }
 }

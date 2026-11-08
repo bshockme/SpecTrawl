@@ -44,6 +44,12 @@ const BLOCKS: usize = 11;
 const WORDS: usize = 88;
 /// Length of the data symbol filter, in 3200-baud symbols.
 const DATA_FILTER: f64 = 0.25;
+/// A bit's reliability scales with the envelope (relative to its block's median) to this power. Under simulcast
+/// fading the cube recovered the most pages without more wrong ones: with no envelope (the distance from the threshold
+/// alone), soft repair barely helps; below FM's threshold the discriminator's clicks grow faster than the noise.
+const ENVELOPE_POWER: i32 = 3;
+/// A block's timing is within this many symbols of the previous block's.
+const TIMING_STEP: f64 = 0.3;
 
 /// One phase's 8 words of a block: corrected word and bits fixed, or None
 /// past repair.
@@ -92,6 +98,8 @@ pub struct FlexFrame {
     pub block_ok: [u8; BLOCKS],
     /// Symbol timing used per block, in symbols from nominal.
     pub block_off: [f32; BLOCKS],
+    /// Words the soft repair made good, over all phases (not in `block_ok`).
+    pub soft_words: u16,
     pub pages: Vec<Page>,
 }
 
@@ -246,7 +254,18 @@ fn sync2_timing(d: &[f32], start: f64, s: f64, inv: bool, level: f32, span: f64)
 }
 
 /// Slices one block into each phase's 256 bits.
-fn slice_block(d: &[f32], t0: f64, s: f64, n: usize, levels: u8, inv: bool, header_level: f32, thr_ratio: f32) -> Vec<Vec<u8>> {
+#[allow(clippy::too_many_arguments)]
+fn slice_block(
+    d: &[f32],
+    env: &[f32],
+    t0: f64,
+    s: f64,
+    n: usize,
+    levels: u8,
+    inv: bool,
+    header_level: f32,
+    thr_ratio: f32,
+) -> Vec<(Vec<u8>, Vec<f32>)> {
     let mut v: Vec<f32> = (0..n).map(|k| at(d, t0 + (k as f64 + 0.5) * s)).collect();
     // The carrier drifts a few hundred Hz between blocks, and idle fill
     // makes the symbol mix lopsided (so no percentile midpoint): estimate
@@ -275,21 +294,65 @@ fn slice_block(d: &[f32], t0: f64, s: f64, n: usize, levels: u8, inv: bool, head
     for x in v.iter_mut() {
         *x = if inv { dc - *x } else { *x - dc };
     }
+    // The envelope at each symbol, relative to the block's median.
+    let e: Vec<f32> = (0..n).map(|k| at(env, t0 + (k as f64 + 0.5) * s)).collect();
+    let mut sorted = e.clone();
+    sorted.sort_by(f32::total_cmp);
+    let usual = sorted[n / 2].max(1e-12);
+    let e: Vec<f32> = e.iter().map(|&e| (e / usual).min(1.0)).collect();
     let thr = outer * thr_ratio;
     // Data bits: bit a is the sign (positive = 1); with 4 levels, bit b is
-    // set on the inner levels.
-    let bits: Vec<(u8, u8)> = v.iter().map(|&x| ((x > 0.0) as u8, (x.abs() < thr) as u8)).collect();
+    // set on the inner levels. Each bit's reliability: its distance from its threshold, in units of a clean level's distance (1 on a clean
+    // level), scaled by the envelope there to `ENVELOPE_POWER`. In a fade (a simulcast beat's null) the discriminator
+    // jumps, so a bit there can sit far from its threshold and still be a guess.
+    let (ra, rb) = if levels == 4 { (3.0 / outer, 3.0 / outer) } else { (1.0 / outer, 0.0) };
+    let bits: Vec<(u8, u8, f32, f32)> = v
+        .iter()
+        .zip(&e)
+        .map(|(&x, &e)| {
+            let e = e.powi(ENVELOPE_POWER);
+            ((x > 0.0) as u8, (x.abs() < thr) as u8, x.abs() * ra * e, (x.abs() - thr).abs() * rb * e)
+        })
+        .collect();
+    let a = |b: &(u8, u8, f32, f32)| (b.0, b.2);
+    let b = |b: &(u8, u8, f32, f32)| (b.1, b.3);
+    let take = |it: &mut dyn Iterator<Item = (u8, f32)>| -> (Vec<u8>, Vec<f32>) { it.unzip() };
     match (n, levels) {
-        (256, 2) => vec![bits.iter().map(|b| b.0).collect()],
-        (256, _) => vec![bits.iter().map(|b| b.0).collect(), bits.iter().map(|b| b.1).collect()],
-        (_, 2) => vec![bits.iter().step_by(2).map(|b| b.0).collect(), bits.iter().skip(1).step_by(2).map(|b| b.0).collect()],
+        (256, 2) => vec![take(&mut bits.iter().map(a))],
+        (256, _) => vec![take(&mut bits.iter().map(a)), take(&mut bits.iter().map(b))],
+        (_, 2) => vec![take(&mut bits.iter().step_by(2).map(a)), take(&mut bits.iter().skip(1).step_by(2).map(a))],
         _ => vec![
-            bits.iter().step_by(2).map(|b| b.0).collect(),
-            bits.iter().step_by(2).map(|b| b.1).collect(),
-            bits.iter().skip(1).step_by(2).map(|b| b.0).collect(),
-            bits.iter().skip(1).step_by(2).map(|b| b.1).collect(),
+            take(&mut bits.iter().step_by(2).map(a)),
+            take(&mut bits.iter().step_by(2).map(b)),
+            take(&mut bits.iter().skip(1).step_by(2).map(a)),
+            take(&mut bits.iter().skip(1).step_by(2).map(b)),
         ],
     }
+}
+
+/// The envelope, smoothed like the data. A block's reliabilities divide it by the block's median.
+fn envelope(x: &[Complex32], fs: f64, frac: f64) -> Vec<f32> {
+    let n = ((fs / 3200.0 * frac).round() as usize).max(1);
+    let a: Vec<f32> = x.iter().map(|c| c.norm()).collect();
+    let mut out = vec![0.0; a.len()];
+    let mut acc = 0.0f32;
+    for i in 0..a.len() + n / 2 {
+        if i < a.len() {
+            acc += a[i];
+        }
+        if i >= n {
+            acc -= a[i - n];
+        }
+        if i >= n / 2 && i - n / 2 < a.len() {
+            out[i - n / 2] = acc / n as f32;
+        }
+    }
+    out
+}
+
+/// De-interleaves a phase's 256 bit reliabilities as [`block_words`] does its bits.
+fn block_rels(rel: &[f32]) -> [[f32; 32]; 8] {
+    std::array::from_fn(|w| std::array::from_fn(|b| rel[b * 8 + w]))
 }
 
 /// De-interleaves a phase's 256 block bits into 8 words: bit `b` of word
@@ -350,6 +413,11 @@ pub fn headers(x: &[Complex32], fs: f64) -> Vec<Header> {
 /// on the FLEX carrier, at least ~16 kHz sample rate). Frames cut off by
 /// the end of `x` are left out.
 pub fn decode(x: &[Complex32], fs: f64) -> Vec<FlexFrame> {
+    decode_with(x, fs, true)
+}
+
+/// [`decode`], with the soft repair on or off (off: hard decisions alone, for comparing them).
+fn decode_with(x: &[Complex32], fs: f64, soft: bool) -> Vec<FlexFrame> {
     if (x.len() as f64) < fs * 0.1 {
         return Vec::new();
     }
@@ -362,6 +430,7 @@ pub fn decode(x: &[Complex32], fs: f64) -> Vec<FlexFrame> {
     // Longer filters, made when a weak block first asks for them, keyed by
     // length in 3200-baud symbols.
     let mut longer: Vec<(f64, Vec<f32>)> = Vec::new();
+    let env = envelope(x, fs, 1.0);
     let sps = fs / HEADER_BAUD;
     let mut out = Vec::new();
     for (end, speed, inv) in find_sync1(&dh, fs) {
@@ -372,13 +441,22 @@ pub fn decode(x: &[Complex32], fs: f64) -> Vec<FlexFrame> {
         let n = (baud as f64 * 0.16).round() as usize;
         // First data symbol: after the FIW and sync 2.
         let t0 = end + 48.5 * sps + SYNC2_S * fs;
-        if t0 + (BLOCKS * n) as f64 * s + 2.0 * s > (d.len() - 1) as f64 {
-            break;
+        // The blocks the buffer holds, with two symbols to spare past each and room for its timing search (three
+        // symbols in block 0, under one after): past the buffer's end `at` repeats the last sample, which slices as a
+        // constant word, and the all-zero word is a valid codeword. A transmitter may stop once the frame's last used
+        // block is sent (on air at 929.6125 MHz many 3200/4 transmissions are 0.42 s, a header and two blocks), so a
+        // slice of one holds no more. The rest are missing, not failed: no words and nothing for the soft repair.
+        let fits = |b: usize| t0 + (((b + 1) * n) as f64 + 2.0 + if b == 0 { 3.0 } else { 1.0 }) * s <= (d.len() - 1) as f64;
+        let present = (0..BLOCKS).take_while(|&b| fits(b)).count();
+        if present == 0 {
+            continue;
         }
         let nph = phase_names(baud, levels).len();
         // Full deviation, from the 1600-baud header after sync 1's start.
         let level = (0..112).map(|k| at(&dh, end - (63 - k) as f64 * sps).abs()).sum::<f32>() / 112.0;
         let mut phases: Vec<Vec<Option<u32>>> = vec![Vec::with_capacity(WORDS); nph];
+        // Every word as sliced, with its bits' reliabilities, for the soft repair once the frame is read.
+        let mut sliced: Vec<Vec<(u32, [f32; 32])>> = vec![Vec::with_capacity(WORDS); nph];
         let mut block_ok = [0u8; BLOCKS];
         let mut block_off = [0f32; BLOCKS];
         // Symbol timing (in symbols from nominal). The header places it
@@ -392,7 +470,14 @@ pub fn decode(x: &[Complex32], fs: f64) -> Vec<FlexFrame> {
         // several offsets and would let a tracking loop wander.
         let locked = if (baud, levels) == (3200, 4) { sync2_timing(d, end + 48.5 * sps, s, inv, level, 4.0) } else { None };
         let mut anchor = (locked.unwrap_or(0.0), 0usize);
+        let mut previous: Option<f64> = None;
         for (blk, ok_out) in block_ok.iter_mut().enumerate() {
+            if blk >= present {
+                for p in &mut phases {
+                    p.extend([None; 8]);
+                }
+                continue;
+            }
             // Timing: the offset whose words need the fewest corrections.
             let span = if locked.is_some() {
                 5
@@ -402,13 +487,14 @@ pub fn decode(x: &[Complex32], fs: f64) -> Vec<FlexFrame> {
                 5
             };
             // Slices the block at `off` through `d` with threshold `thr`:
-            // (corrections, words needing at most one, words).
+            // (corrections, words needing at most one, words, the words as sliced).
             let slice = |d: &[f32], off: f64, thr: f32| {
                 let mut cost = 0;
                 let mut good = 0;
-                let words: Vec<BlockWords> = slice_block(d, t0 + ((blk * n) as f64 + off) * s, s, n, levels, inv, level, thr)
+                let cut = slice_block(d, &env, t0 + ((blk * n) as f64 + off) * s, s, n, levels, inv, level, thr);
+                let words: Vec<BlockWords> = cut
                     .iter()
-                    .map(|b| {
+                    .map(|(b, _)| {
                         block_words(b).map(|w| {
                             let c = pocsag::correct(w);
                             // Corrected bits, or 9 for a word past repair.
@@ -418,19 +504,30 @@ pub fn decode(x: &[Complex32], fs: f64) -> Vec<FlexFrame> {
                         })
                     })
                     .collect();
-                (cost, good, words)
+                let raw: Vec<[(u32, [f32; 32]); 8]> = cut
+                    .iter()
+                    .map(|(b, r)| {
+                        let (w, r) = (block_words(b), block_rels(r));
+                        std::array::from_fn(|i| (w[i], r[i]))
+                    })
+                    .collect();
+                (cost, good, words, raw)
             };
-            let mut best: Option<(u32, f64, Vec<BlockWords>)> = None;
-            // Nearest offsets first, so ties (idle fill decodes at several)
-            // keep the timing where it is.
-            for o in (0..=2 * span).map(|k| if k % 2 == 0 { k / 2 } else { -(k + 1) / 2 }) {
-                let off = anchor.0 + o as f64 * 0.1;
-                let (cost, _, words) = slice(d, off, 2.0 / 3.0);
-                if best.as_ref().is_none_or(|b| cost < b.0) {
-                    best = Some((cost, off, words));
-                }
-            }
-            let (_, mut off, mut words) = best.expect("offset range is non-empty");
+            // Every offset, nearest first, so ties (idle fill decodes at several) keep the timing where it is.
+            let tried: Vec<_> = (0..=2 * span)
+                .map(|k| if k % 2 == 0 { k / 2 } else { -(k + 1) / 2 })
+                .map(|o| {
+                    let off = anchor.0 + o as f64 * 0.1;
+                    let (cost, _, words, raw) = slice(d, off, 2.0 / 3.0);
+                    (cost, off, words, raw)
+                })
+                .collect();
+            // The fewest corrections, among offsets near the last block's: a symbol from it is the neighbouring
+            // symbol, and at 3200 baud another phase's, whose idle fill decodes without a correction while the right
+            // timing's data may need some for a fade.
+            let near = |off: f64| previous.is_none_or(|p| (off - p).abs() <= TIMING_STEP + 1e-9);
+            let (_, mut off, mut words, mut raw) =
+                tried.into_iter().filter(|t| near(t.1)).reduce(|a, b| if b.0 < a.0 { b } else { a }).expect("the nearest offset is near");
             let mut ok = words.iter().flatten().filter(|w| w.is_some()).count();
             if ok < nph * 8 {
                 // A weak block (a fade, noise): the short filter and the
@@ -448,10 +545,11 @@ pub fn decode(x: &[Complex32], fs: f64) -> Vec<FlexFrame> {
                     let dl = &longer.iter().find(|(f, _)| *f == frac).unwrap().1;
                     for thr in [0.55f32, 2.0 / 3.0, 0.8] {
                         for o in -3..=3 {
-                            let (_, g, w) = slice(dl, base + o as f64 * 0.1, thr);
+                            let (_, g, w, r) = slice(dl, base + o as f64 * 0.1, thr);
                             if g > good {
                                 good = g;
                                 words = w;
+                                raw = r;
                                 off = base + o as f64 * 0.1;
                             }
                         }
@@ -461,6 +559,7 @@ pub fn decode(x: &[Complex32], fs: f64) -> Vec<FlexFrame> {
             }
             *ok_out = ok as u8;
             block_off[blk] = off as f32;
+            previous = Some(off);
             if locked.is_none() && ok > anchor.1 {
                 anchor = (off, ok);
             }
@@ -473,14 +572,68 @@ pub fn decode(x: &[Complex32], fs: f64) -> Vec<FlexFrame> {
             for (p, w) in phases.iter_mut().zip(&words) {
                 p.extend(w.iter().map(|w| w.filter(|c| !weak || c.1 <= 1).map(|c| data21(c.0))));
             }
+            for (p, r) in sliced.iter_mut().zip(raw) {
+                p.extend(r);
+            }
+        }
+        let mut soft_words = 0;
+        for (ph, raw) in phases.iter_mut().zip(&sliced).filter(|_| soft) {
+            soft_words += soft_repair(ph, raw);
         }
         let mut pages = Vec::new();
         for (ph, name) in phases.iter().zip(phase_names(baud, levels)) {
             pages.extend(phase_pages(ph, *name));
         }
-        out.push(FlexFrame { at: end as usize, baud, levels, cycle, frame, block_ok, block_off, pages });
+        out.push(FlexFrame { at: end as usize, baud, levels, cycle, frame, block_ok, block_off, soft_words, pages });
     }
     out
+}
+
+/// Soft repair: only bits less reliable than this may be overruled ([`pocsag::chase`]). The simulcast tests measured
+/// it: bolder, and miscorrected text outnumbers what more repairs recover.
+const DOUBT: f32 = 0.6;
+
+/// Repairs, in one phase's words, those hard correction could not (or, in a weak block, would not) trust, from the
+/// bits' reliabilities. Returns the words repaired.
+///
+/// Never the address words: a soft-repaired address put the right text under a capcode nobody sent (18 of 100 pages
+/// in the simulcast tests at 4 dB), and a wrong address is a page that was never sent. A page starts only from an
+/// address that decoded hard; the repair completes its vector and text. The block information word and the vectors
+/// are repaired too: each has a checksum besides.
+fn soft_repair(dw: &mut [Option<u32>], raw: &[(u32, [f32; 32])]) -> u16 {
+    let mut repaired = 0;
+    let mut fix = |i: usize, dw: &mut [Option<u32>]| {
+        if dw[i].is_none()
+            && let Some((cw, _)) = raw.get(i).and_then(|(w, r)| pocsag::chase(*w, r, DOUBT))
+        {
+            dw[i] = Some(data21(cw));
+            repaired += 1;
+        }
+    };
+    fix(0, dw);
+    // The address words, from the block information word (every word may be one when it failed).
+    let (aoff, voff) = match dw[0].filter(|&b| checks(b)) {
+        Some(biw) => (((biw >> 8 & 3) + 1) as usize, (biw >> 10 & 0x3F) as usize),
+        None => (1, dw.len()),
+    };
+    for i in 1..dw.len() {
+        if !(aoff..voff).contains(&i) {
+            fix(i, dw);
+        }
+    }
+    repaired
+}
+
+/// The 4-bit checksum of a block information or vector word (as of the frame information word): its six nibbles
+/// (21 data bits, the top one alone) sum to 0xF. Every alphanumeric and numeric vector heard on air checks.
+fn checks(w: u32) -> bool {
+    (0..6).map(|k| w >> (4 * k) & 0xF).sum::<u32>() & 0xF == 0xF
+}
+
+/// A message word, or None for one that failed, or that is idle fill: no message holds one, so an idle word where a
+/// message's should be was read from another phase (a whole-symbol slip, which BCH can't see).
+fn message(w: Option<u32>) -> Option<u32> {
+    w.filter(|&w| w != 0x1F_FFFF)
 }
 
 fn is_long(aw: u32) -> bool {
@@ -493,7 +646,7 @@ fn phase_pages(dw: &[Option<u32>], phase: char) -> Vec<Page> {
     let Some(biw) = dw[0] else { return out };
     // Idle, or a block info word whose checksum (as the FIW's: nibbles
     // sum to 0xF) fails.
-    if biw == 0 || biw == 0x1F_FFFF || (0..6).map(|k| biw >> (4 * k) & 0xF).sum::<u32>() & 0xF != 0xF {
+    if biw == 0 || biw == 0x1F_FFFF || !checks(biw) {
         return out;
     }
     let aoff = ((biw >> 8 & 3) + 1) as usize;
@@ -501,7 +654,9 @@ fn phase_pages(dw: &[Option<u32>], phase: char) -> Vec<Page> {
     let mut i = aoff;
     while i < voff {
         let vi = voff + i - aoff;
-        let (Some(aw), Some(&Some(vec))) = (dw[i], dw.get(vi)) else {
+        // A vector whose checksum fails is not the one sent (a word miscorrected past it), and would read the
+        // wrong words as the page.
+        let (Some(aw), Some(&Some(vec))) = (dw[i], dw.get(vi).filter(|v| v.is_some_and(checks))) else {
             i += 1;
             continue;
         };
@@ -550,6 +705,7 @@ fn phase_pages(dw: &[Option<u32>], phase: char) -> Vec<Page> {
 /// (as multimon-ng reads them, and as seen on air).
 fn alpha(dw: &[Option<u32>], mw1: usize, len: usize, header: Option<u32>, long: bool) -> (&'static str, String, bool, bool, u8, u8) {
     let (header, first) = if long { (header, mw1) } else { (dw.get(mw1).copied().flatten(), mw1 + 1) };
+    let header = message(header);
     // Without a header the fragment number is unknown; 3 (a whole message)
     // keeps it out of the joiner, and `damaged` says it was guessed.
     let frag = header.map_or(3, |h| h >> 11 & 3);
@@ -559,7 +715,7 @@ fn alpha(dw: &[Option<u32>], mw1: usize, len: usize, header: Option<u32>, long: 
     let mut text = String::new();
     let mut damaged = header.is_none();
     for (k, w) in dw.iter().enumerate().take(last).skip(first) {
-        let Some(w) = w else {
+        let Some(w) = message(*w) else {
             text.push_str("???");
             damaged = true;
             continue;
@@ -596,6 +752,7 @@ fn numeric(dw: &[Option<u32>], mw1: usize, len: usize, header: Option<u32>, long
         mw1 + 1
     };
     words.extend(dw.iter().take((from + len).min(dw.len())).skip(from));
+    words.iter_mut().for_each(|w| *w = message(*w));
     let damaged = words.iter().any(|w| w.is_none());
     let bits: Vec<u8> = words.iter().flat_map(|w| (0..21).map(move |b| w.map_or(0, |w| (w >> b & 1) as u8))).collect();
     let skip = if numbered { 10 } else { 2 };
@@ -609,17 +766,22 @@ fn numeric(dw: &[Option<u32>], mw1: usize, len: usize, header: Option<u32>, long
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     /// A codeword for 21 data bits given LSB first.
-    fn word(x: u32) -> u32 {
+    pub(super) fn word(x: u32) -> u32 {
         pocsag::encode(x.reverse_bits() >> 11)
+    }
+
+    /// A block information or vector word (its low nibble zero) with its checksum.
+    pub(super) fn checked(x: u32) -> u32 {
+        word(x | (0xF - ((0..6).map(|k| x >> (4 * k) & 0xF).sum::<u32>() & 0xF)))
     }
 
     /// FM-modulates a FLEX 3200/4 frame with `phase_a` as phase A's words
     /// (other phases idle) at `fs`, with a carrier offset.
-    fn modulate(phase_a: &[u32], cycle: u32, frame: u32, fs: f64, offset_hz: f64) -> Vec<Complex32> {
+    pub(super) fn modulate(phase_a: &[u32], cycle: u32, frame: u32, fs: f64, offset_hz: f64) -> Vec<Complex32> {
         let mut freq: Vec<f64> = Vec::new();
         // An absolute timeline, so symbol lengths don't round cumulatively.
         let mut clock = 0.0f64;
@@ -642,9 +804,15 @@ mod tests {
         for b in hdr {
             push(&mut freq, if b == 1 { -4800.0 } else { 4800.0 }, 1.0 / 1600.0);
         }
-        // Sync 2: alternating.
-        for k in 0..80 {
-            push(&mut freq, if k % 2 == 0 { 4800.0 } else { -4800.0 }, 1.0 / 3200.0);
+        // Sync 2, as 3200/4 transmitters send it.
+        for &c in SYNC2_3200_4 {
+            let dev = match c {
+                b'+' => 4800.0,
+                b'p' => 1600.0,
+                b'n' => -1600.0,
+                _ => -4800.0,
+            };
+            push(&mut freq, dev, 1.0 / 3200.0);
         }
         // 11 blocks, 4 phases interleaved.
         let idle = word(0x1F_FFFF);
@@ -684,7 +852,7 @@ mod tests {
             .collect()
     }
 
-    fn alpha_words(text: &str) -> Vec<u32> {
+    pub(super) fn alpha_words(text: &str) -> Vec<u32> {
         let mut c: Vec<u32> = text.bytes().map(u32::from).collect();
         while !c.len().is_multiple_of(3) {
             c.push(3);
@@ -696,6 +864,47 @@ mod tests {
     fn data21_reverses() {
         assert_eq!(data21(word(0x12345)), 0x12345);
         assert_eq!(data21(word(1)), 1);
+    }
+
+    /// A transmitter that stops after the blocks it used (on air, 0.42 s 3200/4 transmissions): its slice holds the
+    /// header, those blocks, and then noise. The blocks sent decode; the rest are missing, and nothing comes of them.
+    #[test]
+    fn a_frame_cut_short_decodes_the_blocks_sent() {
+        let (a, sent) = super::simulcast::pages_frame(2);
+        assert!(a.len() <= 3 * 8, "the pages fit in three blocks");
+        let fs = 62_500.0;
+        let full = modulate(&a, 4, 33, fs, 350.0);
+        let block = (0.16 * fs) as usize;
+        let cut = |kept: usize| {
+            let mut x = full[..full.len() - (0.05 * fs) as usize - (BLOCKS - kept) * block].to_vec();
+            let mut rng = 0x9E37_79B9u32;
+            let mut noise = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 17;
+                rng ^= rng << 5;
+                (rng as f32 / u32::MAX as f32 - 0.5) * 0.2
+            };
+            // The slice's post-roll: 150 ms of the channel with nobody on it.
+            x.extend((0..(0.15 * fs) as usize).map(|_| Complex32::new(noise(), noise())));
+            x
+        };
+        let fr = decode(&cut(4), fs);
+        assert_eq!(fr.len(), 1);
+        let f = &fr[0];
+        assert_eq!((f.mode().as_str(), f.cycle, f.frame), ("3200/4", 4, 33));
+        assert!(f.block_ok[..4].iter().all(|&n| n == 32) && f.block_ok[4..].iter().all(|&n| n == 0), "{:?}", f.block_ok);
+        let got: Vec<(u64, String)> = f.pages.iter().map(|p| (p.capcode, p.text.clone())).collect();
+        assert_eq!(got, sent);
+        assert!(f.pages.iter().all(|p| !p.damaged));
+        // Cut sooner, inside the messages: what decodes was sent, and a page whose words are missing says so.
+        for kept in 1..4 {
+            for f in decode(&cut(kept), fs) {
+                for p in &f.pages {
+                    let s = sent.iter().find(|s| s.0 == p.capcode).unwrap_or_else(|| panic!("{kept} blocks: {p:?} was never sent"));
+                    assert!(p.damaged || p.text == s.1, "{kept} blocks: {p:?}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -721,10 +930,10 @@ mod tests {
             word(aw1),
             word(aw2),
             // Short alpha vector: header word + message words.
-            word(5 << 4 | mw_short << 7 | (1 + short_msg.len() as u32) << 14),
+            checked(5 << 4 | mw_short << 7 | (1 + short_msg.len() as u32) << 14),
             // Long alpha vector (its length counts the header word, which
             // follows as the second vector word).
-            word(5 << 4 | mw_long << 7 | (1 + long_msg.len() as u32) << 14),
+            checked(5 << 4 | mw_long << 7 | (1 + long_msg.len() as u32) << 14),
             word(3 << 11),
         ];
         a.push(word(3 << 11)); // short message header: fragment 3
@@ -790,9 +999,9 @@ mod tests {
                 word(aw1),
                 word(aw2),
                 // Short numeric: 3 words from mw1 (length 2 = two more).
-                word(3 << 4 | mw_short << 7 | 2 << 14 | junk),
+                checked(3 << 4 | mw_short << 7 | 2 << 14 | junk),
                 // Long numeric: the first word is the second vector word, then 2 from mw1.
-                word(3 << 4 | mw_long << 7 | 2 << 14 | junk),
+                checked(3 << 4 | mw_long << 7 | 2 << 14 | junk),
                 msg[0],
             ],
             msg.clone(),
@@ -820,7 +1029,7 @@ mod tests {
             vec![
                 word(biw | (0xF - ((0..6).map(|k| biw >> (4 * k) & 0xF).sum::<u32>() & 0xF))),
                 word(0x8000 + 1_234_567),
-                word(5 << 4 | 3 << 7 | (1 + msg.len() as u32) << 14),
+                checked(5 << 4 | 3 << 7 | (1 + msg.len() as u32) << 14),
                 word(0 << 11),
             ],
             msg,
@@ -832,5 +1041,148 @@ mod tests {
         let p = &fr[0].pages;
         assert_eq!(p.len(), 1, "{p:?}");
         assert_eq!((p[0].fragment, p[0].continued, p[0].text.as_str()), (0, false, text));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod simulcast {
+    //! Pages under simulcast fading: two transmitters a few hertz apart beat, and the nulls between them put bursts of
+    //! errors into every block. Pages are known, so a page is right, damaged (its words failed and show as '?'), or
+    //! false (an address nobody sent, or text that differs from what was sent without being marked damaged).
+    use super::tests::{alpha_words, checked, modulate, word};
+    use super::*;
+
+    /// A phase A with `n` short alpha pages: (the words, the pages as (capcode, text)).
+    pub(super) fn pages_frame(n: u32) -> (Vec<u32>, Vec<(u64, String)>) {
+        let (aoff, voff) = (1u32, 1 + n);
+        let biw = (aoff - 1) << 8 | voff << 10;
+        let mut a = vec![word(biw | (0xF - ((0..6).map(|k| biw >> (4 * k) & 0xF).sum::<u32>() & 0xF)))];
+        let mut sent = Vec::new();
+        let mut msgs = Vec::new();
+        for k in 0..n {
+            let capcode = 100_000 + 7_919 * k as u64;
+            let text = format!("PAGE {k} SIMULCAST");
+            a.push(word(0x8000 + capcode as u32));
+            sent.push((capcode, text.clone()));
+            msgs.push(alpha_words(&format!("${text}")));
+        }
+        let mut mw = 1 + 2 * n;
+        for m in &msgs {
+            a.push(checked(5 << 4 | mw << 7 | (1 + m.len() as u32) << 14));
+            mw += 1 + m.len() as u32;
+        }
+        for m in &msgs {
+            a.push(word(3 << 11));
+            a.extend(m);
+        }
+        assert!(a.len() <= WORDS);
+        (a, sent)
+    }
+
+    /// The signal plus a second copy `beat_hz` off, `delay_s` late, at `ratio` of its amplitude, plus noise at
+    /// `snr_db` (over the whole channel).
+    pub(crate) fn simulcast(x: &[Complex32], fs: f64, beat_hz: f64, delay_s: f64, ratio: f32, snr_db: f64, seed: u64) -> Vec<Complex32> {
+        let d = (delay_s * fs).round() as usize;
+        let mut s = seed | 1;
+        let mut gauss = move || {
+            let mut u = || {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 11) as f64 / (1u64 << 53) as f64
+            };
+            let (a, b) = (u().max(1e-12), u());
+            (-2.0 * a.ln()).sqrt() * (std::f64::consts::TAU * b).cos()
+        };
+        let sigma = (10f64.powf(-snr_db / 10.0) / 2.0).sqrt();
+        (0..x.len())
+            .map(|i| {
+                let two = if i >= d {
+                    x[i - d] * Complex32::from_polar(ratio, (std::f64::consts::TAU * beat_hz * i as f64 / fs) as f32)
+                } else {
+                    Complex32::new(0.0, 0.0)
+                };
+                x[i] + two + Complex32::new((gauss() * sigma) as f32, (gauss() * sigma) as f32)
+            })
+            .collect()
+    }
+
+    /// (right, damaged, false) over the frames.
+    pub(super) fn score(frames: &[FlexFrame], sent: &[(u64, String)]) -> (usize, usize, usize) {
+        let (mut right, mut damaged, mut wrong) = (0, 0, 0);
+        for p in frames.iter().flat_map(|f| &f.pages) {
+            match sent.iter().find(|(c, _)| *c == p.capcode) {
+                Some((_, t)) if !p.damaged && p.text == *t => right += 1,
+                Some(_) if p.damaged => damaged += 1,
+                _ => wrong += 1,
+            }
+        }
+        (right, damaged, wrong)
+    }
+
+    #[test]
+    fn soft_repair_recovers_pages_under_simulcast_without_inventing_text() {
+        let fs = 39_062.5;
+        let (a, sent) = pages_frame(6);
+        let clean = modulate(&a, 2, 17, fs, 120.0);
+        let (mut hard, mut soft) = ((0, 0, 0), (0, 0, 0));
+        let seeds = 8;
+        for seed in 0..seeds {
+            let x = simulcast(&clean, fs, 30.0, 40e-6, 0.9, 11.0, 1 + seed);
+            let (h, s) = (score(&decode_with(&x, fs, false), &sent), score(&decode(&x, fs), &sent));
+            hard = (hard.0 + h.0, hard.1 + h.1, hard.2 + h.2);
+            soft = (soft.0 + s.0, soft.1 + s.1, soft.2 + s.2);
+        }
+        let n = seeds as usize * sent.len();
+        // Hard decisions lose most pages to the beat's nulls (as on air at 931.3375 MHz); the soft repair gets them back.
+        assert!(hard.0 * 3 < n, "hard {hard:?} of {n}");
+        assert!(soft.0 * 10 >= n * 7, "soft {soft:?} of {n} (hard {hard:?})");
+        assert!(soft.2 <= hard.2 + 1, "soft {soft:?} gets text wrong beyond hard {hard:?}");
+    }
+
+    #[test]
+    fn soft_repair_never_puts_a_page_under_an_address_nobody_sent() {
+        let fs = 39_062.5;
+        let (a, sent) = pages_frame(6);
+        let clean = modulate(&a, 2, 17, fs, 120.0);
+        let mut pages = 0;
+        for (seed, snr) in (0..12).zip([4.0, 5.0, 6.0].into_iter().cycle()) {
+            let x = simulcast(&clean, fs, 15.0, 40e-6, 0.85, snr, 100 + seed);
+            for p in decode(&x, fs).iter().flat_map(|f| &f.pages) {
+                pages += 1;
+                assert!(sent.iter().any(|(c, _)| *c == p.capcode), "{p:?}");
+            }
+        }
+        assert!(pages > 0);
+    }
+
+    #[test]
+    #[ignore = "an experiment: prints hard and soft decoding side by side"]
+    fn simulcast_experiment() {
+        let fs = 39_062.5;
+        let (a, sent) = pages_frame(6);
+        let clean = modulate(&a, 2, 17, fs, 120.0);
+        for (beat, ratio) in [(8.0, 0.7), (15.0, 0.85), (30.0, 0.9)] {
+            for snr in [8.0, 11.0, 14.0, 20.0] {
+                let (mut h, mut so, mut words) = ((0, 0, 0), (0, 0, 0), (0, 0, 0usize));
+                for seed in 0..20 {
+                    let x = simulcast(&clean, fs, beat, 40e-6, ratio, snr, 1 + seed);
+                    let (fh, fsoft) = (decode_with(&x, fs, false), decode_with(&x, fs, true));
+                    let (a, b) = (score(&fh, &sent), score(&fsoft, &sent));
+                    h = (h.0 + a.0, h.1 + a.1, h.2 + a.2);
+                    so = (so.0 + b.0, so.1 + b.1, so.2 + b.2);
+                    words.0 += fh.iter().flat_map(|f| f.block_ok).map(|n| n as usize).sum::<usize>();
+                    words.1 += fsoft.iter().map(|f| f.soft_words as usize).sum::<usize>();
+                    words.2 += fh.len() * BLOCKS * 32;
+                }
+                println!(
+                    "beat {beat:4} Hz ×{ratio}, SNR {snr:4} dB: hard right/damaged/false {h:?}, soft {so:?} of {}; words {}/{} +{} soft",
+                    20 * sent.len(),
+                    words.0,
+                    words.2,
+                    words.1
+                );
+            }
+        }
     }
 }

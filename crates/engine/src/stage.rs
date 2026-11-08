@@ -224,7 +224,7 @@ impl Stage {
         if r.input.len() != n {
             r.input = vec![Complex32::default(); n];
         }
-        let seg = self.shared.source.read((block - 1) * self.hop, &mut r.input)?;
+        let seg = self.shared.source.read_ring((block - 1) * self.hop, &mut r.input)?;
         let fft = r.fft.get_or_insert_with(|| SharedFft::new(n));
         let mut bins: Arc<[Complex32]> = std::iter::repeat_n(Complex32::default(), n).collect();
         fft.forward(&r.input, Arc::get_mut(&mut bins).expect("a fresh Arc is unique"));
@@ -331,7 +331,7 @@ impl Worker {
                 continue;
             }
             let first = (b - 1) * l;
-            match source.read(first, &mut buf) {
+            match source.read_ring(first, &mut buf) {
                 Ok(seg) => {
                     let t0 = Instant::now();
                     let mut bins: Arc<[Complex32]> = std::iter::repeat_n(Complex32::default(), n).collect();

@@ -409,7 +409,7 @@ impl Source {
 
     /// Copy `start .. start + out.len()` as stored; refuses a range that
     /// crosses a segment boundary or touches a gap's hole.
-    pub fn read_raw(&self, start: u64, out: &mut [[i16; 2]]) -> Result<Segment, ReadError> {
+    pub fn read_ring_raw(&self, start: u64, out: &mut [[i16; 2]]) -> Result<Segment, ReadError> {
         let seg = self.covering(start, out.len())?;
         self.inner.ring.read_raw(start, out)?;
         Ok(seg)
@@ -417,7 +417,7 @@ impl Source {
 
     /// Copy `start .. start + out.len()` scaled to ±1.0; refuses a range that
     /// crosses a segment boundary or touches a gap's hole.
-    pub fn read(&self, start: u64, out: &mut [Complex32]) -> Result<Segment, ReadError> {
+    pub fn read_ring(&self, start: u64, out: &mut [Complex32]) -> Result<Segment, ReadError> {
         let seg = self.covering(start, out.len())?;
         self.inner.ring.read(start, out)?;
         Ok(seg)

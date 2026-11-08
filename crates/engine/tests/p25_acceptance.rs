@@ -120,10 +120,24 @@ fn a_p25_system_row_within_10_s_that_every_view_agrees_with() {
     };
     println!("decoder after {:.1} s: {:?}", t0.elapsed().as_secs_f64(), s.decoders);
     agree(&s);
-    // The scenario's sync-only P25 emitters are named by their syncs and decoded as nothing (once their windows,
-    // 1.5 s from their start, have been looked at).
+    // The scenario's sync-only P25 emitters are named by their syncs and decoded as nothing, once their windows (1.5 s
+    // from their start) have been looked at: from 6 s until both are named, for at most 40 s (the checks below then say
+    // what is missing). A fixed 6 s was not enough on CI, whose runner gives the pool one thread: 15 looks were still
+    // queued there.
+    let named = |s: &Snapshot, hz: f64| {
+        s.records.records.iter().any(|r| {
+            (r.center_hz() - hz).abs() < 3e3
+                && r.claims.iter().any(|c| matches!(&c.by, Evidence::SyncBank { protocol, .. } if protocol == "P25 Phase 1"))
+        })
+    };
     std::thread::sleep(Duration::from_secs(6).saturating_sub(t0.elapsed()));
-    let s = h.latest();
+    let s = loop {
+        let s = h.latest();
+        if [851.0125e6, 851.2625e6].iter().all(|&hz| named(&s, hz)) || t0.elapsed() > Duration::from_secs(40) {
+            break s;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
     agree(&s);
     for hz in [851.0125e6, 851.2625e6] {
         let mine: Vec<_> = s.records.records.iter().filter(|r| (r.center_hz() - hz).abs() < 3e3).collect();

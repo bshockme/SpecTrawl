@@ -40,7 +40,7 @@ impl App {
     pub fn new(handle: Handle) -> App {
         let snap = handle.latest();
         let mut dock = DockState::new(vec![Tab::Devices]);
-        dock.main_surface_mut().split_right(NodeIndex::root(), DEVICES_SHARE, vec![Tab::Log, Tab::Records, Tab::Systems]);
+        dock.main_surface_mut().split_right(NodeIndex::root(), DEVICES_SHARE, vec![Tab::Log, Tab::Records, Tab::Systems, Tab::Channels]);
         App {
             handle,
             snap,
@@ -83,7 +83,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("SpecTrawl").strong());
                 ui.menu_button("View ⏷", |ui| {
-                    for tab in [Tab::Devices, Tab::Log, Tab::Records, Tab::Systems] {
+                    for tab in [Tab::Devices, Tab::Log, Tab::Records, Tab::Systems, Tab::Channels] {
                         let shown = self.dock.find_tab(&tab).is_some();
                         if ui.add_enabled(!shown, egui::Button::new(tab.name())).clicked() {
                             reopen(&mut self.dock, tab);
@@ -241,6 +241,7 @@ impl egui_dock::TabViewer for App {
             Tab::Log => log_pane::show(ui, &snap),
             Tab::Records => self.records.show(ui, &snap, &mut self.selected, &mut self.out),
             Tab::Systems => crate::systems_pane::show(ui, &snap),
+            Tab::Channels => crate::channels_pane::show(ui, &snap, &mut self.selected),
         }
     }
 
@@ -288,7 +289,7 @@ fn reopen(dock: &mut DockState<Tab>, tab: Tab) {
         return;
     }
     match tab {
-        Tab::Systems => match tree.find_tab(&Tab::Records).or_else(|| tree.find_tab(&Tab::Log)) {
+        Tab::Systems | Tab::Channels => match tree.find_tab(&Tab::Records).or_else(|| tree.find_tab(&Tab::Log)) {
             Some((node, _)) => tree[node].append_tab(tab),
             None => {
                 tree.split_right(NodeIndex::root(), DEVICES_SHARE, vec![tab]);
