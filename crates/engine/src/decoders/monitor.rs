@@ -48,9 +48,15 @@ pub struct Monitor {
     pages_total: u64,
     /// FLEX frames already counted: (cycle, frame).
     flex_seen: VecDeque<(u8, u8)>,
+    /// POCSAG pages kept, as `pages` shows them.
+    pocsag_seen: VecDeque<detect::pocsag::Page>,
     capplus_repeater: Option<u8>,
     capplus_rest: Option<(u8, u8)>,
     lamp: Lamp,
+    /// Samples fed since `configure`.
+    fed: u64,
+    /// Where the decodes since the last [`Decoder::take_heard`] fell, in samples fed.
+    heard: Vec<u64>,
 }
 
 impl Monitor {
@@ -72,9 +78,12 @@ impl Monitor {
             pages: VecDeque::new(),
             pages_total: 0,
             flex_seen: VecDeque::new(),
+            pocsag_seen: VecDeque::new(),
             capplus_repeater: None,
             capplus_rest: None,
             lamp: Lamp::Searching,
+            fed: 0,
+            heard: Vec::new(),
         }
     }
 
@@ -94,7 +103,36 @@ impl Monitor {
         true
     }
 
-    fn decode(&mut self, x: &[Complex32]) {
+    /// Decodes block `x`, which starts `start` samples after `configure`.
+    /// Keeps a POCSAG page once: a block that ends inside a page decodes the start of it, and the next block (they
+    /// overlap) the whole, so a page whose text starts another's to the same address is the same page; the fuller one
+    /// is kept, in the older one's place. True if it is a new page.
+    fn keep_pocsag(&mut self, p: detect::pocsag::Page) -> bool {
+        let related = |a: &str, b: &str| a.starts_with(b) || b.starts_with(a);
+        let same = |q: &detect::pocsag::Page| {
+            q.address == p.address && q.function == p.function && (related(&q.alpha, &p.alpha) || related(&q.numeric, &p.numeric))
+        };
+        if let Some(i) = self.pocsag_seen.iter().position(same) {
+            let q = &self.pocsag_seen[i];
+            let fuller = (p.alpha.len(), !p.damaged) > (q.alpha.len(), !q.damaged);
+            if fuller {
+                let old = q.summary();
+                if let Some(line) = self.pages.iter_mut().find(|l| **l == old) {
+                    *line = p.summary();
+                }
+                self.pocsag_seen[i] = p;
+            }
+            return false;
+        }
+        Self::push(&mut self.pages, p.summary());
+        self.pocsag_seen.push_back(p);
+        while self.pocsag_seen.len() > KEPT {
+            self.pocsag_seen.pop_front();
+        }
+        true
+    }
+
+    fn decode(&mut self, x: &[Complex32], start: u64) {
         let first = self.blocks == 0;
         self.blocks += 1;
         let w = Window::new(x, self.rate, self.bandwidth_hz, detect::Hints::default());
@@ -107,6 +145,7 @@ impl Monitor {
                     continue;
                 }
                 self.flex_seen.push_back((f.cycle, f.frame));
+                self.heard.push(start + f.at as u64);
                 while self.flex_seen.len() > 64 {
                     self.flex_seen.pop_front();
                 }
@@ -129,24 +168,34 @@ impl Monitor {
             let (_, overlap) = timing(self.protocol);
             let skip = if first { 0 } else { (overlap * s.sync.baud) as usize };
             let new: Vec<detect::frames::Frame> = s.frames.iter().filter(|f| f.at_symbol >= skip).cloned().collect();
+            let rate = self.rate;
+            let at = |f: &detect::frames::Frame| start + (f.at_symbol as f64 / s.sync.baud * rate) as u64;
             if self.protocol == "POCSAG" {
                 // Pages from the whole block (a page may start in the overlap), each kept once.
                 self.tried += new.len() as u64;
                 let pages = detect::pocsag::pages(&s.frames);
                 locked = !pages.is_empty();
+                let mut fresh = false;
                 for p in pages {
-                    let line = p.summary();
-                    if Self::push(&mut self.pages, line) {
+                    if self.keep_pocsag(p) {
                         self.pages_total += 1;
                         self.decoded += 1;
                         *self.kinds.entry("page".into()).or_default() += 1;
+                        fresh = true;
                     }
+                }
+                // A page ends in the block's newest batch, or one before it: either is inside a POCSAG transmission.
+                if let Some(f) = s.frames.last().filter(|_| fresh) {
+                    self.heard.push(at(f));
                 }
             } else {
                 let f = detect::decode::summarise(&new);
                 self.tried += f.tried as u64;
                 self.decoded += f.decoded as u64;
                 locked = f.decoded > 0;
+                if let Some(fr) = new.last().filter(|_| locked) {
+                    self.heard.push(at(fr));
+                }
                 if let Some(id) = f.id {
                     *self.ids.entry(id).or_default() += f.decoded.max(1) as u64;
                 }
@@ -191,6 +240,8 @@ impl Decoder for Monitor {
     fn configure(&mut self, rate: f64) {
         self.rate = rate;
         self.buf.clear();
+        self.fed = 0;
+        self.heard.clear();
     }
 
     fn feed(&mut self, block: &[Complex32]) {
@@ -198,11 +249,12 @@ impl Decoder for Monitor {
             return;
         }
         self.buf.extend_from_slice(block);
+        self.fed += block.len() as u64;
         let (len, overlap) = timing(self.protocol);
         let (n, keep) = ((len * self.rate) as usize, (overlap * self.rate) as usize);
         while self.buf.len() >= n {
             let x: Vec<Complex32> = self.buf[..n].to_vec();
-            self.decode(&x);
+            self.decode(&x, self.fed - self.buf.len() as u64);
             self.buf.drain(..n - keep);
         }
     }
@@ -211,6 +263,10 @@ impl Decoder for Monitor {
     fn reset(&mut self) {
         self.buf.clear();
         self.blocks = 0;
+    }
+
+    fn take_heard(&mut self) -> Option<Vec<u64>> {
+        Some(std::mem::take(&mut self.heard))
     }
 
     fn telemetry(&self) -> Telemetry {
