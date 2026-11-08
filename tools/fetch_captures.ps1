@@ -37,7 +37,7 @@ foreach ($c in $captures) {
         continue
     }
     Write-Output "${name}: downloading"
-    & gh release download $release -R auggiesoft/SpecTrawl -p "$name.*" -D $dest --clobber
+    & gh release download $release -R trunk-reporter/SpecTrawl -p "$name.*" -D $dest --clobber
     if ($LASTEXITCODE -ne 0) { [Console]::Error.WriteLine("${name}: download failed"); exit 1 }
     if (-not ((Test-Path $data) -and (Test-Path $meta))) { [Console]::Error.WriteLine("${name}: asset missing"); exit 1 }
     $got = (Get-FileHash -Algorithm SHA256 $data).Hash

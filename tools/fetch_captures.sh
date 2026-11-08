@@ -33,7 +33,7 @@ printf '%s\n' "$lines" | while IFS="$tab" read -r release name want; do
     fi
     echo "$name: downloading"
     # </dev/null: gh must not read the loop's input (the manifest lines).
-    gh release download "$release" -R auggiesoft/SpecTrawl -p "$name.*" -D "$dest" --clobber </dev/null || { echo "$name: download failed" >&2; exit 1; }
+    gh release download "$release" -R trunk-reporter/SpecTrawl -p "$name.*" -D "$dest" --clobber </dev/null || { echo "$name: download failed" >&2; exit 1; }
     if [ ! -f "$data" ] || [ ! -f "$dest/$name.sigmf-meta" ]; then echo "$name: asset missing" >&2; exit 1; fi
     got="$(sha "$data")"
     if [ "$got" != "$want" ]; then echo "$name: sha256 mismatch (got $got, want $want)" >&2; exit 1; fi
