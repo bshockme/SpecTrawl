@@ -13,7 +13,7 @@ pub mod bank;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -143,6 +143,10 @@ struct Shared {
     ready: Condvar,
     stats: Mutex<Stats>,
     windows: Mutex<HashMap<RecordId, Arc<Win>>>,
+    /// Jobs a thread has taken off the queue and not yet counted: raised under the queue's lock, lowered under the
+    /// stats', so a view never misses a look in progress (CI's debug build takes ~0.8 s a look, and a test that read
+    /// "nothing waiting" there found a record neither looked at nor counted).
+    busy: AtomicUsize,
 }
 
 impl Shared {
@@ -182,6 +186,7 @@ impl Classifier {
             ready: Condvar::new(),
             stats: Mutex::new(Stats::default()),
             windows: Mutex::new(HashMap::new()),
+            busy: AtomicUsize::new(0),
         });
         let mut threads = Vec::new();
         if cfg.enabled {
@@ -200,7 +205,10 @@ impl Classifier {
         ClassifyView {
             workers: self.shared.workers,
             looked: s.looked,
-            waiting: self.shared.windows.lock().len() + self.shared.queue.lock().len(),
+            waiting: self.shared.windows.lock().len() + {
+                let q = self.shared.queue.lock();
+                q.len() + self.shared.busy.load(Ordering::SeqCst)
+            },
             missed: s.missed,
             dropped: s.dropped,
             survey: s.survey,
@@ -359,7 +367,6 @@ impl Window {
     fn finish(&mut self) -> Flow {
         if !self.sent {
             self.sent = true;
-            self.shared.windows.lock().remove(&self.record);
             let job = Job {
                 record: self.record,
                 relook: self.relook,
@@ -371,7 +378,10 @@ impl Window {
                 snr_db: f64::from_bits(self.win.snr_db.load(Ordering::Relaxed)) as f32,
                 am_band: self.am_band,
             };
+            // Submitted (queued, or counted missed or dropped) before it leaves the in-flight windows, so it is never
+            // in neither.
             self.shared.submit(job);
+            self.shared.windows.lock().remove(&self.record);
         }
         Flow::Stop
     }
@@ -493,6 +503,7 @@ fn work(shared: Arc<Shared>, book: Arc<RecordBook>) {
                     return;
                 }
                 if let Some(j) = q.pop_front() {
+                    shared.busy.fetch_add(1, Ordering::SeqCst);
                     break j;
                 }
                 shared.ready.wait_for(&mut q, Duration::from_millis(200));
@@ -526,5 +537,6 @@ fn work(shared: Arc<Shared>, book: Arc<RecordBook>) {
         s.looked += 1;
         s.looked_secs += job.iq.len() as f64 / job.rate;
         s.work_secs += t0.elapsed().as_secs_f64();
+        shared.busy.fetch_sub(1, Ordering::SeqCst);
     }
 }

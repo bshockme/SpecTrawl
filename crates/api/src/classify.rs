@@ -13,7 +13,7 @@ pub struct ClassifyView {
     pub workers: usize,
     /// Records looked at.
     pub looked: u64,
-    /// Waiting for their window or for a thread.
+    /// Waiting for their window or for a thread, or being looked at.
     pub waiting: usize,
     /// Never looked at: their IQ had left the ring (or the source had gone) before the window could be cut.
     pub missed: u64,

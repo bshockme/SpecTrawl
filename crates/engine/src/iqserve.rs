@@ -255,7 +255,7 @@ fn stream(
         let Some((_, rx)) = &current else { continue };
         match rx.recv_timeout(POLL) {
             Ok(bytes) => {
-                if let Err(e) = out.write_all(&bytes) {
+                if let Err(e) = write_block(out, &bytes, || alive.load(Ordering::Relaxed) && !shared.stop.load(Ordering::Relaxed)) {
                     break Err(e);
                 }
                 shared.stats.lock().bytes_sent += bytes.len() as u64;
@@ -268,6 +268,23 @@ fn stream(
         bus.unsubscribe(id);
     }
     result
+}
+
+/// Writes one block whole while `going()`. A client that stops reading fills the socket and the write times out
+/// (on Windows after one 64 KB buffer): that is a slow client, not a gone one, so the write waits on, where it stopped
+/// (a block cut short would shift every later I/Q pair), and the queue behind it drops blocks instead (the test
+/// `a_client_that_stops_reading_loses_blocks_not_the_bus`; Windows failed it on CI, Linux's larger buffers hid it).
+fn write_block(out: &mut TcpStream, bytes: &[u8], going: impl Fn() -> bool) -> io::Result<()> {
+    let mut done = 0;
+    while done < bytes.len() && going() {
+        match out.write(&bytes[done..]) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => done += n,
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 fn subscribe(
