@@ -35,6 +35,11 @@ restyled.
 - **Data:** the spectrum trace is the trace cyan, never the accent; the peak hold is ink-2. The
   waterfall uses inferno at every tenth (`theme::CMAP`; the Instrument look's five stops are among them, but interpolating those five alone lifts the noise floor to a bright purple), whose floor and ceiling are the
   receiver's dB range. Plot wells are flat black.
+- **Plots:** the band plan is a 20 px strip between the spectrum and the waterfall (O14), its
+  fills in identity colours at 15 % with stronger edges, names cut to fit, two rows for overlaps,
+  every allocation at the pointer on hover. The waterfall's time sits in the left gutter on chips,
+  marks at least 48 px apart, with the top row's clock time (O2, O13). The spectrum's smoothed
+  trace carries the peak hold (D3).
 - **Gold thread:** the wordmark top left, and (with the page bar, step 8 Task 8) the 2 px underline
   under the active workspace. Nowhere else.
 - **Project voice:** none.
@@ -48,6 +53,9 @@ restyled.
   Presets and Reset layout give the escape hatch the rule asks for.
 - **R1, a redesign behind a setting:** the new app is not yet the default, and `app-old` is the way
   back until step 8 switches over, so the new app carries one look only.
+- **O13, a hairline at each retune:** a retune clears the waterfall's history, so no rows span
+  one and there is nothing for the line to separate. The time gutter's chips and the clock time
+  at the top follow O13 otherwise.
 - **Page bar (signature §3, L3):** SpecTrawl's pages are its workspaces, because the dock lets the
   owner rearrange panes. The page bar lists the workspaces, and the gold underline marks the active
   one, not a dock tab (several dock tabs are active at once).

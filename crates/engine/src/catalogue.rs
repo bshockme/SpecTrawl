@@ -3,7 +3,7 @@
 //! When a detector or decoder gains a mode, it gets an entry here; the test below checks the sync bank's protocols
 //! are all listed.
 
-use api::{CatalogueEntry, Domain, Reach};
+use api::{BandSpan, CatalogueEntry, Domain, Reach};
 
 const fn entry(mode: &'static str, domain: Domain, reach: Reach, blurb: &'static str, labels: &'static [&'static str]) -> CatalogueEntry {
     CatalogueEntry { mode, domain, reach, blurb, labels }
@@ -61,6 +61,11 @@ pub fn entries() -> Vec<CatalogueEntry> {
         entry("GSM", Cellular, Decodes, "GSM base stations: the FCCH, and the BSIC from the SCH", &["GSM"]),
         entry("LoRa", Other, Shape, "Chirp spread spectrum: bandwidth and spreading factor from the chirps", &["LoRa"]),
     ]
+}
+
+/// The band plan's allocations, for the band strip.
+pub fn band_plan() -> Vec<BandSpan> {
+    detect::bandplan::BANDS.iter().map(|b| BandSpan { lo_hz: b.lo_hz, hi_hz: b.hi_hz, name: b.name, service: b.service.name() }).collect()
 }
 
 #[cfg(test)]

@@ -231,3 +231,15 @@ impl CatalogueEntry {
         self.labels.iter().any(|p| label.starts_with(p))
     }
 }
+
+/// One band-plan allocation, for the band strip on a receiver's frequency axis (spec §4.5's band plan; the guide's
+/// O14). It says what a frequency is allocated to, never what a signal there is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BandSpan {
+    pub lo_hz: f64,
+    pub hi_hz: f64,
+    /// "Air band", "800 MHz SMR/public safety".
+    pub name: &'static str,
+    /// The kind of service: "Aviation voice", "Trunked radio".
+    pub service: &'static str,
+}

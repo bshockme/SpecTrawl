@@ -79,6 +79,7 @@ impl ReceiverPane {
     }
 
     /// `records`: this receiver's, from the snapshot; `selected` is shared with the records list.
+    #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -86,6 +87,7 @@ impl ReceiverPane {
         records: &[std::sync::Arc<api::SignalRecord>],
         decoders: &[api::DecoderView],
         selected: &mut crate::selection::Selection,
+        bands: &[api::BandSpan],
         out: &mut Vec<Command>,
     ) {
         self.header(ui, r, selected, out);
@@ -95,7 +97,7 @@ impl ReceiverPane {
             crate::systems_pane::decoder_line(ui, d);
         }
         ui.add_space(4.0);
-        self.body.show(ui, r, records, selected, self.db_range, &mut self.paused, out);
+        self.body.show(ui, r, records, selected, bands, self.db_range, &mut self.paused, out);
     }
 
     pub fn last_status(&self) -> &Status {

@@ -6,7 +6,7 @@ use std::time::SystemTime;
 use sdr_core::{Capabilities, DeviceInfo, GainSetting};
 
 use crate::audio::AudioView;
-use crate::classify::{CatalogueEntry, ChannelsView, ClassifyView, DecoderView, SystemsView, WorkerMode, WorkerView};
+use crate::classify::{BandSpan, CatalogueEntry, ChannelsView, ClassifyView, DecoderView, SystemsView, WorkerMode, WorkerView};
 use crate::command::Ack;
 use crate::records::{QueryResult, RecordsView, StoreView};
 use crate::timeline::{Row, SegmentId};
@@ -41,6 +41,8 @@ pub struct Snapshot {
     pub worker_modes: Arc<Vec<WorkerMode>>,
     /// Every mode the engine can name or decode (the same `Arc` in every snapshot).
     pub catalogue: Arc<Vec<CatalogueEntry>>,
+    /// The band plan's allocations (the same `Arc` in every snapshot).
+    pub band_plan: Arc<Vec<BandSpan>>,
 }
 
 impl Snapshot {
@@ -64,6 +66,7 @@ impl Snapshot {
             workers: Vec::new(),
             worker_modes: Arc::new(Vec::new()),
             catalogue: Arc::new(Vec::new()),
+            band_plan: Arc::new(Vec::new()),
         }
     }
 }

@@ -66,6 +66,7 @@ struct Publisher {
     log: Log,
     narrator: narrate::Narrator,
     catalogue: Arc<Vec<api::CatalogueEntry>>,
+    band_plan: Arc<Vec<api::BandSpan>>,
     watch: Watch,
     version: u64,
     /// The systems view and the records view version it was built from.
@@ -97,6 +98,7 @@ pub fn spawn_with_guard(engine: Engine, backends: Vec<Box<dyn Backend>>, cfg: Pu
         log,
         narrator: narrate::Narrator::default(),
         catalogue: Arc::new(crate::catalogue::entries()),
+        band_plan: Arc::new(crate::catalogue::band_plan()),
         watch: Watch::default(),
         version: 0,
         swap: swap.clone(),
@@ -247,6 +249,7 @@ impl Publisher {
             workers: self.engine.worker_views(),
             worker_modes: self.engine.worker_modes(),
             catalogue: self.catalogue.clone(),
+            band_plan: self.band_plan.clone(),
         }));
     }
 }

@@ -28,7 +28,7 @@ const STORAGE_KEY: &str = "spectrawl-next";
 const DEVICES_SHARE: f32 = 0.3;
 
 /// Devices' share of the left column; the inspector takes the rest.
-const INSPECTOR_SPLIT: f32 = 0.3;
+const INSPECTOR_SPLIT: f32 = 0.4;
 
 pub struct App {
     handle: Handle,
@@ -310,7 +310,7 @@ impl egui_dock::TabViewer for App {
                 if let (Some(r), Some(p)) = (snap.receivers.iter().find(|r| r.id == *id), self.panes.get_mut(id)) {
                     let mine: Vec<_> = snap.records.records.iter().filter(|x| x.source == r.id).cloned().collect();
                     let decoders: Vec<_> = snap.decoders.iter().filter(|d| d.source == r.id).cloned().collect();
-                    p.show(ui, r, &mine, &decoders, &mut self.selection, &mut self.out);
+                    p.show(ui, r, &mine, &decoders, &mut self.selection, &snap.band_plan, &mut self.out);
                 }
             }
             Tab::Devices => devices_pane::show(ui, &snap, &mut self.budget_draft, &mut self.out),
