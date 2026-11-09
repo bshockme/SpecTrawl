@@ -271,7 +271,20 @@ impl SignalRecord {
     pub fn headline(&self) -> Option<&Claim> {
         headline(&self.claims)
     }
+
+    /// Part of a long-running or wideband occupant rather than an event (spec §5: the Records table shows events; occupants
+    /// have their own view): on the air [`OCCUPANT_SECS`] or more, at least [`OCCUPANT_HZ`] wide, or named as a
+    /// broadcast, TV or cellular signal.
+    pub fn is_occupant(&self) -> bool {
+        let named = self.headline().is_some_and(|c| ["FM broadcast", "TV ", "LTE", "GSM"].iter().any(|p| c.label.starts_with(p)));
+        self.duration().as_secs_f64() >= OCCUPANT_SECS || self.bandwidth_hz() >= OCCUPANT_HZ || named
+    }
 }
+
+/// A record on the air this long is an occupant, not an event.
+pub const OCCUPANT_SECS: f64 = 60.0;
+/// A record this wide is a wideband occupant (broadcast FM is about 200 kHz; land mobile at most 25 kHz).
+pub const OCCUPANT_HZ: f64 = 150e3;
 
 /// The headline of a set of claims; see [`SignalRecord::headline`].
 pub fn headline(claims: &[Claim]) -> Option<&Claim> {
@@ -546,6 +559,32 @@ mod tests {
 
     fn sync(label: &str, c: f32) -> Claim {
         Claim::new(label, c, Evidence::SyncBank { protocol: label.into(), syncs: 3, frames_tried: 2, frames_decoded: 2 })
+    }
+
+    #[test]
+    fn long_wide_or_broadcast_records_are_occupants_and_the_rest_are_events() {
+        let event = record(vec![sync("P25 Phase 1", 0.9)]);
+        assert!(!event.is_occupant(), "a 100 ms, 12.5 kHz burst is an event");
+        let mut long = record(vec![]);
+        long.t_end = long.t_start + Duration::from_secs(61);
+        assert!(long.is_occupant());
+        let mut wide = record(vec![]);
+        wide.f_hi_hz = wide.f_lo_hz + 200e3;
+        assert!(wide.is_occupant());
+        let fm = Claim::new(
+            "FM broadcast",
+            0.6,
+            Evidence::Features {
+                bandwidth_hz: 12.5e3,
+                snr_db: 30.0,
+                duty: 1.0,
+                envelope_cv: None,
+                symbol_rate: None,
+                fsk_levels: None,
+                deviation_hz: None,
+            },
+        );
+        assert!(record(vec![fm]).is_occupant(), "named broadcast, however short the look");
     }
 
     #[test]

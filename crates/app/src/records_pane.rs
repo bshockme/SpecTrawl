@@ -46,6 +46,8 @@ pub struct RecordsPane {
     pub search_seq: Option<u64>,
     /// Show the search's answer instead of the live list.
     pub showing_history: bool,
+    /// List occupants too, not only events (spec §5: by default the table shows events).
+    pub show_occupants: bool,
 }
 
 impl Default for RecordsPane {
@@ -78,6 +80,7 @@ impl RecordsPane {
             search: String::new(),
             search_seq: None,
             showing_history: false,
+            show_occupants: false,
         }
     }
 
@@ -91,6 +94,7 @@ impl RecordsPane {
         let words: Vec<String> = self.filter.split_whitespace().map(str::to_lowercase).collect();
         let mut rows: Vec<Arc<SignalRecord>> = source
             .into_iter()
+            .filter(|r| self.show_occupants || !r.is_occupant())
             .filter(|r| {
                 words.iter().all(|w| {
                     format!("{:.4}", r.center_hz() / 1e6).contains(w.as_str())
@@ -140,6 +144,21 @@ impl RecordsPane {
             if self.showing_history && ui.button("Live").clicked() {
                 self.showing_history = false;
             }
+            ui.separator();
+            if ui
+                .add(egui::Button::new("Events").selected(!self.show_occupants))
+                .on_hover_text("Records shorter than a minute and narrower than 150 kHz, not broadcast or cellular")
+                .clicked()
+            {
+                self.show_occupants = false;
+            }
+            if ui
+                .add(egui::Button::new("All").selected(self.show_occupants))
+                .on_hover_text("Occupants too: long or wideband records (the Emitters tab lists them)")
+                .clicked()
+            {
+                self.show_occupants = true;
+            }
         });
         let store_line = match &snap.store {
             Some(s) if s.error.is_some() => format!("store: {}", s.error.as_deref().unwrap_or_default()),
@@ -156,7 +175,10 @@ impl RecordsPane {
                 _ => "searching…".into(),
             }
         } else {
-            format!("{} of {}", fmt::count(rows.len(), "record"), snap.records.records.len())
+            let occupants = snap.records.records.iter().filter(|r| r.is_occupant()).count();
+            let hidden =
+                if self.show_occupants || occupants == 0 { String::new() } else { format!(" ({occupants} occupant records hidden)") };
+            format!("{} of {}{hidden}", fmt::count(rows.len(), "record"), snap.records.records.len())
         };
         ui.label(RichText::new(format!("{source} · {store_line}")).color(theme::INK2).small());
         ui.label(RichText::new(crate::systems_pane::budget_line(snap)).color(theme::INK2).small());

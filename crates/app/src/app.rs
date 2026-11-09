@@ -8,6 +8,7 @@ use api::{Command, Handle, RecordId, Snapshot, SourceId};
 use egui_dock::{DockArea, DockState, NodeIndex, Tree};
 
 use crate::devices_pane::{self, BudgetDraft};
+use crate::emitters_pane::EmittersPane;
 use crate::inspector::Inspector;
 use crate::log_pane::LogPane;
 use crate::receiver_pane::{DEFAULT_DB_RANGE, ReceiverPane};
@@ -38,6 +39,7 @@ pub struct App {
     /// Commands collected while drawing, sent once the frame is drawn.
     out: Vec<Command>,
     records: RecordsPane,
+    emitters: EmittersPane,
     log: LogPane,
     status: StatusBar,
     /// What is selected, shared by every pane and shown by the inspector.
@@ -55,7 +57,7 @@ impl App {
         let [left, _] = dock.main_surface_mut().split_right(
             NodeIndex::root(),
             DEVICES_SHARE,
-            vec![Tab::Log, Tab::Records, Tab::Systems, Tab::Channels],
+            vec![Tab::Log, Tab::Records, Tab::Emitters, Tab::Systems, Tab::Channels],
         );
         // The inspector under Devices (docs/ui-design.md §4: docked left).
         dock.main_surface_mut().split_below(left, INSPECTOR_SPLIT, vec![Tab::Inspector]);
@@ -70,6 +72,7 @@ impl App {
             db_ranges: HashMap::new(),
             out: Vec::new(),
             records: RecordsPane::new(),
+            emitters: EmittersPane::default(),
             log: LogPane::default(),
             status: StatusBar::default(),
             selection: Selection::None,
@@ -118,7 +121,7 @@ impl App {
                 theme::wordmark(ui);
                 ui.add_space(12.0);
                 ui.menu_button("View ⏷", |ui| {
-                    for tab in [Tab::Devices, Tab::Inspector, Tab::Log, Tab::Records, Tab::Systems, Tab::Channels] {
+                    for tab in [Tab::Devices, Tab::Inspector, Tab::Log, Tab::Records, Tab::Emitters, Tab::Systems, Tab::Channels] {
                         let shown = self.dock.find_tab(&tab).is_some();
                         if ui.add_enabled(!shown, egui::Button::new(tab.name())).clicked() {
                             reopen(&mut self.dock, tab);
@@ -291,6 +294,7 @@ impl egui_dock::TabViewer for App {
             Tab::Devices => devices_pane::show(ui, &snap, &mut self.budget_draft, &mut self.out),
             Tab::Log => self.log.show(ui, &snap),
             Tab::Records => self.records.show(ui, &snap, &mut self.selection, &mut self.out),
+            Tab::Emitters => self.emitters.show(ui, &snap, &mut self.selection),
             Tab::Inspector => self.inspector.show(ui, &snap, &mut self.selection, &mut self.out),
             Tab::Systems => crate::systems_pane::show(ui, &snap, &mut self.selection),
             Tab::Channels => crate::channels_pane::show(ui, &snap, &mut self.selection),
@@ -341,7 +345,7 @@ fn reopen(dock: &mut DockState<Tab>, tab: Tab) {
         return;
     }
     match tab {
-        Tab::Systems | Tab::Channels => match tree.find_tab(&Tab::Records).or_else(|| tree.find_tab(&Tab::Log)) {
+        Tab::Systems | Tab::Channels | Tab::Emitters => match tree.find_tab(&Tab::Records).or_else(|| tree.find_tab(&Tab::Log)) {
             Some((node, _)) => tree[node].append_tab(tab),
             None => {
                 tree.split_right(NodeIndex::root(), DEVICES_SHARE, vec![tab]);

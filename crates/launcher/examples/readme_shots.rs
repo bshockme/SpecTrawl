@@ -6,7 +6,7 @@
 //!         [--db <serial>=<lo>,<hi>]... [--records <filter words>]
 //!
 //! Shots (in `out_dir`): `receiver_<letter>.png` for each receiver; `records.png` (the list filtered by `--records`,
-//! its newest decoded record selected), `systems.png` and `channels.png` (in front of the receiver tuned to the air
+//! its newest decoded record selected), `emitters.png` (the busiest named one selected), `systems.png` and `channels.png` (in front of the receiver tuned to the air
 //! band, if one is), drawn taller. `--db` sets a receiver's waterfall range, as the app's saved settings would.
 
 use std::time::{Duration, Instant};
@@ -15,6 +15,7 @@ use api::{Command, Snapshot};
 use engine::snapshot::PublisherConfig;
 use engine::{BudgetConfig, BusConfig, Engine, EngineConfig, RingBudget, SourceConfig};
 use spectrawl_app::app::App;
+use spectrawl_app::selection::Selection;
 use spectrawl_app::tabs::Tab;
 
 /// The window the launcher opens, in points, and the scale it is drawn at; the list shots are taller.
@@ -144,6 +145,11 @@ fn main() {
     }
     h.state_mut().show_tab(Tab::Records);
     save(&mut h, "records");
+    // The emitters, the most active one selected.
+    let busiest = s.records.emitters.iter().filter(|e| e.headline.is_some()).max_by_key(|e| e.records).map(|e| e.id);
+    h.state_mut().set_selection(busiest.map_or(Selection::None, Selection::Emitter));
+    h.state_mut().show_tab(Tab::Emitters);
+    save(&mut h, "emitters");
     h.state_mut().select(None);
     h.state_mut().show_tab(Tab::Systems);
     save(&mut h, "systems");

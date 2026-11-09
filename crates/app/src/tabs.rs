@@ -13,6 +13,8 @@ pub enum Tab {
     Log,
     /// The records list, beside the Log.
     Records,
+    /// Every recent emitter, occupants included.
+    Emitters,
     /// The systems the decoders found, and the decoders' lamps, beside the records.
     Systems,
     /// The band-plan channels heard (air band), beside the systems.
@@ -28,6 +30,7 @@ impl Tab {
             Tab::Inspector => "Inspector",
             Tab::Log => "Log",
             Tab::Records => "Records",
+            Tab::Emitters => "Emitters",
             Tab::Systems => "Systems",
             Tab::Channels => "Channels",
         }
