@@ -86,6 +86,9 @@ impl Page {
     }
 }
 
+/// A frame's length: 128 frames in a 4-minute cycle.
+pub const FRAME_SECS: f64 = 240.0 / 128.0;
+
 /// A frame's length after the end of sync 1 (where [`FlexFrame::at`] points): the frame information word (32 bits at
 /// 1600 bit/s), sync 2 (25 ms) and 11 blocks of 160 ms.
 pub const FRAME_AFTER_SYNC1_SECS: f64 = 0.020 + 0.025 + 11.0 * 0.160;
@@ -203,6 +206,23 @@ fn find_sync1(d: &[f32], fs: f64) -> Vec<(f64, usize, bool)> {
     groups.into_iter().map(|g| (g.3 / g.4 as f64, g.1, g.2)).collect()
 }
 
+/// Zero deviation at a frame, from its sync 1 (speed `code`, last bit at `end`): midway between the medians of the
+/// bits sent positive and those sent negative.
+fn sync1_centre(d: &[f32], end: f64, sps: f64, code: u16, inv: bool) -> f32 {
+    let pattern = (code as u64) << 48 | (MARKER as u64) << 16 | (!code) as u64;
+    let (mut pos, mut neg) = (Vec::with_capacity(64), Vec::with_capacity(64));
+    for k in 0..64 {
+        let v = at(d, end - (63 - k) as f64 * sps);
+        // A header 1 is negative deviation.
+        if (pattern >> (63 - k) & 1 == 1) != inv { neg.push(v) } else { pos.push(v) }
+    }
+    let median = |v: &mut Vec<f32>| {
+        v.sort_by(f32::total_cmp);
+        v[v.len() / 2]
+    };
+    (median(&mut pos) + median(&mut neg)) / 2.0
+}
+
 /// Frame information word: (cycle, frame) if it checks out.
 fn fiw(d: &[f32], fs: f64, end: f64, inv: bool) -> Option<(u8, u8)> {
     let sps = fs / HEADER_BAUD;
@@ -267,6 +287,7 @@ fn slice_block(
     n: usize,
     levels: u8,
     inv: bool,
+    header_centre: f32,
     header_level: f32,
     thr_ratio: f32,
 ) -> Vec<(Vec<u8>, Vec<f32>)> {
@@ -275,10 +296,10 @@ fn slice_block(
     // makes the symbol mix lopsided (so no percentile midpoint): estimate
     // the offset and outer level decision-directed, from each symbol's
     // distance to its nearest ideal level.
-    // Start from the header's level: idle fill can put nearly every symbol
-    // on the inner levels, which would pass for outer ones.
+    // Start from the header's centre and level: idle fill can put nearly
+    // every symbol on the inner levels, which would pass for outer ones.
     let mut outer = header_level;
-    let mut dc = 0.0;
+    let mut dc = header_centre;
     for _ in 0..4 {
         let (mut resid, mut out_sum, mut out_n) = (0.0, 0.0, 0);
         for &x in &v {
@@ -456,7 +477,13 @@ fn decode_with(x: &[Complex32], fs: f64, soft: bool) -> Vec<FlexFrame> {
             continue;
         }
         let nph = phase_names(baud, levels).len();
-        // Full deviation, from the 1600-baud header after sync 1's start.
+        // The frame's centre, from sync 1, whose bits are known: midway between its positive and its negative bits
+        // (medians, as a simulcast beat's nulls throw the discriminator about). The buffer's median, which
+        // `discriminator` takes off, is not the centre: idle fill and the four levels' mix put it kilohertz off, which
+        // in slices from 931.3375 MHz sliced every data symbol of a frame to the wrong level while its header read.
+        let centre = sync1_centre(&dh, end, sps, SPEEDS[speed].0, inv);
+        // Full deviation, from the 1600-baud header after sync 1's start (two levels: an offset short of the deviation
+        // leaves the mean distance from zero as it is).
         let level = (0..112).map(|k| at(&dh, end - (63 - k) as f64 * sps).abs()).sum::<f32>() / 112.0;
         let mut phases: Vec<Vec<Option<u32>>> = vec![Vec::with_capacity(WORDS); nph];
         // Every word as sliced, with its bits' reliabilities, for the soft repair once the frame is read.
@@ -495,7 +522,7 @@ fn decode_with(x: &[Complex32], fs: f64, soft: bool) -> Vec<FlexFrame> {
             let slice = |d: &[f32], off: f64, thr: f32| {
                 let mut cost = 0;
                 let mut good = 0;
-                let cut = slice_block(d, &env, t0 + ((blk * n) as f64 + off) * s, s, n, levels, inv, level, thr);
+                let cut = slice_block(d, &env, t0 + ((blk * n) as f64 + off) * s, s, n, levels, inv, centre, level, thr);
                 let words: Vec<BlockWords> = cut
                     .iter()
                     .map(|(b, _)| {
