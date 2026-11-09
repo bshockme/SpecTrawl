@@ -52,6 +52,8 @@ pub struct DecoderView {
     pub level_dbfs: Option<f32>,
     /// The bus channel feeding it (its lag is that consumer's), while it has one.
     pub channel: Option<ChannelId>,
+    /// Its newest calls or pages, one line each, newest last ("1234567 (A): text"; the part before ": " is who).
+    pub recent: Vec<String>,
 }
 
 /// A trunked system, built from records' decoder claims (and nothing else), so it reads the same [`Identity`] as the
@@ -162,4 +164,70 @@ pub struct WorkerView {
     pub error: Option<String>,
     /// Times the process was restarted.
     pub restarts: u32,
+}
+
+/// Where a mode belongs in the catalogue (spec §5: modes grouped by domain).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Domain {
+    Trunking,
+    LandMobile,
+    Aviation,
+    Pagers,
+    Broadcast,
+    Cellular,
+    Other,
+}
+
+impl Domain {
+    pub fn name(self) -> &'static str {
+        match self {
+            Domain::Trunking => "Trunking",
+            Domain::LandMobile => "Land mobile",
+            Domain::Aviation => "Aviation",
+            Domain::Pagers => "Pagers",
+            Domain::Broadcast => "Broadcast",
+            Domain::Cellular => "Cellular",
+            Domain::Other => "Other",
+        }
+    }
+}
+
+/// How far SpecTrawl gets with a mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Reach {
+    /// A decoder reads its frames: identities, messages, calls.
+    Decodes,
+    /// Its sync words name it; its frames aren't read.
+    Names,
+    /// Recognised from its shape alone (AM, analog FM, chirps).
+    Shape,
+}
+
+impl Reach {
+    pub fn name(self) -> &'static str {
+        match self {
+            Reach::Decodes => "decodes",
+            Reach::Names => "names by sync",
+            Reach::Shape => "by shape",
+        }
+    }
+}
+
+/// One mode the engine can name or decode (spec §5's catalogue, built from the decoder registry).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatalogueEntry {
+    pub mode: &'static str,
+    pub domain: Domain,
+    pub reach: Reach,
+    /// One line: what it is and what SpecTrawl reads from it.
+    pub blurb: &'static str,
+    /// Claim labels that are this mode: a claim whose label starts with one of them counts for it.
+    pub labels: &'static [&'static str],
+}
+
+impl CatalogueEntry {
+    /// Whether a claim label is this mode.
+    pub fn matches(&self, label: &str) -> bool {
+        self.labels.iter().any(|p| label.starts_with(p))
+    }
 }

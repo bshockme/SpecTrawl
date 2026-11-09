@@ -6,8 +6,8 @@
 //!         [--db <serial>=<lo>,<hi>]... [--records <filter words>]
 //!
 //! Shots (in `out_dir`): `receiver_<letter>.png` for each receiver; `records.png` (the list filtered by `--records`,
-//! its newest decoded record selected), `emitters.png` (the busiest named one selected), `systems.png` and `channels.png` (in front of the receiver tuned to the air
-//! band, if one is), drawn taller. `--db` sets a receiver's waterfall range, as the app's saved settings would.
+//! its newest decoded record selected), `emitters.png` (the busiest named one selected), `systems.png`, `channels.png` (in front of the receiver tuned to the air
+//! band, if one is) and `catalogue.png`, drawn taller. `--db` sets a receiver's waterfall range, as the app's saved settings would.
 
 use std::time::{Duration, Instant};
 
@@ -158,6 +158,8 @@ fn main() {
     }
     h.state_mut().show_tab(Tab::Channels);
     save(&mut h, "channels");
+    h.state_mut().show_tab(Tab::Catalogue);
+    save(&mut h, "catalogue");
     drop(h);
     guard.join(Duration::from_secs(3));
 }

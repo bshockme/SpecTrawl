@@ -22,7 +22,8 @@ pub mod timeline;
 
 pub use audio::{AudioMode, AudioView, PlayFrom, PlayId, PlayState, PlayTarget, PlayTo, PlayView};
 pub use classify::{
-    ChannelRow, ChannelsView, ClassifyView, DecoderView, Lamp, SystemRow, SystemsView, WorkerId, WorkerMessage, WorkerMode, WorkerView,
+    CatalogueEntry, ChannelRow, ChannelsView, ClassifyView, DecoderView, Domain, Lamp, Reach, SystemRow, SystemsView, WorkerId,
+    WorkerMessage, WorkerMode, WorkerView,
 };
 pub use command::{Ack, Command, CommandReceiver, CommandSender, Outcome, command_channel};
 pub use handle::Handle;

@@ -72,6 +72,10 @@ pub trait Decoder: Send {
     fn telemetry(&self) -> Telemetry;
     /// One sentence.
     fn summary(&self) -> String;
+    /// The newest calls or pages it decoded, one line each, newest last (none by default).
+    fn recent(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// The claim the decoder makes about its signal, if it has locked.
     fn claim(&self) -> Option<Claim>;
 }
@@ -91,6 +95,8 @@ struct Attached {
     stop: AtomicBool,
     ended: AtomicBool,
     view: Mutex<(Telemetry, String)>,
+    /// The decoder's newest calls or pages.
+    recent: Mutex<Vec<String>>,
     /// The fed channel's power, dBFS, smoothed (NaN before the first samples).
     level_dbfs: Mutex<f32>,
     channel: Mutex<Option<ChannelId>>,
@@ -163,6 +169,7 @@ impl DecoderBank {
                     blocks_bad: t.blocks_bad,
                     level_dbfs: Some(*a.level_dbfs.lock()).filter(|v| v.is_finite()),
                     channel: *a.channel.lock(),
+                    recent: a.recent.lock().clone(),
                 }
             })
             .collect()
@@ -333,6 +340,7 @@ fn manage(shared: Arc<Shared>, book: Arc<RecordBook>, bus: Arc<ChannelBus>, sour
                 )),
                 channel: Mutex::new(None),
                 level_dbfs: Mutex::new(f32::NAN),
+                recent: Mutex::new(Vec::new()),
             });
             let feed = || -> Box<dyn Consumer> {
                 let decoder: Box<dyn Decoder> = match &want {
@@ -462,6 +470,10 @@ impl Consumer for Feed {
                 }
                 self.decoder.feed(samples);
                 *self.attached.view.lock() = (self.decoder.telemetry(), self.decoder.summary());
+                let recent = self.decoder.recent();
+                if *self.attached.recent.lock() != recent {
+                    *self.attached.recent.lock() = recent;
+                }
                 self.measure_level(samples);
                 match self.decoder.take_heard() {
                     Some(heard) => {

@@ -136,6 +136,13 @@ fn decoder(ui: &mut egui::Ui, d: &DecoderView, h: &History) {
     if tried > 0 {
         muted(ui, format!("{} of {} frames decoded ({:.0} %)", d.blocks_ok, tried, 100.0 * d.blocks_ok as f64 / tried as f64));
     }
+    if !d.recent.is_empty() {
+        let what = if d.mode == "POCSAG" || d.mode == "FLEX" { "Newest pages" } else { "Newest calls" };
+        ui.label(theme::label(what));
+        for line in d.recent.iter().rev().take(5) {
+            ui.label(RichText::new(line).monospace().size(11.5).color(theme::INK2));
+        }
+    }
     if let Some(level) = d.level_dbfs {
         ui.label(theme::value_unit(&format!("{level:.1}"), "dBFS in its channel"));
     }

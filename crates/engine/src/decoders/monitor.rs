@@ -269,6 +269,10 @@ impl Decoder for Monitor {
         Some(std::mem::take(&mut self.heard))
     }
 
+    fn recent(&self) -> Vec<String> {
+        self.calls.iter().chain(self.pages.iter()).cloned().collect()
+    }
+
     fn telemetry(&self) -> Telemetry {
         Telemetry {
             lamp: self.lamp,

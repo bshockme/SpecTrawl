@@ -19,6 +19,10 @@ pub enum Tab {
     Systems,
     /// The band-plan channels heard (air band), beside the systems.
     Channels,
+    /// The pages the pager monitors decoded.
+    Pages,
+    /// Every mode the engine can name or decode.
+    Catalogue,
 }
 
 impl Tab {
@@ -33,6 +37,8 @@ impl Tab {
             Tab::Emitters => "Emitters",
             Tab::Systems => "Systems",
             Tab::Channels => "Channels",
+            Tab::Pages => "Pages",
+            Tab::Catalogue => "Catalogue",
         }
     }
 }

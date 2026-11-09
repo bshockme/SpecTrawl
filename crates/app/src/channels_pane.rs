@@ -28,7 +28,7 @@ pub fn show(ui: &mut egui::Ui, snap: &Snapshot, selected: &mut Selection) {
             for c in rows {
                 let me = Selection::Channel { plan: c.plan.clone(), name: c.name.clone() };
                 let is_selected = *selected == me;
-                theme::dot(ui, if c.open { theme::INK } else { theme::INK3 }, c.open);
+                theme::dot(ui, if c.open { theme::INK } else { theme::INK2 }, c.open);
                 let name = RichText::new(format!("{} {}", c.plan, c.name)).strong();
                 if ui
                     .selectable_label(is_selected, name)
