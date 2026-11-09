@@ -85,3 +85,50 @@ fn a_selected_record_shows_every_claim_and_why_the_headline_won() {
         assert!(h.query_all_by_label_contains(text).next().is_some(), "the inspector should show {text:?}");
     }
 }
+
+#[test]
+fn the_page_bar_switches_layouts_and_a_saved_layout_joins_it() {
+    let (tx, _rx) = api::command_channel();
+    let handle = api::Handle::new(Arc::new(ArcSwap::from_pointee(Snapshot::empty())), tx);
+    let mut h =
+        Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_ui_state(|ui, app: &mut App| app.frame(ui), App::new(handle));
+    h.run_steps(3);
+    assert_eq!(h.state().page(), "Survey");
+    // Paging puts the Pages table in front: its empty-table sentence shows.
+    h.get_by_label("Paging").click();
+    h.run_steps(2);
+    assert_eq!(h.state().page(), "Paging");
+    assert!(h.query_all_by_label_contains("a page appears once a POCSAG or FLEX monitor decodes one").next().is_some());
+    // Saved under a name, it joins the page bar and is the page in use.
+    h.state_mut().save_page("Night watch");
+    h.run_steps(2);
+    assert_eq!(h.state().page(), "Night watch");
+    h.get_by_label("Survey").click();
+    h.run_steps(2);
+    assert_eq!(h.state().page(), "Survey");
+    h.get_by_label("Night watch").click();
+    h.run_steps(2);
+    assert_eq!(h.state().page(), "Night watch");
+    // A preset's name can't be taken.
+    h.state_mut().save_page("Survey");
+    assert_eq!(h.state().page(), "Night watch");
+}
+
+#[test]
+fn the_palette_runs_its_first_entry_on_enter() {
+    let (tx, _rx) = api::command_channel();
+    let handle = api::Handle::new(Arc::new(ArcSwap::from_pointee(Snapshot::empty())), tx);
+    let mut h =
+        Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_ui_state(|ui, app: &mut App| app.frame(ui), App::new(handle));
+    h.run_steps(3);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+    h.run_steps(2);
+    assert!(h.state().palette_open());
+    // The palette's box has the focus: typing goes to it, as a keyboard's would.
+    h.event(egui::Event::Text("pop out catalogue".into()));
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert!(!h.state().palette_open(), "Enter should run the entry and close the palette");
+    assert_eq!(h.state().popped_out(), [Tab::Catalogue]);
+}
