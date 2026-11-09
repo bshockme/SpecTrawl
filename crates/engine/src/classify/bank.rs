@@ -140,6 +140,8 @@ impl Detector for Modulation {
             symbol_rate: f.symbol_rate,
             fsk_levels: Some(f.fsk_levels).filter(|&n| n >= 2),
             deviation_hz: Some(f.deviation_hz).filter(|v| v.is_finite() && *v > 0.0),
+            // Set by the pool, which knows where the look was cut.
+            carrier_hz: None,
         };
         vec![Claim::new(d.label, d.confidence.min(MAX_FEATURE_CONFIDENCE), by)]
     }

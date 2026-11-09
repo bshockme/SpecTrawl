@@ -286,14 +286,33 @@ impl RecordBook {
                 return false;
             }
             if let Some((Some(em), serial, claims, closed)) = changed {
+                let mut folds = Vec::new();
+                let mut em = em;
                 if let Some(b) = inner.emitters.get_mut(&serial) {
-                    b.note_claims(em, record, &claims);
-                    if let Some(s) = b.state(em).filter(|_| closed.is_some()) {
+                    folds = b.note_claims(em, record, &claims);
+                    for &(gone, into) in &folds {
+                        if gone == em {
+                            em = into;
+                        }
+                    }
+                    if let Some(s) = b.state(em).filter(|_| closed.is_some() || !folds.is_empty()) {
                         out.emitters.push(s.clone());
                     }
                 }
                 inner.dirty_emitters.insert(em);
-                out.records.extend(closed.map(Arc::new));
+                for &(gone, into) in &folds {
+                    inner.dirty_emitters.insert(gone);
+                    out.folded.push((gone, into));
+                    inner.repoint(gone, into);
+                }
+                // The record as it now stands: closed, it goes back to the store (its emitter may have just changed).
+                let closed = closed.map(|mut r| {
+                    if r.emitter.is_some_and(|e| folds.iter().any(|f| f.0 == e)) {
+                        r.emitter = Some(em);
+                    }
+                    Arc::new(r)
+                });
+                out.records.extend(closed);
             }
             out
         };
@@ -514,18 +533,28 @@ impl Inner {
             }
             r.claims.extend(band_plan(r.center_hz()));
             r.claims.extend(self.extra.get(&r.id).into_iter().flat_map(|m| m.values().flatten().cloned()));
-            b.note_claims(o.emitter, r.id, &r.claims);
-            self.dirty_emitters.insert(o.emitter);
+            let mut folds: Vec<(EmitterId, EmitterId)> = o.folded.into_iter().collect();
+            folds.extend(b.note_claims(o.emitter, r.id, &r.claims));
+            // A station named just now may have gone into an older one on its carrier.
+            let mut em = o.emitter;
+            for &(gone, into) in &folds {
+                if gone == em {
+                    em = into;
+                }
+            }
+            r.emitter = Some(em);
+            self.dirty_emitters.insert(em);
             if !r.open
-                && let Some(s) = b.state(o.emitter)
+                && let Some(s) = b.state(em)
             {
                 out.emitters.push(s.clone());
             }
             if let Some(from) = o.left {
                 self.dirty_emitters.insert(from);
             }
-            if let Some((gone, into)) = o.folded {
+            for (gone, into) in folds {
                 self.dirty_emitters.insert(gone);
+                self.dirty_emitters.insert(into);
                 out.folded.push((gone, into));
                 self.repoint(gone, into);
             }

@@ -68,7 +68,7 @@ pub fn evidence_numbers(c: &Claim) -> String {
             let frames = if *frames_tried > 0 { format!(", {frames_decoded} of {frames_tried} frames decoded") } else { String::new() };
             format!("{syncs} syncs{frames}")
         }
-        Evidence::Features { bandwidth_hz, snr_db, duty, envelope_cv, symbol_rate, fsk_levels, deviation_hz } => {
+        Evidence::Features { bandwidth_hz, snr_db, duty, envelope_cv, symbol_rate, fsk_levels, deviation_hz, carrier_hz } => {
             let mut v = vec![format!("{:.1} kHz", bandwidth_hz / 1e3)];
             if snr_db.is_finite() {
                 v.push(format!("{snr_db:.0} dB SNR"));
@@ -78,6 +78,7 @@ pub fn evidence_numbers(c: &Claim) -> String {
             v.extend(symbol_rate.map(|r| format!("{r:.0} Bd")));
             v.extend(fsk_levels.map(|n| format!("{n} levels")));
             v.extend(deviation_hz.map(|d| format!("±{:.1} kHz deviation", d / 1e3)));
+            v.extend(carrier_hz.map(|c| format!("carrier {:.4} MHz", c / 1e6)));
             v.join(", ")
         }
         Evidence::Decoder { mode, locked, summary, .. } => {

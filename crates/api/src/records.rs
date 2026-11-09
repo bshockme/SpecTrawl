@@ -97,6 +97,10 @@ pub enum Evidence {
         /// Robust peak frequency deviation, Hz.
         #[cfg_attr(feature = "serde", serde(default))]
         deviation_hz: Option<f32>,
+        /// Where the carrier is, Hz, when the shape says: an FM broadcast station's mean frequency (programme audio has
+        /// none of its own), which a look cut around a fragment of the station still measures.
+        #[cfg_attr(feature = "serde", serde(default))]
+        carrier_hz: Option<f64>,
     },
     /// A decoder that locked, with its telemetry, and who the signal says it is when it says.
     Decoder {
@@ -451,6 +455,7 @@ mod standing_tests {
             symbol_rate: Some(4800.0),
             fsk_levels: Some(4),
             deviation_hz: None,
+            carrier_hz: None,
         };
         Claim::new(label, confidence, by)
     }
@@ -496,6 +501,7 @@ mod tests {
                     symbol_rate: None,
                     fsk_levels: None,
                     deviation_hz: None,
+                    carrier_hz: None,
                 },
             )
         };
@@ -582,6 +588,7 @@ mod tests {
                 symbol_rate: None,
                 fsk_levels: None,
                 deviation_hz: None,
+                carrier_hz: None,
             },
         );
         assert!(record(vec![fm]).is_occupant(), "named broadcast, however short the look");
@@ -600,6 +607,7 @@ mod tests {
                 symbol_rate: None,
                 fsk_levels: None,
                 deviation_hz: None,
+                carrier_hz: None,
             },
         );
         assert_eq!(record(vec![shape.clone()]).headline(), None);

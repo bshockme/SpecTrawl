@@ -53,6 +53,7 @@ fn a_selected_record_shows_every_claim_and_why_the_headline_won() {
         symbol_rate: Some(4800.0),
         fsk_levels: Some(4),
         deviation_hz: Some(1944.0),
+        carrier_hz: None,
     };
     let claims = vec![
         Claim::new("4FSK", 0.6, shape),

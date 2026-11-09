@@ -60,6 +60,18 @@ const GRID_HZ: f64 = 2.5e3;
 /// A line this close to the tuner centre is at DC.
 const DC_HZ: f64 = 1.5e3;
 
+/// A broadcast station's channel either side of its carrier: ±75 kHz of deviation and the programme's 15 kHz.
+const STATION_HALF_HZ: f64 = 100e3;
+/// HD Radio's digital sidebands either side of a station's carrier, from the widest (extended hybrid, 101 kHz in) to
+/// their outer edge (198 kHz). On air at 105.9 MHz they were records of 65–86 kHz at 105.700–105.786 and
+/// 106.014–106.100, each its own emitter.
+const STATION_HD_HZ: (f64, f64) = (95e3, 205e3);
+/// A sideband's record: at least this wide, its outer edge at least this far out. A neighbouring station 200 kHz
+/// away swings through the same place, but its fragments there are narrower (2–30 kHz on air) and its whole records
+/// reach past the sideband's edge.
+const STATION_HD_MIN_HZ: f64 = 50e3;
+const STATION_HD_OUTER_HZ: f64 = 180e3;
+
 /// How sure a position alone makes us: a suspicion until the line is measured (step 6).
 const POSITION_CONFIDENCE: f32 = 0.3;
 /// An image pair or a comb is stronger: another line in view says so.
@@ -290,13 +302,28 @@ impl EmitterBook {
     /// inside them stay their own.
     fn contains(e: &EmitterState, c: f64, bw: f64, bin: f64) -> bool {
         let bin = bin.max(e.bin_hz);
-        if bin >= COARSE_BIN_HZ || !e.confirmed || bw * 2.0 > e.bandwidth_hz + bin {
+        if bin >= COARSE_BIN_HZ {
             return false;
         }
+        // A station: anything within its channel, however it swings.
         if e.station {
-            return (e.center_hz - c).abs() <= e.bandwidth_hz / 2.0 + bin;
+            return (e.center_hz - c).abs() + bw / 2.0 <= STATION_HALF_HZ + bin;
+        }
+        if !e.confirmed || bw * 2.0 > e.bandwidth_hz + bin {
+            return false;
         }
         e.bandwidth_hz <= CONTAIN_MAX_HZ && (e.center_hz - c).abs() + bw / 2.0 <= e.bandwidth_hz / 2.0 + bin
+    }
+
+    /// Is a record of this centre and bandwidth one of station `e`'s HD Radio sidebands?
+    fn sideband(e: &EmitterState, c: f64, bw: f64, bin: f64) -> bool {
+        let bin = bin.max(e.bin_hz);
+        let off = (c - e.center_hz).abs();
+        e.station
+            && bin < COARSE_BIN_HZ
+            && bw >= STATION_HD_MIN_HZ
+            && off - bw / 2.0 >= STATION_HD_HZ.0 - bin
+            && (STATION_HD_OUTER_HZ - bin..=STATION_HD_HZ.1 + bin).contains(&(off + bw / 2.0))
     }
 
     /// Is `r` clearly wider than `e` and spanning all of it?
@@ -307,13 +334,14 @@ impl EmitterBook {
             && r.f_hi_hz >= e.center_hz + e.bandwidth_hz / 2.0 - bin
     }
 
-    /// The emitter a record belongs to, other than `except`: a confirmed narrowband emitter containing it (the
-    /// busiest), else the closest it fits.
+    /// The emitter a record belongs to, other than `except`: a confirmed narrowband emitter or a station containing it
+    /// (the busiest), else a station whose HD Radio sideband it is, else the closest it fits.
     fn find(&self, c: f64, bw: f64, bin: f64, except: Option<EmitterId>) -> Option<EmitterId> {
         let others = || self.map.values().map(|e| &e.s).filter(move |e| Some(e.id) != except);
         others()
             .filter(|e| Self::contains(e, c, bw, bin))
             .max_by_key(|e| e.records)
+            .or_else(|| others().filter(|e| Self::sideband(e, c, bw, bin)).max_by_key(|e| e.records))
             .or_else(|| {
                 others().filter(|e| Self::fits(e, c, bw, bin)).min_by(|a, b| (a.center_hz - c).abs().total_cmp(&(b.center_hz - c).abs()))
             })
@@ -332,7 +360,13 @@ impl EmitterBook {
             // A record that closes wider than its emitter and covering it, on an emitter with only a few records, built
             // that emitter from its own early fragments (two tracks of a broadcast station that later merged): the
             // emitter takes its final shape.
-            Some(&id) if closed && self.map.get(&id).is_some_and(|e| e.s.records == 1 || (e.s.records <= 3 && Self::covers(r, &e.s))) => {
+            Some(&id)
+                if closed
+                    && self
+                        .map
+                        .get(&id)
+                        .is_some_and(|e| !e.s.station && (e.s.records == 1 || (e.s.records <= 3 && Self::covers(r, &e.s)))) =>
+            {
                 let (to, f) = self.refit(r, id, c, bw);
                 folded = f;
                 to
@@ -344,7 +378,10 @@ impl EmitterBook {
             Some(&id)
                 if closed
                     && self.map.get(&id).is_some_and(|e| {
-                        e.s.records > 1 && !Self::fits(&e.s, c, bw, r.bin_hz) && !Self::contains(&e.s, c, bw, r.bin_hz)
+                        e.s.records > 1
+                            && !Self::fits(&e.s, c, bw, r.bin_hz)
+                            && !Self::contains(&e.s, c, bw, r.bin_hz)
+                            && !Self::sideband(&e.s, c, bw, r.bin_hz)
                     }) =>
             {
                 if let Some(e) = self.map.get_mut(&id) {
@@ -358,7 +395,7 @@ impl EmitterBook {
                     n
                 });
                 if let Some(e) = self.map.get_mut(&to) {
-                    if e.s.records > 0 && !Self::contains(&e.s, c, bw, r.bin_hz) {
+                    if e.s.records > 0 && !e.s.station && !Self::contains(&e.s, c, bw, r.bin_hz) {
                         e.s.center_hz += (c - e.s.center_hz) * 0.1;
                         e.s.bandwidth_hz += (bw - e.s.bandwidth_hz) * 0.1;
                     }
@@ -375,8 +412,10 @@ impl EmitterBook {
                     id
                 });
                 // A record taken in because it lies inside the emitter is a partial view: it doesn't move the
-                // emitter's centre or width.
-                let partial = self.map.get(&id).is_some_and(|e| e.s.records > 0 && Self::contains(&e.s, c, bw, r.bin_hz));
+                // emitter's centre or width. Nor does any record move a station, which sits on its carrier.
+                let partial = self.map.get(&id).is_some_and(|e| {
+                    e.s.records > 0 && (e.s.station || Self::contains(&e.s, c, bw, r.bin_hz) || Self::sideband(&e.s, c, bw, r.bin_hz))
+                });
                 if let Some(e) = self.map.get_mut(&id) {
                     e.s.records += 1;
                     if !partial {
@@ -438,7 +477,7 @@ impl EmitterBook {
             return (id, None);
         }
         self.by_record.insert(r.id, to);
-        if let Some(e) = self.map.get_mut(&to) {
+        if let Some(e) = self.map.get_mut(&to).filter(|e| !e.s.station) {
             e.s.center_hz += (c - e.s.center_hz) * 0.1;
             e.s.bandwidth_hz += (bw - e.s.bandwidth_hz) * 0.1;
         }
@@ -543,9 +582,11 @@ impl EmitterBook {
 
     /// Takes record `record`'s claims (all of them, as they now stand) into its emitter's vote, and the vote into the
     /// headline (spec §4.4: an emitter's label is computed from its records' claims). `station` follows a headline that
-    /// names a broadcast station.
-    pub fn note_claims(&mut self, id: EmitterId, record: RecordId, claims: &[Claim]) {
-        let Some(e) = self.map.get_mut(&id) else { return };
+    /// names a broadcast station; a station sits on its carrier, where a look measured it, and is its channel wide.
+    /// An emitter just named a station takes in the emitters its fragments made before (see [`Self::gather`]): the
+    /// folds, `(gone, into)`.
+    pub fn note_claims(&mut self, id: EmitterId, record: RecordId, claims: &[Claim]) -> Vec<(EmitterId, EmitterId)> {
+        let Some(e) = self.map.get_mut(&id) else { return Vec::new() };
         let v = &mut e.votes;
         // The newest decoder claim stands for the emitter, unless it names the same identity as the one standing with
         // fewer of its fields (a site heard again before its network broadcast came round).
@@ -588,7 +629,59 @@ impl EmitterBook {
             }
         }
         e.s.headline = v.headline();
+        let was = e.s.station;
         e.s.station = e.s.headline.as_ref().is_some_and(|h| h.label.starts_with("FM broadcast"));
+        if !e.s.station {
+            return Vec::new();
+        }
+        if let Some(Evidence::Features { carrier_hz: Some(c), .. }) = e.s.headline.as_ref().map(|h| &h.by) {
+            e.s.center_hz = *c;
+        }
+        e.s.bandwidth_hz = 2.0 * STATION_HALF_HZ;
+        if was { Vec::new() } else { self.gather(id) }
+    }
+
+    /// Station `id` takes in what is part of it: a second emitter on the same carrier (two began before either was
+    /// named; the busier stays), then every other emitter inside its channel or on its HD Radio sidebands. A weak
+    /// station's fragments each made an emitter of their own before any look named one of them: on air at 99.1 MHz,
+    /// a dozen per receiver.
+    fn gather(&mut self, id: EmitterId) -> Vec<(EmitterId, EmitterId)> {
+        let mut out = Vec::new();
+        let Some(s) = self.state(id).cloned() else { return out };
+        let mut keep = id;
+        let twin = self
+            .map
+            .values()
+            .map(|e| &e.s)
+            .filter(|o| o.id != id && o.station && (o.center_hz - s.center_hz).abs() <= STATION_HALF_HZ / 2.0)
+            .max_by_key(|o| o.records)
+            .map(|o| (o.id, o.records));
+        if let Some((t, n)) = twin {
+            let (from, to) = if n >= s.records { (id, t) } else { (t, id) };
+            if self.fold(from, to) {
+                out.push((from, to));
+                keep = to;
+            }
+        }
+        let Some(k) = self.state(keep).cloned() else { return out };
+        let pieces: Vec<EmitterId> = self
+            .map
+            .values()
+            .map(|e| &e.s)
+            .filter(|o| {
+                o.id != keep
+                    && !o.station
+                    && (Self::contains(&k, o.center_hz, o.bandwidth_hz, o.bin_hz)
+                        || Self::sideband(&k, o.center_hz, o.bandwidth_hz, o.bin_hz))
+            })
+            .map(|o| o.id)
+            .collect();
+        for p in pieces {
+            if self.fold(p, keep) {
+                out.push((p, keep));
+            }
+        }
+        out
     }
 
     /// What the receiver's own artefacts say about a record at `r`: at DC (on a zero-IF radio), on the spur grid, the
@@ -807,6 +900,79 @@ mod tests {
         assert_eq!(b.observe(&rec(11, 93.6400, 40.0, 11)), st);
         // A station 200 kHz away is not part of it.
         assert_ne!(b.observe(&rec(12, 93.9, 130.0, 12)), st);
+    }
+
+    /// What a look at a piece of a station says: its pilot, and its carrier (`carrier_mhz`).
+    fn pilot(carrier_mhz: f64) -> Claim {
+        Claim::new(
+            "FM broadcast (stereo)",
+            0.6,
+            Evidence::Features {
+                bandwidth_hz: 280e3,
+                snr_db: 12.0,
+                duty: 1.0,
+                envelope_cv: Some(0.05),
+                symbol_rate: None,
+                fsk_levels: None,
+                deviation_hz: Some(60e3),
+                carrier_hz: Some(carrier_mhz * 1e6),
+            },
+        )
+    }
+
+    #[test]
+    fn a_weak_stations_fragments_fold_into_it_once_one_is_named() {
+        // A weak station at 99.1 MHz is seen as fragments of its swing, up to 70 kHz either side, each too unlike the
+        // others to join them (as on air: a dozen emitters per receiver).
+        let mut b = Book::new();
+        let pieces: Vec<EmitterId> = [(99.030, 9.0), (99.047, 30.0), (99.068, 6.0), (99.105, 40.0), (99.148, 8.0), (99.163, 15.0)]
+            .iter()
+            .enumerate()
+            .map(|(i, (mhz, khz))| b.observe(&rec(i as u64 + 1, *mhz, *khz, i as u64)))
+            .collect();
+        assert_eq!(b.b.len(), 6);
+        // A neighbour 200 kHz up swings through 99.24 too.
+        let neighbour = b.observe(&rec(20, 99.240, 20.0, 20));
+        // One look, cut at station width around a fragment, finds the pilot and measures the carrier.
+        let named = pieces[1];
+        let folds = b.b.note_claims(named, RecordId(2), &[pilot(99.1003)]);
+        let e = b.get(named).unwrap();
+        assert!(e.station && (e.center_hz - 99.1003e6).abs() < 1.0 && e.bandwidth_hz == 200e3, "{e:?}");
+        assert_eq!(folds.len(), 5, "{folds:?}");
+        assert!(folds.iter().all(|&(gone, into)| into == named && gone != neighbour));
+        assert_eq!(b.b.len(), 2);
+        assert_eq!(b.of(1), named);
+        // Later fragments join it straight away; the neighbour's don't.
+        assert_eq!(b.observe(&rec(30, 99.035, 5.0, 30)), named);
+        assert_eq!(b.observe(&rec(31, 99.245, 12.0, 31)), neighbour);
+    }
+
+    #[test]
+    fn a_stations_hd_radio_sidebands_are_part_of_it() {
+        let mut b = Book::new();
+        let st = b.observe(&rec(1, 105.900, 166.0, 1));
+        b.b.note_claims(st, RecordId(1), &[pilot(105.9)]);
+        // Extended hybrid sidebands, as on air: 105.700–105.786 and 106.014–106.100.
+        assert_eq!(b.observe(&rec(2, 105.743, 86.0, 2)), st);
+        assert_eq!(b.observe(&rec(3, 106.057, 86.0, 3)), st);
+        // The core and a sideband in one record.
+        assert_eq!(b.observe(&rec(4, 105.842, 283.0, 4)), st);
+        assert_eq!(b.get(st).unwrap().center_hz, 105.9e6, "a station's records don't drag it off its carrier");
+        // A narrow fragment where a sideband would be is a neighbour's, not this station's.
+        assert_ne!(b.observe(&rec(5, 106.070, 15.0, 5)), st);
+    }
+
+    #[test]
+    fn two_emitters_named_for_one_station_become_one() {
+        let mut b = Book::new();
+        let a = b.observe(&rec(1, 105.890, 181.0, 1));
+        b.observe(&rec(2, 105.890, 181.0, 2));
+        let c = b.observe(&rec(3, 105.700, 600.0, 3));
+        assert_ne!(a, c);
+        b.b.note_claims(a, RecordId(1), &[pilot(105.9)]);
+        let folds = b.b.note_claims(c, RecordId(3), &[pilot(105.901)]);
+        assert_eq!(folds, vec![(c, a)], "the busier stays");
+        assert_eq!(b.of(3), a);
     }
 
     #[test]
