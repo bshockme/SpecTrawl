@@ -85,10 +85,10 @@ impl ReceiverPane {
         r: &Receiver,
         records: &[std::sync::Arc<api::SignalRecord>],
         decoders: &[api::DecoderView],
-        selected: &mut Option<api::RecordId>,
+        selected: &mut crate::selection::Selection,
         out: &mut Vec<Command>,
     ) {
-        self.header(ui, r, out);
+        self.header(ui, r, selected, out);
         status_lines(ui, r);
         // One sentence per decoder on this receiver, with its lamp (spec §5's status line and lamps).
         for d in decoders {
@@ -140,12 +140,16 @@ impl ReceiverPane {
         self.db_range = range;
     }
 
-    fn header(&mut self, ui: &mut egui::Ui, r: &Receiver, out: &mut Vec<Command>) {
+    fn header(&mut self, ui: &mut egui::Ui, r: &Receiver, selected: &mut crate::selection::Selection, out: &mut Vec<Command>) {
         ui.horizontal(|ui| {
             let letter = r.letter.to_string();
             // The letter is an identifier, not a state: a neutral chip.
             theme::chip(ui, &letter, theme::CHIP, theme::INK);
-            ui.label(egui::RichText::new(&r.device.label).strong());
+            // The receiver's name selects it: the inspector shows its ring, stage and decoders.
+            let me = crate::selection::Selection::Receiver(r.id);
+            if ui.selectable_label(*selected == me, &r.device.label).on_hover_text("Show this receiver in the inspector").clicked() {
+                selected.toggle(me);
+            }
             for mode in [Mode::Live, Mode::Sweep] {
                 if ui.add(egui::Button::new(mode_name(mode)).selected(r.mode == mode)).clicked() && r.mode != mode {
                     out.push(Command::SetMode { source: r.id, mode });

@@ -249,13 +249,13 @@ fn play_on_a_record_plays_it_and_stop_stops_it() {
     }
     let cw = cw.expect("an open record at 855.000 MHz");
     app.select(Some(cw));
-    let play = app.records_pane().play_command(cw);
+    let play = app.inspector().play_command(cw);
     app.push_command(play);
     let mut playing = None;
     for k in 100..160 {
         frame(&mut app, k);
         let snap = handle.latest();
-        if let Some(p) = spectrawl_app::records_pane::RecordsPane::play_of(&snap, cw)
+        if let Some(p) = spectrawl_app::inspector::Inspector::play_of(&snap, cw)
             && p.state == api::PlayState::Playing
         {
             playing = Some(p.clone());
@@ -263,14 +263,14 @@ fn play_on_a_record_plays_it_and_stop_stops_it() {
         }
     }
     let p = playing.expect("the play reached Playing");
-    let line = spectrawl_app::records_pane::RecordsPane::play_line(&p);
+    let line = spectrawl_app::inspector::Inspector::play_line(&p);
     // 855 MHz is not an air band: NFM, chosen by band, from the ring.
     assert!(line.starts_with("playing") && line.contains("NFM (by band) from the ring"), "{line}");
     app.push_command(Command::StopPlay(p.id));
     let mut stopped = false;
     for k in 160..200 {
         frame(&mut app, k);
-        if spectrawl_app::records_pane::RecordsPane::play_of(&handle.latest(), cw).is_some_and(|p| p.state == api::PlayState::Stopped) {
+        if spectrawl_app::inspector::Inspector::play_of(&handle.latest(), cw).is_some_and(|p| p.state == api::PlayState::Stopped) {
             stopped = true;
             break;
         }

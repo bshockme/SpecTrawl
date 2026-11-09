@@ -18,6 +18,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
+arc-swap = "1.7"
+egui_kittest = "0.36.2"
 backend-sim = { path = "../backend-sim" }
 engine = { path = "../engine" }
 sdr-core = { path = "../sdr-core" }

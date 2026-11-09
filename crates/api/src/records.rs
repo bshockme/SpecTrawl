@@ -82,8 +82,22 @@ impl Evidence {
 pub enum Evidence {
     /// The `detect` sync bank: syncs found, frames tried and decoded.
     SyncBank { protocol: String, syncs: u32, frames_tried: u32, frames_decoded: u32 },
-    /// The record's own shape and power.
-    Features { bandwidth_hz: f64, snr_db: f32, duty: f32, envelope_cv: Option<f32> },
+    /// The record's own shape and power, and what the modulation rules measured in it.
+    Features {
+        bandwidth_hz: f64,
+        snr_db: f32,
+        duty: f32,
+        envelope_cv: Option<f32>,
+        /// Symbols per second from the transition line, snapped to a standard rate within 3 %.
+        #[cfg_attr(feature = "serde", serde(default))]
+        symbol_rate: Option<f64>,
+        /// Levels in the frequency histogram (2 or 4) when it looks like FSK.
+        #[cfg_attr(feature = "serde", serde(default))]
+        fsk_levels: Option<u8>,
+        /// Robust peak frequency deviation, Hz.
+        #[cfg_attr(feature = "serde", serde(default))]
+        deviation_hz: Option<f32>,
+    },
     /// A decoder that locked, with its telemetry, and who the signal says it is when it says.
     Decoder {
         mode: String,
@@ -280,6 +294,50 @@ pub fn is_analog_shape(c: &Claim) -> bool {
 /// Least confidence of an analog shape that headlines (see [`is_analog_shape`]).
 pub const ANALOG_SHAPE_CONFIDENCE: f32 = 0.599;
 
+/// Where a claim stands against the headline rule ([`headline`]), so an interface can say why a record carries the
+/// name it does and why each other claim didn't win. Built from the same tiers as [`headline`], so the two cannot
+/// disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    /// This claim is the headline.
+    Headline,
+    /// It could name the record, but a claim of a stronger kind did ("decoded" beats "sync bank" beats "shape").
+    Outranked { by: &'static str },
+    /// Same kind as the headline, less confident.
+    LessConfident,
+    /// This kind of claim never names a record; the reason in words.
+    NeverNames(&'static str),
+}
+
+/// The tier [`headline`] puts a claim in: higher wins; 0 never names.
+fn tier(c: &Claim) -> u8 {
+    match c.by {
+        Evidence::Decoder { .. } => 3,
+        Evidence::SyncBank { .. } => 2,
+        _ if is_analog_shape(c) => 1,
+        _ => 0,
+    }
+}
+
+/// Where `c` (one of `claims`) stands; see [`Standing`].
+pub fn standing(claims: &[Claim], c: &Claim) -> Standing {
+    if tier(c) == 0 {
+        return Standing::NeverNames(match c.by {
+            Evidence::Features { .. } => "a shape names only AM or analog FM, measured at 60 % or more",
+            Evidence::BandPlan { .. } => "the band plan describes where it is, never what it is",
+            Evidence::Neighbour { .. } => "borrowed from a neighbour, never the name",
+            Evidence::Position(_) => "where it sits says what it may be, never what it is",
+            _ => "it never names",
+        });
+    }
+    match headline(claims) {
+        Some(h) if std::ptr::eq(h, c) => Standing::Headline,
+        Some(h) if tier(h) > tier(c) => Standing::Outranked { by: h.by.kind() },
+        Some(_) => Standing::LessConfident,
+        None => Standing::Headline,
+    }
+}
+
 /// Short: claims, tags and notes are counted, not printed.
 impl std::fmt::Debug for SignalRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -368,13 +426,65 @@ pub struct QueryResult {
 }
 
 #[cfg(test)]
+mod standing_tests {
+    use super::*;
+
+    fn shape(label: &str, confidence: f32) -> Claim {
+        let by = Evidence::Features {
+            bandwidth_hz: 12.5e3,
+            snr_db: 20.0,
+            duty: 1.0,
+            envelope_cv: None,
+            symbol_rate: Some(4800.0),
+            fsk_levels: Some(4),
+            deviation_hz: None,
+        };
+        Claim::new(label, confidence, by)
+    }
+
+    fn sync(label: &str, confidence: f32) -> Claim {
+        Claim::new(label, confidence, Evidence::SyncBank { protocol: label.into(), syncs: 9, frames_tried: 0, frames_decoded: 0 })
+    }
+
+    #[test]
+    fn every_claim_says_why_it_did_or_did_not_name_the_record() {
+        let claims = vec![
+            shape("4FSK", 0.6),
+            sync("DMR BS voice", 0.7),
+            sync("P25 Phase 1", 0.9),
+            shape("Analog FM", 0.6),
+            Claim::new("Public safety 800", 0.4, Evidence::BandPlan { entry: "800 MHz trunking".into() }),
+        ];
+        let s: Vec<_> = claims.iter().map(|c| standing(&claims, c)).collect();
+        assert!(matches!(s[0], Standing::NeverNames(_)), "a digital shape never names: {:?}", s[0]);
+        assert_eq!(s[1], Standing::LessConfident);
+        assert_eq!(s[2], Standing::Headline);
+        assert_eq!(s[3], Standing::Outranked { by: "sync bank" });
+        assert!(matches!(s[4], Standing::NeverNames(_)));
+        assert_eq!(headline(&claims).map(|c| c.label.as_str()), Some("P25 Phase 1"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn digital_modes_need_a_sync_or_a_decode_and_measured_analog_headlines() {
         let shape = |label: &str, confidence: f32| {
-            Claim::new(label, confidence, Evidence::Features { bandwidth_hz: 12.5e3, snr_db: 20.0, duty: 1.0, envelope_cv: None })
+            Claim::new(
+                label,
+                confidence,
+                Evidence::Features {
+                    bandwidth_hz: 12.5e3,
+                    snr_db: 20.0,
+                    duty: 1.0,
+                    envelope_cv: None,
+                    symbol_rate: None,
+                    fsk_levels: None,
+                    deviation_hz: None,
+                },
+            )
         };
         // A digital shape names nothing on its own, however confident.
         assert_eq!(headline(&[shape("4FSK", 0.6), shape("2FSK 2400 Bd", 0.6), shape("QPSK", 0.6)]), None);
@@ -440,7 +550,19 @@ mod tests {
 
     #[test]
     fn the_headline_prefers_a_decoder_then_a_sync_bank_and_is_otherwise_unknown() {
-        let shape = Claim::new("narrowband", 0.9, Evidence::Features { bandwidth_hz: 12.5e3, snr_db: 30.0, duty: 1.0, envelope_cv: None });
+        let shape = Claim::new(
+            "narrowband",
+            0.9,
+            Evidence::Features {
+                bandwidth_hz: 12.5e3,
+                snr_db: 30.0,
+                duty: 1.0,
+                envelope_cv: None,
+                symbol_rate: None,
+                fsk_levels: None,
+                deviation_hz: None,
+            },
+        );
         assert_eq!(record(vec![shape.clone()]).headline(), None);
         let r = record(vec![shape.clone(), sync("DMR", 0.6), sync("P25", 0.8)]);
         assert_eq!(r.headline().unwrap().label, "P25");

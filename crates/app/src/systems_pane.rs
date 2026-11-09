@@ -4,6 +4,7 @@
 use api::{DecoderView, Lamp, Snapshot, fmt};
 use egui::RichText;
 
+use crate::selection::Selection;
 use crate::theme;
 
 /// The lamp's word and colour.
@@ -25,7 +26,7 @@ pub fn decoder_line(ui: &mut egui::Ui, d: &DecoderView) {
     });
 }
 
-pub fn show(ui: &mut egui::Ui, snap: &Snapshot) {
+pub fn show(ui: &mut egui::Ui, snap: &Snapshot, sel: &mut Selection) {
     ui.label(theme::label("Systems"));
     if snap.systems.systems.is_empty() {
         ui.label(RichText::new("none yet: a system appears once a control channel's broadcasts are decoded").italics().color(theme::INK2));
@@ -38,7 +39,10 @@ pub fn show(ui: &mut egui::Ui, snap: &Snapshot) {
             ui.end_row();
         }
         for s in &snap.systems.systems {
-            ui.label(&s.mode);
+            let me = Selection::System(s.emitter);
+            if ui.selectable_label(*sel == me, &s.mode).on_hover_text("Show this system in the inspector").clicked() {
+                sel.toggle(me);
+            }
             ui.label(fmt::mhz(s.control_hz));
             ui.label(RichText::new(s.identity.line()).strong());
             ui.label(s.records.len().to_string());
@@ -52,7 +56,11 @@ pub fn show(ui: &mut egui::Ui, snap: &Snapshot) {
         ui.label(RichText::new("none running").italics().color(theme::INK2));
     }
     for d in &snap.decoders {
-        decoder_line(ui, d);
+        let me = Selection::Emitter(d.emitter);
+        let resp = ui.scope(|ui| decoder_line(ui, d)).response.interact(egui::Sense::click());
+        if resp.on_hover_text("Show its emitter in the inspector").clicked() {
+            sel.toggle(me);
+        }
     }
 }
 

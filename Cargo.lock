@@ -3212,10 +3212,12 @@ name = "spectrawl-app"
 version = "0.1.0"
 dependencies = [
  "api",
+ "arc-swap",
  "backend-sim",
  "eframe",
  "egui",
  "egui_dock",
+ "egui_kittest",
  "engine",
  "log",
  "sdr-core",

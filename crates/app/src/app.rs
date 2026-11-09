@@ -8,9 +8,11 @@ use api::{Command, Handle, RecordId, Snapshot, SourceId};
 use egui_dock::{DockArea, DockState, NodeIndex, Tree};
 
 use crate::devices_pane::{self, BudgetDraft};
+use crate::inspector::Inspector;
 use crate::log_pane::LogPane;
 use crate::receiver_pane::{DEFAULT_DB_RANGE, ReceiverPane};
 use crate::records_pane::RecordsPane;
+use crate::selection::Selection;
 use crate::status_bar::StatusBar;
 use crate::tabs::Tab;
 use crate::theme;
@@ -20,6 +22,9 @@ const STORAGE_KEY: &str = "spectrawl-next";
 
 /// The Devices column's share of the window: wide enough for a row with `open as A` and `Close`.
 const DEVICES_SHARE: f32 = 0.3;
+
+/// Devices' share of the left column; the inspector takes the rest.
+const INSPECTOR_SPLIT: f32 = 0.3;
 
 pub struct App {
     handle: Handle,
@@ -35,8 +40,9 @@ pub struct App {
     records: RecordsPane,
     log: LogPane,
     status: StatusBar,
-    /// The record selected in a waterfall or the list (shared by both).
-    selected: Option<RecordId>,
+    /// What is selected, shared by every pane and shown by the inspector.
+    selection: Selection,
+    inspector: Inspector,
     /// The house theme and type are installed in this context.
     styled: bool,
 }
@@ -46,7 +52,13 @@ impl App {
     pub fn new(handle: Handle) -> App {
         let snap = handle.latest();
         let mut dock = DockState::new(vec![Tab::Devices]);
-        dock.main_surface_mut().split_right(NodeIndex::root(), DEVICES_SHARE, vec![Tab::Log, Tab::Records, Tab::Systems, Tab::Channels]);
+        let [left, _] = dock.main_surface_mut().split_right(
+            NodeIndex::root(),
+            DEVICES_SHARE,
+            vec![Tab::Log, Tab::Records, Tab::Systems, Tab::Channels],
+        );
+        // The inspector under Devices (docs/ui-design.md §4: docked left).
+        dock.main_surface_mut().split_below(left, INSPECTOR_SPLIT, vec![Tab::Inspector]);
         App {
             handle,
             snap,
@@ -60,7 +72,8 @@ impl App {
             records: RecordsPane::new(),
             log: LogPane::default(),
             status: StatusBar::default(),
-            selected: None,
+            selection: Selection::None,
+            inspector: Inspector::default(),
             styled: false,
         }
     }
@@ -105,7 +118,7 @@ impl App {
                 theme::wordmark(ui);
                 ui.add_space(12.0);
                 ui.menu_button("View ⏷", |ui| {
-                    for tab in [Tab::Devices, Tab::Log, Tab::Records, Tab::Systems, Tab::Channels] {
+                    for tab in [Tab::Devices, Tab::Inspector, Tab::Log, Tab::Records, Tab::Systems, Tab::Channels] {
                         let shown = self.dock.find_tab(&tab).is_some();
                         if ui.add_enabled(!shown, egui::Button::new(tab.name())).clicked() {
                             reopen(&mut self.dock, tab);
@@ -157,12 +170,26 @@ impl App {
         &mut self.records
     }
 
+    /// The selected record, when a record is selected.
     pub fn selected(&self) -> Option<RecordId> {
-        self.selected
+        self.selection.record()
     }
 
+    /// Selects a record, or clears the selection.
     pub fn select(&mut self, id: Option<RecordId>) {
-        self.selected = id;
+        self.selection = id.map_or(Selection::None, Selection::Record);
+    }
+
+    pub fn selection(&self) -> &Selection {
+        &self.selection
+    }
+
+    pub fn set_selection(&mut self, s: Selection) {
+        self.selection = s;
+    }
+
+    pub fn inspector(&self) -> &Inspector {
+        &self.inspector
     }
 
     /// Queues a command as a pane would (sent at the end of the next frame).
@@ -258,14 +285,15 @@ impl egui_dock::TabViewer for App {
                 if let (Some(r), Some(p)) = (snap.receivers.iter().find(|r| r.id == *id), self.panes.get_mut(id)) {
                     let mine: Vec<_> = snap.records.records.iter().filter(|x| x.source == r.id).cloned().collect();
                     let decoders: Vec<_> = snap.decoders.iter().filter(|d| d.source == r.id).cloned().collect();
-                    p.show(ui, r, &mine, &decoders, &mut self.selected, &mut self.out);
+                    p.show(ui, r, &mine, &decoders, &mut self.selection, &mut self.out);
                 }
             }
             Tab::Devices => devices_pane::show(ui, &snap, &mut self.budget_draft, &mut self.out),
             Tab::Log => self.log.show(ui, &snap),
-            Tab::Records => self.records.show(ui, &snap, &mut self.selected, &mut self.out),
-            Tab::Systems => crate::systems_pane::show(ui, &snap),
-            Tab::Channels => crate::channels_pane::show(ui, &snap, &mut self.selected),
+            Tab::Records => self.records.show(ui, &snap, &mut self.selection, &mut self.out),
+            Tab::Inspector => self.inspector.show(ui, &snap, &mut self.selection, &mut self.out),
+            Tab::Systems => crate::systems_pane::show(ui, &snap, &mut self.selection),
+            Tab::Channels => crate::channels_pane::show(ui, &snap, &mut self.selection),
         }
     }
 
@@ -329,6 +357,14 @@ fn reopen(dock: &mut DockState<Tab>, tab: Tab) {
                     tree.split_right(NodeIndex::root(), DEVICES_SHARE, vec![tab]);
                 }
             },
+        },
+        Tab::Inspector => match tree.find_tab(&Tab::Devices) {
+            Some((node, _)) => {
+                tree.split_below(node, INSPECTOR_SPLIT, vec![tab]);
+            }
+            None => {
+                tree.split_left(NodeIndex::root(), DEVICES_SHARE, vec![tab]);
+            }
         },
         Tab::Log => match tree.find_tab_from(|t| matches!(t, Tab::Receiver(_))) {
             Some((node, _)) => {

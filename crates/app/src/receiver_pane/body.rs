@@ -108,7 +108,7 @@ impl Body {
         ui: &mut egui::Ui,
         r: &Receiver,
         records: &[Arc<SignalRecord>],
-        selected: &mut Option<RecordId>,
+        selected: &mut crate::selection::Selection,
         db_range: (f32, f32),
         paused: &mut bool,
         out: &mut Vec<Command>,
@@ -137,16 +137,13 @@ impl Body {
 
         if wf.height() > 1.0 {
             self.draw_waterfall(ui, &painter, wf, span, view, r.letter);
-            let boxes = self.draw_records(&painter, wf, span, &view, records, *selected);
+            let boxes = self.draw_records(&painter, wf, span, &view, records, selected);
             // A click (not a drag) picks the smallest box under the pointer, or clears the selection.
             if wf_resp.clicked()
                 && let Some(p) = wf_resp.interact_pointer_pos()
             {
-                *selected = boxes
-                    .iter()
-                    .filter(|(_, b)| b.expand(2.0).contains(p))
-                    .min_by(|a, b| a.1.area().total_cmp(&b.1.area()))
-                    .map(|(id, _)| *id);
+                let hit = boxes.iter().filter(|(_, b)| b.expand(2.0).contains(p)).min_by(|a, b| a.1.area().total_cmp(&b.1.area()));
+                *selected = hit.map_or(crate::selection::Selection::None, |(id, _)| crate::selection::Selection::Record(*id));
             }
         }
         self.draw_spectrum(&painter, spec, span, &view);
@@ -315,7 +312,7 @@ impl Body {
         span: (f64, f64),
         view: &View,
         records: &[Arc<SignalRecord>],
-        selected: Option<RecordId>,
+        selected: &crate::selection::Selection,
     ) -> Vec<(RecordId, Rect)> {
         let row_h = wf.height() / ROWS as f32;
         let behind = self.behind as isize;
@@ -337,8 +334,13 @@ impl Body {
             }
             let (y0, y1) = (wf.top() + top as f32 * row_h, wf.top() + (bottom + 1) as f32 * row_h);
             let b = Rect::from_min_max(pos2(x0, y0), pos2(x1, y1.max(y0 + 2.0))).intersect(wf);
-            let colour = if selected == Some(rec.id) { theme::ACCENT } else { theme::RECORD.gamma_multiply(0.7) };
-            let stroke = Stroke::new(if selected == Some(rec.id) { 1.5 } else { 1.0 }, colour);
+            // The selected record in the accent, thicker; the rest of a selected emitter or system in the accent too.
+            let (colour, width) = match (selected.record() == Some(rec.id), selected.covers(rec)) {
+                (true, _) => (theme::ACCENT, 1.5),
+                (false, true) => (theme::ACCENT.gamma_multiply(0.7), 1.0),
+                _ => (theme::RECORD.gamma_multiply(0.7), 1.0),
+            };
+            let stroke = Stroke::new(width, colour);
             painter.line_segment([b.left_bottom(), b.right_bottom()], stroke);
             painter.line_segment([b.left_top(), b.left_bottom()], stroke);
             painter.line_segment([b.right_top(), b.right_bottom()], stroke);

@@ -136,6 +136,9 @@ impl Detector for Modulation {
             snr_db: f.snr_db,
             duty: w.on_fraction(),
             envelope_cv: Some(f.envelope_cv).filter(|v| v.is_finite()),
+            symbol_rate: f.symbol_rate,
+            fsk_levels: Some(f.fsk_levels).filter(|&n| n >= 2),
+            deviation_hz: Some(f.deviation_hz).filter(|v| v.is_finite() && *v > 0.0),
         };
         vec![Claim::new(d.label, d.confidence.min(MAX_FEATURE_CONFIDENCE), by)]
     }

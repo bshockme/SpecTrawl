@@ -28,7 +28,7 @@ pub use command::{Ack, Command, CommandReceiver, CommandSender, Outcome, command
 pub use handle::Handle;
 pub use records::{
     Claim, EmitterId, EmitterView, Evidence, Identity, IqClip, Note, PositionKind, QueryResult, RecordId, RecordQuery, RecordsView, Role,
-    SignalRecord, StoreView, headline,
+    SignalRecord, Standing, StoreView, headline, standing,
 };
 pub use sdr_core::{Capabilities, DeviceInfo, GainSetting};
 pub use snapshot::{

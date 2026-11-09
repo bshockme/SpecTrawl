@@ -150,7 +150,8 @@ pub fn value_unit_in(value: &str, unit: &str, ink: Color32) -> LayoutJob {
     let mut job = LayoutJob::default();
     job.append(value, 0.0, TextFormat::simple(FontId::monospace(12.5), ink));
     if !unit.is_empty() {
-        job.append(&format!("\u{2009}{unit}"), 0.0, TextFormat::simple(FontId::proportional(11.5), INK2));
+        // A thin space as a gap: neither face has U+2009, and egui's fallbacks draw it at no width.
+        job.append(unit, 3.0, TextFormat::simple(FontId::proportional(11.5), INK2));
     }
     job
 }

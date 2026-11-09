@@ -1,14 +1,13 @@
-//! The records list: every record the snapshot carries, filtered and sorted, the selected one's claims, tags and notes,
-//! and a search of the store's history. Reads `api` types only and edits through commands.
+//! The records list: every record the snapshot carries, filtered and sorted, and a search of the store's history.
+//! Clicking a row selects it; the inspector shows it in full. Reads `api` types only.
 
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use api::{
-    AudioMode, Claim, Command, Evidence, PlayState, PlayTarget, PlayTo, PlayView, RecordId, RecordQuery, SignalRecord, Snapshot, fmt,
-};
+use api::{Command, Evidence, RecordQuery, SignalRecord, Snapshot, fmt};
 use egui::{RichText, Sense, vec2};
 
+use crate::selection::Selection;
 use crate::theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,10 +46,6 @@ pub struct RecordsPane {
     pub search_seq: Option<u64>,
     /// Show the search's answer instead of the live list.
     pub showing_history: bool,
-    tag_draft: String,
-    note_draft: String,
-    /// The mode Play asks for; `None` lets the engine choose from the frequency.
-    pub play_mode: Option<AudioMode>,
 }
 
 impl Default for RecordsPane {
@@ -74,51 +69,6 @@ pub fn what(r: &SignalRecord) -> (String, bool) {
     (shape.map_or_else(|| "unknown".to_string(), |c| format!("unknown · looks like {}", c.label)), true)
 }
 
-/// Inferred from where a signal is or what is next to it, not from the signal (spec §5: muted, with the word).
-fn inferred(c: &Claim) -> bool {
-    matches!(c.by, Evidence::BandPlan { .. } | Evidence::Neighbour { .. } | Evidence::Position(_))
-}
-
-/// One claim as the inspector shows it: decoded solid with its summary, a sync-bank claim with its counts, inferred
-/// ones muted and marked.
-fn claim_line(ui: &mut egui::Ui, c: &Claim) {
-    let pct = c.confidence * 100.0;
-    match &c.by {
-        Evidence::Decoder { summary, locked, .. } => {
-            let lock = if *locked { "" } else { ", not locked now" };
-            ui.label(RichText::new(format!("{} · decoded{lock} · {pct:.0}%", c.label)).strong());
-            if !summary.is_empty() {
-                ui.label(RichText::new(format!("    {summary}")).small());
-            }
-        }
-        Evidence::SyncBank { syncs, frames_tried, frames_decoded, .. } => {
-            let frames = if *frames_tried > 0 { format!(", {frames_decoded} of {frames_tried} frames decoded") } else { String::new() };
-            ui.label(format!("{} · sync bank: {syncs} syncs{frames} · {pct:.0}%", c.label));
-        }
-        _ if inferred(c) => {
-            let entry = match &c.by {
-                Evidence::BandPlan { entry } => format!(" ({entry})"),
-                _ => String::new(),
-            };
-            ui.label(RichText::new(format!("{}{entry} · inferred from {} · {pct:.0}%", c.label, evidence_kind(c))).color(theme::INK2));
-        }
-        _ => {
-            ui.label(format!("{} · {} · {pct:.0}%", c.label, evidence_kind(c)));
-        }
-    }
-}
-
-fn evidence_kind(c: &Claim) -> &'static str {
-    match c.by {
-        Evidence::SyncBank { .. } => "sync bank",
-        Evidence::Features { .. } => "shape",
-        Evidence::Decoder { .. } => "decoded",
-        Evidence::BandPlan { .. } => "band plan",
-        Evidence::Neighbour { .. } => "neighbour",
-        Evidence::Position(_) => "position",
-    }
-}
-
 impl RecordsPane {
     pub fn new() -> RecordsPane {
         RecordsPane {
@@ -128,9 +78,6 @@ impl RecordsPane {
             search: String::new(),
             search_seq: None,
             showing_history: false,
-            tag_draft: String::new(),
-            note_draft: String::new(),
-            play_mode: None,
         }
     }
 
@@ -173,7 +120,7 @@ impl RecordsPane {
         rows
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, snap: &Snapshot, selected: &mut Option<RecordId>, out: &mut Vec<Command>) {
+    pub fn show(&mut self, ui: &mut egui::Ui, snap: &Snapshot, selected: &mut Selection, out: &mut Vec<Command>) {
         ui.horizontal(|ui| {
             ui.label("Filter");
             ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("MHz, tag, note, receiver…").desired_width(180.0));
@@ -228,12 +175,11 @@ impl RecordsPane {
                 }
             }
         });
-        let detail_h = if selected.is_some() { 200.0 } else { 0.0 };
-        let list_h = (ui.available_height() - detail_h).max(ROW_H * 3.0);
+        let list_h = ui.available_height().max(ROW_H * 3.0);
         let letter = |r: &SignalRecord| snap.receivers.iter().find(|x| x.id == r.source).map_or('–', |x| x.letter);
         egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, false]).show_rows(ui, ROW_H, rows.len(), |ui, range| {
             for r in &rows[range] {
-                let is_sel = *selected == Some(r.id);
+                let is_sel = selected.covers(r);
                 let resp = ui
                     .horizontal(|ui| {
                         let cells = [
@@ -268,154 +214,8 @@ impl RecordsPane {
                     .response
                     .interact(Sense::click());
                 if resp.clicked() {
-                    *selected = if is_sel { None } else { Some(r.id) };
+                    selected.toggle(Selection::Record(r.id));
                 }
-            }
-        });
-
-        let Some(id) = *selected else { return };
-        let Some(r) = rows.iter().find(|r| r.id == id).or_else(|| snap.records.records.iter().find(|r| r.id == id)).cloned() else {
-            return;
-        };
-        ui.separator();
-        self.detail(ui, snap, &r, out);
-    }
-
-    /// What Play sends for a record.
-    pub fn play_command(&self, id: RecordId) -> Command {
-        Command::Play { target: PlayTarget::Record(id), mode: self.play_mode, gain: 1.0, to: PlayTo::Speaker }
-    }
-
-    /// What Save audio sends: a WAV named after the record, under the engine's audio directory.
-    pub fn save_command(&self, id: RecordId) -> Command {
-        let to = PlayTo::Wav(format!("record-{}.wav", id.0).into());
-        Command::Play { target: PlayTarget::Record(id), mode: self.play_mode, gain: 1.0, to }
-    }
-
-    /// The record's newest replay: running ones first, else the latest that ended.
-    pub fn play_of(snap: &Snapshot, id: RecordId) -> Option<&PlayView> {
-        let mine = || snap.audio.plays.iter().filter(move |p| p.target == PlayTarget::Record(id));
-        mine().rev().find(|p| !p.state.is_over()).or_else(|| mine().next_back())
-    }
-
-    /// The line the detail shows for a replay.
-    pub fn play_line(p: &PlayView) -> String {
-        let mode = format!("{}{}", p.mode.name(), if p.mode_guessed { " (by band)" } else { "" });
-        let from = match p.from {
-            api::PlayFrom::Ring => "ring",
-            api::PlayFrom::Slice => "slice",
-        };
-        let what = match (&p.to, &p.state) {
-            (PlayTo::Wav(path), PlayState::Finished) => format!("saved {}", path.display()),
-            (PlayTo::Wav(_), s) if !s.is_over() => "saving".into(),
-            (_, PlayState::Preparing) => "starting".into(),
-            (_, PlayState::Playing) => "playing".into(),
-            (_, PlayState::Finished) => "played".into(),
-            (_, PlayState::Stopped) => "stopped".into(),
-            (_, PlayState::EndedEarly(why)) => format!("ended early: {why}"),
-        };
-        let length = if p.complete { fmt::secs(p.length_s) } else { format!("{}…", fmt::secs(p.length_s)) };
-        format!("{what} · {} of {length} · {mode} from the {from}", fmt::secs(p.position_s))
-    }
-
-    fn listen(&mut self, ui: &mut egui::Ui, snap: &Snapshot, r: &SignalRecord, out: &mut Vec<Command>) {
-        ui.horizontal(|ui| {
-            let modes = [(None, "Auto"), (Some(AudioMode::Am), "AM"), (Some(AudioMode::Nfm), "NFM"), (Some(AudioMode::Wfm), "WFM")];
-            let current = modes.iter().find(|m| m.0 == self.play_mode).map_or("Auto", |m| m.1);
-            egui::ComboBox::from_id_salt("play-mode").selected_text(current).width(64.0).show_ui(ui, |ui| {
-                for (m, name) in modes {
-                    ui.selectable_value(&mut self.play_mode, m, name);
-                }
-            });
-            let running = Self::play_of(snap, r.id).filter(|p| !p.state.is_over());
-            match running {
-                Some(p) if p.to == PlayTo::Speaker => {
-                    if ui.button("■ Stop").clicked() {
-                        out.push(Command::StopPlay(p.id));
-                    }
-                }
-                _ => {
-                    if ui.button("▶ Play").on_hover_text("Hear it (from the ring, or its slice)").clicked() {
-                        out.push(self.play_command(r.id));
-                    }
-                }
-            }
-            if ui.button("Save audio").on_hover_text("Write it out as a WAV").clicked() {
-                out.push(self.save_command(r.id));
-            }
-            if let Some(p) = Self::play_of(snap, r.id) {
-                let colour = if matches!(p.state, PlayState::EndedEarly(_)) { theme::ALARM } else { theme::INK };
-                ui.label(RichText::new(Self::play_line(p)).small().color(colour));
-            }
-            if let Err(e) = &snap.audio.output {
-                ui.label(RichText::new(format!("no sound: {e}")).small().color(theme::INK2));
-            }
-        });
-        // A refused play is answered with the reason.
-        let refused = snap.acks.iter().rev().find_map(|a| match &a.result {
-            Err(e) if e.contains(&format!("record {} ", r.id.0)) && e.contains("can't be heard") => Some(e.clone()),
-            _ => None,
-        });
-        if let Some(e) = refused {
-            ui.label(RichText::new(e).small().color(theme::ALARM));
-        }
-    }
-
-    fn detail(&mut self, ui: &mut egui::Ui, snap: &Snapshot, r: &SignalRecord, out: &mut Vec<Command>) {
-        ui.label(
-            RichText::new(format!(
-                "Record {} · {} · {:.1} kHz · {} · samples {}..{}",
-                r.id.0,
-                fmt::mhz(r.center_hz()),
-                r.bandwidth_hz() / 1e3,
-                if r.open { "open".to_string() } else { fmt::secs(r.duration().as_secs_f64()) },
-                r.first_sample,
-                r.end_sample
-            ))
-            .strong(),
-        );
-        self.listen(ui, snap, r, out);
-        if r.claims.is_empty() {
-            ui.label(RichText::new("unknown: no claims yet").italics().color(theme::INK2));
-        }
-        if r.headline().is_none() && !r.claims.is_empty() {
-            ui.label(RichText::new("unknown: nothing decoded").italics().color(theme::INK2));
-        }
-        for c in &r.claims {
-            claim_line(ui, c);
-        }
-        match (&r.iq_clip, r.slice_evicted) {
-            (Some(c), _) => {
-                ui.label(RichText::new(format!("slice: {} ({})", c.path.display(), fmt::secs(c.samples as f64 / c.rate))).small())
-            }
-            (None, true) => ui.label(RichText::new("slice: removed to stay under the disk cap").small().color(theme::INK2)),
-            (None, false) => ui.label(RichText::new("slice: none").small().color(theme::INK2)),
-        };
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Tags");
-            for t in &r.tags {
-                if ui.small_button(format!("{t} ×")).clicked() {
-                    out.push(Command::Untag { record: r.id, tag: t.clone() });
-                }
-            }
-            let resp = ui.add(egui::TextEdit::singleline(&mut self.tag_draft).hint_text("add a tag").desired_width(120.0));
-            if (ui.small_button("Add").clicked() || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))))
-                && !self.tag_draft.trim().is_empty()
-            {
-                out.push(Command::Tag { record: r.id, tag: self.tag_draft.trim().to_string() });
-                self.tag_draft.clear();
-            }
-        });
-        for n in &r.notes {
-            ui.label(RichText::new(format!("{} · {}", fmt::clock(n.time), n.text)).small());
-        }
-        ui.horizontal(|ui| {
-            let resp = ui.add(egui::TextEdit::singleline(&mut self.note_draft).hint_text("add a note").desired_width(260.0));
-            if (ui.small_button("Note").clicked() || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))))
-                && !self.note_draft.trim().is_empty()
-            {
-                out.push(Command::Note { record: r.id, text: self.note_draft.trim().to_string() });
-                self.note_draft.clear();
             }
         });
     }

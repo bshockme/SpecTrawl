@@ -8,6 +8,8 @@ pub enum Tab {
     /// One open device: its header, status and (from Task 6) waterfall.
     Receiver(SourceId),
     Devices,
+    /// Whatever is selected, in full (spec §5).
+    Inspector,
     Log,
     /// The records list, beside the Log.
     Records,
@@ -23,6 +25,7 @@ impl Tab {
         match self {
             Tab::Receiver(_) => "Receiver",
             Tab::Devices => "Devices",
+            Tab::Inspector => "Inspector",
             Tab::Log => "Log",
             Tab::Records => "Records",
             Tab::Systems => "Systems",

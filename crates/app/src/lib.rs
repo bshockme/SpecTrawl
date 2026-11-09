@@ -7,9 +7,11 @@
 pub mod app;
 pub mod channels_pane;
 pub mod devices_pane;
+pub mod inspector;
 pub mod log_pane;
 pub mod receiver_pane;
 pub mod records_pane;
+pub mod selection;
 pub mod status_bar;
 pub mod systems_pane;
 pub mod tabs;
