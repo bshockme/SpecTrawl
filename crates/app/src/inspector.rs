@@ -11,6 +11,7 @@ use api::{
 };
 use egui::RichText;
 
+use crate::health::{self, History};
 use crate::selection::Selection;
 use crate::systems_pane::lamp;
 use crate::theme;
@@ -122,8 +123,8 @@ fn claim(ui: &mut egui::Ui, claims: &[Claim], c: &Claim) {
     });
 }
 
-/// A decoder's lamp, sentence and counts.
-fn decoder(ui: &mut egui::Ui, d: &DecoderView) {
+/// A decoder's lamp, sentence and counts, then its health plots.
+fn decoder(ui: &mut egui::Ui, d: &DecoderView, h: &History) {
     let (word, colour) = lamp(d.lamp);
     ui.horizontal_wrapped(|ui| {
         theme::dot(ui, colour, d.lamp != api::Lamp::Searching);
@@ -134,6 +135,14 @@ fn decoder(ui: &mut egui::Ui, d: &DecoderView) {
     let tried = d.blocks_ok + d.blocks_bad;
     if tried > 0 {
         muted(ui, format!("{} of {} frames decoded ({:.0} %)", d.blocks_ok, tried, 100.0 * d.blocks_ok as f64 / tried as f64));
+    }
+    if let Some(level) = d.level_dbfs {
+        ui.label(theme::value_unit(&format!("{level:.1}"), "dBFS in its channel"));
+    }
+    if let Some(s) = h.decoders.get(&(d.source, d.emitter, d.mode.clone())) {
+        health::plot(ui, "SNR", "dB", &s.snr_db, 0, None);
+        health::plot(ui, "Frames ok", "%", &s.ok_pct, 0, Some((0.0, 100.0)));
+        health::plot(ui, "Lag", "s", &s.lag_s, 2, None);
     }
 }
 
@@ -158,17 +167,17 @@ fn record_links<'a>(ui: &mut egui::Ui, records: impl Iterator<Item = &'a SignalR
 }
 
 impl Inspector {
-    pub fn show(&mut self, ui: &mut egui::Ui, snap: &Snapshot, sel: &mut Selection, out: &mut Vec<Command>) {
+    pub fn show(&mut self, ui: &mut egui::Ui, snap: &Snapshot, sel: &mut Selection, out: &mut Vec<Command>, h: &History) {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match sel.clone() {
             Selection::None => {
                 muted(ui, "Click a box on a waterfall, a row in a list, or a receiver's name to see it here.");
             }
             Selection::Record(id) => match snap.records.records.iter().find(|r| r.id == id).cloned() {
-                Some(r) => self.record(ui, snap, &r, sel, out),
+                Some(r) => self.record(ui, snap, &r, sel, out, h),
                 None => muted(ui, format!("Record {} is no longer in the recent records; search History for it.", id.0)),
             },
             Selection::Emitter(e) => match snap.records.emitters.iter().find(|x| x.id == e).cloned() {
-                Some(x) => emitter(ui, snap, &x, sel),
+                Some(x) => emitter(ui, snap, &x, sel, h),
                 None => muted(ui, format!("Emitter {} is no longer among the recent emitters.", e.0)),
             },
             Selection::System(e) => match snap.systems.systems.iter().find(|s| s.emitter == e).cloned() {
@@ -184,7 +193,7 @@ impl Inspector {
                     ui.label(&s.summary);
                     section(ui, "Decoder");
                     match snap.decoders.iter().find(|d| d.emitter == e) {
-                        Some(d) => decoder(ui, d),
+                        Some(d) => decoder(ui, d, h),
                         None => muted(ui, "none attached now"),
                     }
                     if ui.link(format!("Emitter {}", e.0)).clicked() {
@@ -238,13 +247,21 @@ impl Inspector {
                         field(ui, "FFT behind", fmt::secs(r.stage.behind_secs));
                         field(ui, "Channels", r.consumers.len().to_string());
                     });
+                    if let Some(s) = h.receivers.get(&id) {
+                        section(ui, "Health");
+                        health::plot(ui, "Worst lag", "s", &s.lag_s, 2, None);
+                        health::plot(ui, "FFT behind", "s", &s.behind_s, 2, None);
+                        health::plot(ui, "Holding", "s", &s.held_s, 0, None);
+                    }
                     section(ui, "Decoders");
                     let mine: Vec<_> = snap.decoders.iter().filter(|d| d.source == id).collect();
                     if mine.is_empty() {
                         muted(ui, "none running");
                     }
                     for d in mine {
-                        decoder(ui, d);
+                        if ui.link(format!("{} {:.4} MHz", d.mode, d.center_hz / 1e6)).clicked() {
+                            *sel = Selection::Emitter(d.emitter);
+                        }
                     }
                 }
                 None => muted(ui, "That receiver is closed."),
@@ -252,7 +269,7 @@ impl Inspector {
         });
     }
 
-    fn record(&mut self, ui: &mut egui::Ui, snap: &Snapshot, r: &SignalRecord, sel: &mut Selection, out: &mut Vec<Command>) {
+    fn record(&mut self, ui: &mut egui::Ui, snap: &Snapshot, r: &SignalRecord, sel: &mut Selection, out: &mut Vec<Command>, h: &History) {
         let headline = r.headline();
         ui.horizontal_wrapped(|ui| {
             let (name, ink) = match headline {
@@ -310,7 +327,7 @@ impl Inspector {
             if !decs.is_empty() {
                 section(ui, "Decoder on its emitter");
                 for d in decs {
-                    decoder(ui, d);
+                    decoder(ui, d, h);
                 }
             }
         }
@@ -443,7 +460,7 @@ impl Inspector {
 }
 
 /// An emitter: its name and how it was reached, its numbers, its decoder and its records.
-fn emitter(ui: &mut egui::Ui, snap: &Snapshot, e: &EmitterView, sel: &mut Selection) {
+fn emitter(ui: &mut egui::Ui, snap: &Snapshot, e: &EmitterView, sel: &mut Selection, h: &History) {
     ui.horizontal_wrapped(|ui| {
         let (name, ink) = match &e.headline {
             Some(c) => (c.label.as_str(), theme::INK),
@@ -471,7 +488,7 @@ fn emitter(ui: &mut egui::Ui, snap: &Snapshot, e: &EmitterView, sel: &mut Select
     if !decs.is_empty() {
         section(ui, "Decoder");
         for d in decs {
-            decoder(ui, d);
+            decoder(ui, d, h);
         }
     }
     if snap.systems.systems.iter().any(|s| s.emitter == e.id) && ui.link("Its system").clicked() {

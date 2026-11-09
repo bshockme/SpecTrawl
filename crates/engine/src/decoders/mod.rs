@@ -91,6 +91,8 @@ struct Attached {
     stop: AtomicBool,
     ended: AtomicBool,
     view: Mutex<(Telemetry, String)>,
+    /// The fed channel's power, dBFS, smoothed (NaN before the first samples).
+    level_dbfs: Mutex<f32>,
     channel: Mutex<Option<ChannelId>>,
 }
 
@@ -159,6 +161,8 @@ impl DecoderBank {
                     summary,
                     blocks_ok: t.blocks_ok,
                     blocks_bad: t.blocks_bad,
+                    level_dbfs: Some(*a.level_dbfs.lock()).filter(|v| v.is_finite()),
+                    channel: *a.channel.lock(),
                 }
             })
             .collect()
@@ -328,6 +332,7 @@ fn manage(shared: Arc<Shared>, book: Arc<RecordBook>, bus: Arc<ChannelBus>, sour
                     format!("{title} {:.4} MHz: searching", center_hz / 1e6),
                 )),
                 channel: Mutex::new(None),
+                level_dbfs: Mutex::new(f32::NAN),
             });
             let feed = || -> Box<dyn Consumer> {
                 let decoder: Box<dyn Decoder> = match &want {
@@ -402,6 +407,9 @@ struct Feed {
     last: Option<(RecordId, Claim)>,
 }
 
+/// The time constant of a decoder's level, seconds.
+const LEVEL_SECS: f32 = 1.0;
+
 /// Deliveries remembered to place a decode: more than a monitor's longest block (FLEX's 4 s) lags.
 const PLACE_SECS: f64 = 12.0;
 
@@ -411,6 +419,19 @@ impl Feed {
         let i = self.deliveries.partition_point(|d| d.0 <= k).checked_sub(1)?;
         let (fed, first, len) = self.deliveries[i];
         (k < fed + len as u64).then(|| first + ((k - fed) as f64 * self.hop as f64 / len as f64) as u64)
+    }
+
+    /// Folds a block's power into the attached decoder's level: an average with a time constant of about a second.
+    fn measure_level(&self, samples: &[Complex32]) {
+        if samples.is_empty() {
+            return;
+        }
+        let power = samples.iter().map(|x| x.norm_sqr()).sum::<f32>() / samples.len() as f32;
+        let db = 10.0 * power.max(1e-20).log10();
+        let block_secs = (self.hop as f64 / self.input_rate) as f32;
+        let k = (block_secs / LEVEL_SECS).clamp(0.0, 1.0);
+        let mut level = self.attached.level_dbfs.lock();
+        *level = if level.is_finite() { *level + k * (db - *level) } else { db };
     }
 
     fn set_claim(&mut self, id: RecordId) {
@@ -441,6 +462,7 @@ impl Consumer for Feed {
                 }
                 self.decoder.feed(samples);
                 *self.attached.view.lock() = (self.decoder.telemetry(), self.decoder.summary());
+                self.measure_level(samples);
                 match self.decoder.take_heard() {
                     Some(heard) => {
                         let margin = (crate::classify::LEAD.as_secs_f64() * self.input_rate) as u64;

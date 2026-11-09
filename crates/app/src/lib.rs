@@ -8,6 +8,7 @@ pub mod app;
 pub mod channels_pane;
 pub mod devices_pane;
 pub mod emitters_pane;
+pub mod health;
 pub mod inspector;
 pub mod log_pane;
 pub mod receiver_pane;

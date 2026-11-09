@@ -2,8 +2,8 @@
 
 use std::time::SystemTime;
 
-use crate::SourceId;
 use crate::records::{EmitterId, Identity, RecordId};
+use crate::{ChannelId, SourceId};
 
 /// Every record with IQ gets at least one look before its IQ leaves the ring; these say how that went (spec §4.5: "the
 /// budget is a number on screen").
@@ -48,6 +48,10 @@ pub struct DecoderView {
     /// Frames that decoded, and frames tried that didn't.
     pub blocks_ok: u64,
     pub blocks_bad: u64,
+    /// The power of the channel it is fed, dBFS, smoothed over about a second; `None` before its first samples.
+    pub level_dbfs: Option<f32>,
+    /// The bus channel feeding it (its lag is that consumer's), while it has one.
+    pub channel: Option<ChannelId>,
 }
 
 /// A trunked system, built from records' decoder claims (and nothing else), so it reads the same [`Identity`] as the

@@ -9,6 +9,7 @@ use egui_dock::{DockArea, DockState, NodeIndex, Tree};
 
 use crate::devices_pane::{self, BudgetDraft};
 use crate::emitters_pane::EmittersPane;
+use crate::health::History;
 use crate::inspector::Inspector;
 use crate::log_pane::LogPane;
 use crate::receiver_pane::{DEFAULT_DB_RANGE, ReceiverPane};
@@ -45,6 +46,8 @@ pub struct App {
     /// What is selected, shared by every pane and shown by the inspector.
     selection: Selection,
     inspector: Inspector,
+    /// The health plots' history.
+    health: History,
     /// The house theme and type are installed in this context.
     styled: bool,
 }
@@ -77,6 +80,7 @@ impl App {
             status: StatusBar::default(),
             selection: Selection::None,
             inspector: Inspector::default(),
+            health: History::default(),
             styled: false,
         }
     }
@@ -115,6 +119,7 @@ impl App {
         if self.seen_version != Some(self.snap.version) {
             self.sync();
         }
+        self.health.sample(&self.snap, std::time::Instant::now());
 
         egui::Panel::top("top_bar").frame(theme::bar_frame()).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -295,7 +300,7 @@ impl egui_dock::TabViewer for App {
             Tab::Log => self.log.show(ui, &snap),
             Tab::Records => self.records.show(ui, &snap, &mut self.selection, &mut self.out),
             Tab::Emitters => self.emitters.show(ui, &snap, &mut self.selection),
-            Tab::Inspector => self.inspector.show(ui, &snap, &mut self.selection, &mut self.out),
+            Tab::Inspector => self.inspector.show(ui, &snap, &mut self.selection, &mut self.out, &self.health),
             Tab::Systems => crate::systems_pane::show(ui, &snap, &mut self.selection),
             Tab::Channels => crate::channels_pane::show(ui, &snap, &mut self.selection),
         }
