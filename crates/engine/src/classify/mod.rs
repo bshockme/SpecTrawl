@@ -81,6 +81,10 @@ const CENTRE_SLACK_HZ: f64 = 6e3;
 /// swinging with the programme) up to 75 kHz off its carrier, and a station with HD Radio starts as one sideband. Cut
 /// to the fragment, a look held no pilot to find (on air at 99.1 and 105.9 MHz no fragment was ever named).
 const STATION_LOOK_HZ: f64 = 280e3;
+/// A weak station's pilot is lost in a station-wide look (the noise across it puts the discriminator under FM's
+/// threshold), but the look still finds the carrier, within 4 kHz on air at 99.1 MHz. A second look this wide, centred
+/// there, found its pilot at 26 dB.
+const STATION_CORE_HZ: f64 = 120e3;
 /// Rows a new open record has before its window is cut (8 rows: 180 ms).
 const SETTLE_ROWS: u32 = 8;
 /// A window starts this long before its record (never before the record's segment): the detector opens a record once
@@ -100,7 +104,10 @@ struct Job {
     relook: bool,
     iq: Vec<Complex32>,
     rate: f64,
+    /// What the look takes as the record's width (see [`look_bandwidth`]).
     bandwidth_hz: f64,
+    /// The record's own width.
+    record_hz: f64,
     /// The channel's passband.
     width_hz: f64,
     /// The record's centre now, less the channel's: the pool re-centres the window by this and narrows it to the
@@ -111,6 +118,8 @@ struct Job {
     am_band: bool,
     /// The channel's centre.
     center_hz: f64,
+    /// The band plan says FM broadcast: a look that names nothing looks again at the carrier it found.
+    broadcast_fm: bool,
 }
 
 /// A window being cut: where its record ends (`u64::MAX` while it is open), and its width and SNR as they now stand
@@ -392,11 +401,13 @@ impl Window {
                 iq: std::mem::take(&mut self.iq),
                 rate: self.rate.max(1.0),
                 bandwidth_hz: look_bandwidth(f64::from_bits(self.win.bandwidth_hz.load(Ordering::Relaxed)), self.broadcast_fm),
+                record_hz: f64::from_bits(self.win.bandwidth_hz.load(Ordering::Relaxed)),
                 width_hz: self.width_hz,
                 offset_hz: f64::from_bits(self.win.center_hz.load(Ordering::Relaxed)) - self.center_hz,
                 snr_db: f64::from_bits(self.win.snr_db.load(Ordering::Relaxed)) as f32,
                 am_band: self.am_band,
                 center_hz: self.center_hz,
+                broadcast_fm: self.broadcast_fm,
             };
             // Submitted (queued, or counted missed or dropped) before it leaves the in-flight windows, so it is never
             // in neither.
@@ -512,6 +523,44 @@ fn recentre(job: &Job) -> (std::borrow::Cow<'_, [Complex32]>, f64) {
     (std::borrow::Cow::Owned(out), width)
 }
 
+/// The bank's look at `job`'s window (`full`, and `iq` within it with its quiet ends trimmed). An FM broadcast claim
+/// carries the station's carrier; in the FM broadcast band a look that names no station looks again at the carrier it
+/// found (see [`STATION_CORE_HZ`]).
+fn look(bank: &[Box<dyn bank::Detector>], job: &Job, full: &[Complex32], iq: &[Complex32], hints: detect::Hints) -> Vec<api::Claim> {
+    let w = detect::bank::Window::new(iq, job.rate, job.bandwidth_hz, hints).with_full(full);
+    let mut claims = bank::look(bank, &w);
+    // A station's carrier: the window's centre (the record's, as it now stands) and the shape's offset from it.
+    let mut carrier = job.center_hz + job.offset_hz + w.features.offset_hz as f64;
+    let station = |c: &[api::Claim]| c.iter().any(|c| c.label.starts_with("FM broadcast"));
+    if job.broadcast_fm && !station(&claims) {
+        let mut ddc = detect::Ddc::new(job.rate, w.features.offset_hz as f64, window_width(STATION_CORE_HZ) / 2.0, job.rate);
+        let mut core = Vec::with_capacity(iq.len());
+        ddc.process(iq, &mut core);
+        let w = detect::bank::Window::new(&core, job.rate, STATION_CORE_HZ, hints);
+        let again = bank::look(bank, &w);
+        if station(&again) {
+            claims = again;
+            carrier += w.features.offset_hz as f64;
+        } else if job.record_hz < job.bandwidth_hz {
+            // No station: what the record itself shows, as a look at its own width says (a distant station's bare
+            // carrier, 2–6 kHz on air, is not "Wideband").
+            let width = window_width(job.record_hz);
+            let mut ddc = detect::Ddc::new(job.rate, 0.0, width / 2.0, job.rate);
+            let mut own = Vec::with_capacity(iq.len());
+            ddc.process(iq, &mut own);
+            let snr = window_snr(&own, job.rate, job.record_hz, width).or(Some(job.snr_db).filter(|s| s.is_finite()));
+            let hints = detect::Hints { snr_db: snr, ..hints };
+            claims = bank::look(bank, &detect::bank::Window::new(&own, job.rate, job.record_hz, hints));
+        }
+    }
+    for c in claims.iter_mut().filter(|c| c.label.starts_with("FM broadcast")) {
+        if let api::Evidence::Features { carrier_hz, .. } = &mut c.by {
+            *carrier_hz = Some(carrier);
+        }
+    }
+    claims
+}
+
 /// A pool thread: windows off the queue, through the bank, into the book.
 fn work(shared: Arc<Shared>, book: Arc<RecordBook>) {
     let bank = bank::bank();
@@ -538,15 +587,7 @@ fn work(shared: Arc<Shared>, book: Arc<RecordBook>) {
             if (iq.len() as f64) < MIN_WINDOW_SECS * job.rate {
                 return Vec::new();
             }
-            let w = detect::bank::Window::new(iq, job.rate, job.bandwidth_hz, hints).with_full(&full);
-            let mut claims = bank::look(&bank, &w);
-            // A station's carrier: the window's centre (the record's, as it now stands) and the shape's offset from it.
-            for c in claims.iter_mut().filter(|c| c.label.starts_with("FM broadcast")) {
-                if let api::Evidence::Features { carrier_hz, .. } = &mut c.by {
-                    *carrier_hz = Some(job.center_hz + job.offset_hz + w.features.offset_hz as f64);
-                }
-            }
-            claims
+            look(&bank, &job, &full, iq, hints)
         }));
         let claims = match looked {
             Ok(c) => c,
@@ -571,10 +612,12 @@ fn work(shared: Arc<Shared>, book: Arc<RecordBook>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use api::Evidence;
 
     /// A stereo FM broadcast station `offset_hz` from the window's centre at `fs`: programme tones in both channels,
-    /// the 19 kHz pilot at 9 %, the stereo difference on 38 kHz, ±75 kHz at full modulation, and noise.
-    fn station(fs: f64, offset_hz: f64, secs: f64) -> Vec<Complex32> {
+    /// the 19 kHz pilot at 9 %, the stereo difference on 38 kHz, ±75 kHz at full modulation, and noise (`noise` is its
+    /// amplitude per component, uniform, against a carrier of 1).
+    fn station(fs: f64, offset_hz: f64, secs: f64, noise_amp: f32) -> Vec<Complex32> {
         let n = (fs * secs) as usize;
         let tau = std::f64::consts::TAU;
         let mut phase = 0.0f64;
@@ -592,7 +635,7 @@ mod tests {
                 let right = 0.5 * (tau * 660.0 * t).sin() + 0.3 * (tau * 7300.0 * t).sin();
                 let m = 0.45 * (left + right) / 1.6 + 0.09 * (tau * 19e3 * t).sin() + 0.45 * (left - right) / 1.6 * (tau * 38e3 * t).sin();
                 phase += tau * (offset_hz + 75e3 * m) / fs;
-                Complex32::from_polar(1.0, phase as f32) + Complex32::new(0.05 * noise() as f32, 0.05 * noise() as f32)
+                Complex32::from_polar(1.0, phase as f32) + Complex32::new(noise_amp * noise() as f32, noise_amp * noise() as f32)
             })
             .collect()
     }
@@ -614,7 +657,7 @@ mod tests {
         assert_eq!(wide, STATION_LOOK_HZ);
         // A fragment's record 60 kHz below the carrier, and an HD Radio sideband's 157 kHz below: the window is cut there.
         for offset in [60e3, 157e3] {
-            let x = channel(&station(fs, offset, 1.5), fs, window_width(wide));
+            let x = channel(&station(fs, offset, 1.5, 0.05), fs, window_width(wide));
             let w = detect::bank::Window::new(&x, fs, wide, hints);
             let claims = bank::look(&bank, &w);
             assert!(claims.iter().any(|c| c.label.starts_with("FM broadcast")), "{offset} Hz off: {claims:?}");
@@ -623,7 +666,7 @@ mod tests {
         }
         // Cut to the fragment, as before: no pilot to find.
         let narrow = look_bandwidth(20e3, false);
-        let x = channel(&station(fs, 60e3, 1.5), fs, window_width(narrow));
+        let x = channel(&station(fs, 60e3, 1.5, 0.05), fs, window_width(narrow));
         let w = detect::bank::Window::new(&x, fs, narrow, hints);
         assert!(!bank::look(&bank, &w).iter().any(|c| c.label.starts_with("FM broadcast")));
     }
@@ -633,5 +676,71 @@ mod tests {
         assert!(broadcast_fm(99.1e6) && !broadcast_fm(162.55e6) && !broadcast_fm(118.0e6));
         assert_eq!(look_bandwidth(12.5e3, false), 12.5e3);
         assert_eq!(look_bandwidth(400e3, true), 400e3);
+    }
+
+    #[test]
+    fn a_weak_station_lost_in_a_station_wide_look_is_found_at_its_carrier() {
+        let bank = bank::bank();
+        let fs = 781_250.0;
+        let hints = detect::Hints { snr_db: Some(20.0), am_band: false };
+        // A weak station, its record 20 kHz below the carrier: across 350 kHz the noise hides its pilot.
+        let width = window_width(STATION_LOOK_HZ);
+        let x = channel(&station(fs, 20e3, 1.5, 4.5), fs, width);
+        let w = detect::bank::Window::new(&x, fs, STATION_LOOK_HZ, hints);
+        assert!(!bank::look(&bank, &w).iter().any(|c| c.label.starts_with("FM broadcast")));
+        let job = Job {
+            record: RecordId(1),
+            relook: false,
+            iq: Vec::new(),
+            rate: fs,
+            bandwidth_hz: STATION_LOOK_HZ,
+            record_hz: 30e3,
+            width_hz: width,
+            offset_hz: 0.0,
+            snr_db: 20.0,
+            am_band: false,
+            center_hz: 99.08e6,
+            broadcast_fm: true,
+        };
+        let claims = look(&bank, &job, &x, &x, hints);
+        let c = claims.iter().find(|c| c.label.starts_with("FM broadcast")).expect("named at its carrier");
+        let Evidence::Features { carrier_hz: Some(carrier), .. } = c.by else { panic!("{c:?}") };
+        assert!((carrier - 99.1e6).abs() < 8e3, "carrier {:+.0} Hz off", carrier - 99.1e6);
+        // Outside the FM broadcast band there is no second look.
+        let elsewhere = Job { broadcast_fm: false, ..job };
+        assert!(!look(&bank, &elsewhere, &x, &x, hints).iter().any(|c| c.label.starts_with("FM broadcast")));
+    }
+
+    #[test]
+    fn a_record_in_the_fm_band_that_is_no_station_is_described_at_its_own_width() {
+        let bank = bank::bank();
+        let fs = 781_250.0;
+        // A bare carrier (a distant station's, as on air at 96.5 and 104.7 MHz: records of 2–6 kHz), and noise.
+        let mut seed = 7u64;
+        let mut noise = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 as f32 / (1u64 << 53) as f32 - 0.5
+        };
+        let x: Vec<Complex32> = (0..(1.5 * fs) as usize).map(|_| Complex32::new(1.0 + 0.3 * noise(), 0.3 * noise())).collect();
+        let x = channel(&x, fs, window_width(STATION_LOOK_HZ));
+        let job = Job {
+            record: RecordId(1),
+            relook: false,
+            iq: Vec::new(),
+            rate: fs,
+            bandwidth_hz: STATION_LOOK_HZ,
+            record_hz: 3e3,
+            width_hz: window_width(STATION_LOOK_HZ),
+            offset_hz: 0.0,
+            snr_db: 30.0,
+            am_band: false,
+            center_hz: 104.7e6,
+            broadcast_fm: true,
+        };
+        let claims = look(&bank, &job, &x, &x, detect::Hints { snr_db: Some(30.0), am_band: false });
+        let shape = claims.iter().find(|c| matches!(c.by, Evidence::Features { .. })).expect("a shape");
+        assert_eq!(shape.label, "Carrier", "{claims:?}");
     }
 }

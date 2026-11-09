@@ -262,13 +262,18 @@ pub fn squelch(w: &Window<'_>) -> Option<Identified> {
 /// OOK, bursts), or "Unknown". It describes noise too: a caller gates it on [`Window::weak`].
 pub fn modulation(w: &Window<'_>) -> Described {
     let (raw, x, fs, f, bw) = (w.raw, &w.x[..], w.fs, &w.features, w.bandwidth_hz);
-    // A broadcast station's pilot and RDS subcarrier are as decisive as a sync word. The detector often cuts a station
+    // A broadcast station's pilot or RDS subcarrier is as decisive as a sync word. The detector often cuts a station
     // into fragments of 70–150 kHz (its centre, a sideband), whose discriminator still holds the pilot but whose squared
     // derivative also holds lines the FSK rules took for "2FSK 2400 Bd"; so this goes first, for anything wide enough to
     // carry a 19 kHz subcarrier.
-    let pilot = (bw >= 30e3).then(|| blind::fm_pilot(&w.disc, fs)).flatten();
-    let (label, confidence) = if let Some(p) = pilot {
-        (if p.rds { "FM broadcast (stereo, RDS)".to_string() } else { "FM broadcast (stereo)".to_string() }, 0.9)
+    let station = (bw >= 30e3).then(|| blind::fm_broadcast(&w.disc, fs)).flatten();
+    let (label, confidence) = if let Some(p) = station {
+        let label = match (p.pilot_db.is_some(), p.rds) {
+            (true, true) => "FM broadcast (stereo, RDS)",
+            (true, false) => "FM broadcast (stereo)",
+            _ => "FM broadcast (mono, RDS)",
+        };
+        (label.to_string(), 0.9)
     } else if bw > 150e3 {
         if let Some(o) = blind::ofdm(x, fs, OFDM_USEFUL_S.0, OFDM_USEFUL_S.1) {
             (ofdm_label(&o), 0.7)

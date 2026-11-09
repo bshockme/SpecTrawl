@@ -63,9 +63,9 @@ const DC_HZ: f64 = 1.5e3;
 /// A broadcast station's channel either side of its carrier: ±75 kHz of deviation and the programme's 15 kHz.
 const STATION_HALF_HZ: f64 = 100e3;
 /// HD Radio's digital sidebands either side of a station's carrier, from the widest (extended hybrid, 101 kHz in) to
-/// their outer edge (198 kHz). On air at 105.9 MHz they were records of 65–86 kHz at 105.700–105.786 and
+/// their outer edge (198 kHz), with room for the carrier being a few kHz out. On air at 105.9 MHz they were records of 65–86 kHz at 105.700–105.786 and
 /// 106.014–106.100, each its own emitter.
-const STATION_HD_HZ: (f64, f64) = (95e3, 205e3);
+const STATION_HD_HZ: (f64, f64) = (95e3, 212e3);
 /// A sideband's record: at least this wide, its outer edge at least this far out. A neighbouring station 200 kHz
 /// away swings through the same place, but its fragments there are narrower (2–30 kHz on air) and its whole records
 /// reach past the sideband's edge.
@@ -123,7 +123,13 @@ struct Votes {
     shaped: HashMap<String, SyncVote>,
     /// The headline the store had, kept until the votes name one.
     loaded: Option<Claim>,
+    /// Carriers the looks at its records measured (a broadcast station's), newest last, one per record.
+    carriers: VecDeque<(RecordId, f64)>,
 }
+
+/// Carriers a station's centre is the median of: a look cut on an HD Radio sideband measured 105.9 MHz 9–11 kHz high
+/// on air, one cut at the core within 3 kHz.
+const CARRIERS: usize = 16;
 
 impl Votes {
     /// A record that left the emitter: its claims no longer vote here.
@@ -137,6 +143,14 @@ impl Votes {
             }
             map.retain(|_, v| !v.records.is_empty());
         }
+        self.carriers.retain(|(r, _)| *r != record);
+    }
+
+    /// The median of the carriers measured.
+    fn carrier(&self) -> Option<f64> {
+        let mut c: Vec<f64> = self.carriers.iter().map(|(_, c)| *c).collect();
+        c.sort_by(f64::total_cmp);
+        c.get(c.len() / 2).copied()
     }
 }
 
@@ -305,9 +319,12 @@ impl EmitterBook {
         if bin >= COARSE_BIN_HZ {
             return false;
         }
-        // A station: anything within its channel, however it swings.
+        // A station: anything centred in its channel, however it swings, and reaching no further than its HD Radio
+        // sidebands (on air at 97.7 MHz, records of 58 kHz 85 kHz either side: the swing's edge and a sideband's inner
+        // part). A neighbour's fragments are centred 125 kHz away or more.
         if e.station {
-            return (e.center_hz - c).abs() + bw / 2.0 <= STATION_HALF_HZ + bin;
+            let off = (e.center_hz - c).abs();
+            return off <= STATION_HALF_HZ + bin && off + bw / 2.0 <= STATION_HD_HZ.1 + bin;
         }
         if !e.confirmed || bw * 2.0 > e.bandwidth_hz + bin {
             return false;
@@ -628,14 +645,24 @@ impl EmitterBook {
                 vote.best = c.clone();
             }
         }
+        if let Some(c) = claims.iter().find_map(|c| match c.by {
+            Evidence::Features { carrier_hz: Some(c), .. } if c.is_finite() => Some(c),
+            _ => None,
+        }) {
+            v.carriers.retain(|(r, _)| *r != record);
+            v.carriers.push_back((record, c));
+            while v.carriers.len() > CARRIERS {
+                v.carriers.pop_front();
+            }
+        }
         e.s.headline = v.headline();
         let was = e.s.station;
         e.s.station = e.s.headline.as_ref().is_some_and(|h| h.label.starts_with("FM broadcast"));
         if !e.s.station {
             return Vec::new();
         }
-        if let Some(Evidence::Features { carrier_hz: Some(c), .. }) = e.s.headline.as_ref().map(|h| &h.by) {
-            e.s.center_hz = *c;
+        if let Some(c) = e.votes.carrier() {
+            e.s.center_hz = c;
         }
         e.s.bandwidth_hz = 2.0 * STATION_HALF_HZ;
         if was { Vec::new() } else { self.gather(id) }
@@ -957,9 +984,27 @@ mod tests {
         assert_eq!(b.observe(&rec(3, 106.057, 86.0, 3)), st);
         // The core and a sideband in one record.
         assert_eq!(b.observe(&rec(4, 105.842, 283.0, 4)), st);
+        // The swing's edge and a sideband's inner part (as on air at 97.7 MHz: 58 kHz, 85 kHz out).
+        assert_eq!(b.observe(&rec(6, 105.815, 58.0, 6)), st);
+        assert_eq!(b.observe(&rec(7, 105.986, 59.0, 7)), st);
         assert_eq!(b.get(st).unwrap().center_hz, 105.9e6, "a station's records don't drag it off its carrier");
         // A narrow fragment where a sideband would be is a neighbour's, not this station's.
         assert_ne!(b.observe(&rec(5, 106.070, 15.0, 5)), st);
+    }
+
+    #[test]
+    fn a_station_sits_on_the_median_of_its_looks_carriers() {
+        let mut b = Book::new();
+        let st = b.observe(&rec(1, 105.900, 166.0, 1));
+        // The first look was cut on a sideband and measured the carrier 9 kHz high; its sideband still joins.
+        b.b.note_claims(st, RecordId(1), &[pilot(105.909)]);
+        assert_eq!(b.observe(&rec(2, 105.743, 86.0, 2)), st);
+        for (r, mhz) in [(3, 105.9008), (4, 105.8994), (5, 105.9011)] {
+            b.observe(&rec(r, 105.9, 160.0, r));
+            b.b.note_claims(st, RecordId(r), &[pilot(mhz)]);
+        }
+        let c = b.get(st).unwrap().center_hz;
+        assert!((c - 105.9e6).abs() < 1.5e3, "centre {c}");
     }
 
     #[test]

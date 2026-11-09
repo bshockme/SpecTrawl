@@ -22,9 +22,9 @@
 //! - **Envelope periodicity** (`burst_period`): a slotted or framed
 //!   signal's envelope repeats at the frame period (TDMA slots, beacons,
 //!   pagers' batches); the autocorrelation of the envelope shows it.
-//! - **FM stereo pilot** (`fm_pilot`): a broadcast station's discriminator
-//!   carries a 19 kHz pilot and its RDS subcarrier at 57 kHz, which is as
-//!   decisive as a sync word.
+//! - **FM broadcast** (`fm_broadcast`): a broadcast station's discriminator
+//!   carries a 19 kHz stereo pilot or an RDS subcarrier at 57 kHz (a mono
+//!   station has only RDS), either as decisive as a sync word.
 //!
 //! Every test compares a line against the periodogram's own background
 //! and asks for it in both halves of the window, since the maximum of a
@@ -425,26 +425,25 @@ pub fn burst_period(x: &[Complex32], fs: f64, min_s: f64, max_s: f64) -> Option<
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct FmBroadcast {
     /// The 19 kHz stereo pilot, dB over the discriminator spectrum's
-    /// median around it.
-    pub pilot_db: f32,
+    /// median around it; `None` for a mono station.
+    pub pilot_db: Option<f32>,
     /// RDS at 57 kHz, if the discriminator reaches that far and it is there.
     pub rds: bool,
 }
 
-/// The stereo pilot in a discriminator output (`disc` at `fs`): a line
-/// within ±25 Hz of 19 kHz, `LINE_DB` over the 17–21 kHz median in both
-/// halves. RDS is a 57 kHz subcarrier ±2.4 kHz, read as a bump 6 dB over
-/// the 50–54 and 60–64 kHz medians.
-pub fn fm_pilot(disc: &[f32], fs: f64) -> Option<FmBroadcast> {
+/// A broadcast station's signalling in a discriminator output (`disc` at
+/// `fs`). The stereo pilot: a line within ±25 Hz of 19 kHz, `LINE_DB` over
+/// the 17–21 kHz median in both halves. RDS: a 57 kHz subcarrier ±2.4 kHz,
+/// read as a bump 6 dB over the 50–54 and 60–64 kHz medians. Either names
+/// a station: on air a mono station (105.9 MHz, no pilot at any window)
+/// carried RDS 25 dB over its baseband's floor.
+pub fn fm_broadcast(disc: &[f32], fs: f64) -> Option<FmBroadcast> {
     if fs < 44e3 {
         return None;
     }
     let x: Vec<Complex32> = disc.iter().map(|v| Complex32::new(*v, 0.0)).collect();
-    let line = stable_line(&x, fs, 17e3, 21e3, |p| p.to_vec())?;
-    if (line.hz - 19e3).abs() > 25.0 {
-        return None;
-    }
-    let mut out = FmBroadcast { pilot_db: line.over_db, rds: false };
+    let pilot_db = stable_line(&x, fs, 17e3, 21e3, |p| p.to_vec()).filter(|l| (l.hz - 19e3).abs() <= 25.0).map(|l| l.over_db);
+    let mut rds = false;
     if fs > 130e3 {
         let n = 1usize << x.len().min(MAX_FFT).ilog2();
         let pw = periodogram(&x[..n]);
@@ -457,13 +456,13 @@ pub fn fm_pilot(disc: &[f32], fs: f64) -> Option<FmBroadcast> {
             let m = s.len() / 2;
             *s.select_nth_unstable_by(m, f32::total_cmp).1
         };
-        let rds = med(55.5e3, 58.5e3);
+        let sub = med(55.5e3, 58.5e3);
         // Beside it: the quieter of the two sides (a heavily processed
         // station's stereo subcarrier reaches up to 53 kHz).
         let beside = med(50e3, 54e3).min(med(60e3, 64e3));
-        out.rds = beside > 0.0 && rds > 4.0 * beside;
+        rds = beside > 0.0 && sub > 4.0 * beside;
     }
-    Some(out)
+    (pilot_db.is_some() || rds).then_some(FmBroadcast { pilot_db, rds })
 }
 
 #[cfg(test)]
@@ -659,10 +658,14 @@ mod tests {
                 audio + pilot + rds
             })
             .collect();
-        let p = fm_pilot(&disc, fs).expect("pilot");
-        assert!(p.rds, "{p:?}");
-        // Voice-like FM without a pilot.
+        let p = fm_broadcast(&disc, fs).expect("pilot");
+        assert!(p.pilot_db.is_some() && p.rds, "{p:?}");
+        // A mono station: the same without its pilot.
+        let mono: Vec<f32> =
+            disc.iter().enumerate().map(|(i, v)| v - (2.0 * std::f64::consts::PI * 19e3 * i as f64 / fs).sin() as f32 * 6.75e3).collect();
+        assert_eq!(fm_broadcast(&mono, fs), Some(FmBroadcast { pilot_db: None, rds: true }));
+        // Voice-like FM: neither.
         let plain: Vec<f32> = (0..240_000).map(|_| rnd() * 30e3).collect();
-        assert_eq!(fm_pilot(&plain, fs), None);
+        assert_eq!(fm_broadcast(&plain, fs), None);
     }
 }
