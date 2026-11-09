@@ -134,7 +134,11 @@ fn a_flex_pager_gets_a_monitor_that_decodes_its_pages_once_each() {
     let e = engine(clip("flex_synthetic_929.6125", on, 9_000.0), on, 929.0e6);
     // The 10 s synthetic slice holds five pages; looped, they repeat, and are kept once.
     let d = locked(&e, "FLEX", 40, |s| s.contains(": 5 pages"));
-    assert!(d.summary.contains("END OF SYNTHETIC SLICE"), "the newest page last: {}", d.summary);
+    // The pages are in its newest lines, not its sentence (a sentence is shown and logged everywhere; pages are
+    // people's), and none came out damaged.
+    assert!(d.recent.iter().any(|l| l.ends_with(": END OF SYNTHETIC SLICE")), "the newest page kept: {:?}", d.recent);
+    assert!(!d.summary.contains("END OF SYNTHETIC SLICE") && !d.summary.contains(" | "), "no page in the sentence: {}", d.summary);
+    assert!(!d.recent.iter().any(|l| l.contains("[damaged]")), "{} damaged", d.recent.iter().filter(|l| l.contains("[damaged]")).count());
     std::thread::sleep(Duration::from_secs(12));
     let d = e.decoder_views().into_iter().find(|d| d.mode == "FLEX").unwrap();
     assert!(d.summary.contains(": 5 pages"), "a loop's repeats are not new pages: {}", d.summary);
@@ -165,8 +169,7 @@ fn a_channel_sending_flex_and_pocsag_gets_a_monitor_for_each_whose_claims_stay_o
         if let (Some(f), Some(p)) = (decoded("FLEX", 4, ": 5 pages in 4 frames"), decoded("POCSAG", 3, ": 3 pages")) {
             break (f, p);
         }
-        // Counts only: what comes after " | " is a page's text.
-        let modes: Vec<_> = e.decoder_views().iter().map(|d| d.summary.split(" | ").next().unwrap_or_default().to_string()).collect();
+        let modes: Vec<_> = e.decoder_views().iter().map(|d| d.summary.clone()).collect();
         assert!(t0.elapsed() < Duration::from_secs(60), "monitors: {modes:?}");
         std::thread::sleep(Duration::from_millis(200));
     };

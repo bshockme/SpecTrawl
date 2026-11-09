@@ -521,6 +521,9 @@ impl Inner {
             {
                 out.emitters.push(s.clone());
             }
+            if let Some(from) = o.left {
+                self.dirty_emitters.insert(from);
+            }
             if let Some((gone, into)) = o.folded {
                 self.dirty_emitters.insert(gone);
                 out.folded.push((gone, into));

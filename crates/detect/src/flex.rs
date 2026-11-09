@@ -86,6 +86,10 @@ impl Page {
     }
 }
 
+/// A frame's length after the end of sync 1 (where [`FlexFrame::at`] points): the frame information word (32 bits at
+/// 1600 bit/s), sync 2 (25 ms) and 11 blocks of 160 ms.
+pub const FRAME_AFTER_SYNC1_SECS: f64 = 0.020 + 0.025 + 11.0 * 0.160;
+
 #[derive(Debug, Clone)]
 pub struct FlexFrame {
     /// Sample index of the end of sync 1.

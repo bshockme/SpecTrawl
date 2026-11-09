@@ -113,6 +113,21 @@ struct Votes {
     loaded: Option<Claim>,
 }
 
+impl Votes {
+    /// A record that left the emitter: its claims no longer vote here.
+    fn forget(&mut self, record: RecordId) {
+        if self.decoded.as_ref().is_some_and(|(r, _)| *r == record) {
+            self.decoded = None;
+        }
+        for map in [&mut self.synced, &mut self.shaped] {
+            for v in map.values_mut() {
+                v.records.retain(|r| *r != record);
+            }
+            map.retain(|_, v| !v.records.is_empty());
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SyncVote {
     records: Vec<RecordId>,
@@ -192,6 +207,9 @@ pub struct Observed {
     pub emitter: EmitterId,
     /// `(gone, into)`: an emitter its record had started on its own folded into another.
     pub folded: Option<(EmitterId, EmitterId)>,
+    /// The emitter the record left: it joined while its first rows looked like that emitter, and closed as something
+    /// else.
+    pub left: Option<EmitterId>,
 }
 
 /// One device's emitters.
@@ -309,6 +327,7 @@ impl EmitterBook {
         let bw = r.bandwidth_hz().max(1.0);
         let c = r.center_hz();
         let mut folded = None;
+        let mut left = None;
         let id = match self.by_record.get(&r.id) {
             // A record that closes wider than its emitter and covering it, on an emitter with only a few records, built
             // that emitter from its own early fragments (two tracks of a broadcast station that later merged): the
@@ -316,6 +335,36 @@ impl EmitterBook {
             Some(&id) if closed && self.map.get(&id).is_some_and(|e| e.s.records == 1 || (e.s.records <= 3 && Self::covers(r, &e.s))) => {
                 let (to, f) = self.refit(r, id, c, bw);
                 folded = f;
+                to
+            }
+            // A record placed from its first rows that closes as something its emitter isn't (two pager channels keyed
+            // together look like one wide signal at first; the record then closes on one of them): it leaves for the
+            // emitter its final shape fits, or a new one, taking its votes with it. Left alone, such records drag an
+            // emitter's centre between channels, and a decoder tuned there hears neither.
+            Some(&id)
+                if closed
+                    && self.map.get(&id).is_some_and(|e| {
+                        e.s.records > 1 && !Self::fits(&e.s, c, bw, r.bin_hz) && !Self::contains(&e.s, c, bw, r.bin_hz)
+                    }) =>
+            {
+                if let Some(e) = self.map.get_mut(&id) {
+                    e.s.records = e.s.records.saturating_sub(1);
+                    e.votes.forget(r.id);
+                }
+                left = Some(id);
+                let to = self.find(c, bw, r.bin_hz, Some(id)).unwrap_or_else(|| {
+                    let n = ids();
+                    self.map.insert(n, Self::new_emitter(n, self.serial.clone(), r, c, bw));
+                    n
+                });
+                if let Some(e) = self.map.get_mut(&to) {
+                    if e.s.records > 0 && !Self::contains(&e.s, c, bw, r.bin_hz) {
+                        e.s.center_hz += (c - e.s.center_hz) * 0.1;
+                        e.s.bandwidth_hz += (bw - e.s.bandwidth_hz) * 0.1;
+                    }
+                    e.s.records += 1;
+                }
+                self.by_record.insert(r.id, to);
                 to
             }
             Some(&id) => id,
@@ -363,7 +412,7 @@ impl EmitterBook {
                 || (r.duration().as_secs_f64() >= CONFIRM_DURATION_S && r.rows >= CONFIRM_ROWS)
                 || r.max_snr_db >= CONFIRM_SNR_DB;
         }
-        Observed { emitter: id, folded }
+        Observed { emitter: id, folded, left }
     }
 
     /// A record that was visible merged into another before it closed: it no longer counts.
@@ -786,9 +835,32 @@ mod tests {
         assert_ne!(side, main);
         // ...that closes at the channel's full width.
         let o = b.observed(&rec(2, 856.3375, 9.0, 2));
-        assert_eq!(o, Observed { emitter: main, folded: Some((side, main)) });
+        assert_eq!(o, Observed { emitter: main, folded: Some((side, main)), left: None });
         assert!(b.get(side).is_none());
         assert_eq!(b.get(main).unwrap().records, 2);
+    }
+
+    #[test]
+    fn a_record_that_joined_while_wide_and_closed_on_one_channel_leaves_for_it() {
+        let mut b = Book::new();
+        // Two pager channels 50 kHz apart keyed together: three records catch both as one wide signal.
+        let both = b.observe(&rec(1, 929.6375, 54.0, 1));
+        for i in 2..4 {
+            assert_eq!(b.observe(&rec(i, 929.6375, 54.0, i)), both);
+        }
+        // A key-up seen first as the same wide signal joins that emitter...
+        let mut r = open(rec(10, 929.6375, 54.0, 10));
+        assert_eq!(b.observe(&r), both);
+        // ...and closes on 929.6125 alone: it leaves for an emitter of its own channel.
+        (r.f_lo_hz, r.f_hi_hz, r.open) = (929.6125e6 - 7.5e3, 929.6125e6 + 7.5e3, false);
+        let o = b.observed(&r);
+        assert_eq!(o.left, Some(both));
+        assert_ne!(o.emitter, both);
+        assert_eq!(b.get(both).unwrap().records, 3);
+        let mine = b.get(o.emitter).unwrap();
+        assert!((mine.center_hz - 929.6125e6).abs() < 1e3, "{}", mine.center_hz);
+        // The next record on that channel joins it, not the wide one.
+        assert_eq!(b.observe(&rec(11, 929.6125, 15.0, 11)), o.emitter);
     }
 
     #[test]

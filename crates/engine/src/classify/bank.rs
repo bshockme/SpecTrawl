@@ -68,7 +68,7 @@ impl Detector for SyncBank {
                 None => (f.id.clone().map(|id| Identity::Other { id }), IDENTIFIED_CONFIDENCE, s.sync.protocol, label),
             };
             if identity.is_some() {
-                let summary = summary(f, identity.as_ref());
+                let summary = summary(f, identity.as_ref(), !is_pager(s.sync.protocol));
                 out.push(Claim::new(label, confidence, Evidence::Decoder { mode: mode.into(), locked: true, summary, identity }));
             }
         }
@@ -92,7 +92,8 @@ impl Detector for Identifiers {
             .flatten()
             .map(|i| {
                 let identity = i.fields.as_ref().and_then(|f| f.id.clone()).map(|id| Identity::Other { id });
-                let summary = i.fields.as_ref().map(|f| summary(f, identity.as_ref())).unwrap_or_default();
+                let summary =
+                    i.fields.as_ref().map(|f| summary(f, identity.as_ref(), !i.protocol.is_some_and(is_pager))).unwrap_or_default();
                 let mode = i.protocol.unwrap_or("FM");
                 let label = match &identity {
                     Some(Identity::Other { id }) if i.protocol.is_none() => format!("{} ({id})", i.label),
@@ -175,7 +176,14 @@ pub fn p25_site(frames: &[Frame]) -> Option<P25Site> {
 }
 
 /// "NAC 0x34D: TSDU×12, 12 of 14 frames": the identity, then what decoded.
-fn summary(f: &Fields, identity: Option<&Identity>) -> String {
+/// Pager protocols: their messages are people's pages.
+fn is_pager(protocol: &str) -> bool {
+    matches!(protocol, "POCSAG" | "FLEX")
+}
+
+/// `message`: end with the newest message decoded. Pages never are: pager traffic is personal and medical, and a claim's
+/// summary is stored and shown everywhere the claim is.
+fn summary(f: &Fields, identity: Option<&Identity>, message: bool) -> String {
     let kinds: Vec<String> = f.kinds.iter().take(3).map(|(k, n)| format!("{k}×{n}")).collect();
     let mut s = identity.map(|i| i.line()).unwrap_or_default();
     if !kinds.is_empty() {
@@ -190,8 +198,8 @@ fn summary(f: &Fields, identity: Option<&Identity>) -> String {
     if let Some(t) = &f.talk {
         s.push_str(&format!(", {t}"));
     }
-    // The newest message decoded (an ACARS block, a page), as the decoder words it.
-    if let Some(m) = f.messages.last() {
+    // The newest message decoded (an ACARS block), as the decoder words it.
+    if let Some(m) = f.messages.last().filter(|_| message) {
         s.push_str(&format!(" | {m}"));
     }
     s

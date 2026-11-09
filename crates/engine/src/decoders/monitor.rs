@@ -139,8 +139,14 @@ impl Monitor {
         let mut locked = false;
         let mut synced = false;
         if self.protocol == "FLEX" {
+            let block_secs = w.raw.len() as f64 / w.fs;
             for f in detect::flex::decode(w.raw, w.fs) {
                 synced = true;
+                // A frame the block cuts off is left for the next block, which holds it whole (blocks overlap by more
+                // than a frame): taken here, its pages would be cut short and the whole copy dropped as seen.
+                if f.at as f64 / w.fs + detect::flex::FRAME_AFTER_SYNC1_SECS > block_secs {
+                    continue;
+                }
                 if self.flex_seen.contains(&(f.cycle, f.frame)) {
                     continue;
                 }
@@ -298,8 +304,10 @@ impl Decoder for Monitor {
             if self.protocol == "FLEX" {
                 s.push_str(&format!(" in {} frames", self.decoded));
             }
-            if let Some(p) = self.pages.back() {
-                s.push_str(&format!(" | {p}"));
+            // Counts only: the pages themselves are people's, and this sentence is shown and logged everywhere.
+            let damaged = self.pages.iter().filter(|p| p.contains("[damaged]")).count();
+            if damaged > 0 {
+                s.push_str(&format!(", {damaged} of the last {} damaged", self.pages.len()));
             }
             return s;
         }
@@ -333,5 +341,47 @@ impl Decoder for Monitor {
                 identity: self.identity(),
             },
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The committed synthetic FLEX slice: four 3200/4 frames carrying five invented pages, 50 kS/s.
+    fn synthetic() -> Vec<Complex32> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/small/flex_synthetic_929.6125.sigmf-data");
+        let raw = std::fs::read(path).expect("the synthetic FLEX slice (testdata/small)");
+        raw.as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| Complex32::new(f32::from_le_bytes(c[0..4].try_into().unwrap()), f32::from_le_bytes(c[4..8].try_into().unwrap())))
+            .collect()
+    }
+
+    #[test]
+    fn a_flex_frame_cut_short_by_a_block_is_taken_whole_from_the_next() {
+        // Blocks are 4 s, every 2 s: the second frame (about 2.1 s in) is cut off by the first block's end and whole in
+        // the second. A monitor that kept the first copy it saw printed its pages damaged.
+        for lead_secs in [0.0, 0.5, 1.0, 1.5] {
+            let pages = monitor_pages(lead_secs);
+            assert_eq!(pages.len(), 5, "{lead_secs} s lead: every page, once: {} lines", pages.len());
+            let damaged = pages.iter().filter(|p| p.contains("[damaged]")).count();
+            assert_eq!(damaged, 0, "{lead_secs} s lead: {damaged} of 5 pages damaged");
+            assert!(pages.iter().any(|p| p.ends_with(": END OF SYNTHETIC SLICE")));
+        }
+    }
+
+    /// The monitor's lines for the synthetic slice after `lead_secs` of silence, then 4 s more (a live channel goes on).
+    fn monitor_pages(lead_secs: f64) -> Vec<String> {
+        let mut x = vec![Complex32::new(0.0, 0.0); (lead_secs * 50e3) as usize];
+        x.extend(synthetic());
+        x.extend(std::iter::repeat_n(Complex32::new(0.0, 0.0), 200_000));
+        let mut m = Monitor::new("FLEX", "FLEX", 929.6125e6, 15e3);
+        m.configure(50e3);
+        for chunk in x.chunks(500) {
+            m.feed(chunk);
+        }
+        m.recent()
     }
 }

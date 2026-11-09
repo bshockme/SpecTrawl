@@ -226,8 +226,11 @@ fn channel_for(want: &Want, bandwidth_hz: f64) -> (f64, f64, Priority) {
     match want {
         Want::P25Control => (P25_WIDTH_HZ, P25_RATE, Priority::TrunkControl),
         Want::Monitor { protocol, .. } => {
-            let width = (1.25 * bandwidth_hz).clamp(MONITOR_MIN_WIDTH_HZ, MONITOR_MAX_WIDTH_HZ);
-            let priority = if matches!(*protocol, "POCSAG" | "FLEX") { Priority::PagerMonitor } else { Priority::EmitterDecoder };
+            let pager = matches!(*protocol, "POCSAG" | "FLEX");
+            // A pager gets its whole 25 kHz channel: a 4-level FLEX signal clipped to its measured width (a record often
+            // catches only part of it) loses its outer levels.
+            let width = if pager { PAGER_WIDTH_HZ } else { (1.25 * bandwidth_hz).clamp(MONITOR_MIN_WIDTH_HZ, MONITOR_MAX_WIDTH_HZ) };
+            let priority = if pager { Priority::PagerMonitor } else { Priority::EmitterDecoder };
             (width, MONITOR_RATE, priority)
         }
     }
@@ -238,6 +241,8 @@ fn channel_for(want: &Want, bandwidth_hz: f64) -> (f64, f64, Priority) {
 const MONITOR_MIN_WIDTH_HZ: f64 = 12.5e3;
 const MONITOR_MAX_WIDTH_HZ: f64 = 30e3;
 const MONITOR_RATE: f64 = 48e3;
+/// A pager monitor's channel: a paging channel's whole 25 kHz.
+const PAGER_WIDTH_HZ: f64 = 25e3;
 
 /// A decoder follows its emitter: one tuned more than this from where the emitter now is (1.5 kHz, or 15 % of its
 /// width) is detached and attached again there. An emitter's first records can put it kHz off (a fading FLEX pager's
@@ -274,6 +279,13 @@ fn manage(shared: Arc<Shared>, book: Arc<RecordBook>, bus: Arc<ChannelBus>, sour
                 list.push((r, w));
             }
         }
+        // Where each emitter's decoders belong: the newest record whose claim asks for that mode (the look that synced
+        // or decoded it saw the signal there). An emitter's own centre is an average of its records and can sit between
+        // two channels, or drift off one, so a decoder never tunes to it.
+        let at: HashMap<(EmitterId, &'static str), (f64, f64)> = wanted
+            .iter()
+            .flat_map(|(em, list)| list.iter().map(move |(r, w)| ((*em, w.mode()), (r.center_hz(), r.bandwidth_hz()))))
+            .collect();
         let mut attached = shared.attached.lock();
         // The newest time the book has seen: idleness is measured on the records' own clock.
         let now = view.records.iter().map(|r| r.t_end).max();
@@ -288,20 +300,22 @@ fn manage(shared: Arc<Shared>, book: Arc<RecordBook>, bus: Arc<ChannelBus>, sour
             }
             let idle = if matches!(a.mode, "POCSAG" | "FLEX") { PAGER_IDLE } else { IDLE };
             let quiet = now.is_some_and(|now| now.duration_since(*last).unwrap_or_default() > idle);
-            let moved = view.emitters.iter().find(|e| e.id == a.emitter).filter(|e| moved(a.center_hz, e.center_hz, e.bandwidth_hz));
-            let keep = !a.ended.load(Ordering::Relaxed) && !quiet && moved.is_none() && sources.lock().contains_key(&a.source);
+            let moved = at.get(&(a.emitter, a.mode)).copied().filter(|&(c, bw)| moved(a.center_hz, c, bw));
+            // A retune leaves a decoder outside its receiver's span: it ends with the span it was attached in.
+            let in_span = sources.lock().get(&a.source).is_some_and(|src| {
+                let seg = src.current_segment();
+                (a.center_hz - seg.center_hz).abs() < seg.sample_rate / 2.0
+            });
+            let keep = !a.ended.load(Ordering::Relaxed) && !quiet && moved.is_none() && in_span;
             if !keep {
                 a.stop.store(true, Ordering::Relaxed);
                 if let Some(ch) = a.channel.lock().take() {
                     bus.unsubscribe(ch);
                 }
                 match moved {
-                    Some(e) => log::info!(
-                        "decoder {} at {:.4} MHz detached: its emitter is at {:.4} MHz",
-                        a.mode,
-                        a.center_hz / 1e6,
-                        e.center_hz / 1e6
-                    ),
+                    Some((c, _)) => {
+                        log::info!("decoder {} at {:.4} MHz detached: its signal is now at {:.4} MHz", a.mode, a.center_hz / 1e6, c / 1e6)
+                    }
                     None => log::info!("decoder {} at {:.4} MHz detached", a.mode, a.center_hz / 1e6),
                 }
             }
@@ -316,9 +330,8 @@ fn manage(shared: Arc<Shared>, book: Arc<RecordBook>, bus: Arc<ChannelBus>, sour
             }
             let Some(src) = sources.lock().get(&r.source).cloned() else { continue };
             let Some(stage) = bus.stage(src.id()) else { continue };
-            let emitter = view.emitters.iter().find(|e| e.id == em);
-            let center_hz = emitter.map_or(r.center_hz(), |e| e.center_hz);
-            let bandwidth_hz = emitter.map_or(r.bandwidth_hz(), |e| e.bandwidth_hz);
+            // On the signal as the claiming record saw it, not the emitter's average (see `at` above).
+            let (center_hz, bandwidth_hz) = (r.center_hz(), r.bandwidth_hz());
             let title = match &want {
                 Want::P25Control => mode.to_string(),
                 Want::Monitor { label, .. } => label.clone(),
