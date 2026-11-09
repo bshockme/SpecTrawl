@@ -8,10 +8,12 @@ use api::{Command, Handle, RecordId, Snapshot, SourceId};
 use egui_dock::{DockArea, DockState, NodeIndex, Tree};
 
 use crate::devices_pane::{self, BudgetDraft};
+use crate::log_pane::LogPane;
 use crate::receiver_pane::{DEFAULT_DB_RANGE, ReceiverPane};
 use crate::records_pane::RecordsPane;
+use crate::status_bar::StatusBar;
 use crate::tabs::Tab;
-use crate::{log_pane, theme};
+use crate::theme;
 
 /// The eframe storage key everything this app persists lives under.
 const STORAGE_KEY: &str = "spectrawl-next";
@@ -31,8 +33,12 @@ pub struct App {
     /// Commands collected while drawing, sent once the frame is drawn.
     out: Vec<Command>,
     records: RecordsPane,
+    log: LogPane,
+    status: StatusBar,
     /// The record selected in a waterfall or the list (shared by both).
     selected: Option<RecordId>,
+    /// The house theme and type are installed in this context.
+    styled: bool,
 }
 
 impl App {
@@ -52,7 +58,10 @@ impl App {
             db_ranges: HashMap::new(),
             out: Vec::new(),
             records: RecordsPane::new(),
+            log: LogPane::default(),
+            status: StatusBar::default(),
             selected: None,
+            styled: false,
         }
     }
 
@@ -74,6 +83,18 @@ impl App {
 
     /// The whole frame: take in the newest snapshot, draw, send what was clicked.
     pub fn frame(&mut self, ui: &mut egui::Ui) {
+        // A context the launcher didn't style (a test's) gets the theme here; fonts take effect from the next frame, so
+        // this frame draws nothing.
+        if !self.styled {
+            let ctx = ui.ctx().clone();
+            if ctx.fonts(|f| f.definitions().families.contains_key(&theme::label_family())) {
+                self.styled = true;
+            } else {
+                theme::apply(&ctx);
+                ctx.request_repaint();
+                return;
+            }
+        }
         self.snap = self.handle.latest();
         if self.seen_version != Some(self.snap.version) {
             self.sync();
@@ -81,7 +102,8 @@ impl App {
 
         egui::Panel::top("top_bar").frame(theme::bar_frame()).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("SpecTrawl").strong());
+                theme::wordmark(ui);
+                ui.add_space(12.0);
                 ui.menu_button("View ⏷", |ui| {
                     for tab in [Tab::Devices, Tab::Log, Tab::Records, Tab::Systems, Tab::Channels] {
                         let shown = self.dock.find_tab(&tab).is_some();
@@ -93,6 +115,8 @@ impl App {
                 });
             });
         });
+        let snap = self.snap.clone();
+        egui::Panel::top("status_bar").frame(theme::status_frame()).show(ui, |ui| self.status.show(ui, &snap));
 
         // The dock is lent to the viewer (us) while it draws.
         let mut dock = std::mem::replace(&mut self.dock, DockState::new(Vec::new()));
@@ -238,7 +262,7 @@ impl egui_dock::TabViewer for App {
                 }
             }
             Tab::Devices => devices_pane::show(ui, &snap, &mut self.budget_draft, &mut self.out),
-            Tab::Log => log_pane::show(ui, &snap),
+            Tab::Log => self.log.show(ui, &snap),
             Tab::Records => self.records.show(ui, &snap, &mut self.selected, &mut self.out),
             Tab::Systems => crate::systems_pane::show(ui, &snap),
             Tab::Channels => crate::channels_pane::show(ui, &snap, &mut self.selected),

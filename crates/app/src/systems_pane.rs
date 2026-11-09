@@ -9,9 +9,9 @@ use crate::theme;
 /// The lamp's word and colour.
 pub fn lamp(l: Lamp) -> (&'static str, egui::Color32) {
     match l {
-        Lamp::Searching => ("Searching", theme::MUTED),
-        Lamp::Syncing => ("Syncing", theme::SELECT),
-        Lamp::Locked => ("Locked", theme::VOICE),
+        Lamp::Searching => ("Searching", theme::INK2),
+        Lamp::Syncing => ("Syncing", theme::INFO),
+        Lamp::Locked => ("Locked", theme::OK),
     }
 }
 
@@ -19,21 +19,21 @@ pub fn lamp(l: Lamp) -> (&'static str, egui::Color32) {
 pub fn decoder_line(ui: &mut egui::Ui, d: &DecoderView) {
     let (word, colour) = lamp(d.lamp);
     ui.horizontal(|ui| {
-        ui.label(RichText::new("●").color(colour));
+        theme::dot(ui, colour, d.lamp != Lamp::Searching);
         ui.label(RichText::new(word).color(colour).small());
         ui.label(&d.summary);
     });
 }
 
 pub fn show(ui: &mut egui::Ui, snap: &Snapshot) {
-    ui.label(RichText::new("SYSTEMS").strong());
+    ui.label(theme::label("Systems"));
     if snap.systems.systems.is_empty() {
-        ui.label(RichText::new("none yet: a system appears once a control channel's broadcasts are decoded").italics().color(theme::MUTED));
+        ui.label(RichText::new("none yet: a system appears once a control channel's broadcasts are decoded").italics().color(theme::INK2));
     }
     egui::Grid::new("systems").striped(true).show(ui, |ui| {
         if !snap.systems.systems.is_empty() {
             for h in ["Mode", "Control", "Identity", "Records", "Last seen"] {
-                ui.label(RichText::new(h).small().color(theme::MUTED));
+                ui.label(theme::label(h));
             }
             ui.end_row();
         }
@@ -47,9 +47,9 @@ pub fn show(ui: &mut egui::Ui, snap: &Snapshot) {
         }
     });
     ui.add_space(8.0);
-    ui.label(RichText::new("DECODERS").strong());
+    ui.label(theme::label("Decoders"));
     if snap.decoders.is_empty() {
-        ui.label(RichText::new("none running").italics().color(theme::MUTED));
+        ui.label(RichText::new("none running").italics().color(theme::INK2));
     }
     for d in &snap.decoders {
         decoder_line(ui, d);

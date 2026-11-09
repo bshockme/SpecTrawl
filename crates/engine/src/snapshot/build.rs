@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::time::Instant;
 
-use api::{BusView, ConsumerState, ConsumerView, Receiver, RingView, StageView};
+use api::{BusView, ConsumerState, ConsumerView, LogKind, Receiver, RingView, StageView};
 
 use super::Log;
 use super::devices::Registry;
@@ -68,7 +68,7 @@ pub(crate) fn receivers(engine: &Engine, registry: &Registry, rows: usize, watch
         let head = source.head();
         let silent_secs = watch.silent_secs(id, head, now);
         if stats.device_lost && watch.lost.insert(id) {
-            log.push(Some(o.letter), format!("{}: device lost", o.letter));
+            log.push(Some(o.letter), LogKind::Device, format!("{}: device lost", o.letter));
         }
         let mode = source.mode();
         let sweep = stage.as_ref().and_then(|s| s.sweep_status()).filter(|_| mode == api::Mode::Sweep).map(|s| api::SweepView {

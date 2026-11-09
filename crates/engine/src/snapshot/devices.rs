@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use api::{Capabilities, Command, DeviceEntry, DeviceInfo, GainSetting, Outcome, fmt};
+use api::{Capabilities, Command, DeviceEntry, DeviceInfo, GainSetting, LogKind, Outcome, fmt};
 use sdr_core::Backend;
 
 use super::Log;
@@ -45,7 +45,7 @@ impl Registry {
         for b in &self.backends {
             match b.enumerate() {
                 Ok(found) => entries.extend(found.into_iter().map(|info| DeviceEntry { info, open_as: None })),
-                Err(e) => log.push(None, format!("{}: enumeration failed: {e}", b.name())),
+                Err(e) => log.push(None, LogKind::Device, format!("{}: enumeration failed: {e}", b.name())),
             }
         }
         self.entries = entries;
@@ -101,7 +101,7 @@ impl Registry {
                 let o = self.open.remove(&id).ok_or_else(|| no_receiver(id))?;
                 engine.remove_source(id);
                 self.sync();
-                log.push(Some(o.letter), format!("{} closed", o.letter));
+                log.push(Some(o.letter), LogKind::Device, format!("{} closed", o.letter));
                 Ok(Outcome::Done)
             }
             Command::Tune { source, center_hz } => {
@@ -114,7 +114,7 @@ impl Registry {
                     return Err(format!("{} is outside the device's range", fmt::mhz(center_hz)));
                 }
                 src.set_center(center_hz).map_err(|e| e.to_string())?;
-                log.push(Some(letter), format!("{letter} tuned to {}", fmt::mhz(center_hz)));
+                log.push(Some(letter), LogKind::Tune, format!("{letter} tuned to {}", fmt::mhz(center_hz)));
                 Ok(Outcome::Done)
             }
             Command::SetGain { source, gain } => {
@@ -123,7 +123,7 @@ impl Registry {
                 if let Some(o) = self.open.get_mut(&source) {
                     o.gain = Some(gain);
                 }
-                log.push(Some(letter), format!("{letter} gain set"));
+                log.push(Some(letter), LogKind::Tune, format!("{letter} gain set"));
                 Ok(Outcome::Done)
             }
             Command::Tag { record, tag } | Command::Untag { record, tag } if tag.trim().is_empty() => {
@@ -155,7 +155,7 @@ impl Registry {
                     Mode::Sweep => "Sweep",
                 };
                 let text = if now == letter { format!("{letter} mode {name}") } else { format!("{letter} mode {name}, now {now}") };
-                log.push(Some(now), text);
+                log.push(Some(now), LogKind::Tune, text);
                 Ok(Outcome::Done)
             }
             Command::SetSweep { source, start_hz, stop_hz, segments } => {
@@ -174,14 +174,18 @@ impl Registry {
                     ..Default::default()
                 }
                 .normalised();
-                log.push(Some(letter), format!("{letter} sweeps {}–{}", fmt::mhz(plan.start_hz), fmt::mhz(plan.stop_hz)));
+                log.push(Some(letter), LogKind::Tune, format!("{letter} sweeps {}–{}", fmt::mhz(plan.start_hz), fmt::mhz(plan.stop_hz)));
                 src.set_sweep_plan(plan);
                 Ok(Outcome::Done)
             }
             Command::SetBudget { guaranteed_secs, ceiling_bytes } => {
                 let sweep_secs = engine.config().budget.sweep_secs;
                 engine.keeper().budget().set_config(BudgetConfig { guaranteed_secs, ceiling_bytes, sweep_secs });
-                log.push(None, format!("budget: guaranteed {}, ceiling {} MB", fmt::secs(guaranteed_secs), ceiling_bytes >> 20));
+                log.push(
+                    None,
+                    LogKind::Device,
+                    format!("budget: guaranteed {}, ceiling {} MB", fmt::secs(guaranteed_secs), ceiling_bytes >> 20),
+                );
                 Ok(Outcome::Done)
             }
         }
@@ -196,7 +200,7 @@ impl Registry {
         let device = b.open(serial).map_err(|e| e.to_string())?;
         let source = engine.add_source(device, Mode::Live).map_err(|e| e.to_string())?;
         let snap = source.snapshot();
-        log.push(Some(letter), format!("opened {} as {letter}", snap.info.label));
+        log.push(Some(letter), LogKind::Device, format!("opened {} as {letter}", snap.info.label));
         self.open.insert(source.id(), Opened { letter, info: snap.info, caps: Arc::new(snap.caps), gain: None });
         self.sync();
         Ok(Outcome::Opened(source.id()))

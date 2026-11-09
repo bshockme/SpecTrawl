@@ -143,11 +143,8 @@ impl ReceiverPane {
     fn header(&mut self, ui: &mut egui::Ui, r: &Receiver, out: &mut Vec<Command>) {
         ui.horizontal(|ui| {
             let letter = r.letter.to_string();
-            if r.letter == 'S' {
-                theme::chip(ui, &letter, theme::ACCENT, theme::BG);
-            } else {
-                theme::chip(ui, &letter, theme::CHIP_FOCUS_BG, theme::CHIP_FOCUS_FG);
-            }
+            // The letter is an identifier, not a state: a neutral chip.
+            theme::chip(ui, &letter, theme::CHIP, theme::INK);
             ui.label(egui::RichText::new(&r.device.label).strong());
             for mode in [Mode::Live, Mode::Sweep] {
                 if ui.add(egui::Button::new(mode_name(mode)).selected(r.mode == mode)).clicked() && r.mode != mode {
@@ -238,9 +235,9 @@ impl ReceiverPane {
                 set = Some(GainSetting::Auto);
             }
             ui.separator();
-            ui.label(egui::RichText::new("Manual").color(theme::MUTED));
+            ui.label(egui::RichText::new("Manual").color(theme::INK2));
             if r.caps.gain_stages.is_empty() {
-                ui.label(egui::RichText::new("This device has no hand-set stages.").color(theme::MUTED));
+                ui.label(egui::RichText::new("This device has no hand-set stages.").color(theme::INK2));
             }
             for (i, stage) in r.caps.gain_stages.iter().take(3).enumerate() {
                 ui.horizontal(|ui| {
@@ -303,18 +300,18 @@ fn mode_name(m: Mode) -> &'static str {
 /// The status sentence coloured by health, then a muted clipping count when the input has clipped.
 fn status_lines(ui: &mut egui::Ui, r: &Receiver) {
     let colour = match r.status.health {
-        Health::Ok => theme::TEXT2,
-        Health::Warning => theme::SELECT,
-        Health::Lost => theme::ALERT,
+        Health::Ok => theme::INK2,
+        Health::Warning => theme::CAUTION,
+        Health::Lost => theme::ALARM,
     };
     ui.horizontal_wrapped(|ui| {
         ui.label(egui::RichText::new(&r.status.text).color(colour));
         if let Some(reason) = &r.status.reason {
-            ui.label(egui::RichText::new(format!("· {reason}")).color(theme::MUTED));
+            ui.label(egui::RichText::new(format!("· {reason}")).color(theme::INK2));
         }
     });
     if r.ring.overloads > 0 {
-        ui.label(egui::RichText::new(format!("clipping ({})", r.ring.overloads)).small().color(theme::MUTED));
+        ui.label(egui::RichText::new(format!("clipping ({})", r.ring.overloads)).small().color(theme::INK2));
     }
 }
 

@@ -31,7 +31,9 @@ pub use records::{
     SignalRecord, StoreView, headline,
 };
 pub use sdr_core::{Capabilities, DeviceInfo, GainSetting};
-pub use snapshot::{BusView, ConsumerView, DeviceEntry, Health, LogEntry, Receiver, RingView, Snapshot, StageView, Status, SweepView};
+pub use snapshot::{
+    BusView, ConsumerView, DeviceEntry, Health, LogEntry, LogKind, Receiver, RingView, Snapshot, StageView, Status, SweepView,
+};
 pub use timeline::{Boundary, Row, Segment, SegmentId};
 
 /// Identifies a source within the budget.

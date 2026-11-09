@@ -115,9 +115,9 @@ impl Body {
     ) {
         let (rect, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 4.0, theme::PLOT_BG);
+        painter.rect_filled(rect, 4.0, theme::WELL);
         let Some(span) = self.history.span() else {
-            painter.text(rect.center(), egui::Align2::CENTER_CENTER, "waiting for rows…", egui::FontId::proportional(13.0), theme::MUTED);
+            painter.text(rect.center(), egui::Align2::CENTER_CENTER, "waiting for rows…", egui::FontId::proportional(13.0), theme::INK2);
             return;
         };
         let spec = Rect::from_min_size(rect.min, vec2(rect.width(), SPECTRUM_H.min(rect.height())));
@@ -150,8 +150,8 @@ impl Body {
             }
         }
         self.draw_spectrum(&painter, spec, span, &view);
-        painter.hline(rect.x_range(), spec.bottom() + 0.5, Stroke::new(1.0, theme::BORDER));
-        painter.rect_stroke(rect, 4.0, Stroke::new(1.0, theme::BORDER), egui::StrokeKind::Inside);
+        painter.hline(rect.x_range(), spec.bottom() + 0.5, Stroke::new(1.0, theme::LINE));
+        painter.rect_stroke(rect, 4.0, Stroke::new(1.0, theme::LINE), egui::StrokeKind::Inside);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -215,8 +215,8 @@ impl Body {
         let mut db = (db_min as f64 / step).ceil() * step;
         while db <= db_max as f64 {
             let y = y_of(db as f32);
-            painter.hline(plot.x_range(), y, Stroke::new(1.0, theme::GRID));
-            painter.text(pos2(plot.left() + 4.0, y - 1.0), egui::Align2::LEFT_BOTTOM, format!("{db:.dec$}"), font.clone(), theme::MUTED);
+            painter.hline(plot.x_range(), y, Stroke::new(1.0, theme::GRATICULE));
+            painter.text(pos2(plot.left() + 4.0, y - 1.0), egui::Align2::LEFT_BOTTOM, format!("{db:.dec$}"), font.clone(), theme::INK2);
             db += step;
         }
         // Frequency ticks, in MHz.
@@ -226,14 +226,14 @@ impl Body {
         let mut f = (lo / step).ceil() * step;
         while f <= hi {
             let x = view.hz_to_x(span, spec, f);
-            painter.vline(x, plot.y_range(), Stroke::new(1.0, theme::GRID));
+            painter.vline(x, plot.y_range(), Stroke::new(1.0, theme::GRATICULE));
             if x > spec.left() + 24.0 && x < spec.right() - 24.0 {
                 painter.text(
                     pos2(x, spec.bottom() - 2.0),
                     egui::Align2::CENTER_BOTTOM,
                     format!("{:.dec$}", f / 1e6),
                     font.clone(),
-                    theme::MUTED,
+                    theme::INK2,
                 );
             }
             f += step;
@@ -249,7 +249,7 @@ impl Body {
                 view.hz_to_x(span, spec, col_hz(c0 as f64 + (r.start + r.end) as f64 / 2.0)) + self.tune_drag
             })
             .collect();
-        for (line, colour, width) in [(&self.trace.hold, theme::MUTED, 1.0), (&self.trace.smooth, theme::ACCENT, 1.3)] {
+        for (line, colour, width) in [(&self.trace.hold, theme::INK2, 1.0), (&self.trace.smooth, theme::TRACE, 1.3)] {
             if line.len() != HIST_W {
                 continue;
             }
@@ -294,13 +294,13 @@ impl Body {
                 break;
             }
             // A tick at the mark, its label just above it.
-            painter.hline(wf.left()..=wf.left() + 10.0, y, Stroke::new(1.0, theme::TEXT2));
+            painter.hline(wf.left()..=wf.left() + 10.0, y, Stroke::new(1.0, theme::INK2));
             painter.text(
                 pos2(wf.left() + 3.0, y - 1.0),
                 egui::Align2::LEFT_BOTTOM,
                 format!("−{} s", k * MARK_SECS as u64),
                 font.clone(),
-                theme::TEXT2,
+                theme::INK2,
             );
             k += 1;
         }
@@ -337,7 +337,7 @@ impl Body {
             }
             let (y0, y1) = (wf.top() + top as f32 * row_h, wf.top() + (bottom + 1) as f32 * row_h);
             let b = Rect::from_min_max(pos2(x0, y0), pos2(x1, y1.max(y0 + 2.0))).intersect(wf);
-            let colour = if selected == Some(rec.id) { theme::SELECT } else { theme::RECORD.gamma_multiply(0.7) };
+            let colour = if selected == Some(rec.id) { theme::ACCENT } else { theme::RECORD.gamma_multiply(0.7) };
             let stroke = Stroke::new(if selected == Some(rec.id) { 1.5 } else { 1.0 }, colour);
             painter.line_segment([b.left_bottom(), b.right_bottom()], stroke);
             painter.line_segment([b.left_top(), b.left_bottom()], stroke);
@@ -354,7 +354,7 @@ impl Body {
     fn rebuild(&mut self, ctx: &egui::Context, letter: char, want: Built) {
         let Built { w, view, span } = want;
         let (c0, c1) = view.cols(span, HIST_W);
-        let mut px = vec![theme::PLOT_BG; w * ROWS];
+        let mut px = vec![theme::WELL; w * ROWS];
         self.cols.resize(w, 0.0);
         for (i, row) in self.history.iter().skip(self.behind).take(ROWS).enumerate() {
             waterfall::resample_max(&row.db[c0..c1], &mut self.cols);

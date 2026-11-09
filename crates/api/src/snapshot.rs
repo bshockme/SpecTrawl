@@ -174,5 +174,35 @@ pub struct BusView {
 pub struct LogEntry {
     pub n: u64,
     pub receiver: Option<char>,
+    pub kind: LogKind,
     pub text: String,
+}
+
+/// What a log line narrates (spec §5's Log slot), so the log can be filtered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LogKind {
+    /// A device opened, closed, lost, or enumerated; the budget changed.
+    Device,
+    /// A receiver retuned, changed mode or gain, or started a sweep.
+    Tune,
+    /// The bus shed a channel, or a consumer panicked.
+    Bus,
+    /// A claim changed an emitter's headline (or named it).
+    Headline,
+    /// A command failed.
+    Error,
+}
+
+impl LogKind {
+    pub const ALL: [LogKind; 5] = [LogKind::Device, LogKind::Tune, LogKind::Bus, LogKind::Headline, LogKind::Error];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            LogKind::Device => "Devices",
+            LogKind::Tune => "Tuning",
+            LogKind::Bus => "Bus",
+            LogKind::Headline => "Names",
+            LogKind::Error => "Errors",
+        }
+    }
 }

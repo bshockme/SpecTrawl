@@ -100,7 +100,7 @@ fn claim_line(ui: &mut egui::Ui, c: &Claim) {
                 Evidence::BandPlan { entry } => format!(" ({entry})"),
                 _ => String::new(),
             };
-            ui.label(RichText::new(format!("{}{entry} · inferred from {} · {pct:.0}%", c.label, evidence_kind(c))).color(theme::MUTED));
+            ui.label(RichText::new(format!("{}{entry} · inferred from {} · {pct:.0}%", c.label, evidence_kind(c))).color(theme::INK2));
         }
         _ => {
             ui.label(format!("{} · {} · {pct:.0}%", c.label, evidence_kind(c)));
@@ -211,14 +211,14 @@ impl RecordsPane {
         } else {
             format!("{} of {}", fmt::count(rows.len(), "record"), snap.records.records.len())
         };
-        ui.label(RichText::new(format!("{source} · {store_line}")).color(theme::MUTED).small());
-        ui.label(RichText::new(crate::systems_pane::budget_line(snap)).color(theme::MUTED).small());
+        ui.label(RichText::new(format!("{source} · {store_line}")).color(theme::INK2).small());
+        ui.label(RichText::new(crate::systems_pane::budget_line(snap)).color(theme::INK2).small());
         ui.separator();
 
         ui.horizontal(|ui| {
             for (col, name, w) in COLS {
                 let arrow = if self.sort == col { if self.descending { " ⏷" } else { " ⏶" } } else { "" };
-                let resp = ui.add_sized(vec2(w, ROW_H), egui::Button::new(RichText::new(format!("{name}{arrow}")).strong()).frame(false));
+                let resp = ui.add_sized(vec2(w, ROW_H), egui::Button::new(theme::label(&format!("{name}{arrow}"))).frame(false));
                 if resp.clicked() {
                     if self.sort == col {
                         self.descending = !self.descending;
@@ -250,11 +250,15 @@ impl RecordsPane {
                         for ((col, _, w), text) in COLS.iter().zip(cells) {
                             let colour = match col {
                                 // "Unknown" is an honest answer, shown as one: not styled like a claim.
-                                Col::Headline if r.headline().is_none() => theme::MUTED,
-                                _ if is_sel => theme::SELECT,
-                                _ => theme::TEXT,
+                                Col::Headline if r.headline().is_none() => theme::INK2,
+                                _ if is_sel => theme::ACCENT,
+                                _ => theme::INK,
                             };
-                            let mut t = RichText::new(text).color(colour).monospace();
+                            // Values and identifiers in Auggie Mono; the headline is words, in Barlow.
+                            let mut t = RichText::new(text).color(colour);
+                            if *col != Col::Headline {
+                                t = t.monospace();
+                            }
                             if *col == Col::Headline && r.headline().is_none() {
                                 t = t.italics();
                             }
@@ -340,11 +344,11 @@ impl RecordsPane {
                 out.push(self.save_command(r.id));
             }
             if let Some(p) = Self::play_of(snap, r.id) {
-                let colour = if matches!(p.state, PlayState::EndedEarly(_)) { theme::ALERT } else { theme::TEXT };
+                let colour = if matches!(p.state, PlayState::EndedEarly(_)) { theme::ALARM } else { theme::INK };
                 ui.label(RichText::new(Self::play_line(p)).small().color(colour));
             }
             if let Err(e) = &snap.audio.output {
-                ui.label(RichText::new(format!("no sound: {e}")).small().color(theme::MUTED));
+                ui.label(RichText::new(format!("no sound: {e}")).small().color(theme::INK2));
             }
         });
         // A refused play is answered with the reason.
@@ -353,7 +357,7 @@ impl RecordsPane {
             _ => None,
         });
         if let Some(e) = refused {
-            ui.label(RichText::new(e).small().color(theme::ALERT));
+            ui.label(RichText::new(e).small().color(theme::ALARM));
         }
     }
 
@@ -372,10 +376,10 @@ impl RecordsPane {
         );
         self.listen(ui, snap, r, out);
         if r.claims.is_empty() {
-            ui.label(RichText::new("unknown: no claims yet").italics().color(theme::MUTED));
+            ui.label(RichText::new("unknown: no claims yet").italics().color(theme::INK2));
         }
         if r.headline().is_none() && !r.claims.is_empty() {
-            ui.label(RichText::new("unknown: nothing decoded").italics().color(theme::MUTED));
+            ui.label(RichText::new("unknown: nothing decoded").italics().color(theme::INK2));
         }
         for c in &r.claims {
             claim_line(ui, c);
@@ -384,8 +388,8 @@ impl RecordsPane {
             (Some(c), _) => {
                 ui.label(RichText::new(format!("slice: {} ({})", c.path.display(), fmt::secs(c.samples as f64 / c.rate))).small())
             }
-            (None, true) => ui.label(RichText::new("slice: removed to stay under the disk cap").small().color(theme::MUTED)),
-            (None, false) => ui.label(RichText::new("slice: none").small().color(theme::MUTED)),
+            (None, true) => ui.label(RichText::new("slice: removed to stay under the disk cap").small().color(theme::INK2)),
+            (None, false) => ui.label(RichText::new("slice: none").small().color(theme::INK2)),
         };
         ui.horizontal_wrapped(|ui| {
             ui.label("Tags");

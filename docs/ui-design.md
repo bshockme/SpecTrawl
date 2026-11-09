@@ -4,6 +4,54 @@ Status: design, 2026-10-10; all of §8 is implemented (commits 1496c78 onward), 
 current UI (fixed left column of cards, two spectrum views, a tab strip at
 the bottom) is the starting point; this is where it goes and in what order.
 
+## 0. House guide (adopted 2026-11-08, rebuild step 8)
+
+The new app (`crates/app`) follows the owner's house guide, `~/auggiesoft-ui-guide` (its `rules/` and
+`looks/instrument.md`). Where this document and the guide disagree, this document wins, and the
+disagreement is listed under "Deviations" below with its reason. The old app (`app-old`) is not
+restyled.
+
+- **Look:** Instrument, on every pane. No Plain page yet.
+- **Type:** Barlow 500 for the UI, Barlow Semi Condensed 600 (uppercase, 0.08 em tracking) for
+  labels, section titles and column headers, Auggie Mono for every frequency, level, count, time
+  and identifier. TTFs decompressed from the guide's woff2 live in `crates/app/assets/fonts/` with
+  their OFL licences; egui's own fonts are the fallbacks. Units are drawn quieter than values
+  (`theme::value_unit`).
+- **The six roles** (`crates/app/src/theme.rs`):
+
+  | Role | SpecTrawl meaning |
+  |---|---|
+  | accent `#5aa9f0` | the selected record, row or box; a selected toggle (Live/Sweep) |
+  | caution `#f0a830` | a receiver's Warning status; the bus saturated |
+  | alarm `#ff4d4d` | a receiver Lost; losing samples; a replay ended early; an error |
+  | ok `#3ccf6e` | a decoder Locked |
+  | live `#ff5cc8` | audio playing out; recording (none drawn yet) |
+  | info `#9fd3ff` | a decoder Syncing |
+
+  Searching lamps are ink-2 rings. A healthy screen shows no caution, alarm or live.
+- **Identity colours:** the Instrument set (no red, amber, green or magenta). Known wideband
+  occupants take violet, always with their name. The receiver letter is a neutral chip: it is an
+  identifier, not a state.
+- **Data:** the spectrum trace is the trace cyan, never the accent; the peak hold is ink-2. The
+  waterfall uses inferno at every tenth (`theme::CMAP`; the Instrument look's five stops are among them, but interpolating those five alone lifts the noise floor to a bright purple), whose floor and ceiling are the
+  receiver's dB range. Plot wells are flat black.
+- **Gold thread:** the wordmark top left, and (with the page bar, step 8 Task 8) the 2 px underline
+  under the active workspace. Nowhere else.
+- **Project voice:** none.
+
+### Deviations from the guide
+
+- **I4, 44 px targets:** SpecTrawl is a desktop, mouse-driven app with dense tables; rows stay
+  18 px and controls are egui-sized. It is the guide's Compact density without the touch floor.
+  There is no touch page.
+- **L8, presets rather than free docking:** free docking stays (§4, the owner's earlier choice).
+  Presets and Reset layout give the escape hatch the rule asks for.
+- **R1, a redesign behind a setting:** the new app is not yet the default, and `app-old` is the way
+  back until step 8 switches over, so the new app carries one look only.
+- **Page bar (signature §3, L3):** SpecTrawl's pages are its workspaces, because the dock lets the
+  owner rearrange panes. The page bar lists the workspaces, and the gold underline marks the active
+  one, not a dock tab (several dock tabs are active at once).
+
 ## 1. Principles
 
 1. **One pane per receiver.** Each SDR is a self-contained pane: spectrum,

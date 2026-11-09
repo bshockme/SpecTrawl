@@ -93,7 +93,6 @@ fn main() {
         .with_pixels_per_point(SCALE)
         .wgpu()
         .build_ui_state(|ui, app: &mut App| app.frame(ui), app);
-    spectrawl_app::theme::apply(&h.ctx);
 
     // Runs the app's frames in real time (the engine is live).
     let run = |h: &mut egui_kittest::Harness<'_, App>, d: Duration| {

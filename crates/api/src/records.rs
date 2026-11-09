@@ -54,6 +54,26 @@ impl Claim {
     pub fn is_decoded(&self) -> bool {
         matches!(self.by, Evidence::Decoder { .. } | Evidence::SyncBank { .. })
     }
+
+    /// Inferred from where the signal is or what is next to it, not from the signal itself (spec §5: shown muted, with
+    /// the word "inferred").
+    pub fn is_inferred(&self) -> bool {
+        matches!(self.by, Evidence::BandPlan { .. } | Evidence::Neighbour { .. } | Evidence::Position(_))
+    }
+}
+
+impl Evidence {
+    /// The kind of evidence in a word or two: "decoded", "sync bank", "shape", "band plan", "neighbour", "position".
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Evidence::SyncBank { .. } => "sync bank",
+            Evidence::Features { .. } => "shape",
+            Evidence::Decoder { .. } => "decoded",
+            Evidence::BandPlan { .. } => "band plan",
+            Evidence::Neighbour { .. } => "neighbour",
+            Evidence::Position(_) => "position",
+        }
+    }
 }
 
 /// What produced a [`Claim`] (spec §4.4).
