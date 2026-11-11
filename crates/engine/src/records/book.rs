@@ -7,6 +7,7 @@
 //! (the store) after the book's lock is released.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
@@ -222,6 +223,23 @@ impl RecordBook {
             s.tag(record, tag, on);
         }
         found
+    }
+
+    /// Save IQ (see [`Recorder::save`]): the saved stem and whether the copy is still to come; the record is tagged
+    /// `saved`. `Err` says why there is no IQ to keep.
+    pub fn save_iq(&self, record: RecordId) -> Result<(PathBuf, bool), String> {
+        let r = self.recorder.get().ok_or_else(|| format!("record {} has no IQ to save: slices are off", record.0))?;
+        let saved = r.save(record).map_err(|e| {
+            let why = match self.get(record) {
+                _ if e.kind() != std::io::ErrorKind::NotFound => format!("copying its slice failed: {e}"),
+                Some(rec) if rec.slice_evicted => "its slice was evicted to keep under the disk cap".into(),
+                Some(_) => "it has no slice".into(),
+                None => "its slice is gone".into(),
+            };
+            format!("record {} has no IQ to save: {why}", record.0)
+        })?;
+        self.tag(record, "saved", true);
+        Ok(saved)
     }
 
     /// Adds a note to a record, timed by its source's timeline (else the newest time any open source gives, else the

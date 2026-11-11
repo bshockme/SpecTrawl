@@ -67,6 +67,12 @@ pub enum Command {
         to: PlayTo,
     },
     StopPlay(PlayId),
+    /// Keep a record's IQ: its slice is copied out of the capped slice directory (into `saved/`, beside it), now if it
+    /// is written, else as soon as it is. The record is tagged `saved`. Acknowledged with [`Outcome::SavedIq`], or an
+    /// error saying why there is no IQ to keep.
+    SaveIq {
+        record: RecordId,
+    },
     /// Run a decoder worker (`docs/decoder-worker.md`) in `mode` (an id from [`Snapshot::worker_modes`]) on a channel
     /// of `source` centred at `center_hz`. Acknowledged with [`Outcome::WorkerStarted`].
     ///
@@ -79,7 +85,7 @@ pub enum Command {
     StopWorker(WorkerId),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
     Done,
     Opened(SourceId),
@@ -89,6 +95,12 @@ pub enum Outcome {
     Playing(PlayId),
     /// The worker is starting; it shows in [`Snapshot::workers`](crate::Snapshot::workers).
     WorkerStarted(WorkerId),
+    /// The record's IQ is kept at `path` (a SigMF stem); `pending` while its slice is still being written.
+    SavedIq {
+        record: RecordId,
+        path: std::path::PathBuf,
+        pending: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -33,7 +33,7 @@ SpecTrawl is signal-centric: you work on **records**, not on tools.
 - **Looks back.** Each radio's IQ stream is kept in a RAM ring (30 s guaranteed by default, more when memory allows). Any record can be replayed or exported after it has ended.
 - **Classifies** every live record. A pool of workers runs a multi-phase sync search and shape measurements on each one. Records of a protocol it can decode get a **decoder** attached, which follows the channel.
 - **Shows evidence.** Every label is a *claim* that says what produced it, how sure it is and what it saw. Labels inferred from the band plan or a record's position look different from decoded ones. "Unknown" is an allowed answer, and no record is named after a digital mode without a sync or a decode.
-- **Keeps** records, tags and notes in a SQLite store across restarts. A channelised IQ slice (SigMF) is kept for each record, under a disk cap.
+- **Keeps** records, tags and notes in a SQLite store across restarts. A channelised IQ slice (SigMF) is kept for each record, under a disk cap; **Save IQ** copies a record's slice to `saved/`, outside the cap.
 - **Replays** a record as audio (AM, NFM or WFM) from the ring, or from its slice once the ring has moved on, and saves it as WAV.
 
 One wideband stream per radio is shared by everything. Channels are cut from a single FFT per radio, so no feature opens the device or down-converts the full-rate stream on its own.
@@ -105,7 +105,7 @@ cargo run --release -p spectrawl-next     # the app (new engine)
 
 1. In **Devices**, choose **Open** on a radio. It becomes receiver A, B, and so on, with its own tab.
 2. Set its frequency in the receiver's header. **Live** watches a 10 MHz span; **Sweep** surveys a wider range.
-3. Click a box on the waterfall, or a row in **Records**, to see that record's claims. **Play** listens to it; **Save audio** writes a WAV.
+3. Click a box on the waterfall, or a row in **Records**, to see that record's claims. **Play** listens to it; **Save audio** writes the demodulated sound as a WAV; **Save IQ** keeps its IQ slice (`Documents/SpecTrawl/saved/record-<id>.sigmf-*`) and tags it `saved`.
 4. **Systems** lists decoded trunking sites and every running decoder. **Channels** lists air band activity per channel.
 
 | Where | What |

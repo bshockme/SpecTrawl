@@ -143,3 +143,49 @@ fn the_slice_directory_stays_under_its_cap_oldest_first() {
     let slice = 640_000; // ~0.8 s (the burst and its rolls) at 78 kS/s, 8 bytes a sample, with room
     assert!(max_seen <= cap + 2 * slice, "{max_seen} B on disk under a {cap} B cap");
 }
+
+#[test]
+fn a_saved_slice_outlives_the_cap_and_one_saved_while_open_is_kept_when_written() {
+    let dir = Dir::new("saved");
+    let saved = dir.0.join("saved");
+    let cap = 1_200_000; // about two slices: within a few seconds every slice here is evicted
+    let e = engine(SliceConfig { cap_bytes: cap, saved_dir: saved.clone(), ..SliceConfig::new(dir.0.join("slices")) });
+    e.add_source(device(), Mode::Live).unwrap();
+    // One closed record with its slice written, and one still open.
+    let (mut closed, mut open) = (None, None);
+    for _ in 0..60 {
+        std::thread::sleep(Duration::from_millis(100));
+        let view = e.records().view();
+        closed = closed.or_else(|| view.records.iter().find(|r| !r.open && r.iq_clip.is_some()).cloned());
+        if closed.is_some() {
+            open = view.records.iter().find(|r| r.open && r.rows > 3).cloned();
+        }
+        if open.is_some() {
+            break;
+        }
+    }
+    let (closed, open) = (closed.expect("a closed record with a slice"), open.expect("an open record"));
+    let (path, pending) = e.records().save_iq(closed.id).unwrap();
+    assert!(!pending && path == saved.join(format!("record-{}", closed.id.0)));
+    let (open_path, pending) = e.records().save_iq(open.id).unwrap();
+    assert!(pending, "an open record's slice is not written yet");
+    // Long enough for both originals to be evicted.
+    std::thread::sleep(Duration::from_secs(5));
+    let view = e.records().view();
+    let now = |id| view.records.iter().find(|r| r.id == id).expect("still in the book");
+    for (id, stem) in [(closed.id, &path), (open.id, &open_path)] {
+        let r = now(id);
+        assert!(r.slice_evicted, "record {} kept its slice under a {cap} B cap", id.0);
+        assert!(r.tags.iter().any(|t| t == "saved"), "{:?}", r.tags);
+        let x = read_slice(stem);
+        assert!(!x.is_empty(), "record {}'s saved slice is empty", id.0);
+        let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(stem.with_extension("sigmf-meta")).unwrap()).unwrap();
+        assert!(meta["global"]["core:description"].as_str().unwrap().starts_with(&format!("record {} slice", id.0)));
+    }
+    // The closed one's copy is the whole slice it had.
+    assert_eq!(read_slice(&path).len() as u64, closed.iq_clip.as_ref().unwrap().samples);
+    // An evicted record can't be saved, and says why.
+    let gone = view.records.iter().find(|r| r.slice_evicted && !r.tags.iter().any(|t| t == "saved")).expect("an evicted record");
+    let err = e.records().save_iq(gone.id).unwrap_err();
+    assert!(err.contains("evicted"), "{err}");
+}

@@ -4,14 +4,15 @@
 //! A slice starts `pre_roll` before the record (back-filled from the ring, or from the oldest block it still holds) and
 //! ends `post_roll` after the record closes, after `max`, at a gap in the stream, or when the pool sheds it. Finished
 //! slices are handed back to the record book, which sets the record's `iq_clip`. The directory is kept under
-//! `cap_bytes`, oldest slice first; an evicted slice's record says so.
+//! `cap_bytes`, oldest slice first; an evicted slice's record says so. A slice the owner saves (Save IQ) is copied to
+//! `saved_dir`, outside the cap, and kept until the owner deletes it.
 //!
 //! A slice is cut where the record's first rows put it, which can be kHz from where the record ends up: those rows
 //! see only part of the signal. So it is collected [`COLLECT_SLACK_HZ`] wider each side, and once the record closes
 //! the recorder's finisher thread re-centres it on the record's final centre and narrows it to the record's final
 //! width, at the same rate and sample for sample.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -39,14 +40,18 @@ pub struct SliceConfig {
     pub post_roll: Duration,
     /// Longest slice.
     pub max: Duration,
+    /// Saved slices (`record-<id>.sigmf-*`), outside the cap.
+    pub saved_dir: PathBuf,
 }
 
 impl SliceConfig {
     pub fn new(dir: impl Into<PathBuf>) -> SliceConfig {
         // The looks' lead (a record opens once its rows clear the threshold, after a transmission's start: a short FLEX
         // frame's only header is its first 80 ms), at both ends.
+        let dir: PathBuf = dir.into();
         SliceConfig {
-            dir: dir.into(),
+            saved_dir: dir.with_file_name("saved"),
+            dir,
             cap_bytes: 4 << 30,
             pre_roll: crate::classify::LEAD,
             post_roll: crate::classify::LEAD,
@@ -141,6 +146,8 @@ pub struct Recorder {
     events: Mutex<Vec<SliceEvent>>,
     /// Finished slices on disk: record → (stem, bytes), oldest id first.
     index: Mutex<BTreeMap<RecordId, (PathBuf, u64)>>,
+    /// Records saved while their slice was still being written: copied out as it finishes.
+    to_save: Mutex<HashSet<RecordId>>,
     /// Written slices to the finisher thread, which re-centres them off the bus's workers.
     jobs: Mutex<Option<mpsc::Sender<Finish>>>,
     finisher: Mutex<Option<JoinHandle<()>>>,
@@ -180,6 +187,7 @@ impl Recorder {
                 live: Mutex::new(HashMap::new()),
                 events: Mutex::new(Vec::new()),
                 index: Mutex::new(index),
+                to_save: Mutex::new(HashSet::new()),
                 jobs: Mutex::new(Some(tx)),
                 finisher: Mutex::new(Some(finisher)),
             }
@@ -296,6 +304,28 @@ impl Recorder {
         }
     }
 
+    /// Where a record's saved slice goes (a SigMF stem).
+    pub fn saved_stem(&self, record: RecordId) -> PathBuf {
+        self.cfg.saved_dir.join(format!("record-{}", record.0))
+    }
+
+    /// Save IQ: copies the record's slice out of the capped directory, now if it is written, else as soon as it is.
+    /// The saved stem, and whether the copy is still to come; `Err` if the record has no slice, here or coming.
+    pub fn save(&self, record: RecordId) -> Result<(PathBuf, bool), std::io::Error> {
+        let stem = self.saved_stem(record);
+        // The index's lock is held while a slice moves from `live` to the index (see `completed`).
+        let index = self.index.lock();
+        if let Some((from, _)) = index.get(&record) {
+            copy_slice(from, &stem)?;
+            return Ok((stem, false));
+        }
+        if self.live.lock().contains_key(&record) {
+            self.to_save.lock().insert(record);
+            return Ok((stem, true));
+        }
+        Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no slice"))
+    }
+
     /// Hands a written slice to the finisher thread (or finishes it here once the thread has stopped).
     fn submit(&self, job: Finish) {
         let job = match self.jobs.lock().as_ref() {
@@ -311,12 +341,15 @@ impl Recorder {
 
     /// The finisher is done with a slice: to the book, unless its record was cancelled meanwhile.
     fn completed(&self, job: &Finish, done: std::io::Result<(IqClip, u64)>) {
+        // Held until the slice is indexed, so a save in between finds it in one or the other.
+        let mut index = self.index.lock();
         if self.live.lock().remove(&job.record).is_none() {
+            drop(index);
             remove(&job.stem);
             return;
         }
         match done {
-            Ok((clip, bytes)) => self.finished(job.record, clip, bytes),
+            Ok((clip, bytes)) => self.finished(&mut index, job.record, clip, bytes),
             Err(e) => {
                 log::warn!("record {}: slice not finished: {e}", job.record.0);
                 remove(&job.stem);
@@ -334,20 +367,22 @@ impl Recorder {
         std::mem::take(&mut *self.events.lock())
     }
 
-    /// A slice is finished: index it, keep the directory under the cap, tell the book.
-    fn finished(&self, record: RecordId, clip: IqClip, bytes: u64) {
-        let mut events = vec![SliceEvent::Done { record, clip: clip.clone() }];
+    /// A slice is finished: copy it out if it was saved, index it, keep the directory under the cap, tell the book.
+    fn finished(&self, index: &mut BTreeMap<RecordId, (PathBuf, u64)>, record: RecordId, clip: IqClip, bytes: u64) {
+        if self.to_save.lock().remove(&record)
+            && let Err(e) = copy_slice(&clip.path, &self.saved_stem(record))
         {
-            let mut index = self.index.lock();
-            index.insert(record, (clip.path.clone(), bytes));
-            let mut total: u64 = index.values().map(|v| v.1).sum();
-            while total > self.cfg.cap_bytes {
-                let Some((&old, _)) = index.iter().next() else { break };
-                let (stem, b) = index.remove(&old).expect("the first entry");
-                remove(&stem);
-                total -= b;
-                events.push(SliceEvent::Evicted(old));
-            }
+            log::warn!("record {}: saving its slice failed: {e}", record.0);
+        }
+        let mut events = vec![SliceEvent::Done { record, clip: clip.clone() }];
+        index.insert(record, (clip.path.clone(), bytes));
+        let mut total: u64 = index.values().map(|v| v.1).sum();
+        while total > self.cfg.cap_bytes {
+            let Some((&old, _)) = index.iter().next() else { break };
+            let (stem, b) = index.remove(&old).expect("the first entry");
+            remove(&stem);
+            total -= b;
+            events.push(SliceEvent::Evicted(old));
         }
         self.events.lock().extend(events);
     }
@@ -443,6 +478,22 @@ fn recentre(path: &Path, samples: u64, rate: f64, offset_hz: f64, width_hz: f64)
     drop(out);
     debug_assert_eq!(written, samples);
     std::fs::rename(&part, path)
+}
+
+/// Copies a slice's files to `to` (a stem): a hard link where the file system allows (the cap's eviction then removes
+/// only the slice directory's name), else a copy. A copy saved before is replaced.
+fn copy_slice(from: &Path, to: &Path) -> std::io::Result<()> {
+    if let Some(dir) = to.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    for ext in ["sigmf-data", "sigmf-meta"] {
+        let (src, dst) = (from.with_extension(ext), to.with_extension(ext));
+        let _ = std::fs::remove_file(&dst);
+        if std::fs::hard_link(&src, &dst).is_err() {
+            std::fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
 }
 
 fn remove(stem: &Path) {

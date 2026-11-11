@@ -136,6 +136,7 @@ impl Registry {
             Command::QueryRecords(_)
             | Command::Play { .. }
             | Command::StopPlay(_)
+            | Command::SaveIq { .. }
             | Command::StartWorker { .. }
             | Command::StopWorker(_) => Err("the publisher's to apply".into()),
             Command::SetMode { source, mode } => {

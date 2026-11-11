@@ -346,9 +346,30 @@ impl Inspector {
                 ui.label(RichText::new(format!("{} ({})", c.path.display(), fmt::secs(c.samples as f64 / c.rate))).monospace().size(11.5))
             }
             (None, true) => ui.label(RichText::new("removed to stay under the disk cap").color(theme::INK2)),
+            (None, false) if r.open => ui.label(RichText::new("written when the record closes").color(theme::INK2)),
             (None, false) => ui.label(RichText::new("none").color(theme::INK2)),
         };
+        if !r.slice_evicted
+            && ui.button("Save IQ").on_hover_text("Keep this record's IQ (SigMF) out of reach of the disk cap, and tag it saved").clicked()
+        {
+            out.push(Command::SaveIq { record: r.id });
+        }
+        if let Some((text, ok)) = Self::save_line(snap, r.id) {
+            ui.label(RichText::new(text).color(if ok { theme::INK2 } else { theme::ALARM }));
+        }
         self.tags_and_notes(ui, r, out);
+    }
+
+    /// The newest Save IQ answer for a record, and whether it worked.
+    pub fn save_line(snap: &Snapshot, id: RecordId) -> Option<(String, bool)> {
+        snap.acks.iter().rev().find_map(|a| match &a.result {
+            Ok(api::Outcome::SavedIq { record, path, pending }) if *record == id => {
+                let when = if *pending { " once its slice is written" } else { "" };
+                Some((format!("IQ saved to {}.sigmf-data{when}", path.display()), true))
+            }
+            Err(e) if e.starts_with(&format!("record {} has no IQ to save", id.0)) => Some((e.clone(), false)),
+            _ => None,
+        })
     }
 
     /// What Play sends for a record.
@@ -410,7 +431,7 @@ impl Inspector {
                     }
                 }
             }
-            if ui.button("Save audio").on_hover_text("Write it out as a WAV").clicked() {
+            if ui.button("Save audio").on_hover_text("Write the demodulated sound out as a WAV (for IQ, Save IQ below)").clicked() {
                 out.push(self.save_command(r.id));
             }
         });

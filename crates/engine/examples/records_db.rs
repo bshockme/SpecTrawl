@@ -3,6 +3,8 @@
 //! Opens the device (`airspy` or `sim`), tunes to each stop for its seconds, and after each stop prints the confirmed
 //! emitters seen within the usable span of that tuning (centre, width, records, SNR) and the stop's records; the store
 //! keeps everything. The step 4 on-air check runs this beside `engine-old`'s `trawl_db` on another radio.
+//!
+//! With `SLICES=<dir>` each record's IQ slice is kept there too (no cap), to replay what was or wasn't named.
 
 use std::time::Duration;
 
@@ -29,7 +31,7 @@ fn main() {
         bus: BusConfig::default(),
         source: SourceConfig::default(),
         store: Some(StoreConfig::new(db)),
-        slices: None,
+        slices: std::env::var_os("SLICES").map(|d| engine::recorder::SliceConfig { cap_bytes: u64::MAX, ..engine::recorder::SliceConfig::new(d) }),
         audio: engine::audio::AudioConfig::Manual,
         classify: engine::classify::ClassifyConfig::default(),
     });

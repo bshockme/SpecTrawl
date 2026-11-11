@@ -133,3 +133,35 @@ fn the_palette_runs_its_first_entry_on_enter() {
     assert!(!h.state().palette_open(), "Enter should run the entry and close the palette");
     assert_eq!(h.state().popped_out(), [Tab::Catalogue]);
 }
+
+#[test]
+fn save_iq_on_a_record_asks_for_its_slice_and_shows_where_it_went() {
+    let mut snap = Snapshot::empty();
+    snap.version = 1;
+    let mut view = (*snap.records).clone();
+    view.records.push(Arc::new(record(Vec::new())));
+    snap.records = Arc::new(view);
+    let swap = Arc::new(ArcSwap::from_pointee(snap.clone()));
+    let (tx, mut rx) = api::command_channel();
+    let handle = api::Handle::new(swap.clone(), tx);
+
+    let mut app = App::new(handle);
+    app.show_tab(Tab::Inspector);
+    app.set_selection(Selection::Record(RecordId(42)));
+    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_ui_state(|ui, app: &mut App| app.frame(ui), app);
+    h.run_steps(3);
+    h.get_by_label("Save IQ").click();
+    h.run_steps(2);
+    let sent: Vec<_> = rx.drain().unwrap_or_default().into_iter().map(|(_, c)| c).collect();
+    assert!(sent.iter().any(|c| matches!(c, api::Command::SaveIq { record: RecordId(42) })), "{sent:?}");
+
+    // The engine's answer shows under the slice.
+    snap.version = 2;
+    snap.acks = vec![api::Ack {
+        seq: 1,
+        result: Ok(api::Outcome::SavedIq { record: RecordId(42), path: "/data/saved/record-42".into(), pending: true }),
+    }];
+    swap.store(Arc::new(snap));
+    h.run_steps(3);
+    assert!(h.query_all_by_label_contains("IQ saved to /data/saved/record-42.sigmf-data once its slice is written").next().is_some());
+}

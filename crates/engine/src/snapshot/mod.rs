@@ -181,6 +181,9 @@ impl Publisher {
                 None => Err("history search needs the record store".into()),
             },
             Command::Play { target, mode, gain, to } => engine.play(target, mode, gain, to).map(api::Outcome::Playing),
+            Command::SaveIq { record } => {
+                engine.records().save_iq(record).map(|(path, pending)| api::Outcome::SavedIq { record, path, pending })
+            }
             Command::StopPlay(id) => {
                 if engine.stop_play(id) {
                     Ok(api::Outcome::Done)
@@ -271,6 +274,7 @@ fn command_name(c: &Command) -> &'static str {
         Command::QueryRecords(_) => "query records",
         Command::Play { .. } => "play",
         Command::StopPlay(_) => "stop play",
+        Command::SaveIq { .. } => "save IQ",
         Command::StartWorker { .. } => "start worker",
         Command::StopWorker(_) => "stop worker",
     }
@@ -297,6 +301,7 @@ fn command_source(c: &Command) -> Option<SourceId> {
         | Command::Note { .. }
         | Command::QueryRecords(_)
         | Command::StopPlay(_)
+        | Command::SaveIq { .. }
         | Command::StopWorker(_) => None,
         Command::StartWorker { source, .. } => Some(*source),
         Command::Play { target: api::PlayTarget::Region { source, .. }, .. } => Some(*source),
