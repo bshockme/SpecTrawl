@@ -128,3 +128,82 @@ fn a_record_that_starts_at_a_retune_is_looked_at() {
     assert_eq!(cw.claims.iter().find(|c| matches!(c.by, Evidence::Features { .. })).unwrap().label, "Carrier");
     assert_eq!(e.classify_view().missed, 0, "{:?}", e.classify_view());
 }
+
+#[test]
+fn a_call_whose_first_seconds_hold_no_sync_is_named_by_a_later_look() {
+    // On air (851.90 MHz, 2026-11-10), a P25 call's first 2 s showed no sync the bank finds, and the rest decoded: the
+    // record's one look, at its start, named nothing, and the call closed long before the 30 s relook. Here: one
+    // transmission, 2.5 s of 4800 Bd 4FSK with no sync, then 3 s of P25 with its frame sync, every 12 s.
+    let (period, hz) = (12.0, 851.2625e6);
+    let fsk = |sync| Modulation::Fsk { levels: 4, sym_rate: 4800.0, dev_hz: 1800.0, sync };
+    let emitters = vec![
+        // On from 1 s (the gate is on while `t / period + phase` is within `duty` of a whole number).
+        Emitter {
+            freq_hz: hz,
+            level_dbfs: -40.0,
+            modulation: fsk(None),
+            keying: Keying::Bursts { period_s: period, duty: 2.5 / period, phase: 1.0 - 1.0 / period },
+        },
+        Emitter {
+            freq_hz: hz,
+            level_dbfs: -40.0,
+            modulation: fsk(Some(P25_SYNC)),
+            keying: Keying::Bursts { period_s: period, duty: 3.0 / period, phase: 1.0 - 3.5 / period },
+        },
+    ];
+    let (d, _) = SimDevice::with_config(SimConfig { emitters, paced: true, report_lag_gaps: false, ..Default::default() });
+    let e = Engine::new(EngineConfig {
+        budget: BudgetConfig { guaranteed_secs: 10.0, ceiling_bytes: 1 << 30, sweep_secs: 0.2 },
+        bus: BusConfig::default(),
+        source: SourceConfig::default(),
+        store: None,
+        slices: None,
+        audio: engine::audio::AudioConfig::Manual,
+        classify: ClassifyConfig { workers: 1, ..Default::default() },
+    });
+    e.add_source(Box::new(d), Mode::Live).unwrap();
+    // The call runs from 1 s to 6.5 s.
+    std::thread::sleep(Duration::from_secs(8));
+    let view = e.records().view();
+    let calls: Vec<_> = view.records.iter().filter(|r| near(r, hz) && !r.open && r.end_sample - r.first_sample > 40_000_000).collect();
+    assert!(!calls.is_empty(), "no 4 s record at {hz}: {:?}", view.records);
+    for r in calls {
+        let p25 = r.claims.iter().any(|c| matches!(&c.by, Evidence::SyncBank { protocol, .. } if protocol == "P25 Phase 1"));
+        assert!(p25, "a {:.1} s call never named: {:?}", (r.end_sample - r.first_sample) as f64 / 10e6, r.claims);
+    }
+}
+
+#[test]
+fn a_long_call_whose_syncs_fall_between_its_looks_is_named_when_it_closes() {
+    // On air (852.575 MHz, 2026-11-10), an 8.5 s P25 call's syncs fell where none of its looks were, and the whole call
+    // decoded. Here a 9 s transmission of 4800 Bd 4FSK carries P25 frame syncs only 4.1–5.7 s in: between its looks
+    // (cut about 0.2 s, 2.2 s and 6.2 s in), and inside the look at its last 8 s when it closes.
+    let (period, hz) = (20.0, 851.2625e6);
+    let fsk = |sync| Modulation::Fsk { levels: 4, sym_rate: 4800.0, dev_hz: 1800.0, sync };
+    // On from `from` s for `secs` (the gate is on while `t / period + phase` is within `duty` of a whole number).
+    let on = |from: f64, secs: f64| Keying::Bursts { period_s: period, duty: secs / period, phase: 1.0 - from / period };
+    let emitters = vec![
+        Emitter { freq_hz: hz, level_dbfs: -40.0, modulation: fsk(None), keying: on(1.0, 4.1) },
+        Emitter { freq_hz: hz, level_dbfs: -40.0, modulation: fsk(Some(P25_SYNC)), keying: on(5.1, 1.6) },
+        Emitter { freq_hz: hz, level_dbfs: -40.0, modulation: fsk(None), keying: on(6.7, 3.3) },
+    ];
+    let (d, _) = SimDevice::with_config(SimConfig { emitters, paced: true, report_lag_gaps: false, ..Default::default() });
+    let e = Engine::new(EngineConfig {
+        budget: BudgetConfig { guaranteed_secs: 15.0, ceiling_bytes: 1 << 30, sweep_secs: 0.2 },
+        bus: BusConfig::default(),
+        source: SourceConfig::default(),
+        store: None,
+        slices: None,
+        audio: engine::audio::AudioConfig::Manual,
+        classify: ClassifyConfig { workers: 1, ..Default::default() },
+    });
+    e.add_source(Box::new(d), Mode::Live).unwrap();
+    std::thread::sleep(Duration::from_secs(12));
+    let view = e.records().view();
+    let calls: Vec<_> = view.records.iter().filter(|r| near(r, hz) && !r.open && r.end_sample - r.first_sample > 80_000_000).collect();
+    assert!(!calls.is_empty(), "no 9 s record at {hz}: {:?}", view.records);
+    for r in calls {
+        let p25 = r.claims.iter().any(|c| matches!(&c.by, Evidence::SyncBank { protocol, .. } if protocol == "P25 Phase 1"));
+        assert!(p25, "a {:.1} s call never named: {:?}", (r.end_sample - r.first_sample) as f64 / 10e6, r.claims);
+    }
+}

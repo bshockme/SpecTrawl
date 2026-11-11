@@ -69,6 +69,29 @@ const TICK: Duration = Duration::from_millis(50);
 /// a TDMA channel is on for hours, and what can be decoded changes (a Phase 2 channel descrambles once its site's
 /// control channel has been heard).
 pub const RELOOK: Duration = Duration::from_secs(30);
+/// An open record nothing has named (no sync, no decode) is looked at again sooner: 2 s after its last window was cut,
+/// then twice as long each time, up to [`RELOOK`]. A P25 call's first 1.5 s can hold no sync the bank finds while the
+/// rest of it decodes: on air at 851.90 and 853.39 MHz (2026-11-10, R2), 5–7 s calls whose first looks found nothing
+/// had 8–11 syncs and decoded frames in 1.5 s windows 2–3 s later, and closed long before a relook 30 s on.
+pub const UNNAMED_RELOOK: Duration = Duration::from_secs(2);
+/// A record that closes with nothing having named it, longer than two windows, gets one more look: at up to this much
+/// of its end, in one window. A weak call's syncs can fall where none of its 1.5 s looks were: on air at 852.575 MHz
+/// (2026-11-10, mean SNR 15 dB) an 8.5 s P25 call had syncs in 6 of 17 half-second-spaced 1.5 s windows, its looks
+/// found none, and the whole call decoded 14 of 14 frames.
+pub const CLOSING_LOOK: Duration = Duration::from_secs(8);
+/// `cut_at`'s look count once a record has had its closing look.
+const CLOSED: u32 = u32::MAX;
+
+/// Which look a window is.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Look {
+    /// From [`LEAD`] before the record's first sample.
+    First,
+    /// From the live edge, while the record is open.
+    Again,
+    /// The last [`CLOSING_LOOK`] of a closed record.
+    Closing,
+}
 /// A window is never narrower than a 12.5 kHz channel, nor wider than 1 MHz (the bank's widest detectors want 600 kHz).
 const MIN_WINDOW_HZ: f64 = 12.5e3;
 /// A window is collected this much wider each side than its record, and re-centred on the record's centre when it is
@@ -253,8 +276,8 @@ impl Drop for Classifier {
 fn schedule(shared: Arc<Shared>, book: Arc<RecordBook>, bus: Arc<ChannelBus>, sources: Sources) {
     // Records already in the book when the engine started (loaded from the store) are not this run's to look at.
     let mut seen: HashSet<RecordId> = book.view().records.iter().map(|r| r.id).collect();
-    // When each open record's last window was cut.
-    let mut cut_at: HashMap<RecordId, Instant> = HashMap::new();
+    // When each open record's last window was cut, and how many it has had.
+    let mut cut_at: HashMap<RecordId, (Instant, u32)> = HashMap::new();
     while !shared.stop.load(Ordering::Relaxed) {
         let view = book.view();
         let mut present = HashSet::with_capacity(view.records.len());
@@ -273,11 +296,18 @@ fn schedule(shared: Arc<Shared>, book: Arc<RecordBook>, bus: Arc<ChannelBus>, so
                 } else {
                     false
                 };
-                let due = r.open && !in_flight && cut_at.get(&r.id).is_some_and(|t| t.elapsed() >= RELOOK);
-                if due && let Some(src) = sources.lock().get(&r.source).cloned() {
-                    cut_at.insert(r.id, Instant::now());
-                    if cut(&shared, &bus, &src, r, true).is_err() {
-                        log::debug!("classify: record {} not looked at again", r.id.0);
+                let named = r.claims.iter().any(api::Claim::is_decoded);
+                let looks = cut_at.get(&r.id).map_or(0, |c| c.1);
+                let due = r.open && !in_flight && cut_at.get(&r.id).is_some_and(|c| c.0.elapsed() >= relook_after(c.1, named));
+                let long = r.t_end.duration_since(r.t_start).is_ok_and(|d| d.as_secs_f64() > 2.0 * shared.cfg.window_secs);
+                let closing = !r.open && !in_flight && !named && long && looks > 0 && looks != CLOSED;
+                let look = if due { Look::Again } else { Look::Closing };
+                if (due || closing)
+                    && let Some(src) = sources.lock().get(&r.source).cloned()
+                {
+                    cut_at.insert(r.id, (Instant::now(), if closing { CLOSED } else { looks + 1 }));
+                    if let Err(why) = cut(&shared, &bus, &src, r, look) {
+                        log::debug!("classify: record {} not looked at again ({look:?}): {why}", r.id.0);
                     }
                 }
                 continue;
@@ -287,8 +317,8 @@ fn schedule(shared: Arc<Shared>, book: Arc<RecordBook>, bus: Arc<ChannelBus>, so
                 continue;
             }
             let source = sources.lock().get(&r.source).cloned();
-            cut_at.insert(r.id, Instant::now());
-            if let Err(why) = source.ok_or("its source is gone").and_then(|s| cut(&shared, &bus, &s, r, false)) {
+            cut_at.insert(r.id, (Instant::now(), 1));
+            if let Err(why) = source.ok_or("its source is gone").and_then(|s| cut(&shared, &bus, &s, r, Look::First)) {
                 log::debug!("classify: record {} not looked at: {why}", r.id.0);
                 shared.stats.lock().missed += 1;
             }
@@ -300,8 +330,18 @@ fn schedule(shared: Arc<Shared>, book: Arc<RecordBook>, bus: Arc<ChannelBus>, so
     }
 }
 
-/// Subscribes the record's window: from [`LEAD`] before its first sample, or (`relook`) from the live edge.
-fn cut(shared: &Arc<Shared>, bus: &ChannelBus, source: &Arc<Source>, r: &SignalRecord, relook: bool) -> Result<(), &'static str> {
+/// How long after an open record's last window (its `looks`-th) the next is cut: [`UNNAMED_RELOOK`], doubling, while
+/// nothing has named it; [`RELOOK`] once something has.
+fn relook_after(looks: u32, named: bool) -> Duration {
+    if named {
+        return RELOOK;
+    }
+    UNNAMED_RELOOK.saturating_mul(1 << looks.saturating_sub(1).min(4)).min(RELOOK)
+}
+
+/// Subscribes the record's window, where `look` says.
+fn cut(shared: &Arc<Shared>, bus: &ChannelBus, source: &Arc<Source>, r: &SignalRecord, look: Look) -> Result<(), &'static str> {
+    let relook = look != Look::First;
     let stage = bus.stage(source.id()).ok_or("its source is not on the bus")?;
     let bw = look_bandwidth(r.bandwidth_hz(), broadcast_fm(r.center_hz()));
     let min_rate = (2.5 * bw).max(MIN_RATE);
@@ -314,6 +354,7 @@ fn cut(shared: &Arc<Shared>, bus: &ChannelBus, source: &Arc<Source>, r: &SignalR
         win: win.clone(),
         record: r.id,
         relook,
+        max_secs: if look == Look::Closing { CLOSING_LOOK.as_secs_f64() } else { shared.cfg.window_secs },
         center_hz: r.center_hz(),
         width_hz,
         group_delay: stage.fft_size() as u64 / 4,
@@ -327,7 +368,12 @@ fn cut(shared: &Arc<Shared>, bus: &ChannelBus, source: &Arc<Source>, r: &SignalR
     };
     shared.windows.lock().insert(r.id, win.clone());
     let lead = (LEAD.as_secs_f64() * segment.sample_rate) as u64;
-    let start = if relook { Start::Live } else { Start::At(r.first_sample.saturating_sub(lead).max(segment.from_sample)) };
+    let from = r.first_sample.saturating_sub(lead).max(segment.from_sample);
+    let start = match look {
+        Look::First => Start::At(from),
+        Look::Again => Start::Live,
+        Look::Closing => Start::At(from.max(r.end_sample.saturating_sub((CLOSING_LOOK.as_secs_f64() * segment.sample_rate) as u64))),
+    };
     // Collected with slack either side for the centre to move; at a span's edge, where the bus may refuse the wider
     // channel, as the record stands.
     let width = window_width(bw);
@@ -362,6 +408,8 @@ struct Window {
     win: Arc<Win>,
     record: RecordId,
     relook: bool,
+    /// Most IQ it takes, seconds.
+    max_secs: f64,
     /// The channel's centre: the record's when the window was cut.
     center_hz: f64,
     width_hz: f64,
@@ -431,7 +479,7 @@ impl Consumer for Window {
                     return self.finish();
                 }
                 self.rate = self.input_rate * samples.len() as f64 / self.hop as f64;
-                let room = (self.shared.cfg.window_secs * self.rate) as usize;
+                let room = (self.max_secs * self.rate) as usize;
                 let take = samples.len().min(room.saturating_sub(self.iq.len()));
                 self.iq.extend_from_slice(&samples[..take]);
                 if self.iq.len() >= room { self.finish() } else { Flow::Continue }
@@ -669,6 +717,13 @@ mod tests {
         let x = channel(&station(fs, 60e3, 1.5, 0.05), fs, window_width(narrow));
         let w = detect::bank::Window::new(&x, fs, narrow, hints);
         assert!(!bank::look(&bank, &w).iter().any(|c| c.label.starts_with("FM broadcast")));
+    }
+
+    #[test]
+    fn an_unnamed_open_record_is_looked_at_again_soon_then_less_often() {
+        let secs: Vec<u64> = (1..=6).map(|k| relook_after(k, false).as_secs()).collect();
+        assert_eq!(secs, [2, 4, 8, 16, 30, 30]);
+        assert_eq!(relook_after(1, true), RELOOK);
     }
 
     #[test]

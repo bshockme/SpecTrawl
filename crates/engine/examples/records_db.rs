@@ -31,7 +31,8 @@ fn main() {
         bus: BusConfig::default(),
         source: SourceConfig::default(),
         store: Some(StoreConfig::new(db)),
-        slices: std::env::var_os("SLICES").map(|d| engine::recorder::SliceConfig { cap_bytes: u64::MAX, ..engine::recorder::SliceConfig::new(d) }),
+        slices: std::env::var_os("SLICES")
+            .map(|d| engine::recorder::SliceConfig { cap_bytes: u64::MAX, ..engine::recorder::SliceConfig::new(d) }),
         audio: engine::audio::AudioConfig::Manual,
         classify: engine::classify::ClassifyConfig::default(),
     });
@@ -51,6 +52,8 @@ fn main() {
         emitters.sort_by(|a, b| a.center_hz.total_cmp(&b.center_hz));
         let records = view.records.iter().filter(|r| r.first_sample >= from && r.tuner_hz == center).count();
         println!("== {mhz} MHz after {secs} s: {} confirmed emitters, {records} records", emitters.len());
+        let c = e.classify_view();
+        println!("   pool: {} threads, looked {}, missed {}, dropped {}, waiting {}", c.workers, c.looked, c.missed, c.dropped, c.waiting);
         for m in &emitters {
             let snr = view.records.iter().filter(|r| r.emitter == Some(m.id)).map(|r| r.max_snr_db).fold(f32::MIN, f32::max);
             println!(
@@ -74,7 +77,8 @@ fn env_logger_lite() {
     struct L;
     impl log::Log for L {
         fn enabled(&self, m: &log::Metadata) -> bool {
-            m.level() <= log::Level::Warn
+            // `LOG_CLASSIFY=1`: the pool's reasons for not looking at a record, too.
+            m.level() <= log::Level::Warn || (m.target().starts_with("engine::classify") && std::env::var_os("LOG_CLASSIFY").is_some())
         }
         fn log(&self, r: &log::Record) {
             if self.enabled(r.metadata()) {
@@ -83,5 +87,5 @@ fn env_logger_lite() {
         }
         fn flush(&self) {}
     }
-    let _ = log::set_logger(&L).map(|()| log::set_max_level(log::LevelFilter::Warn));
+    let _ = log::set_logger(&L).map(|()| log::set_max_level(log::LevelFilter::Debug));
 }
