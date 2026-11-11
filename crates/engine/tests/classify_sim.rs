@@ -198,12 +198,24 @@ fn a_long_call_whose_syncs_fall_between_its_looks_is_named_when_it_closes() {
         classify: ClassifyConfig { workers: 1, ..Default::default() },
     });
     e.add_source(Box::new(d), Mode::Live).unwrap();
-    std::thread::sleep(Duration::from_secs(12));
-    let view = e.records().view();
-    let calls: Vec<_> = view.records.iter().filter(|r| near(r, hz) && !r.open && r.end_sample - r.first_sample > 80_000_000).collect();
-    assert!(!calls.is_empty(), "no 9 s record at {hz}: {:?}", view.records);
-    for r in calls {
-        let p25 = r.claims.iter().any(|c| matches!(&c.by, Evidence::SyncBank { protocol, .. } if protocol == "P25 Phase 1"));
-        assert!(p25, "a {:.1} s call never named: {:?}", (r.end_sample - r.first_sample) as f64 / 10e6, r.claims);
+    // The call closes about 10 s in and its closing look follows; a slow (debug, CI) build takes a while over it, so wait
+    // for it until 20 s, before the next call (21 s in) could close.
+    let named =
+        |r: &SignalRecord| r.claims.iter().any(|c| matches!(&c.by, Evidence::SyncBank { protocol, .. } if protocol == "P25 Phase 1"));
+    let t0 = Instant::now();
+    std::thread::sleep(Duration::from_secs(10));
+    loop {
+        let view = e.records().view();
+        let calls: Vec<_> = view.records.iter().filter(|r| near(r, hz) && !r.open && r.end_sample - r.first_sample > 80_000_000).collect();
+        if !calls.is_empty() && calls.iter().all(|r| named(r)) {
+            break;
+        }
+        if t0.elapsed() > Duration::from_secs(20) {
+            assert!(!calls.is_empty(), "no 9 s record at {hz}: {:?}", view.records);
+            for r in calls {
+                assert!(named(r), "a {:.1} s call never named: {:?}", (r.end_sample - r.first_sample) as f64 / 10e6, r.claims);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
