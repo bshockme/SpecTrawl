@@ -258,6 +258,9 @@ pub fn squelch(w: &Window<'_>) -> Option<Identified> {
     })
 }
 
+/// A narrow signal is a carrier only with a steadier envelope than this: noise's CV is about 0.52.
+pub const CARRIER_MAX_CV: f32 = 0.42;
+
 /// The modulation as the signal's shape describes it (FM broadcast by its pilot, OFDM, FSK levels and rate, PSK, AM,
 /// OOK, bursts), or "Unknown". It describes noise too: a caller gates it on [`Window::weak`].
 pub fn modulation(w: &Window<'_>) -> Described {
@@ -289,8 +292,13 @@ pub fn modulation(w: &Window<'_>) -> Described {
         // `Hints::am_band`).
         if w.am_band && carrier::coherent_am(raw, fs).is_some_and(|m| m.is_am()) {
             ("AM".to_string(), 0.6)
-        } else {
+        } else if f.envelope_cv < CARRIER_MAX_CV {
             ("Carrier".to_string(), 0.6)
+        } else {
+            // Noise's envelope (CV ≈ 0.52), not a carrier's: on air (2026-11-10) nearly every "Carrier" was a 1–4 kHz
+            // record at 11–12 dB with CV ≥ 0.42 and 3–5 kHz of "deviation", the core of a weak 4800 Bd channel at
+            // 800 MHz or a distant FM station's peak; the real carriers measured CV < 0.3.
+            ("Unknown".to_string(), 0.0)
         }
     } else if f.fsk_levels <= 2 && f.tone_hz.is_some() && f.envelope_cv < 0.3 {
         // One pure tone carries the frequency: analog FM with a steady tone (an idle repeater, a test tone). Its two-peak
