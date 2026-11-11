@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 backend-airspy = { path = "../backend-airspy" }
+backend-rtlsdr = { path = "../backend-rtlsdr" }
 backend-sim = { path = "../backend-sim" }
 eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11", "persistence"] }
 egui = "0.36.2"

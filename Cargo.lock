@@ -256,6 +256,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "backend-rtlsdr"
+version = "0.1.0"
+dependencies = [
+ "libloading 0.9.0",
+ "log",
+ "sdr-core",
+]
+
+[[package]]
 name = "backend-sim"
 version = "0.1.0"
 dependencies = [
@@ -972,6 +981,7 @@ dependencies = [
  "api",
  "arc-swap",
  "backend-airspy",
+ "backend-rtlsdr",
  "backend-sim",
  "cpal",
  "detect",
@@ -3229,6 +3239,7 @@ version = "0.1.0"
 dependencies = [
  "api",
  "backend-airspy",
+ "backend-rtlsdr",
  "backend-sim",
  "eframe",
  "egui",

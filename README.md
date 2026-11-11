@@ -75,6 +75,7 @@ Voice codecs (AMBE/IMBE) are not decoded, and nothing is decrypted.
 |---|---|
 | **Airspy R2 / Mini** (R0/R1 too) | Through `libairspy`, loaded at run time. |
 | **HydraSDR RFOne** | R2-compatible. Through `libhydrasdr` (the `hydrasdr-host-tools` package). Its sweep firmware lets Sweep mode sweep on the board, at about 375 hops/s; see [docs/hydrasdr-sweep-mode.md](docs/hydrasdr-sweep-mode.md). |
+| **RTL-SDR** (RTL2832U: R820T/R820T2/R828D, E4000, FC001x; RTL-SDR Blog V3/V4) | Through `librtlsdr`, loaded at run time. Opens at 2.4 MS/s, so **Live** watches about 2 MHz rather than 10. Zero-IF: the DC spike is removed in the backend, and anything left at the centre is labelled as such. On Windows the dongle needs the WinUSB driver (install it with [Zadig](https://zadig.akeo.ie/)) and a **64-bit** `rtlsdr.dll` (with its `libusb-1.0.dll`) next to the app or on `PATH`; the V4 needs the [RTL-SDR Blog build](https://github.com/rtlsdrblog/rtl-sdr-blog/releases). See below for the settings. |
 | **Simulated SDR** | Always present. Generates noise and FSK, FM, CW and P25-like emitters at fixed frequencies, for UI work and the test suite. |
 
 Driver libraries are loaded at run time, not linked. If a library is missing, its radios don't appear. To point at a specific build:
@@ -82,7 +83,15 @@ Driver libraries are loaded at run time, not linked. If a library is missing, it
 | Variable | Use |
 |---|---|
 | `SPECTRAWL_AIRSPY_LIB` | Path to `libairspy.so` / `airspy.dll` |
+| `SPECTRAWL_RTLSDR_LIB` | Path to `librtlsdr.so` / `rtlsdr.dll` |
+| `SPECTRAWL_RTLSDR_RATE` | RTL-SDR sample rate, in Hz or MS/s (default 2.4; 0.9–3.2 MS/s, above 2.4 many dongles drop samples) |
+| `SPECTRAWL_RTLSDR_PPM` | RTL-SDR frequency correction, ppm |
+| `SPECTRAWL_RTLSDR_BIAS_TEE` | `1` powers an LNA through the RTL-SDR's antenna input (V3/V4 and librtlsdr 0.6+) |
 | `SPECTRAWL_HYDRASDR_LIB` | Path to `libhydrasdr.so` / `hydrasdr.dll`. Needed for board sweeps until the patched library is packaged. |
+
+RTL-SDR gain: the Linearity and Sensitivity sliders both step through the tuner's gain table (0 = lowest, 1 = highest); **Auto** is the tuner's AGC; the one manual stage, 0–15, spans the same table. Dongles that all report serial `00000001` are told apart by USB index (`00000001#0`, `00000001#1`); give each its own serial with `rtl_eeprom -s` for a stable identity.
+
+To check a dongle on its own: `cargo run --release -p backend-rtlsdr --example rtl_probe -- [id] [MHz] [secs]`.
 
 Two radios at 10 MS/s need separate USB controllers. On one shared hub each gets about half its samples, and the app warns `LOSING n% OF SAMPLES`.
 
@@ -148,7 +157,7 @@ cargo run --release -p spectrawl-next --example readme_shots -- docs/images 180 
 
 ```sh
 cargo test --workspace
-cargo clippy -p sdr-core -p backend-sim -p backend-airspy -p dsp -p api -p engine -p spectrawl-app -p spectrawl-next --all-targets -- -D warnings
+cargo clippy -p sdr-core -p backend-sim -p backend-airspy -p backend-rtlsdr -p dsp -p api -p engine -p spectrawl-app -p spectrawl-next --all-targets -- -D warnings
 ```
 
 CI runs both on Windows and Ubuntu for every push.
@@ -170,7 +179,7 @@ engine      ── per radio: IQ ring ─► one FFT ─┬─► spectrum rows 
                timeline: every sample time comes from the radio's anchors, not the wall clock
    │
 sdr-core    ── Backend/Device traits and the stream contract
-backend-airspy · backend-sim
+backend-airspy · backend-rtlsdr · backend-sim
 ```
 
 | Crate | Role |
@@ -183,6 +192,7 @@ backend-airspy · backend-sim
 | `crates/detect` | Signal features, the sync bank and the protocol decoders (P25, DMR, NXDN, FLEX, POCSAG, ACARS, RDS, …) |
 | `crates/sdr-core` | Hardware abstraction shared by every backend |
 | `crates/backend-airspy` | Airspy and HydraSDR, through their libraries loaded at run time |
+| `crates/backend-rtlsdr` | RTL-SDR dongles, through librtlsdr loaded at run time |
 | `crates/backend-sim` | The simulated SDR |
 | `crates/catalog` | Talkgroup, radio, site and network names imported from other tools' files |
 | `crates/engine-old`, `crates/app-old` | The first build, kept runnable until step 8 |

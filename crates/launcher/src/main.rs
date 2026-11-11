@@ -20,7 +20,11 @@ fn run() -> eframe::Result {
     let classify = engine::classify::ClassifyConfig::default();
     let engine =
         Engine::new(EngineConfig { budget, bus: BusConfig::default(), source: SourceConfig::default(), store, slices, audio, classify });
-    let backends = vec![Box::new(backend_airspy::AirspyBackend::new()) as _, Box::new(backend_sim::SimBackend) as _];
+    let backends = vec![
+        Box::new(backend_airspy::AirspyBackend::new()) as _,
+        Box::new(backend_rtlsdr::RtlSdrBackend::new()) as _,
+        Box::new(backend_sim::SimBackend) as _,
+    ];
     let (handle, guard) = engine::snapshot::spawn_with_guard(engine, backends, PublisherConfig::default());
     let viewport = egui::ViewportBuilder::default().with_title("SpecTrawl").with_inner_size([1600.0, 960.0]);
     let options = eframe::NativeOptions { viewport, renderer: eframe::Renderer::Wgpu, ..Default::default() };

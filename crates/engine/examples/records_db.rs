@@ -14,12 +14,13 @@ fn main() {
     env_logger_lite();
     let a: Vec<String> = std::env::args().collect();
     if a.len() < 5 {
-        eprintln!("usage: records_db <airspy|sim> <serial> <db> <MHz:secs>[,...]");
+        eprintln!("usage: records_db <airspy|rtlsdr|sim> <serial> <db> <MHz:secs>[,...]");
         std::process::exit(2);
     }
     let (backend, serial, db, stops) = (&a[1], &a[2], &a[3], &a[4]);
     let device = match backend.as_str() {
         "airspy" => backend_airspy::AirspyBackend::new().open(serial),
+        "rtlsdr" => backend_rtlsdr::RtlSdrBackend::new().open(serial),
         "sim" => backend_sim::SimBackend.open(serial),
         other => panic!("no backend {other}"),
     }
