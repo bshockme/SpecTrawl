@@ -7,7 +7,7 @@ use num_complex::Complex32;
 use crate::{
     AmKind, Features, Hints, NARROW_CUTOFF_HZ, OFDM_USEFUL_S, PERIOD_WINDOW_S, SyncPass, SyncResult, WEAK_DB, acars, am_evidence, blind,
     carrier, chirp, decode, features, flex, frames, gsm, longest_on_run, ofdm_label, prepare, prepare_cutoff, protocol_cutoff_hz, squelch,
-    sync_disc, sync_features, sync_pass,
+    sunfsk, sync_disc, sync_features, sync_pass,
 };
 
 /// The shortest window any rung looks at: 20 ms.
@@ -238,6 +238,39 @@ pub fn gsm(w: &Window<'_>) -> Option<Identified> {
             ..Default::default()
         }),
         features: w.features.clone(),
+    })
+}
+
+/// 802.15.4g SUN FSK frames (Wi-SUN smart meters at 902–928 MHz): preamble and SFD found (see [`sunfsk`]). 60–600 kHz
+/// windows only (the rates' occupied bands are about 75–450 kHz).
+pub fn sun_fsk(w: &Window<'_>) -> Option<Identified> {
+    if !(60e3..600e3).contains(&w.bandwidth_hz) {
+        return None;
+    }
+    let s = sunfsk::detect(w.full, w.fs)?;
+    let mut f = w.features.clone();
+    f.symbol_rate = Some(s.rate);
+    f.symbol_rate_raw = Some(s.rate);
+    f.fsk_levels = 2;
+    let mut kinds = Vec::new();
+    if s.coded > 0 {
+        kinds.push(("coded frame".to_string(), s.coded));
+    }
+    if s.uncoded > 0 {
+        kinds.push(("uncoded frame".to_string(), s.uncoded));
+    }
+    Some(Identified {
+        protocol: Some("802.15.4g"),
+        label: s.label(),
+        confidence: 0.95,
+        fields: Some(decode::Fields {
+            kinds,
+            decoded: s.frames(),
+            tried: s.frames(),
+            activity: Some(decode::Activity::Data),
+            ..Default::default()
+        }),
+        features: f,
     })
 }
 

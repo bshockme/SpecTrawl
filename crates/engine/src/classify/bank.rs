@@ -76,7 +76,7 @@ impl Detector for SyncBank {
     }
 }
 
-/// Identifiers that need no sync bank: FLEX headers, a GSM SCH, ACARS blocks, sub-audible squelch codes (on windows
+/// Identifiers that need no sync bank: FLEX headers, a GSM SCH, ACARS blocks, 802.15.4g frames, sub-audible squelch codes (on windows
 /// strong enough to describe). Each is a `Decoder` claim.
 pub struct Identifiers;
 
@@ -87,7 +87,7 @@ impl Detector for Identifiers {
 
     fn look(&self, w: &Window<'_>) -> Vec<Claim> {
         let squelch = (!w.weak()).then(|| rungs::squelch(w)).flatten();
-        [rungs::flex(w), rungs::gsm(w), rungs::acars(w), squelch]
+        [rungs::flex(w), rungs::gsm(w), rungs::acars(w), rungs::sun_fsk(w), squelch]
             .into_iter()
             .flatten()
             .map(|i| {

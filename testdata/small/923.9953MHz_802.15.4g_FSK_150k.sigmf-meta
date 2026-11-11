@@ -1,0 +1,17 @@
+{
+  "annotations": [],
+  "captures": [
+    {
+      "core:datetime": "2026-11-11T03:21:46.288Z",
+      "core:frequency": 923995300.2929688,
+      "core:sample_start": 0
+    }
+  ],
+  "global": {
+    "core:datatype": "cf32_le",
+    "core:description": "One 802.15.4g SUN FSK frame (Wi-SUN, 150 kb/s, FEC-coded SFD 0x6F4E), 12 ms, from a 902-928 MHz smart-meter mesh hopping a 400 kHz grid; a slice-tier slice from the Airspy R2 at 926.0 MHz, 2026-11-10",
+    "core:recorder": "spectrawl",
+    "core:sample_rate": 625000.0,
+    "core:version": "1.0.0"
+  }
+}

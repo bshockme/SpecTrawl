@@ -33,6 +33,7 @@ pub mod pocsag;
 pub mod rds;
 pub mod spectral;
 pub mod squelch;
+pub mod sunfsk;
 pub mod sync;
 pub mod trunk;
 
