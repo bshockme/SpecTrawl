@@ -68,7 +68,15 @@ fn data_symbols<T: Copy>(v: &[T], sync_start: usize, n: usize) -> Option<Vec<T>>
 /// The (up to three) 98-dibit TSBK blocks of a TSDU frame, status symbols
 /// removed. `f.dibits` must extend far enough past the sync.
 pub fn tsbk_blocks(f: &Frame) -> Vec<[u8; 98]> {
-    let base = f.sync_start;
+    blocks_of(&f.dibits, f.sync_start)
+}
+
+/// The same blocks' soft symbol values (outer levels ±1, inner ±1/3).
+pub fn tsbk_soft_blocks(f: &Frame) -> Vec<[f32; 98]> {
+    blocks_of(&f.soft, f.sync_start)
+}
+
+fn blocks_of<T: Copy + Default>(v: &[T], base: usize) -> Vec<[T; 98]> {
     let mut out = Vec::new();
     let mut idx = 24; // frame dibit index (0 = first sync dibit)
     // Skip the NID: 32 data dibits plus the status symbol inside it.
@@ -80,11 +88,11 @@ pub fn tsbk_blocks(f: &Frame) -> Vec<[u8; 98]> {
         idx += 1;
     }
     for _ in 0..3 {
-        let mut b = [0u8; 98];
+        let mut b = [T::default(); 98];
         let mut n = 0;
         while n < 98 {
             if (idx + 1) % 36 != 0 {
-                match f.dibits.get(base + idx) {
+                match v.get(base + idx) {
                     Some(&d) => b[n] = d,
                     None => return out,
                 }
@@ -97,8 +105,8 @@ pub fn tsbk_blocks(f: &Frame) -> Vec<[u8; 98]> {
     out
 }
 
-fn deinterleave(rx: &[u8; 98], scatter: bool) -> [u8; 98] {
-    let mut out = [0u8; 98];
+fn deinterleave<T: Copy + Default>(rx: &[T; 98], scatter: bool) -> [T; 98] {
+    let mut out = [T::default(); 98];
     for i in 0..98 {
         if scatter {
             out[INTERLEAVE[i]] = rx[i];
@@ -155,6 +163,60 @@ fn viterbi(d: &[u8; 98], transpose: bool) -> ([u8; 12], u32) {
     (bytes, best)
 }
 
+/// The soft value a dibit is sent at: 01 = +3, 00 = +1, 10 = −1, 11 = −3, scaled to ±1.
+const LEVEL: [f32; 4] = [1.0 / 3.0, 1.0, -1.0 / 3.0, -1.0];
+
+/// [`viterbi`] on soft symbol values: each branch costs the squared distance of its two symbols from the levels its
+/// nibble is sent at, so a symbol near a threshold counts for little either way. Returns the bytes and the hard bit
+/// errors along the chosen path.
+fn viterbi_soft(v: &[f32; 98], transpose: bool) -> ([u8; 12], u32) {
+    const INF: f32 = f32::MAX / 4.0;
+    let cost = |nib: u8, a: f32, b: f32| {
+        (a.clamp(-1.5, 1.5) - LEVEL[(nib >> 2) as usize]).powi(2) + (b.clamp(-1.5, 1.5) - LEVEL[(nib & 3) as usize]).powi(2)
+    };
+    let mut metric = [0.0, INF, INF, INF];
+    let mut back: Vec<[(u8, u8); 4]> = Vec::with_capacity(49);
+    for p in v.chunks(2) {
+        let mut next = [INF; 4];
+        let mut from = [(0u8, 0u8); 4];
+        for s in 0..4 {
+            if metric[s] >= INF {
+                continue;
+            }
+            for i in 0..4 {
+                let m = metric[s] + cost(trellis(s, i, transpose), p[0], p[1]);
+                if m < next[i] {
+                    next[i] = m;
+                    from[i] = (s as u8, i as u8);
+                }
+            }
+        }
+        metric = next;
+        back.push(from);
+    }
+    let mut s = 0usize;
+    let mut inputs = [0u8; 49];
+    for t in (0..49).rev() {
+        let (p, i) = back[t][s];
+        inputs[t] = i;
+        s = p as usize;
+    }
+    // Hard errors along the path, for the same meaning of `trellis_errors`.
+    let mut errors = 0;
+    let mut state = 0usize;
+    for (t, &i) in inputs.iter().enumerate() {
+        let sent = trellis(state, i as usize, transpose);
+        let hard = |x: f32| LEVEL.iter().enumerate().min_by(|a, b| (a.1 - x).abs().total_cmp(&(b.1 - x).abs())).unwrap().0 as u8;
+        errors += (sent ^ (hard(v[2 * t]) << 2 | hard(v[2 * t + 1]))).count_ones();
+        state = i as usize;
+    }
+    let mut bytes = [0u8; 12];
+    for (k, &dib) in inputs[..48].iter().enumerate() {
+        bytes[k / 4] |= dib << (6 - 2 * (k % 4));
+    }
+    (bytes, errors)
+}
+
 /// CRC-CCITT (poly 0x1021) over the first 10 bytes, MSB first.
 fn crc_ccitt(bytes: &[u8], init: u16, xorout: u16) -> u16 {
     let mut crc = init;
@@ -198,11 +260,26 @@ pub fn decode_block(rx: &[u8; 98], c: Coding) -> Tsbk {
     Tsbk { bytes, crc_ok: crc == u16::from_be_bytes([bytes[10], bytes[11]]), trellis_errors }
 }
 
+/// [`decode_block`] from soft symbol values.
+pub fn decode_soft_block(rx: &[f32; 98], c: Coding) -> Tsbk {
+    let (bytes, trellis_errors) = viterbi_soft(&deinterleave(rx, c.scatter), c.transpose);
+    let crc = crc_ccitt(&bytes[..10], c.crc_init, c.crc_xorout);
+    Tsbk { bytes, crc_ok: crc == u16::from_be_bytes([bytes[10], bytes[11]]), trellis_errors }
+}
+
 /// TSBKs of a TSDU frame, in order, stopping after the last-block flag.
+///
+/// A block whose hard decision fails its CRC is decoded again from its soft values, kept if that passes.
 pub fn tsbks(f: &Frame, c: Coding) -> Vec<Tsbk> {
     let mut out = Vec::new();
-    for b in tsbk_blocks(f) {
-        let t = decode_block(&b, c);
+    let soft = tsbk_soft_blocks(f);
+    for (k, b) in tsbk_blocks(f).iter().enumerate() {
+        let mut t = decode_block(b, c);
+        if !t.crc_ok
+            && let Some(again) = soft.get(k).map(|v| decode_soft_block(v, c)).filter(|t| t.crc_ok)
+        {
+            t = again;
+        }
         let last = t.last_block();
         out.push(t);
         if last {
@@ -423,6 +500,49 @@ mod tests {
         tx[60] ^= 2;
         let t = decode_block(&tx, CODING);
         assert!(t.crc_ok && t.bytes == b, "{t:?}");
+    }
+
+    #[test]
+    fn soft_decisions_decode_more_noisy_blocks_than_hard_ones() {
+        let mut b = [0x3Bu8, 0x00, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0, 0];
+        let crc = crc_ccitt(&b[..10], CODING.crc_init, CODING.crc_xorout);
+        b[10..].copy_from_slice(&crc.to_be_bytes());
+        let tx = encode(&b, CODING);
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut gauss = move || {
+            let mut u = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                ((seed >> 11) as f64 + 1.0) / (1u64 << 53) as f64
+            };
+            ((-2.0 * u().ln()).sqrt() * (std::f64::consts::TAU * u()).cos()) as f32
+        };
+        let (mut hard_ok, mut soft_ok) = (0, 0);
+        for _ in 0..300 {
+            // Noise of a third of the level spacing's width: about one symbol in eight read wrong.
+            let soft: [f32; 98] = std::array::from_fn(|i| LEVEL[tx[i] as usize] + 0.27 * gauss());
+            let hard: [u8; 98] = std::array::from_fn(|i| {
+                let v = soft[i];
+                if v >= 2.0 / 3.0 {
+                    0b01
+                } else if v >= 0.0 {
+                    0b00
+                } else if v >= -2.0 / 3.0 {
+                    0b10
+                } else {
+                    0b11
+                }
+            });
+            let h = decode_block(&hard, CODING);
+            let t = decode_soft_block(&soft, CODING);
+            assert!(!h.crc_ok || h.bytes == b);
+            assert!(!t.crc_ok || t.bytes == b);
+            hard_ok += usize::from(h.crc_ok);
+            soft_ok += usize::from(t.crc_ok);
+        }
+        // As written: soft 295, hard 130.
+        assert!(soft_ok > 2 * hard_ok && soft_ok >= 280, "soft {soft_ok}, hard {hard_ok} of 300");
     }
 
     #[test]

@@ -256,3 +256,17 @@ fn a_smart_meter_frame_is_802_15_4g_fsk_at_150_kbps() {
     let i = detect::bank::sun_fsk(&w).expect("identified");
     assert_eq!((i.label.as_str(), i.protocol), ("802.15.4g FSK 150 kb/s", Some("802.15.4g")));
 }
+
+#[test]
+fn a_weak_p25_control_channel_is_named_by_the_weak_pass() {
+    // 851.1625 MHz on air (R2, 2026-11-11): 11 dB, only its 4 kHz core over the detector's threshold, so its records were
+    // 3.7 kHz wide and named by nothing. The exact sync search still finds nothing to confirm in it.
+    let Some((x, fs)) = common::capture("851.1625MHz_P25_Phase_1_weak") else { return };
+    assert!(detect::sync::best(&detect::sync_hits(&x, fs, detect::NARROW_CUTOFF_HZ)).is_none());
+    let c = detect::classify(&x, fs, 3_700.0);
+    assert_eq!(c.label, "P25 Phase 1");
+    let f = c.fields.expect("fields");
+    assert_eq!(f.id.as_deref(), Some("NAC 0x344"));
+    assert_eq!(f.kinds.first().map(|k| k.0.as_str()), Some("TSDU"), "{:?}", f.kinds);
+    assert!(f.decoded >= 4, "decoded {}/{}", f.decoded, f.tried);
+}

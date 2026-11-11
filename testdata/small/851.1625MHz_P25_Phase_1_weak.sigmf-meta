@@ -1,0 +1,18 @@
+{
+  "annotations": [],
+  "captures": [
+    {
+      "core:datetime": "2026-11-11T03:07:02.442Z",
+      "core:frequency": 851162656.5039062,
+      "core:sample_start": 0
+    }
+  ],
+  "global": {
+    "core:datatype": "cf32_le",
+    "core:description": "A weak P25 Phase 1 control channel (NAC 0x344, 11 dB mean SNR, only its 4 kHz core over the detector's threshold), the first 2 s of a slice-tier slice from the Airspy R2 at 852.167 MHz, 2026-11-11; no exact sync search names it",
+    "core:hw": "Airspy R2 735863DC2F650AE3",
+    "core:recorder": "spectrawl",
+    "core:sample_rate": 78125.0,
+    "core:version": "1.0.0"
+  }
+}

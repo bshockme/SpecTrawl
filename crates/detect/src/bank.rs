@@ -7,7 +7,7 @@ use num_complex::Complex32;
 use crate::{
     AmKind, Features, Hints, NARROW_CUTOFF_HZ, OFDM_USEFUL_S, PERIOD_WINDOW_S, SyncPass, SyncResult, WEAK_DB, acars, am_evidence, blind,
     carrier, chirp, decode, features, flex, frames, gsm, longest_on_run, ofdm_label, prepare, prepare_cutoff, protocol_cutoff_hz, squelch,
-    sunfsk, sync_disc, sync_features, sync_pass,
+    sunfsk, sync_disc, sync_features, sync_pass, weak_pass,
 };
 
 /// The shortest window any rung looks at: 20 ms.
@@ -171,36 +171,59 @@ pub fn acars(w: &Window<'_>) -> Option<Identified> {
 /// The sync bank, for narrowband signals that aren't bare carriers (4.5–60 kHz): first through the narrow 4FSK
 /// pre-filter, then the bandwidth's own. Once a protocol is named, the channel is sliced again through the cutoff that
 /// protocol does best with, and the better of the two passes kept.
+///
+/// Channels up to 25 kHz also get the weak pass ([`crate::weak_pass`]), and the pass that decoded more frames wins. So
+/// do records narrower than 4.5 kHz, whose window is still a whole channel: on air at 800 MHz they were mostly the
+/// 2–5 kHz cores of weak P25 channels, all that rose over the detector's threshold.
 pub fn sync_bank(w: &Window<'_>) -> Option<Synced> {
-    if !(4.5e3..60e3).contains(&w.bandwidth_hz) {
+    if w.bandwidth_hz >= 60e3 {
         return None;
     }
     let (raw, fs) = (w.full, w.fs);
     let narrow = w.bandwidth_hz <= 25e3;
-    let own_cutoff = (w.bandwidth_hz * 0.5 + 500.0).clamp(4_000.0, 6_500.0);
-    let mut found: Option<(f64, SyncPass)> = None;
-    for (cutoff, d) in [
-        narrow.then(|| (NARROW_CUTOFF_HZ, sync_disc(&prepare_cutoff(raw, fs, NARROW_CUTOFF_HZ), fs))),
-        Some((own_cutoff, if raw.len() == w.raw.len() { sync_disc(&w.x, fs) } else { sync_disc(&prepare(raw, fs, w.bandwidth_hz), fs) })),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if let Some(p) = sync_pass(&d, fs, None) {
-            found = Some((cutoff, p));
-            break;
-        }
-    }
-    let (used, mut pass) = found?;
-    let pref = protocol_cutoff_hz(pass.best.protocol, pass.best.detail);
-    if (pref - used).abs() > 1.0 {
-        let d = sync_disc(&prepare_cutoff(raw, fs, pref), fs);
-        if let Some(again) = sync_pass(&d, fs, Some(&pass.best))
-            && again.better_than(&pass)
+    let mut hard: Option<SyncPass> = None;
+    if w.bandwidth_hz >= 4.5e3 {
+        let own_cutoff = (w.bandwidth_hz * 0.5 + 500.0).clamp(4_000.0, 6_500.0);
+        let mut found: Option<(f64, SyncPass)> = None;
+        for (cutoff, d) in [
+            narrow.then(|| (NARROW_CUTOFF_HZ, sync_disc(&prepare_cutoff(raw, fs, NARROW_CUTOFF_HZ), fs))),
+            Some((
+                own_cutoff,
+                if raw.len() == w.raw.len() { sync_disc(&w.x, fs) } else { sync_disc(&prepare(raw, fs, w.bandwidth_hz), fs) },
+            )),
+        ]
+        .into_iter()
+        .flatten()
         {
-            pass = again;
+            if let Some(p) = sync_pass(&d, fs, None) {
+                found = Some((cutoff, p));
+                break;
+            }
+        }
+        if let Some((used, mut pass)) = found {
+            let pref = protocol_cutoff_hz(pass.best.protocol, pass.best.detail);
+            if (pref - used).abs() > 1.0 {
+                let d = sync_disc(&prepare_cutoff(raw, fs, pref), fs);
+                if let Some(again) = sync_pass(&d, fs, Some(&pass.best))
+                    && again.better_than(&pass)
+                {
+                    pass = again;
+                }
+            }
+            hard = Some(pass);
         }
     }
+    let weak = if narrow { weak_pass(raw, fs) } else { None };
+    let pass = match (hard, weak) {
+        (Some(h), Some(w)) => {
+            if w.better_than(&h) {
+                w
+            } else {
+                h
+            }
+        }
+        (h, w) => h.or(w)?,
+    };
     let mut f = w.features.clone();
     sync_features(&mut f, &pass.frames, &pass.best);
     let fields = (pass.fields.tried > 0).then_some(pass.fields);

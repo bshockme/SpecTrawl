@@ -298,6 +298,113 @@ fn sync_pass(d: &[f32], fs: f64, want: Option<&SyncResult>) -> Option<SyncPass> 
     Some(SyncPass { best, frames: fr, fields })
 }
 
+/// The least correlation (see [`sync::soft_match`]) a weak pass takes as a sync. On 30 s of noise, 0.8 let through
+/// about 100 candidate syncs a second across the whole table, and noise confirmed NXDN; so a weak pass's syncs name
+/// nothing by themselves, only through frames that check (see [`weak_pass`]).
+pub const WEAK_SYNC_RHO: f32 = 0.8;
+
+/// Frames that agree, by a checked code, on whose they are, before a weak pass names anything.
+pub const WEAK_MIN_AGREEING: usize = 2;
+
+/// What a frame's checked code says about whose it is: a P25 Phase 1 NID's NAC (BCH(63,16), within
+/// `P25_MAX_ERRORS`), or a DMR data burst's colour code when the burst behind its slot type passes its CRC (the slot
+/// type's Golay(20,8) alone takes a third of random words). A constant input slices to the all-zeros or all-ones NID,
+/// both codewords (a tone, an FM carrier's steady swing), so those are no one's.
+fn checked_id(fr: &frames::Frame) -> Option<String> {
+    match fr.protocol {
+        "P25" if fr.detail == "Phase 1" => {
+            let n = decode::p25_nid(fr)?;
+            let trivial = (n.nac, n.duid) == (0, 0) || (n.nac, n.duid) == (0xFFF, 0xF);
+            (!trivial).then(|| format!("NAC 0x{:03X}", n.nac))
+        }
+        "DMR" => {
+            let s = decode::dmr_slot_type(fr)?;
+            dmr::decode_burst(fr, s.data_type).map(|_| format!("CC {}", s.colour_code))
+        }
+        _ => None,
+    }
+}
+
+/// The weak pass's symbol rate: P25 Phase 1 and DMR.
+const WEAK_BAUD: f64 = 4800.0;
+
+/// The weak pass slices the symbol discriminator as it stands: it is already each symbol's average.
+const WEAK_SLICE: frames::SliceOpts =
+    frames::SliceOpts { smooth: 0.0, refine: true, post_lpf: None, robust_levels: true, dc_track: true, isi_boost: true };
+
+/// The weak pass's symbol discriminator of `x` (through the narrow pre-filter, its median removed) and the soft sync
+/// hits in it of the 4800 Bd entries `keep` takes.
+fn weak_hits(x: &[Complex32], fs: f64, keep: impl Fn(&sync::SyncEntry) -> bool) -> Option<(Vec<f32>, Vec<sync::SyncHit>)> {
+    if x.len() < 64 || fs / WEAK_BAUD < 2.0 {
+        return None;
+    }
+    let y = prepare_cutoff(x, fs, NARROW_CUTOFF_HZ);
+    let mut d = features::symbol_discriminator(&y, fs, WEAK_BAUD);
+    let mut s = d.clone();
+    let mid = s.len() / 2;
+    let centre = *s.select_nth_unstable_by(mid, f32::total_cmp).1;
+    d.iter_mut().for_each(|v| *v -= centre);
+    let table: Vec<sync::SyncEntry> = sync::table().into_iter().filter(|e| e.baud == WEAK_BAUD && keep(e)).collect();
+    let hits = sync::search_with(&d, fs, &table, sync::SearchOpts { smooth: 0.0, soft: Some(WEAK_SYNC_RHO) });
+    Some((d, hits))
+}
+
+/// P25 Phase 1 frames in `x` as the weak pass slices them, `after` symbols past each sync, every soft sync's frame
+/// whether its NID decodes or not: for a decoder that checks each frame's codes itself (the control channel's TSBKs
+/// have their CRC). Beside [`frames`], whose exact syncs a weak channel rarely gives.
+pub fn p25_weak_frames(x: &[Complex32], fs: f64, after: usize) -> Vec<frames::Frame> {
+    match weak_hits(x, fs, |e| (e.protocol, e.detail) == ("P25", "Phase 1")) {
+        Some((d, hits)) => frames::slice_with(&d, fs, &hits, 8, after, WEAK_SLICE),
+        None => Vec::new(),
+    }
+}
+
+/// The weak-signal pass over a narrowband channel (`x` at `fs`): P25 Phase 1 and DMR data, the protocols whose frames
+/// carry a code strong enough to say a sync was real, searched on the [`features::symbol_discriminator`] with soft
+/// sync matching ([`WEAK_SYNC_RHO`]) and sliced without further smoothing. It names a protocol only when at least
+/// [`WEAK_MIN_AGREEING`] of its frames pass their code and agree on the system (NAC, colour code); frames that decode
+/// to anyone else are dropped as chance syncs. On air (2026-11-11, R2) an 11 dB P25 control channel at 851.1625 MHz
+/// that no hard search named gave 22 NIDs of NAC 0x344 and six CRC-good TSBKs in 7 s.
+pub(crate) fn weak_pass(x: &[Complex32], fs: f64) -> Option<SyncPass> {
+    let (d, hits) =
+        weak_hits(x, fs, |e| (e.protocol, e.detail) == ("P25", "Phase 1") || (e.protocol == "DMR" && e.detail.contains("data")))?;
+    let slice_opts = WEAK_SLICE;
+    let mut best: Option<SyncPass> = None;
+    for protocol in ["P25", "DMR"] {
+        let mine: Vec<sync::SyncHit> = hits.iter().filter(|h| h.entry.protocol == protocol).cloned().collect();
+        let Some(first) = mine.first() else { continue };
+        let (before, after) = slice_extent(protocol, first.entry.detail);
+        let fr = frames::slice_with(&d, fs, &mine, before, after, slice_opts);
+        let ids: Vec<Option<String>> = fr.iter().map(checked_id).collect();
+        let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+        for id in ids.iter().flatten() {
+            *counts.entry(id).or_default() += 1;
+        }
+        let Some((top, agree)) = counts.into_iter().max_by_key(|(_, n)| *n) else { continue };
+        if agree < WEAK_MIN_AGREEING {
+            continue;
+        }
+        let top = top.to_string();
+        let kept: Vec<frames::Frame> =
+            fr.into_iter().zip(&ids).filter(|(_, id)| id.as_ref().is_none_or(|i| *i == top)).map(|(f, _)| f).collect();
+        let fields = decode::summarise(&kept);
+        // The detail and polarity the agreeing frames were sliced at.
+        let lead = kept.iter().find(|f| checked_id(f).is_some()).unwrap();
+        let confidence = match agree {
+            2 => 0.8,
+            3..=4 => 0.9,
+            _ => 0.97,
+        };
+        let sync =
+            SyncResult { protocol: lead.protocol, detail: lead.detail, baud: WEAK_BAUD, inverted: lead.inverted, count: agree, confidence };
+        let pass = SyncPass { best: sync, frames: kept, fields };
+        if best.as_ref().is_none_or(|b| pass.better_than(b)) {
+            best = Some(pass);
+        }
+    }
+    best
+}
+
 /// Features read off the sliced frames once a sync has named the signal:
 /// the symbol rate is the protocol's, the deviation is the outer level the
 /// sync measured (in Hz), and the level count comes from how many payload
@@ -710,6 +817,89 @@ mod tests {
             .collect();
         let c = classify_with(&ook, fs, 8_000.0, Hints { snr_db: Some(25.0), ..Default::default() });
         assert_eq!(c.label, "OOK", "{c:?}");
+    }
+
+    /// P25 Phase 1 C4FM at 4800 Bd, `fs` (a multiple of 4800), `amp` against unit-power noise: control-channel-like
+    /// frames every 360 symbols, each the frame sync, the NID of `nac` (DUID TSDU) with its status symbol, and random
+    /// dibits. The frequency is each symbol's level held and smoothed over a symbol.
+    fn p25(nac: u16, fs: f64, secs: f64, amp: f32, seed: u64) -> Vec<Complex32> {
+        let nid = decode::p25_nid_codeword(nac, 0x7);
+        let nid_bits: Vec<u8> = (0..64).map(|i| if i < 63 { (nid >> (62 - i)) as u8 & 1 } else { (nid.count_ones() & 1) as u8 }).collect();
+        let mut r = seed | 1;
+        let mut rand = move || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        let nsym = (secs * 4800.0) as usize;
+        let dibits: Vec<u8> = (0..nsym)
+            .map(|k| {
+                let i = k % 360;
+                if i < 24 {
+                    (0x5575_F5FF_77FFu64 >> (46 - 2 * i)) as u8 & 3
+                } else if (i + 1) % 36 != 0 && i < 57 {
+                    // The NID's dibits, the status symbol at 35 skipped.
+                    let j = i - 24 - usize::from(i > 35);
+                    nid_bits[2 * j] << 1 | nid_bits[2 * j + 1]
+                } else {
+                    (rand() >> 40) as u8 & 3
+                }
+            })
+            .collect();
+        let sps = (fs / 4800.0) as usize;
+        let level = |d: u8| [600.0, 1800.0, -600.0, -1800.0][d as usize];
+        let held: Vec<f64> = dibits.iter().flat_map(|&d| std::iter::repeat_n(level(d), sps)).collect();
+        let nz = noise(held.len(), seed ^ 0x5eed);
+        let mut phase = 0.0f64;
+        (0..held.len())
+            .map(|i| {
+                let lo = i.saturating_sub(sps / 2);
+                let hi = (i + sps / 2).min(held.len());
+                phase += std::f64::consts::TAU * held[lo..hi].iter().sum::<f64>() / (hi - lo) as f64 / fs;
+                Complex32::from_polar(amp, phase as f32) + nz[i]
+            })
+            .collect()
+    }
+
+    /// Ten 1.5 s windows of [`p25`] at each level (20 frames each), NIDs decoded by the hard passes against the weak
+    /// pass, by CNR in 12.5 kHz: −0.2 dB 0/4, 1.4 dB 0/26, 3.9 dB 0/96, 5.8 dB 0/130, 8.1 dB 10/161, 9.9 dB 34/168,
+    /// 11.9 dB 69/169. About 6 dB gained.
+    #[test]
+    fn a_weak_p25_channel_is_named_by_its_nids_where_exact_syncs_fail() {
+        let fs = 48_000.0;
+        for seed in 1..=4 {
+            // 3.9 dB in 12.5 kHz.
+            let x = p25(0x344, fs, 1.5, 0.8, seed);
+            // The exact search finds nothing to confirm.
+            let hard = sync_pass(&sync_disc(&prepare_cutoff(&x, fs, NARROW_CUTOFF_HZ), fs), fs, None);
+            assert!(hard.as_ref().is_none_or(|p| p.fields.decoded == 0), "seed {seed}: {:?}", hard.map(|p| p.best));
+            let c = classify(&x, fs, 12_500.0);
+            assert_eq!(c.label, "P25 Phase 1", "seed {seed}");
+            let f = c.fields.expect("fields");
+            assert_eq!(f.id.as_deref(), Some("NAC 0x344"), "seed {seed}");
+            assert!(f.decoded >= WEAK_MIN_AGREEING, "seed {seed}: {}/{}", f.decoded, f.tried);
+            // A record that is only the channel's 3 kHz core is looked at as a whole channel.
+            assert_eq!(classify(&x, fs, 3_000.0).label, "P25 Phase 1", "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn the_weak_pass_names_nothing_in_noise_or_a_tone() {
+        let fs = 48_000.0;
+        for seed in 0..40u64 {
+            assert!(weak_pass(&noise(72_000, 2000 + seed), fs).is_none(), "seed {seed}");
+        }
+        // A steady FM swing slices to runs of one level, which the all-ones and all-zeros NIDs would take.
+        let nz = noise(72_000, 9);
+        let mut ph = 0.0f64;
+        let tone: Vec<Complex32> = (0..72_000)
+            .map(|i| {
+                ph += std::f64::consts::TAU * 1800.0 * (std::f64::consts::TAU * 67.0 * i as f64 / fs).sin().signum() / fs;
+                Complex32::from_polar(3.0, ph as f32) + nz[i]
+            })
+            .collect();
+        assert!(weak_pass(&tone, fs).is_none());
     }
 
     #[test]

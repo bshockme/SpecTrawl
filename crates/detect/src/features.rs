@@ -81,6 +81,26 @@ pub fn envelope_cv(x: &[Complex32]) -> f32 {
     if mean > 0.0 { var.sqrt() / mean } else { 0.0 }
 }
 
+/// The mean frequency over the symbol (at `baud`) centred on each sample, Hz: the phase turned from half a symbol
+/// before to half a symbol after, `arg(x[n+D/2]·conj(x[n−D/2]))`. The same length as `x`, zero for the half symbol at
+/// each end.
+///
+/// On a weak channel it reads symbols far better than the sample [`discriminator`] averaged over the symbol: the
+/// average adds up every sample's phase noise, and near the noise floor each sample's phase can turn by nearly a
+/// whole cycle (a click) which the average keeps, where the phase across the symbol takes only the net turn. On air
+/// (P25 at 852.575 MHz, 16.6 dB) it gave 88 frames and 82 good NIDs from a 12 s record, against 35 and 32; on an
+/// 11 dB control channel its syncs are nearly all whole where the discriminator's are not.
+pub fn symbol_discriminator(x: &[Complex32], fs: f64, baud: f64) -> Vec<f32> {
+    let d = (fs / baud).round().max(1.0) as usize;
+    let k = (fs / (2.0 * std::f64::consts::PI * d as f64)) as f32;
+    let h = d / 2;
+    let mut out = vec![0.0f32; x.len()];
+    for n in h..x.len().saturating_sub(d - h) {
+        out[n] = (x[n + d - h] * x[n - h].conj()).arg() * k;
+    }
+    out
+}
+
 /// FM discriminator: instantaneous frequency in Hz, one sample shorter.
 pub fn discriminator(x: &[Complex32], fs: f64) -> Vec<f32> {
     let k = (fs / (2.0 * std::f64::consts::PI)) as f32;

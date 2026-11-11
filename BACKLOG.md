@@ -3,6 +3,20 @@
 Ideas and known rough edges that aren't scheduled yet. Newest at the top of each section.
 
 ## Rebuild
+- **Weak-signal decoding** (2026-11-11, step 8 branch). The exact sync search took a P25 word only with all 24 signs right, on a discriminator that averages each sample's phase step. Near the floor that average keeps the noise's phase clicks, and every sync had a symbol or two wrong.
+  - **The weak pass** (`detect::weak_pass`) slices the phase turned over one symbol. It takes a word a sixth wrong if it correlates with the pattern at 0.8, and names only what two agreeing NIDs or CRC-checked DMR bursts confirm.
+  - **Synthetic gain:** C4FM P25, 1.5 s windows. At 3.9 dB in 12.5 kHz the old path decodes 0 of 200 NIDs, the weak pass 96. At 11.9 dB it is 69 against 169.
+  - **On air** (852.167 MHz, R2): records under 15 dB went from 0 of 69 named to 48 of 200, with no change in pool work (21.5 s against 21.6 s per 120 s run).
+    - 851.1625 MHz is NAC 0x344's control channel: 22 of 26 records named, and the control decoder reads WACN BEE00 SYS 348 from its TSBKs.
+    - 853.2, 853.325 and 856.4625 MHz are NAC 0x343: 13 of 23, 17 of 30 and 5 of 6 records named.
+    - No foreign NAC in three captures' worth of records.
+  - **Narrow records:** those under 4.5 kHz, which the sync bank skipped outright, now get the weak pass.
+  - **Soft TSBK trellis:** 295 of 300 noisy blocks against 130 hard. On the weak control channel's slices it gave 5→7 and 0→1 CRC-good TSBKs, the others unchanged; not yet measured live.
+  - **Left:**
+    - Fragments of 0.2–0.4 s rarely hold two NIDs and stay unnamed; their emitter is named by its longer records.
+    - Weak traffic channels' voice (IMBE) still comes from the exact search's frames.
+    - NXDN (its sync is its LICH, so no independent check), Phase 2, POCSAG and FLEX have no weak pass.
+    - The streaming per-channel symbol engine of DESIGN §7.1 is still batch passes over windows.
 - **Sample-rate command not in `Command`** (2026-10-23): `Source` has no `set_rate`; the Airspy's 2.5 MS/s is unreachable from the new app.
 - **Waterfall zoom resolution is 4096 columns** (2026-10-23): zooming past 24 columns is blocked; native-bin zoom like the old survey view is step 8.
 - **Opening an Airspy blocks the snapshot thread** (2026-10-23): for the duration of `open` there is no new snapshot (~0.5 s); move opens to a helper thread if it shows.
@@ -61,7 +75,7 @@ Ideas and known rough edges that aren't scheduled yet. Newest at the top of each
 - DESIGN §1 L14: Rewind to, replay and export records — DONE (done 2026-11-05, step 5): Play and Save audio on any record, from the ring while it holds it, else from the record's slice (its IQ export); rewinding by scrubbing is L145/L246, step 8
 - DESIGN §1 L17: Baseline comparison and TSCM baselines — MISSING — not scheduled
 - DESIGN §1 L23: Any SDR fills any role, matched on capabilities — PARTIAL — not scheduled
-- DESIGN §1 L25: Reliable detection across many channels at once — PARTIAL — step 7: the sync bank runs on every record's window in a pool (step 6); the per-channel symbol engine with its adaptive slicer (DESIGN §7.1) is not built, and weak (~12 dB) channels stay unnamed
+- DESIGN §1 L25: Reliable detection across many channels at once — PARTIAL — step 7: the sync bank runs on every record's window in a pool (step 6); the weak pass (2026-11-11: soft syncs on the symbol discriminator, named only by agreeing checked frames) names P25 Phase 1 and DMR data about 6 dB lower than the exact search; a per-channel streaming symbol engine (DESIGN §7.1) is not built, and NXDN, Phase 2 and the pagers have no weak pass
 - DESIGN §1 L26: Unknown signals get bandwidth, modulation family, symbol rate, timing — PARTIAL — step 8: an undecoded record gets a `Features` claim (the modulation rules' label, bandwidth, SNR, duty, envelope CV; step 6); the symbol rate and FSK levels the rules measured are not in `Evidence::Features` yet, nor shown by an inspector
 - DESIGN §1 L28: Windows and Linux support — DONE (done 2026-10-23, step 0/1)
 - DESIGN §1 L33: Voice vocoders are a non-goal — CONTRADICTED — step 9

@@ -266,6 +266,13 @@ Chosen in step 6 (2026-11-05):
   - Re-looks: a record still open 30 s after its last window gets another from the live edge, which replaces the first look's claims only if it decoded something or the first didn't.
   - The weak gate takes the window's own SNR (in-band density over the 20th percentile of the channel's other passband bins). Where the record fills its channel, it takes the record's SNR instead.
 - **Sync confirmation** (DESIGN §7.1): a second sync must be on the protocol's grid within its longest sync-to-sync gap + 3 %, give or take 3 symbols + 0.05 %. The gaps are P25 Phase 1 864 symbols, Phase 2 720, a DMR voice superframe 1728, and two periods elsewhere. A transmission's count is its longest chain. Entries with no grid need six syncs evenly spaced on a grid of their own.
+- **The weak pass** (added 2026-11-11). Channels up to 25 kHz also get a second sync pass for weak signals, and the pass that decoded more frames wins:
+  - It covers P25 Phase 1 and DMR data, whose frames carry a code strong enough to say a sync was real.
+  - Symbols come from the phase turned over one symbol (`features::symbol_discriminator`), not the sample discriminator's average. Near the noise floor that average keeps every sample's phase clicks.
+  - A sync word may have up to a sixth of its symbols on the wrong side of zero if its symbols correlate with the pattern at 0.8 or better (`sync::soft_match`).
+  - Those syncs name nothing by themselves (noise passes them about 100 times a second). The pass names a protocol only when two or more of its frames pass their code and agree on the system: a P25 NID's NAC (never the all-zeros or all-ones codeword), or a DMR colour code behind a burst that passes its CRC. Frames decoding to anyone else are dropped.
+  - Records narrower than 4.5 kHz get the weak pass too: their window is still a whole channel. On air at 800 MHz they were the 2–5 kHz cores of weak P25 channels.
+  - The P25 control decoder keeps the weak pass's frames when more of their NIDs decode. A TSBK whose hard decision fails its CRC is decoded again by a soft-decision Viterbi.
 - **The book.**
   - Claims from the bank and decoders are kept per record and per maker, across an open record's rebuilds.
   - Every record gets the band plan's entry as a `BandPlan` claim, 0.2 sure.

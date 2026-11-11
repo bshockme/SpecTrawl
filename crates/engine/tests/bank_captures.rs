@@ -152,3 +152,27 @@ fn the_p25_control_decoder_names_the_whole_site_within_two_seconds() {
     assert!(t.blocks_ok >= 200 && t.blocks_bad * 10 <= t.blocks_ok, "{t:?}");
     assert_eq!(t.identity.map(|i| i.known()), Some(5));
 }
+
+#[test]
+fn a_weak_p25_control_channel_is_named_at_its_records_width_and_its_decoder_locks() {
+    use engine::decoders::{Decoder, P25Control};
+    // 851.1625 MHz on air (R2, 2026-11-11): 11 dB, recorded 3.7 kHz wide (its core), named by nothing before the weak pass.
+    let (x, fs) = capture("851.1625MHz_P25_Phase_1_weak");
+    let all = windows(&x, fs, 3_700.0, 11.0);
+    assert_eq!(all.len(), 1);
+    let claims = &all[0];
+    let sync = claims.iter().find(|c| matches!(c.by, Evidence::SyncBank { .. })).unwrap_or_else(|| panic!("{claims:?}"));
+    assert_eq!(sync.label, "P25 Phase 1");
+    assert_eq!(claims.iter().find_map(p25).map(|i| matches!(i, Identity::P25 { nac: 0x344, .. })), Some(true), "{claims:?}");
+    // The control channel's decoder, fed the whole slice, takes the weak slicing and learns the NAC from its NIDs. At
+    // 11 dB a TSBK passes its trellis and CRC about once a second (soft decisions help a little), so the system's
+    // identity beyond the NAC takes longer than this slice.
+    let mut d = P25Control::new(851.1625e6);
+    d.configure(fs);
+    for piece in x.chunks(4096) {
+        d.feed(piece);
+    }
+    let t = d.telemetry();
+    assert_eq!(t.identity.as_ref().map(|i| matches!(i, Identity::P25 { nac: 0x344, .. })), Some(true), "{t:?}");
+    assert!(t.blocks_ok + t.blocks_bad >= 2, "TSDUs sliced: {t:?}");
+}

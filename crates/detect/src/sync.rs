@@ -139,9 +139,58 @@ pub struct SyncHit {
 /// Samples per symbol searched (parallel phases).
 pub const PHASES: usize = 10;
 
+/// How the sync search reads a discriminator.
+#[derive(Debug, Clone, Copy)]
+pub struct SearchOpts {
+    /// Boxcar smoothing before sampling, as a fraction of a symbol. A symbol-spaced discriminator
+    /// ([`crate::features::symbol_discriminator`]) is already one symbol's average and takes 0.
+    pub smooth: f64,
+    /// Also accept a word whose signs are a few symbols off (a sixth of its length) when its symbols correlate with
+    /// the pattern's levels at least this well (see [`soft_match`]): a weak channel's noise flips a symbol or two of
+    /// nearly every sync, which an exact match never accepts.
+    pub soft: Option<f32>,
+}
+
+impl Default for SearchOpts {
+    fn default() -> Self {
+        Self { smooth: 0.5, soft: None }
+    }
+}
+
 /// Searches the FM discriminator output `disc` (sampled at `fs`, DC removed)
 /// for every table entry. Returns all hits.
 pub fn search(disc: &[f32], fs: f64, table: &[SyncEntry]) -> Vec<SyncHit> {
+    search_with(disc, fs, table, SearchOpts::default())
+}
+
+/// The correlation of a sync word's symbols (`vals`, newest first) with `e`'s pattern at its outer levels: Σ s·v over
+/// the masked positions, over √(n·Σ v²), so 1 for a clean word and about N(0, 1/n) for noise. The positions the mask
+/// drops (a 4-level word's inner symbols) must be inner on average: under two thirds of the outer level. Negative
+/// for the inverted word.
+pub fn soft_match(e: &SyncEntry, vals: &[f32; 32]) -> f32 {
+    let (mut c, mut energy, mut n, mut inner, mut ni) = (0.0f32, 0.0f32, 0usize, 0.0f32, 0usize);
+    for i in 0..e.len as usize {
+        let v = vals[i];
+        if e.mask >> i & 1 == 1 {
+            c += if e.pattern >> i & 1 == 1 { -v } else { v };
+            energy += v * v;
+            n += 1;
+        } else {
+            inner += v.abs();
+            ni += 1;
+        }
+    }
+    if n == 0 || energy <= 0.0 {
+        return 0.0;
+    }
+    if e.four_level && ni > 0 && inner / ni as f32 >= 2.0 / 3.0 * c.abs() / n as f32 {
+        return 0.0;
+    }
+    c / (n as f32 * energy).sqrt()
+}
+
+/// [`search`] with its options.
+pub fn search_with(disc: &[f32], fs: f64, table: &[SyncEntry], opts: SearchOpts) -> Vec<SyncHit> {
     let mut hits = Vec::new();
     let mut bauds: Vec<f64> = table.iter().map(|e| e.baud).collect();
     bauds.sort_by(f64::total_cmp);
@@ -152,7 +201,7 @@ pub fn search(disc: &[f32], fs: f64, table: &[SyncEntry]) -> Vec<SyncHit> {
         if fs / baud < 2.0 {
             continue;
         }
-        let smoothed = boxcar(disc, ((fs / baud) * 0.5).round().max(1.0) as usize);
+        let smoothed = boxcar(disc, ((fs / baud) * opts.smooth).round().max(1.0) as usize);
         let sym_len = fs / baud;
         let nsym = ((smoothed.len() as f64 - 1.0) / sym_len).floor() as usize;
         for phase in 0..PHASES {
@@ -179,6 +228,13 @@ pub fn search(disc: &[f32], fs: f64, table: &[SyncEntry]) -> Vec<SyncHit> {
                         hits.push(SyncHit { entry: **e, inverted: false, phase, symbol: k, errors: errs });
                     } else if e.invertible && errs_inv <= tol && levels_ok(e, &vals) {
                         hits.push(SyncHit { entry: **e, inverted: true, phase, symbol: k, errors: errs_inv });
+                    } else if let Some(min) = opts.soft {
+                        let near = u32::from(e.len) / 6;
+                        if errs <= near && soft_match(e, &vals) >= min {
+                            hits.push(SyncHit { entry: **e, inverted: false, phase, symbol: k, errors: errs });
+                        } else if e.invertible && errs_inv <= near && -soft_match(e, &vals) >= min {
+                            hits.push(SyncHit { entry: **e, inverted: true, phase, symbol: k, errors: errs_inv });
+                        }
                     }
                 }
             }
@@ -522,6 +578,42 @@ mod tests {
         assert!(best(&even[..5]).is_none(), "five is not enough");
         let scattered: Vec<SyncHit> = [50, 333, 790, 1410, 2002, 2600, 3333].into_iter().map(|s| hit(pv, s)).collect();
         assert!(best(&scattered).is_none(), "seven at no common spacing");
+    }
+
+    #[test]
+    fn a_sync_with_two_symbols_flipped_is_found_only_by_the_soft_match() {
+        let p25 = table().into_iter().find(|e| e.protocol == "P25" && e.detail == "Phase 1").unwrap();
+        // Two weak symbols on the wrong side of zero, as noise leaves them; the rest at ±3 with a little spread.
+        let mut sync = sync_symbols(p25.pattern, 24);
+        sync[5] *= -0.4;
+        sync[17] *= -0.3;
+        for (i, v) in sync.iter_mut().enumerate() {
+            *v *= 1.0 + 0.1 * ((i % 3) as f32 - 1.0);
+        }
+        let mut syms = noise_symbols(100, 3);
+        for _ in 0..3 {
+            syms.extend(&sync);
+            syms.extend(noise_symbols(336, 9));
+        }
+        let disc = disc_from_symbols(&syms, 10);
+        let fs = 48_000.0;
+        assert!(best(&search(&disc, fs, std::slice::from_ref(&p25))).is_none(), "the exact search takes no flipped word");
+        let soft = SearchOpts { smooth: 0.0, soft: Some(0.8) };
+        let r = best(&search_with(&disc, fs, std::slice::from_ref(&p25), soft)).expect("soft hits");
+        assert_eq!((r.protocol, r.count), ("P25", 3));
+        // The correlation itself: 1 for a clean word, −1 inverted, near 0 for random symbols.
+        let vals = |w: &[f32]| -> [f32; 32] {
+            let mut v = [0.0f32; 32];
+            for (i, x) in w.iter().rev().enumerate() {
+                v[i] = *x;
+            }
+            v
+        };
+        let clean = sync_symbols(p25.pattern, 24);
+        assert!((soft_match(&p25, &vals(&clean)) - 1.0).abs() < 1e-6);
+        assert!((soft_match(&p25, &vals(&clean.iter().map(|v| -v).collect::<Vec<_>>())) + 1.0).abs() < 1e-6);
+        assert!(soft_match(&p25, &vals(&sync)) > 0.8);
+        assert!(soft_match(&p25, &vals(&noise_symbols(24, 5))).abs() < 0.6);
     }
 
     #[test]

@@ -70,8 +70,14 @@ impl P25Control {
     fn decode(&mut self, x: &[Complex32]) {
         let skip = if self.blocks == 0 { 0 } else { (OVERLAP_S * BAUD) as usize };
         self.blocks += 1;
-        // TSDUs carry up to three TSBKs: slice far enough past each sync.
-        let frames: Vec<_> = detect::frames(x, self.rate, 12_500.0, 8, 380).into_iter().filter(|f| f.at_symbol >= skip).collect();
+        // TSDUs carry up to three TSBKs: slice far enough past each sync. A weak control channel gives few exact syncs;
+        // the weak pass's slicing (soft syncs on the symbol discriminator) is kept when more of its NIDs decode.
+        let nids = |f: &[detect::frames::Frame]| f.iter().filter(|f| detect::decode::p25_nid(f).is_some()).count();
+        let mut frames: Vec<_> = detect::frames(x, self.rate, 12_500.0, 8, 380).into_iter().filter(|f| f.at_symbol >= skip).collect();
+        let weak: Vec<_> = detect::p25_weak_frames(x, self.rate, 380).into_iter().filter(|f| f.at_symbol >= skip).collect();
+        if nids(&weak) > nids(&frames) {
+            frames = weak;
+        }
         let mut locked = false;
         for f in &frames {
             let Some(nid) = detect::decode::p25_nid(f) else { continue };

@@ -53,7 +53,10 @@ fn main() {
         let records = view.records.iter().filter(|r| r.first_sample >= from && r.tuner_hz == center).count();
         println!("== {mhz} MHz after {secs} s: {} confirmed emitters, {records} records", emitters.len());
         let c = e.classify_view();
-        println!("   pool: {} threads, looked {}, missed {}, dropped {}, waiting {}", c.workers, c.looked, c.missed, c.dropped, c.waiting);
+        println!(
+            "   pool: {} threads, looked {}, missed {}, dropped {}, waiting {}; {:.1} s of work for {:.1} s of IQ",
+            c.workers, c.looked, c.missed, c.dropped, c.waiting, c.work_secs, c.looked_secs
+        );
         for m in &emitters {
             let snr = view.records.iter().filter(|r| r.emitter == Some(m.id)).map(|r| r.max_snr_db).fold(f32::MIN, f32::max);
             println!(

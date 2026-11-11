@@ -60,6 +60,13 @@ pub fn p25_duid_name(d: u8) -> &'static str {
     }
 }
 
+/// The 63-bit BCH codeword of the NID for `nac` and `duid`, most significant bit first as sent (a transmitter follows
+/// it with a parity bit, which the decoder doesn't read).
+pub fn p25_nid_codeword(nac: u16, duid: u8) -> u64 {
+    let info = u64::from(nac & 0xFFF) << 4 | u64::from(duid & 0xF);
+    info << 47 | parity(info, P25_BCH_GEN, 47, 16)
+}
+
 /// Reads and corrects the NID of a frame whose `dibits` start at the frame
 /// sync (`sync_start`), skipping the status symbol after every 35 dibits of
 /// the frame (counted from the start of the sync).
